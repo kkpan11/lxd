@@ -273,14 +273,15 @@ myst_url_schemes = {
 remove_from_toctrees = ['reference/manpages/lxc/*.md']
 
 intersphinx_mapping = {
-    'cloud-init': ('https://cloudinit.readthedocs.io/en/latest/', None)
+    'cloud-init': ('https://cloudinit.readthedocs.io/en/latest/', None),
+    'imagebuilder': ('https://canonical-lxd-imagebuilder.readthedocs-hosted.com/en/latest/', None)
 }
 
 html_extra_path = ['.sphinx/_extra']
 
 # Download and link swagger-ui files
 if not os.path.isdir('.sphinx/deps/swagger-ui'):
-    Repo.clone_from('https://github.com/swagger-api/swagger-ui', '.sphinx/deps/swagger-ui', depth=1, single_branch=True, b='v5.11.7')
+    Repo.clone_from('https://github.com/swagger-api/swagger-ui', '.sphinx/deps/swagger-ui', depth=1)
 
 os.makedirs('.sphinx/_static/swagger-ui/', exist_ok=True)
 
@@ -387,7 +388,6 @@ else:
     custom_excludes.extend(['security.md','external_resources.md','reference/network_external.md','migration.md'])
     redirects['security/index'] = '../explanation/security/'
     redirects['migration/index'] = '../howto/import_machines_to_instances/'
-    redirects['tutorial/index'] = 'first_steps/'
     custom_tags.append('diataxis')
     toc_filter_exclude = ['topical']
 
