@@ -9,6 +9,7 @@ import (
 
 	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/shared"
+	"github.com/canonical/lxd/shared/api"
 )
 
 func (g *cmdGlobal) cmpClusterGroupNames(toComplete string) ([]string, cobra.ShellCompDirective) {
@@ -214,8 +215,8 @@ func (g *cmdGlobal) cmpInstanceAllKeys(instanceName string) ([]string, cobra.She
 	var keys []string
 	cmpDirectives := cobra.ShellCompDirectiveNoFileComp
 
-	_, instanceNameOnly, _ := strings.Cut(instanceName, ":")
-	if instanceNameOnly == "" {
+	_, instanceNameOnly, found := strings.Cut(instanceName, ":")
+	if instanceNameOnly == "" && found {
 		serverKeys, directives := g.cmpServerAllKeys(instanceName)
 		keys = append(keys, serverKeys...)
 		cmpDirectives = directives
@@ -231,7 +232,7 @@ func (g *cmdGlobal) cmpInstanceAllKeys(instanceName string) ([]string, cobra.She
 	resource := resources[0]
 	client := resource.server
 
-	instance, _, err := client.GetInstance(instanceNameOnly)
+	instance, _, err := client.GetInstance(instanceName)
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveError
 	}
@@ -339,6 +340,64 @@ func (g *cmdGlobal) cmpInstanceDeviceNames(instanceName string) ([]string, cobra
 	return results, cobra.ShellCompDirectiveNoFileComp
 }
 
+func (g *cmdGlobal) cmpInstanceAllDevices(instanceName string) ([]string, cobra.ShellCompDirective) {
+	resources, err := g.ParseServers(instanceName)
+	if err != nil || len(resources) == 0 {
+		return nil, cobra.ShellCompDirectiveError
+	}
+
+	resource := resources[0]
+	client := resource.server
+
+	metadataConfiguration, err := client.GetMetadataConfiguration()
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveError
+	}
+
+	devices := make([]string, 0, len(metadataConfiguration.Configs))
+
+	for key := range metadataConfiguration.Configs {
+		if strings.HasPrefix(key, "device-") {
+			parts := strings.Split(key, "-")
+			deviceName := parts[1]
+			devices = append(devices, deviceName)
+		}
+	}
+
+	return devices, cobra.ShellCompDirectiveNoFileComp
+}
+
+func (g *cmdGlobal) cmpInstanceAllDeviceOptions(instanceName string, deviceName string) ([]string, cobra.ShellCompDirective) {
+	resources, err := g.ParseServers(instanceName)
+	if err != nil || len(resources) == 0 {
+		return nil, cobra.ShellCompDirectiveError
+	}
+
+	resource := resources[0]
+	client := resource.server
+
+	metadataConfiguration, err := client.GetMetadataConfiguration()
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveError
+	}
+
+	deviceOptions := make([]string, 0, len(metadataConfiguration.Configs))
+
+	for key, device := range metadataConfiguration.Configs {
+		parts := strings.Split(key, "-")
+		if strings.HasPrefix(key, "device-") && parts[1] == deviceName {
+			conf := device["device-conf"]
+			for _, keyMap := range conf.Keys {
+				for option := range keyMap {
+					deviceOptions = append(deviceOptions, option)
+				}
+			}
+		}
+	}
+
+	return deviceOptions, cobra.ShellCompDirectiveNoFileComp
+}
+
 func (g *cmdGlobal) cmpInstances(toComplete string) ([]string, cobra.ShellCompDirective) {
 	var results []string
 	cmpDirectives := cobra.ShellCompDirectiveNoFileComp
@@ -367,6 +426,66 @@ func (g *cmdGlobal) cmpInstances(toComplete string) ([]string, cobra.ShellCompDi
 		remotes, directives := g.cmpRemotes(false)
 		results = append(results, remotes...)
 		cmpDirectives |= directives
+	}
+
+	return results, cmpDirectives
+}
+
+func (g *cmdGlobal) cmpInstancesAction(toComplete string, action string, flagForce bool) ([]string, cobra.ShellCompDirective) {
+	var results []string
+	cmpDirectives := cobra.ShellCompDirectiveNoFileComp
+
+	resources, _ := g.ParseServers(toComplete)
+
+	var filteredInstanceStatuses []string
+
+	switch action {
+	case "start":
+		filteredInstanceStatuses = append(filteredInstanceStatuses, "Stopped", "Frozen")
+	case "pause", "exec":
+		filteredInstanceStatuses = append(filteredInstanceStatuses, "Running")
+	case "stop":
+		if flagForce {
+			filteredInstanceStatuses = append(filteredInstanceStatuses, "Running", "Frozen")
+		} else {
+			filteredInstanceStatuses = append(filteredInstanceStatuses, "Running")
+		}
+
+	case "delete":
+		if flagForce {
+			filteredInstanceStatuses = append(filteredInstanceStatuses, api.GetAllStatusCodeStrings()...)
+		} else {
+			filteredInstanceStatuses = append(filteredInstanceStatuses, "Stopped")
+		}
+
+	default:
+		filteredInstanceStatuses = append(filteredInstanceStatuses, api.GetAllStatusCodeStrings()...)
+	}
+
+	if len(resources) > 0 {
+		resource := resources[0]
+
+		instances, _ := resource.server.GetInstances("")
+
+		for _, instance := range instances {
+			var name string
+
+			if shared.ValueInSlice(instance.Status, filteredInstanceStatuses) {
+				if resource.remote == g.conf.DefaultRemote && !strings.Contains(toComplete, g.conf.DefaultRemote) {
+					name = instance.Name
+				} else {
+					name = fmt.Sprintf("%s:%s", resource.remote, instance.Name)
+				}
+
+				results = append(results, name)
+			}
+		}
+
+		if !strings.Contains(toComplete, ":") {
+			remotes, directives := g.cmpRemotes(false)
+			results = append(results, remotes...)
+			cmpDirectives |= directives
+		}
 	}
 
 	return results, cmpDirectives
@@ -978,14 +1097,10 @@ func (g *cmdGlobal) cmpProjects(toComplete string) ([]string, cobra.ShellCompDir
 }
 
 func (g *cmdGlobal) cmpRemotes(includeAll bool) ([]string, cobra.ShellCompDirective) {
-	var results []string
+	results := make([]string, 0, len(g.conf.Remotes))
 
 	for remoteName, rc := range g.conf.Remotes {
-		if !includeAll && rc.Protocol != "lxd" && rc.Protocol != "" {
-			continue
-		}
-
-		if remoteName == "local" || rc.Protocol == "simplestreams" {
+		if remoteName == "local" || (!includeAll && rc.Protocol != "lxd" && rc.Protocol != "") {
 			continue
 		}
 

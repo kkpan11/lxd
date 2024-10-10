@@ -11,7 +11,7 @@ GOPATH ?= $(shell go env GOPATH)
 CGO_LDFLAGS_ALLOW ?= (-Wl,-wrap,pthread_create)|(-Wl,-z,now)
 SPHINXENV=doc/.sphinx/venv/bin/activate
 SPHINXPIPPATH=doc/.sphinx/venv/bin/pip
-GOMIN=1.22.6
+GOMIN=1.22.7
 GOCOVERDIR ?= $(shell go env GOCOVERDIR)
 
 ifneq "$(wildcard vendor)" ""
@@ -36,9 +36,11 @@ ifeq "$(TAG_SQLITE3)" ""
 endif
 
 ifeq "$(GOCOVERDIR)" ""
-	CC="$(CC)" CGO_LDFLAGS_ALLOW="$(CGO_LDFLAGS_ALLOW)" go install -v -tags "$(TAG_SQLITE3)" -trimpath $(DEBUG) ./lxd ./lxc-to-lxd ./lxd-user ./lxd-benchmark
+	CC="$(CC)" CGO_LDFLAGS_ALLOW="$(CGO_LDFLAGS_ALLOW)" go install -v -tags "$(TAG_SQLITE3)" -trimpath $(DEBUG) ./lxd ./lxc-to-lxd
+	CGO_ENABLED=0 go install -v -tags netgo -trimpath $(DEBUG) ./lxd-user ./lxd-benchmark
 else
-	CC="$(CC)" CGO_LDFLAGS_ALLOW="$(CGO_LDFLAGS_ALLOW)" go install -v -tags "$(TAG_SQLITE3)" -trimpath -cover $(DEBUG) ./lxd ./lxc-to-lxd ./lxd-user ./lxd-benchmark
+	CC="$(CC)" CGO_LDFLAGS_ALLOW="$(CGO_LDFLAGS_ALLOW)" go install -v -tags "$(TAG_SQLITE3)" -trimpath -cover $(DEBUG) ./lxd ./lxc-to-lxd
+	CGO_ENABLED=0 go install -v -tags netgo -trimpath -cover $(DEBUG) ./lxd-user ./lxd-benchmark
 endif
 
 	@echo "LXD built successfully"
@@ -115,10 +117,7 @@ endif
 	go get -t -v -u ./...
 
 	# Static pins
-	go get github.com/dell/goscaleio@v1.15.0 # Due to pending testing of newer version
 	go get github.com/gorilla/websocket@v1.5.1 # Due to riscv64 crashes in LP
-	go get github.com/openfga/api/proto@v0.0.0-20240807201305-c96ec773cae9 # Due to build errors (API breakages)
-	go get github.com/openfga/openfga@v1.5.9 # Due to build errors (API breakages)
 
 	# Enforce minimum go version
 	go get toolchain@none # Use the bundled toolchain that meets the minimum go version
@@ -173,29 +172,6 @@ endif
 	CGO_ENABLED=0 go install -v -trimpath -tags "agent,netgo,logdebug" ./lxd-agent
 	@echo "LXD built successfully"
 
-.PHONY: nocache
-nocache:
-ifeq "$(TAG_SQLITE3)" ""
-	@echo "Missing custom libsqlite3, run \"make deps\" to setup."
-	exit 1
-endif
-
-	CC="$(CC)" CGO_LDFLAGS_ALLOW="$(CGO_LDFLAGS_ALLOW)" go install -a -v -tags "$(TAG_SQLITE3)" $(DEBUG) ./...
-	CGO_ENABLED=0 go install -a -v -trimpath -tags netgo ./lxd-migrate
-	CGO_ENABLED=0 go install -a -v -trimpath -tags agent,netgo ./lxd-agent
-	@echo "LXD built successfully"
-
-race:
-ifeq "$(TAG_SQLITE3)" ""
-	@echo "Missing custom libsqlite3, run \"make deps\" to setup."
-	exit 1
-endif
-
-	CC="$(CC)" CGO_LDFLAGS_ALLOW="$(CGO_LDFLAGS_ALLOW)" go install -race -v -tags "$(TAG_SQLITE3)" $(DEBUG) ./...
-	CGO_ENABLED=0 go install -v -trimpath -tags netgo ./lxd-migrate
-	CGO_ENABLED=0 go install -v -trimpath -tags agent,netgo ./lxd-agent
-	@echo "LXD built successfully"
-
 .PHONY: check
 check: default check-unit
 	cd test && ./main.sh
@@ -248,7 +224,12 @@ update-po:
 	set -eu; \
 	for lang in $(LINGUAS); do\
 	    msgmerge --backup=none -U $$lang.po po/$(DOMAIN).pot; \
-	done
+	done; \
+	if [ -t 0 ] && ! git diff --quiet -- po/*.po; then \
+		read -rp "Would you like to commit i18n changes (Y/n)? " answer; \
+			if [ "$${answer:-y}" = "y" ] || [ "$${answer:-y}" = "Y" ]; then \
+				git commit -sm "i18n: Update translations." -- po/*.po; fi; \
+	fi
 
 .PHONY: update-pot
 update-pot:
@@ -256,6 +237,12 @@ ifeq "$(LXD_OFFLINE)" ""
 	(cd / ; go install github.com/snapcore/snapd/i18n/xgettext-go@2.57.1)
 endif
 	xgettext-go -o po/$(DOMAIN).pot --add-comments-tag=TRANSLATORS: --sort-output --package-name=$(DOMAIN) --msgid-bugs-address=lxd@lists.canonical.com --keyword=i18n.G --keyword-plural=i18n.NG lxc/*.go lxc/*/*.go
+	if git diff --quiet --ignore-matching-lines='^\s*"POT-Creation-Date: .*\n"' -- po/*.pot; then git checkout -- po/*.pot; fi
+	if [ -t 0 ] && ! git diff --quiet --ignore-matching-lines='^\s*"POT-Creation-Date: .*\n"' -- po/*.pot; then \
+		read -rp "Would you like to commit i18n template changes (Y/n)? " answer; \
+			if [ "$${answer:-y}" = "y" ] || [ "$${answer:-y}" = "Y" ]; then \
+				git commit -sm "i18n: Update translation templates." -- po/*.pot; fi; \
+	fi
 
 .PHONY: build-mo
 build-mo: $(MOFILES)
@@ -293,21 +280,6 @@ endif
         exit 1; \
 	fi
 	run-parts --verbose --exit-on-error --regex '.sh' test/lint
-
-.PHONY: staticcheck
-staticcheck:
-ifeq ($(shell command -v staticcheck),)
-	(cd / ; go install honnef.co/go/tools/cmd/staticcheck@latest)
-endif
-	# To get advance notice of deprecated function usage, consider running:
-	#   sed -i 's/^go 1\.[0-9]\+$/go 1.18/' go.mod
-	# before 'make staticcheck'.
-
-	# Run staticcheck against all the dirs containing Go files.
-	staticcheck $$(git ls-files *.go | sed 's|^|./|; s|/[^/]\+\.go$$||' | sort -u)
-
-tags: */*.go
-	find . -type f -name '*.go' | gotags -L - -f tags
 
 .PHONY: update-auth
 update-auth:
