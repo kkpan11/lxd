@@ -4,22 +4,20 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
-	"github.com/canonical/lxd/lxd/project"
 	"github.com/canonical/lxd/lxd/storage/drivers"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/logger"
 )
 
 var lxdEarlyPatches = map[string]func(b *lxdBackend) error{
-	"storage_missing_snapshot_records":         patchMissingSnapshotRecords,
-	"storage_delete_old_snapshot_records":      patchDeleteOldSnapshotRecords,
-	"storage_prefix_bucket_names_with_project": patchBucketNames,
+	"storage_missing_snapshot_records":    patchMissingSnapshotRecords,
+	"storage_delete_old_snapshot_records": patchDeleteOldSnapshotRecords,
 }
 
 var lxdLatePatches = map[string]func(b *lxdBackend) error{}
@@ -37,7 +35,7 @@ func patchMissingSnapshotRecords(b *lxdBackend) error {
 	err = b.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		localNode, err = tx.GetLocalNodeName(ctx)
 		if err != nil {
-			return fmt.Errorf("Failed to get local member name: %w", err)
+			return fmt.Errorf("Failed getting local member name: %w", err)
 		}
 
 		return err
@@ -49,78 +47,48 @@ func patchMissingSnapshotRecords(b *lxdBackend) error {
 	// Get instances on this local server (as the DB helper functions return volumes on local server), also
 	// avoids running the same queries on every cluster member for instances on shared storage.
 	filter := cluster.InstanceFilter{Node: &localNode}
+	var volType drivers.VolumeType
+	var contentType drivers.ContentType
+	var snapshots []cluster.Instance
+	instances := make([]struct{ Name, projectName string }, 0)
 	err = b.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		return tx.InstanceList(ctx, func(inst db.InstanceArgs, p api.Project) error {
 			// Check we can convert the instance to the volume type needed.
-			volType, err := InstanceTypeToVolumeType(inst.Type)
+			volType, err = InstanceTypeToVolumeType(inst.Type)
 			if err != nil {
 				return err
 			}
 
-			contentType := drivers.ContentTypeFS
+			contentType = drivers.ContentTypeFS
 			if inst.Type == instancetype.VM {
 				contentType = drivers.ContentTypeBlock
 			}
 
 			// Get all the instance snapshot DB records.
-			var instPoolName string
-			var snapshots []cluster.Instance
-			err = b.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
-				instPoolName, err = tx.GetInstancePool(ctx, p.Name, inst.Name)
-				if err != nil {
-					if api.StatusErrorCheck(err, http.StatusNotFound) {
-						// If the instance cannot be associated to a pool its got bigger problems
-						// outside the scope of this patch. Will skip due to empty instPoolName.
-						return nil
-					}
-
-					return fmt.Errorf("Failed finding pool for instance %q in project %q: %w", inst.Name, p.Name, err)
-				}
-
-				snapshots, err = tx.GetInstanceSnapshotsWithName(ctx, p.Name, inst.Name)
-				if err != nil {
-					return err
-				}
-
-				return nil
-			})
+			instPoolName, err := tx.GetInstancePool(ctx, p.Name, inst.Name)
 			if err != nil {
-				return err
+				if api.StatusErrorCheck(err, http.StatusNotFound) {
+					// If the instance cannot be associated to a pool its got bigger problems
+					// outside the scope of this patch. Will skip due to empty instPoolName.
+					return nil
+				}
+
+				return fmt.Errorf("Failed finding pool for instance %q in project %q: %w", inst.Name, p.Name, err)
 			}
 
 			if instPoolName != b.Name() {
 				return nil // This instance isn't hosted on this storage pool, skip.
 			}
 
-			dbVol, err := VolumeDBGet(b, p.Name, inst.Name, volType)
+			snapshots, err = tx.GetInstanceSnapshotsWithName(ctx, p.Name, inst.Name)
 			if err != nil {
-				return fmt.Errorf("Failed loading storage volume record %q: %w", inst.Name, err)
+				return err
 			}
 
-			// Get all the instance volume snapshot DB records.
-			dbVolSnaps, err := VolumeDBSnapshotsGet(b, p.Name, inst.Name, volType)
-			if err != nil {
-				return fmt.Errorf("Failed loading storage volume snapshot records %q: %w", inst.Name, err)
-			}
-
-			for i := range snapshots {
-				foundVolumeSnapshot := false
-				for _, dbVolSnap := range dbVolSnaps {
-					if dbVolSnap.Name == snapshots[i].Name {
-						foundVolumeSnapshot = true
-						break
-					}
-				}
-
-				if !foundVolumeSnapshot {
-					b.logger.Info("Creating missing volume snapshot record", logger.Ctx{"project": snapshots[i].Project, "instance": snapshots[i].Name})
-					err = VolumeDBCreate(b, snapshots[i].Project, snapshots[i].Name, "Auto repaired", volType, true, dbVol.Config, snapshots[i].CreationDate, time.Time{}, contentType, false, true)
-					if err != nil {
-						return err
-					}
-				}
-			}
-
+			instances = append(instances, struct{ Name, projectName string }{
+				Name:        inst.Name,
+				projectName: p.Name,
+			})
 			return nil
 		}, filter)
 	})
@@ -128,6 +96,49 @@ func patchMissingSnapshotRecords(b *lxdBackend) error {
 		return err
 	}
 
+	for _, inst := range instances {
+		dbVol, err := VolumeDBGet(b, inst.projectName, inst.Name, volType)
+		if err != nil {
+			return fmt.Errorf("Failed loading storage volume record %q: %w", inst.Name, err)
+		}
+
+		// Get all the instance volume snapshot DB records.
+		dbVolSnaps, err := VolumeDBSnapshotsGet(b, inst.projectName, inst.Name, volType)
+		if err != nil {
+			return fmt.Errorf("Failed loading storage volume snapshot records %q: %w", inst.Name, err)
+		}
+
+		for i := range snapshots {
+			foundVolumeSnapshot := false
+			for _, dbVolSnap := range dbVolSnaps {
+				if dbVolSnap.Name == snapshots[i].Name {
+					foundVolumeSnapshot = true
+					break
+				}
+			}
+
+			if !foundVolumeSnapshot {
+				// If we're updating from an old LXD release, it's possible that some instance volumes might still have
+				// some of the old-style disk volume keys set in their config. These are not allowed any more for instance
+				// volumes and snapshots. So filter them out here rather than try to configure these as device overrides
+				// which would be the modern way.
+				config := make(map[string]string, len(dbVol.Config))
+				for key, value := range dbVol.Config {
+					if slices.Contains(instanceDiskVolumeEffectiveFields, key) {
+						continue
+					}
+
+					config[key] = value
+				}
+
+				b.logger.Info("Creating missing volume snapshot record", logger.Ctx{"project": snapshots[i].Project, "instance": snapshots[i].Name})
+				err = VolumeDBCreate(b, snapshots[i].Project, snapshots[i].Name, "Auto repaired", volType, true, config, snapshots[i].CreationDate, time.Time{}, contentType, false, true)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -148,7 +159,7 @@ DELETE FROM storage_volumes WHERE id IN (
 );
 `, nodeID, cluster.StoragePoolVolumeTypeContainer)
 		if err != nil {
-			return fmt.Errorf("Failed to delete remaining instance snapshot records in the `storage_volumes` table: %w", err)
+			return fmt.Errorf("Failed deleting remaining instance snapshot records in the `storage_volumes` table: %w", err)
 		}
 
 		return nil
@@ -156,65 +167,6 @@ DELETE FROM storage_volumes WHERE id IN (
 
 	if err != nil {
 		return err
-	}
-
-	return nil
-}
-
-// patchBucketNames modifies the naming convention of bucket volumes by adding
-// the corresponding project name as a prefix.
-func patchBucketNames(b *lxdBackend) error {
-	// Apply patch only for btrfs, dir, lvm, and zfs drivers.
-	if !shared.ValueInSlice(b.driver.Info().Name, []string{"btrfs", "dir", "lvm", "zfs"}) {
-		return nil
-	}
-
-	var buckets map[string]*db.StorageBucket
-
-	err := b.state.DB.Cluster.Transaction(b.state.ShutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
-		// Get local storage buckets.
-		localBuckets, err := tx.GetStoragePoolBuckets(ctx, true)
-		if err != nil {
-			return err
-		}
-
-		buckets = make(map[string]*db.StorageBucket, len(localBuckets))
-		for _, bucket := range localBuckets {
-			buckets[bucket.Name] = bucket
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return err
-	}
-
-	// Get list of volumes.
-	volumes, err := b.driver.ListVolumes()
-	if err != nil {
-		return err
-	}
-
-	for _, v := range volumes {
-		// Ensure volume is of type bucket.
-		if v.Type() != drivers.VolumeTypeBucket {
-			continue
-		}
-
-		// Retrieve the bucket associated with the current volume's name.
-		bucket, ok := buckets[v.Name()]
-		if !ok {
-			continue
-		}
-
-		newVolumeName := project.StorageVolume(bucket.Project, bucket.Name)
-
-		// Rename volume.
-		err := b.driver.RenameVolume(v, newVolumeName, nil)
-		if err != nil {
-			return err
-		}
 	}
 
 	return nil

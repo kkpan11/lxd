@@ -24,7 +24,7 @@ func TestEndpoints_LocalCreateUnixSocket(t *testing.T) {
 
 	// The unix socket file gets removed after shutdown.
 	cleanup()
-	assert.Equal(t, false, shared.PathExists(path))
+	assert.False(t, shared.PathExists(path))
 }
 
 // If socket-based activation is detected, it will be used for binding the API
@@ -57,7 +57,7 @@ func TestEndpoints_LocalSocketBasedActivation(t *testing.T) {
 	// which prevents listeners created from file descriptors from removing
 	// their socket files on close).
 	cleanup()
-	assert.Equal(t, true, shared.PathExists(path))
+	assert.True(t, shared.PathExists(path))
 }
 
 // If a custom group for the unix socket is specified, but no such one exists,
@@ -70,7 +70,7 @@ func TestEndpoints_LocalUnknownUnixGroup(t *testing.T) {
 	err := endpoints.Up(config)
 
 	assert.EqualError(
-		t, err, "local endpoint: cannot get group ID of 'xquibaz': group: unknown group xquibaz")
+		t, err, "local endpoint: cannot get group ID of \"xquibaz\": group: unknown group xquibaz")
 }
 
 // If another LXD endpoints is already listening on the unix socket, an error is

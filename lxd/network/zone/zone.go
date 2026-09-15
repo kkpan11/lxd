@@ -2,21 +2,26 @@ package zone
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
-	lxd "github.com/canonical/lxd/client"
+	"github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/lxd/cluster"
-	"github.com/canonical/lxd/lxd/cluster/request"
+	"github.com/canonical/lxd/lxd/config"
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/network"
+	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
+	"github.com/canonical/lxd/shared/dnsutil"
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/revert"
 	"github.com/canonical/lxd/shared/validate"
@@ -76,7 +81,7 @@ func (d *zone) Info() *api.NetworkZone {
 func (d *zone) networkUsesZone(netConfig map[string]string) bool {
 	for _, key := range []string{"dns.zone.forward", "dns.zone.reverse.ipv4", "dns.zone.reverse.ipv6"} {
 		zoneNames := shared.SplitNTrimSpace(netConfig[key], ",", -1, true)
-		if shared.ValueInSlice(d.info.Name, zoneNames) {
+		if slices.Contains(zoneNames, d.info.Name) {
 			return true
 		}
 	}
@@ -86,12 +91,12 @@ func (d *zone) networkUsesZone(netConfig map[string]string) bool {
 
 // usedBy returns a list of API endpoints referencing this zone.
 // If firstOnly is true then search stops at first result.
-func (d *zone) usedBy(firstOnly bool) ([]string, error) {
+func (d *zone) usedBy(ctx context.Context, firstOnly bool) ([]string, error) {
 	usedBy := []string{}
 
 	var networkNames []string
 
-	err := d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err := d.state.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 		var err error
 
 		// Find networks using the zone.
@@ -103,7 +108,7 @@ func (d *zone) usedBy(firstOnly bool) ([]string, error) {
 		for _, networkName := range networkNames {
 			_, network, _, err := tx.GetNetworkInAnyState(ctx, d.projectName, networkName)
 			if err != nil {
-				return fmt.Errorf("Failed to get network config for %q: %w", networkName, err)
+				return fmt.Errorf("Failed getting network config for %q: %w", networkName, err)
 			}
 
 			// Check if the network is using this zone.
@@ -126,13 +131,13 @@ func (d *zone) usedBy(firstOnly bool) ([]string, error) {
 }
 
 // UsedBy returns a list of API endpoints referencing this zone.
-func (d *zone) UsedBy() ([]string, error) {
-	return d.usedBy(false)
+func (d *zone) UsedBy(ctx context.Context) ([]string, error) {
+	return d.usedBy(ctx, false)
 }
 
 // isUsed returns whether or not the zone is in use.
-func (d *zone) isUsed() (bool, error) {
-	usedBy, err := d.usedBy(true)
+func (d *zone) isUsed(ctx context.Context) (bool, error) {
+	usedBy, err := d.usedBy(ctx, true)
 	if err != nil {
 		return false, err
 	}
@@ -148,11 +153,11 @@ func (d *zone) Etag() []any {
 // validateName checks name is valid.
 func (d *zone) validateName(name string) error {
 	if name == "" {
-		return fmt.Errorf("Name is required")
+		return errors.New("Name is required")
 	}
 
 	if strings.HasPrefix(name, "/") {
-		return fmt.Errorf(`Name cannot start with "/"`)
+		return errors.New(`Name cannot start with "/"`)
 	}
 
 	return nil
@@ -201,24 +206,25 @@ func (d *zone) validateConfig(info *api.NetworkZonePut) error {
 		//  type: string
 		//  required: no
 		//  shortdesc: TSIG key for the server
-		if !strings.HasPrefix(k, "peers.") {
+		suffix, found := strings.CutPrefix(k, "peers.")
+		if !found {
 			continue
 		}
 
-		// Validate remote name in key.
-		fields := strings.Split(k, ".")
-		if len(fields) != 3 {
+		// Extract the field name (last component after the peer name).
+		_, peerKey, found := strings.Cut(suffix, ".")
+		if !found {
 			return fmt.Errorf("Invalid network zone configuration key %q", k)
 		}
-
-		peerKey := fields[2]
 
 		// Add the correct validation rule for the dynamic field based on last part of key.
 		switch peerKey {
 		case "address":
 			rules[k] = validate.Optional(validate.IsNetworkAddress)
 		case "key":
-			rules[k] = validate.Optional(validate.IsAny)
+			rules[k] = validate.IsAny
+		default:
+			return fmt.Errorf("Invalid network zone peer configuration key %q (unknown field %q)", k, peerKey)
 		}
 	}
 
@@ -231,27 +237,27 @@ func (d *zone) validateConfig(info *api.NetworkZonePut) error {
 }
 
 // validateConfigMap checks zone config map against rules.
-func (d *zone) validateConfigMap(config map[string]string, rules map[string]func(value string) error) error {
+func (d *zone) validateConfigMap(zoneConfig map[string]string, rules map[string]func(value string) error) error {
 	checkedFields := map[string]struct{}{}
 
 	// Run the validator against each field.
 	for k, validator := range rules {
 		checkedFields[k] = struct{}{} // Mark field as checked.
-		err := validator(config[k])
+		err := validator(zoneConfig[k])
 		if err != nil {
 			return fmt.Errorf("Invalid value for config option %q: %w", k, err)
 		}
 	}
 
 	// Look for any unchecked fields, as these are unknown fields and validation should fail.
-	for k := range config {
+	for k := range zoneConfig {
 		_, checked := checkedFields[k]
 		if checked {
 			continue
 		}
 
 		// User keys are not validated.
-		if shared.IsUserConfig(k) {
+		if config.IsUserConfig(k) {
 			continue
 		}
 
@@ -292,13 +298,18 @@ func (d *zone) Update(config *api.NetworkZonePut, clientType request.ClientType)
 		})
 
 		// Notify all other nodes to update the network zone if no target specified.
-		notifier, err := cluster.NewNotifier(d.state, d.state.Endpoints.NetworkCert(), d.state.ServerCert(), cluster.NotifyAll)
+		notifier, err := cluster.NewOperationNotifier(d.state, d.state.Endpoints.NetworkCert(), d.state.ServerCert(), cluster.NotifyAll)
 		if err != nil {
 			return err
 		}
 
-		err = notifier(func(client lxd.InstanceServer) error {
-			return client.UseProject(d.projectName).UpdateNetworkZone(d.info.Name, d.info.Writable(), "")
+		err = notifier(func(member db.NodeInfo, client lxd.InstanceServer) error {
+			op, err := client.UseProject(d.projectName).UpdateNetworkZone(d.info.Name, d.info.Writable(), "")
+			if err == nil {
+				err = op.Wait()
+			}
+
+			return err
 		})
 		if err != nil {
 			return err
@@ -316,17 +327,17 @@ func (d *zone) Update(config *api.NetworkZonePut, clientType request.ClientType)
 }
 
 // Delete deletes the zone.
-func (d *zone) Delete() error {
-	isUsed, err := d.isUsed()
+func (d *zone) Delete(ctx context.Context) error {
+	isUsed, err := d.isUsed(ctx)
 	if err != nil {
 		return err
 	}
 
 	if isUsed {
-		return fmt.Errorf("Cannot delete a zone that is in use")
+		return errors.New("Cannot delete a zone that is in use")
 	}
 
-	err = d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err = d.state.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 		// Delete the database record.
 		err = tx.DeleteNetworkZone(ctx, d.id)
 
@@ -346,7 +357,7 @@ func (d *zone) Delete() error {
 }
 
 // Content returns the DNS zone content.
-func (d *zone) Content() (*strings.Builder, error) {
+func (d *zone) Content(ctx context.Context) (*strings.Builder, error) {
 	var err error
 	records := []map[string]string{}
 
@@ -356,15 +367,15 @@ func (d *zone) Content() (*strings.Builder, error) {
 	// Get all managed networks across all projects.
 	var projectNetworks map[string]map[int64]api.Network
 	var zoneProjects map[string]string
-	err = d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err = d.state.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 		projectNetworks, err = tx.GetCreatedNetworks(ctx)
 		if err != nil {
-			return fmt.Errorf("Failed to load all networks: %w", err)
+			return fmt.Errorf("Failed loading all networks: %w", err)
 		}
 
 		zoneProjects, err = tx.GetNetworkZones(ctx)
 		if err != nil {
-			return fmt.Errorf("Failed to load all network zones: %w", err)
+			return fmt.Errorf("Failed loading all network zones: %w", err)
 		}
 
 		return nil
@@ -391,9 +402,9 @@ func (d *zone) Content() (*strings.Builder, error) {
 			includeV6 := includeNAT || shared.IsFalseOrEmpty(netConfig["ipv6.nat"])
 
 			// Check if dealing with a reverse zone.
-			isReverse4 := strings.HasSuffix(d.info.Name, ip4Arpa)
-			isReverse6 := strings.HasSuffix(d.info.Name, ip6Arpa)
-			isReverse := isReverse4 || isReverse6
+			isReverse := dnsutil.IsReverse(d.info.Name + ".")
+			isReverse4 := isReverse == 1
+			isReverse6 := isReverse == 2
 
 			genRecord := func(name string, ip net.IP) map[string]string {
 				isV4 := ip.To4() != nil
@@ -409,7 +420,7 @@ func (d *zone) Content() (*strings.Builder, error) {
 
 				record := map[string]string{}
 				record["ttl"] = "300"
-				if !isReverse {
+				if isReverse == 0 {
 					if isV4 {
 						record["type"] = "A"
 					} else {
@@ -429,7 +440,7 @@ func (d *zone) Content() (*strings.Builder, error) {
 					}
 
 					// Get the ARPA record.
-					reverseAddr := reverse(ip)
+					reverseAddr := dnsutil.Reverse(ip)
 					if reverseAddr == "" {
 						return nil
 					}
@@ -442,7 +453,7 @@ func (d *zone) Content() (*strings.Builder, error) {
 				return record
 			}
 
-			if isReverse {
+			if isReverse > 0 {
 				// Load network leases in correct project context for each forward zone referenced.
 				for _, forwardZoneName := range shared.SplitNTrimSpace(n.Config()["dns.zone.forward"], ",", -1, true) {
 					// Get forward zone's project.
@@ -494,7 +505,7 @@ func (d *zone) Content() (*strings.Builder, error) {
 	}
 
 	// Add the extra records.
-	extraRecords, err := d.GetRecords()
+	extraRecords, err := d.GetRecords(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -503,7 +514,7 @@ func (d *zone) Content() (*strings.Builder, error) {
 		for _, entry := range extraRecord.Entries {
 			record := map[string]string{}
 			if entry.TTL > 0 {
-				record["ttl"] = fmt.Sprintf("%d", entry.TTL)
+				record["ttl"] = strconv.FormatUint(entry.TTL, 10)
 			} else {
 				record["ttl"] = "300"
 			}
@@ -518,7 +529,7 @@ func (d *zone) Content() (*strings.Builder, error) {
 
 	// Get the nameservers.
 	nameservers := []string{}
-	for _, entry := range strings.Split(d.info.Config["dns.nameservers"], ",") {
+	for entry := range strings.SplitSeq(d.info.Config["dns.nameservers"], ",") {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
 			continue
@@ -552,7 +563,7 @@ func (d *zone) Content() (*strings.Builder, error) {
 func (d *zone) SOA() (*strings.Builder, error) {
 	// Get the nameservers.
 	nameservers := []string{}
-	for _, entry := range strings.Split(d.info.Config["dns.nameservers"], ",") {
+	for entry := range strings.SplitSeq(d.info.Config["dns.nameservers"], ",") {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
 			continue

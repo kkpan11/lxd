@@ -77,13 +77,18 @@ To import an image from the local file system, send a POST request to the `/1.0/
 
 For example, to import a unified image from one file:
 
-    curl -X POST --unix-socket /var/snap/lxd/common/lxd/unix.socket lxd/1.0/images \
+    curl -X POST -H 'Content-Type: application/octet-stream' --unix-socket /var/snap/lxd/common/lxd/unix.socket lxd/1.0/images \
     --data-binary @<image_file_path>
 
-To import a split image from a metadata file and a rootfs file:
+To import a split image from a metadata file and a container `rootfs` file:
 
-    curl -X POST --unix-socket /var/snap/lxd/common/lxd/unix.socket lxd/1.0/images \
-    --form metadata=@<metadata_tarball_path> --form rootfs.img=<rootfs_tarball_path>
+    curl -X POST -H 'Content-Type: multipart/form-data' --unix-socket /var/snap/lxd/common/lxd/unix.socket lxd/1.0/images \
+    --form metadata=@<metadata_tarball_path> --form rootfs=@<rootfs_tarball_path>
+
+To import a split image from a metadata file and a VM `rootfs.img` file:
+
+    curl -X POST -H 'Content-Type: multipart/form-data' --unix-socket /var/snap/lxd/common/lxd/unix.socket lxd/1.0/images \
+    --form metadata=@<metadata_tarball_path> --form rootfs.img=@<rootfs_tarball_path>
 
 ```{note}
 For a split image, you must send the metadata tarball first and the rootfs image after.
@@ -92,52 +97,3 @@ For a split image, you must send the metadata tarball first and the rootfs image
 See [`POST /1.0/images`](swagger:/images/images_post) for more information.
 ````
 `````
-
-### Import from a file on a remote web server
-
-You can import image files from a remote web server by URL.
-This method is an alternative to running a LXD server for the sole purpose of distributing an image to users.
-It only requires a basic web server with support for custom headers (see {ref}`images-copy-http-headers`).
-
-The image files must be provided as unified images (see {ref}`image-format-unified`).
-
-````{tabs}
-```{group-tab} CLI
-To import an image file from a remote web server, enter the following command:
-
-    lxc image import <URL>
-
-You can assign an alias to the local image with the `--alias` flag.
-```
-```{group-tab} API
-To import an image file from a remote web server, send a POST request with the image URL to the `/1.0/images` endpoint:
-
-    lxc query --request POST /1.0/images --data '{
-      "source": {
-        "type": "url",
-        "url": "<URL>"
-      }
-    }'
-
-See [`POST /1.0/images`](swagger:/images/images_post) for more information.
-```
-````
-
-(images-copy-http-headers)=
-#### Custom HTTP headers
-
-LXD requires the following custom HTTP headers to be set by the web server:
-
-`LXD-Image-Hash`
-: The SHA256 of the image that is being downloaded.
-
-`LXD-Image-URL`
-: The URL from which to download the image.
-
-LXD sets the following headers when querying the server:
-
-`LXD-Server-Architectures`
-: A comma-separated list of architectures that the client supports.
-
-`LXD-Server-Version`
-: The version of LXD in use.

@@ -44,7 +44,7 @@ func api10Get(d *Daemon, r *http.Request) response.Response {
 		APIStatus:     "stable",
 		APIVersion:    version.APIVersion,
 		Public:        false,
-		Auth:          "trusted",
+		Auth:          api.AuthTrusted,
 		AuthMethods:   []string{api.AuthenticationMethodTLS},
 	}
 
@@ -104,17 +104,37 @@ func api10Put(d *Daemon, r *http.Request) response.Response {
 		return response.ErrorResponse(http.StatusInternalServerError, err.Error())
 	}
 
-	server, err := lxd.ConnectLXDHTTP(nil, client)
+	args := &lxd.ConnectionArgs{
+		SkipGetServer: true,
+	}
+
+	server, err := lxd.ConnectLXDHTTP(args, client)
 	if err != nil {
 		return response.ErrorResponse(http.StatusInternalServerError, err.Error())
 	}
 
 	defer server.Disconnect()
 
+	// Now get the server information to verify the connection.
+	//
+	// If DevLXD was previously disabled, this call will fail as forbidden.
+	// This is expected because DevLXD will allow access only once this call
+	// succeeds and the "security.devlxd" flag is set to true.
+	// Therefore, we ignore forbidden error here, as it is still sufficient to
+	// confirm the DevLXD is actually accessible.
+	_, _, err = server.GetServer()
+	if err != nil && !api.StatusErrorCheck(err, http.StatusForbidden) {
+		return response.SmartError(fmt.Errorf("Failed verifying connection to LXD server: %w", err))
+	}
+
 	// Let LXD know, we were able to connect successfully.
 	d.chConnected <- struct{}{}
 
-	if d.devlxdEnabled {
+	d.devlxdMu.Lock()
+	devlxdEnabled := d.devlxdEnabled
+	d.devlxdMu.Unlock()
+
+	if devlxdEnabled {
 		err = startDevlxdServer(d)
 	} else {
 		err = stopDevlxdServer(d)
@@ -136,10 +156,10 @@ func startDevlxdServer(d *Daemon) error {
 		return nil
 	}
 
-	servers["devlxd"] = devLxdServer(d)
+	servers["devlxd"] = devLXDServer(d)
 
 	// Prepare the devlxd server.
-	devlxdListener, err := createDevLxdlListener("/dev")
+	devlxdListener, err := createDevLXDListener("/dev")
 	if err != nil {
 		return err
 	}
@@ -204,7 +224,7 @@ func startHTTPServer(d *Daemon) error {
 	// subsequently restored using a different one.
 	l, err := vsock.ListenContextID(CIDAny, shared.HTTPSDefaultPort, nil)
 	if err != nil {
-		return fmt.Errorf("Failed to listen on vsock: %w", err)
+		return fmt.Errorf("Failed listening on vsock: %w", err)
 	}
 
 	logger.Info("Started vsock listener")
@@ -212,12 +232,12 @@ func startHTTPServer(d *Daemon) error {
 	// Load the expected server certificate.
 	cert, err := shared.ReadCert("server.crt")
 	if err != nil {
-		return fmt.Errorf("Failed to read client certificate: %w", err)
+		return fmt.Errorf("Failed reading client certificate: %w", err)
 	}
 
 	tlsConfig, err := serverTLSConfig()
 	if err != nil {
-		return fmt.Errorf("Failed to get TLS config: %w", err)
+		return fmt.Errorf("Failed getting TLS config: %w", err)
 	}
 
 	// Prepare the HTTP server.
@@ -226,7 +246,7 @@ func startHTTPServer(d *Daemon) error {
 	// Start the server.
 	go func() {
 		err := servers["http"].Serve(networkTLSListener(l, tlsConfig))
-		if !errors.Is(err, http.ErrServerClosed) {
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errChan <- err
 		}
 

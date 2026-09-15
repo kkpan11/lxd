@@ -1,22 +1,21 @@
 package instance
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
 	"os"
-	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/flosch/pongo2"
 	"github.com/google/uuid"
-	liblxc "github.com/lxc/go-lxc"
 
 	"github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/lxd/backup"
@@ -36,6 +35,7 @@ import (
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/osarch"
 	"github.com/canonical/lxd/shared/revert"
+	"github.com/canonical/lxd/shared/validate"
 	"github.com/canonical/lxd/shared/version"
 )
 
@@ -47,7 +47,7 @@ var Load func(s *state.State, args db.InstanceArgs, p api.Project) (Instance, er
 
 // Create is linked from instance/drivers.create to allow difference instance types to be created.
 // Returns a revert fail function that can be used to undo this function if a subsequent step fails.
-var Create func(s *state.State, args db.InstanceArgs, p api.Project) (Instance, revert.Hook, error)
+var Create func(ctx context.Context, s *state.State, args db.InstanceArgs, p api.Project) (Instance, revert.Hook, error)
 
 // ValidConfig validates an instance's config.
 func ValidConfig(sysOS *sys.OS, config map[string]string, expanded bool, instanceType instancetype.Type) error {
@@ -57,11 +57,11 @@ func ValidConfig(sysOS *sys.OS, config map[string]string, expanded bool, instanc
 
 	for k, v := range config {
 		if instanceType == instancetype.Any && !expanded && strings.HasPrefix(k, instancetype.ConfigVolatilePrefix) {
-			return fmt.Errorf("Volatile keys can only be set on instances")
+			return errors.New("Volatile keys can only be set on instances")
 		}
 
 		if instanceType == instancetype.Any && !expanded && strings.HasPrefix(k, "image.") {
-			return fmt.Errorf("Image keys can only be set on instances")
+			return errors.New("Image keys can only be set on instances")
 		}
 
 		err := validConfigKey(sysOS, k, v, instanceType)
@@ -77,11 +77,11 @@ func ValidConfig(sysOS *sys.OS, config map[string]string, expanded bool, instanc
 	isDenyCompat := shared.IsTrue(config["security.syscalls.deny_compat"])
 
 	if rawSeccomp && (isAllow || isDeny || isDenyDefault || isDenyCompat) {
-		return fmt.Errorf("raw.seccomp is mutually exclusive with security.syscalls*")
+		return errors.New("raw.seccomp is mutually exclusive with security.syscalls*")
 	}
 
 	if isAllow && (isDeny || isDenyDefault || isDenyCompat) {
-		return fmt.Errorf("security.syscalls.allow is mutually exclusive with security.syscalls.deny*")
+		return errors.New("security.syscalls.allow is mutually exclusive with security.syscalls.deny*")
 	}
 
 	_, err := seccomp.SyscallInterceptMountFilter(config)
@@ -90,7 +90,7 @@ func ValidConfig(sysOS *sys.OS, config map[string]string, expanded bool, instanc
 	}
 
 	if expanded && (shared.IsFalseOrEmpty(config["security.privileged"])) && sysOS.IdmapSet == nil {
-		return fmt.Errorf("LXD doesn't have a uid/gid allocation. In this mode, only privileged containers are supported")
+		return errors.New("LXD does not have a uid/gid allocation. In this mode, only privileged containers are supported")
 	}
 
 	unprivOnly := os.Getenv("LXD_UNPRIVILEGED_ONLY")
@@ -103,18 +103,56 @@ func ValidConfig(sysOS *sys.OS, config map[string]string, expanded bool, instanc
 		}
 
 		if shared.IsTrue(config["security.privileged"]) {
-			return fmt.Errorf("LXD was configured to only allow unprivileged containers")
+			return errors.New("LXD was configured to only allow unprivileged containers")
 		}
 	}
 
-	if shared.IsTrue(config["security.privileged"]) && shared.IsTrue(config["nvidia.runtime"]) {
-		return fmt.Errorf("nvidia.runtime is incompatible with privileged containers")
+	// Validate pinning strategy when limits.cpu specifies static pinning.
+	cpuPinStrategy := config["limits.cpu.pin_strategy"]
+	cpuLimit := config["limits.cpu"]
+	err = validate.IsStaticCPUPinning(cpuLimit)
+	if err == nil && !expanded && cpuPinStrategy == "auto" {
+		return errors.New(`CPU pinning specified, but pinning strategy is set to "auto"`)
 	}
 
 	return nil
 }
 
 func validConfigKey(os *sys.OS, key string, value string, instanceType instancetype.Type) error {
+	// Disallow keys with container-specific prefixes such as "linux.sysctl." and "limits.kernel." for VMs.
+	if instanceType == instancetype.VM && shared.StringHasPrefix(key, instancetype.ConfigKeyPrefixesContainer...) {
+		return fmt.Errorf("%q is not supported for %q", key, instanceType)
+	}
+
+	// Check if the key is a valid prefix and whether or not it requires a subkey.
+	knownPrefixes := append(instancetype.ConfigKeyPrefixesAny, instancetype.ConfigKeyPrefixesContainer...)
+	if strings.HasSuffix(key, ".") {
+		if key != instancetype.ConfigVolatilePrefix && !slices.Contains(knownPrefixes, key) {
+			// Not a known prefix.
+			return fmt.Errorf("Unknown configuration key: %q", key)
+		}
+
+		return fmt.Errorf("%q requires a subkey", key)
+	}
+
+	// Validate the configuration key against instance type for containers and VMs.
+	// Ignore configuration keys with known prefixes since usage has already been validated, and ConfigKeyChecker validates keys syntactically.
+	if instanceType != instancetype.Any && !shared.StringHasPrefix(key, knownPrefixes...) && !strings.HasPrefix(key, instancetype.ConfigVolatilePrefix) {
+		// Ensure key is present in instance config key map based on type.
+		exists := false
+		switch instanceType {
+		case instancetype.VM:
+			_, exists = instancetype.InstanceConfigKeysVM[key]
+		case instancetype.Container:
+			_, exists = instancetype.InstanceConfigKeysContainer[key]
+		}
+
+		_, existsAny := instancetype.InstanceConfigKeysAny[key]
+		if !exists && !existsAny {
+			return fmt.Errorf("%q is not supported for %q", key, instanceType)
+		}
+	}
+
 	f, err := instancetype.ConfigKeyChecker(key, instanceType)
 	if err != nil {
 		return err
@@ -122,10 +160,6 @@ func validConfigKey(os *sys.OS, key string, value string, instanceType instancet
 
 	if err = f(value); err != nil {
 		return err
-	}
-
-	if strings.HasPrefix(key, "limits.kernel.") && instanceType == instancetype.VM {
-		return fmt.Errorf("%s isn't supported for VMs", key)
 	}
 
 	if key == "raw.lxc" {
@@ -140,7 +174,7 @@ func validConfigKey(os *sys.OS, key string, value string, instanceType instancet
 				return nil
 			}
 		}
-		return fmt.Errorf("%s isn't supported on this architecture", key)
+		return fmt.Errorf("%s is not supported on this architecture", key)
 	}
 
 	return nil
@@ -161,18 +195,18 @@ func lxcParseRawLXC(line string) (key string, val string, err error) {
 	}
 
 	// Ensure the format is valid
-	membs := strings.SplitN(line, "=", 2)
-	if len(membs) != 2 {
+	key, val, ok := strings.Cut(line, "=")
+	if !ok {
 		return "", "", fmt.Errorf("Invalid raw.lxc line: %s", line)
 	}
 
-	key = strings.ToLower(strings.Trim(membs[0], " \t"))
-	val = strings.Trim(membs[1], " \t")
+	key = strings.ToLower(strings.Trim(key, " \t"))
+	val = strings.Trim(val, " \t")
 	return key, val, nil
 }
 
 func lxcValidConfig(rawLxc string) error {
-	for _, line := range strings.Split(rawLxc, "\n") {
+	for line := range strings.SplitSeq(rawLxc, "\n") {
 		key, _, err := lxcParseRawLXC(line)
 		if err != nil {
 			return err
@@ -185,60 +219,27 @@ func lxcValidConfig(rawLxc string) error {
 		unprivOnly := os.Getenv("LXD_UNPRIVILEGED_ONLY")
 		if shared.IsTrue(unprivOnly) {
 			if key == "lxc.idmap" || key == "lxc.id_map" || key == "lxc.include" {
-				return fmt.Errorf("%s can't be set in raw.lxc as LXD was configured to only allow unprivileged containers", key)
+				return fmt.Errorf("%s cannot be set in raw.lxc as LXD was configured to only allow unprivileged containers", key)
 			}
 		}
 
 		// block some keys
 		if key == "lxc.logfile" || key == "lxc.log.file" {
-			return fmt.Errorf("Setting lxc.logfile is not allowed")
+			return errors.New("Setting lxc.logfile is not allowed")
 		}
 
 		if key == "lxc.syslog" || key == "lxc.log.syslog" {
-			return fmt.Errorf("Setting lxc.log.syslog is not allowed")
+			return errors.New("Setting lxc.log.syslog is not allowed")
 		}
 
 		if key == "lxc.ephemeral" {
-			return fmt.Errorf("Setting lxc.ephemeral is not allowed")
+			return errors.New("Setting lxc.ephemeral is not allowed")
 		}
 
 		if strings.HasPrefix(key, "lxc.prlimit.") {
-			return fmt.Errorf(`Process limits should be set via ` +
+			return errors.New(`Process limits should be set via ` +
 				`"limits.kernel.[limit name]" and not ` +
 				`directly via "lxc.prlimit.[limit name]"`)
-		}
-
-		networkKeyPrefix := "lxc.net."
-		if !liblxc.RuntimeLiblxcVersionAtLeast(liblxc.Version(), 2, 1, 0) {
-			networkKeyPrefix = "lxc.network."
-		}
-
-		if strings.HasPrefix(key, networkKeyPrefix) {
-			fields := strings.Split(key, ".")
-
-			if !liblxc.RuntimeLiblxcVersionAtLeast(liblxc.Version(), 2, 1, 0) {
-				// lxc.network.X.ipv4 or lxc.network.X.ipv6
-				if len(fields) == 4 && shared.ValueInSlice(fields[3], []string{"ipv4", "ipv6"}) {
-					continue
-				}
-
-				// lxc.network.X.ipv4.gateway or lxc.network.X.ipv6.gateway
-				if len(fields) == 5 && shared.ValueInSlice(fields[3], []string{"ipv4", "ipv6"}) && fields[4] == "gateway" {
-					continue
-				}
-			} else {
-				// lxc.net.X.ipv4.address or lxc.net.X.ipv6.address
-				if len(fields) == 5 && shared.ValueInSlice(fields[3], []string{"ipv4", "ipv6"}) && fields[4] == "address" {
-					continue
-				}
-
-				// lxc.net.X.ipv4.gateway or lxc.net.X.ipv6.gateway
-				if len(fields) == 5 && shared.ValueInSlice(fields[3], []string{"ipv4", "ipv6"}) && fields[4] == "gateway" {
-					continue
-				}
-			}
-
-			return fmt.Errorf("Only interface-specific ipv4/ipv6 %s keys are allowed", networkKeyPrefix)
 		}
 	}
 
@@ -254,7 +255,7 @@ func AllowedUnprivilegedOnlyMap(rawIdmap string) error {
 
 	for _, ent := range rawMaps {
 		if ent.Hostid == 0 {
-			return fmt.Errorf("Cannot map root user into container as LXD was configured to only allow unprivileged containers")
+			return errors.New("Cannot map root user into container as LXD was configured to only allow unprivileged containers")
 		}
 	}
 
@@ -296,12 +297,12 @@ func LoadInstanceDatabaseObject(ctx context.Context, tx *db.ClusterTx, project, 
 
 		instance, err := cluster.GetInstance(ctx, tx.Tx(), project, instanceName)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to fetch instance %q in project %q: %w", name, project, err)
+			return nil, fmt.Errorf("Failed fetching instance %q in project %q: %w", name, project, err)
 		}
 
 		snapshot, err := cluster.GetInstanceSnapshot(ctx, tx.Tx(), project, instanceName, snapshotName)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to fetch snapshot %q of instance %q in project %q: %w", snapshotName, instanceName, project, err)
+			return nil, fmt.Errorf("Failed fetching snapshot %q of instance %q in project %q: %w", snapshotName, instanceName, project, err)
 		}
 
 		c := snapshot.ToInstance(instance.Name, instance.Node, instance.Type, instance.Architecture)
@@ -309,7 +310,7 @@ func LoadInstanceDatabaseObject(ctx context.Context, tx *db.ClusterTx, project, 
 	} else {
 		container, err = cluster.GetInstance(ctx, tx.Tx(), project, name)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to fetch instance %q in project %q: %w", name, project, err)
+			return nil, fmt.Errorf("Failed fetching instance %q in project %q: %w", name, project, err)
 		}
 	}
 
@@ -352,7 +353,7 @@ func LoadByProjectAndName(s *state.State, projectName string, instanceName strin
 
 	inst, err := Load(s, args, *p)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to load instance: %w", err)
+		return nil, fmt.Errorf("Failed loading instance: %w", err)
 	}
 
 	return inst, nil
@@ -391,10 +392,20 @@ func LoadNodeAll(s *state.State, instanceType instancetype.Type) ([]Instance, er
 // Project config is not populated (as not in the backup file), however expanded config from backup file is applied
 // to avoid needing to expand config by loading profiles from database.
 func LoadFromBackup(s *state.State, projectName string, instancePath string) (Instance, error) {
-	backupYamlPath := filepath.Join(instancePath, "backup.yaml")
-	backupConf, err := backup.ParseConfigYamlFile(backupYamlPath)
+	instRoot, err := os.OpenRoot(instancePath)
 	if err != nil {
-		return nil, fmt.Errorf("Failed parsing instance backup file from %q: %w", backupYamlPath, err)
+		return nil, fmt.Errorf("Failed opening instance directory %q: %w", instancePath, err)
+	}
+
+	defer func() { _ = instRoot.Close() }()
+
+	backupConf, err := backup.ParseConfigYamlFile(instRoot)
+	if err != nil {
+		return nil, fmt.Errorf("Failed parsing instance backup file from %q: %w", instancePath, err)
+	}
+
+	if backupConf.Instance == nil {
+		return nil, errors.New("Instance definition in backup config is missing")
 	}
 
 	// Specify applyProfiles arg as false to avoid DB query.
@@ -405,16 +416,19 @@ func LoadFromBackup(s *state.State, projectName string, instancePath string) (In
 
 	// Stop instance.Load() from expanding profile config from DB, and apply expanded config from
 	// backup file to local config. This way we can still see the devices even if DB not available.
-	instDBArgs.Config = backupConf.Container.ExpandedConfig
-	instDBArgs.Devices = deviceConfig.NewDevices(backupConf.Container.ExpandedDevices)
+	instDBArgs.Config = backupConf.Instance.ExpandedConfig
+	instDBArgs.Devices = deviceConfig.NewDevices(backupConf.Instance.ExpandedDevices)
+
+	// Set Node field to local node.
+	instDBArgs.Node = s.ServerName
 
 	p := api.Project{
-		Name: backupConf.Container.Project,
+		Name: backupConf.Instance.Project,
 	}
 
 	inst, err := Load(s, *instDBArgs, p)
 	if err != nil {
-		return nil, fmt.Errorf("Failed loading instance from backup file %q: %w", backupYamlPath, err)
+		return nil, fmt.Errorf("Failed loading instance from backup file in %q: %w", instancePath, err)
 	}
 
 	return inst, nil
@@ -422,22 +436,24 @@ func LoadFromBackup(s *state.State, projectName string, instancePath string) (In
 
 // DeviceNextInterfaceHWAddr generates a random MAC address.
 func DeviceNextInterfaceHWAddr() (string, error) {
-	// Generate a new random MAC address using the usual prefix
-	ret := bytes.Buffer{}
-	for _, c := range "00:16:3e:xx:xx:xx" {
-		if c == 'x' {
-			c, err := rand.Int(rand.Reader, big.NewInt(16))
-			if err != nil {
-				return "", err
-			}
+	const prefix = "00:16:3e"
+	buf := make([]byte, 0, 17)
 
-			ret.WriteString(fmt.Sprintf("%x", c.Int64()))
-		} else {
-			ret.WriteString(string(c))
+	// Add the fixed prefix
+	buf = append(buf, prefix...)
+
+	// Append 3 random bytes
+	for range 3 {
+		rb, err := rand.Int(rand.Reader, big.NewInt(256))
+		if err != nil {
+			return "", err
 		}
+
+		buf = append(buf, ':')
+		buf = append(buf, fmt.Sprintf("%02x", rb.Int64())...)
 	}
 
-	return ret.String(), nil
+	return string(buf), nil
 }
 
 // BackupLoadByName load an instance backup from the database.
@@ -484,7 +500,7 @@ func ResolveImage(ctx context.Context, tx *db.ClusterTx, projectName string, sou
 
 	if source.Properties != nil {
 		if source.Server != "" {
-			return "", fmt.Errorf("Property match is only supported for local images")
+			return "", errors.New("Property match is only supported for local images")
 		}
 
 		hashes, err := tx.GetImagesFingerprints(ctx, projectName, false)
@@ -522,10 +538,10 @@ func ResolveImage(ctx context.Context, tx *db.ClusterTx, projectName string, sou
 			return image.Fingerprint, nil
 		}
 
-		return "", fmt.Errorf("No matching image could be found")
+		return "", errors.New("No matching image could be found")
 	}
 
-	return "", fmt.Errorf("Must specify one of alias, fingerprint or properties for init from image")
+	return "", errors.New("Must specify one of alias, fingerprint or properties for init from image")
 }
 
 // SuitableArchitectures returns a slice of architecture ids based on an instance create request.
@@ -534,7 +550,7 @@ func ResolveImage(ctx context.Context, tx *db.ClusterTx, projectName string, sou
 // A nil list indicates that we can't tell at this stage, typically for private images.
 func SuitableArchitectures(ctx context.Context, s *state.State, tx *db.ClusterTx, projectName string, sourceInst *cluster.Instance, sourceImageRef string, req api.InstancesPost) ([]int, error) {
 	// Handle cases where the architecture is already provided.
-	if shared.ValueInSlice(req.Source.Type, []string{"migration", "none"}) && req.Architecture != "" {
+	if slices.Contains([]api.SourceType{api.SourceTypeConversion, api.SourceTypeMigration, api.SourceTypeNone}, req.Source.Type) && req.Architecture != "" {
 		id, err := osarch.ArchitectureId(req.Architecture)
 		if err != nil {
 			return nil, err
@@ -543,23 +559,23 @@ func SuitableArchitectures(ctx context.Context, s *state.State, tx *db.ClusterTx
 		return []int{id}, nil
 	}
 
-	// For migration, an architecture must be specified in the req.
-	if req.Source.Type == "migration" && req.Architecture == "" {
-		return nil, api.StatusErrorf(http.StatusBadRequest, "An architecture must be specified in migration requests")
+	// For migration and conversion, an architecture must be specified in the req.
+	if slices.Contains([]api.SourceType{api.SourceTypeConversion, api.SourceTypeMigration}, req.Source.Type) && req.Architecture == "" {
+		return nil, api.StatusErrorf(http.StatusBadRequest, "An architecture must be specified in migration or conversion requests")
 	}
 
 	// For none, allow any architecture.
-	if req.Source.Type == "none" {
+	if req.Source.Type == api.SourceTypeNone {
 		return []int{}, nil
 	}
 
 	// For copy, always use the source architecture.
-	if req.Source.Type == "copy" {
+	if req.Source.Type == api.SourceTypeCopy {
 		return []int{sourceInst.Architecture}, nil
 	}
 
 	// For image, things get a bit more complicated.
-	if req.Source.Type == "image" {
+	if req.Source.Type == api.SourceTypeImage {
 		// Handle local images.
 		if req.Source.Server == "" {
 			_, img, err := tx.GetImageByFingerprintPrefix(ctx, sourceImageRef, cluster.ImageFilter{Project: &projectName})
@@ -584,7 +600,7 @@ func SuitableArchitectures(ctx context.Context, s *state.State, tx *db.ClusterTx
 
 			var err error
 			var remote lxd.ImageServer
-			if shared.ValueInSlice(req.Source.Protocol, []string{"", "lxd"}) {
+			if slices.Contains([]string{"", "lxd"}, req.Source.Protocol) {
 				// Remote LXD image server.
 				remote, err = lxd.ConnectPublicLXD(req.Source.Server, &lxd.ConnectionArgs{
 					TLSServerCert: req.Source.Certificate,
@@ -653,7 +669,7 @@ func SuitableArchitectures(ctx context.Context, s *state.State, tx *db.ClusterTx
 // Returns the created instance, along with a "create" operation lock that needs to be marked as Done once the
 // instance is fully completed, and a revert fail function that can be used to undo this function if a subsequent
 // step fails.
-func CreateInternal(s *state.State, args db.InstanceArgs, clearLogDir bool) (Instance, *operationlock.InstanceOperation, revert.Hook, error) {
+func CreateInternal(ctx context.Context, s *state.State, args db.InstanceArgs, clearLogDir bool) (Instance, *operationlock.InstanceOperation, revert.Hook, error) {
 	revert := revert.New()
 	defer revert.Fail()
 
@@ -675,7 +691,7 @@ func CreateInternal(s *state.State, args db.InstanceArgs, clearLogDir bool) (Ins
 			return err
 		})
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("Failed to get default profile for new instance")
+			return nil, nil, nil, errors.New("Failed getting default profile for new instance")
 		}
 	}
 
@@ -735,8 +751,8 @@ func CreateInternal(s *state.State, args db.InstanceArgs, clearLogDir bool) (Ins
 		return nil, nil, nil, err
 	}
 
-	if !shared.ValueInSlice(args.Architecture, s.OS.Architectures) {
-		return nil, nil, nil, fmt.Errorf("Requested architecture isn't supported by this host")
+	if !slices.Contains(s.OS.Architectures, args.Architecture) {
+		return nil, nil, nil, errors.New("Requested architecture is not supported by this host")
 	}
 
 	var profiles []string
@@ -753,12 +769,12 @@ func CreateInternal(s *state.State, args db.InstanceArgs, clearLogDir bool) (Ins
 
 	checkedProfiles := map[string]bool{}
 	for _, profile := range args.Profiles {
-		if !shared.ValueInSlice(profile.Name, profiles) {
-			return nil, nil, nil, fmt.Errorf("Requested profile %q doesn't exist", profile.Name)
+		if !slices.Contains(profiles, profile.Name) {
+			return nil, nil, nil, fmt.Errorf("Requested profile %q does not exist", profile.Name)
 		}
 
 		if checkedProfiles[profile.Name] {
-			return nil, nil, nil, fmt.Errorf("Duplicate profile found in request")
+			return nil, nil, nil, errors.New("Duplicate profile found in request")
 		}
 
 		checkedProfiles[profile.Name] = true
@@ -793,6 +809,10 @@ func CreateInternal(s *state.State, args db.InstanceArgs, clearLogDir bool) (Ins
 		if err != nil {
 			return err
 		}
+
+		// Do not store initial.* device config keys in database.
+		initialDevicesConfig := args.Devices.CutInitialConfig()
+		defer func() { initialDevicesConfig.Copy(args.Devices) }() // Restore after DB transaction.
 
 		devices, err := cluster.APIToDevices(args.Devices.CloneNative())
 		if err != nil {
@@ -926,7 +946,7 @@ func CreateInternal(s *state.State, args db.InstanceArgs, clearLogDir bool) (Ins
 				thing = "Snapshot"
 			}
 
-			return nil, nil, nil, fmt.Errorf("%s %q already exists", thing, args.Name)
+			return nil, nil, nil, api.StatusErrorf(http.StatusConflict, "%s %q already exists", thing, args.Name)
 		}
 
 		return nil, nil, nil, err
@@ -937,7 +957,7 @@ func CreateInternal(s *state.State, args db.InstanceArgs, clearLogDir bool) (Ins
 			return tx.DeleteInstance(ctx, dbInst.Project, dbInst.Name)
 		})
 	})
-	inst, cleanup, err := Create(s, args, *p)
+	inst, cleanup, err := Create(ctx, s, args, *p)
 	if err != nil {
 		logger.Error("Failed initialising instance", logger.Ctx{"project": args.Project, "instance": args.Name, "type": args.Type, "err": err})
 		return nil, nil, nil, fmt.Errorf("Failed initialising instance: %w", err)
@@ -973,7 +993,7 @@ func NextSnapshotName(s *state.State, inst Instance, defaultPattern string) (str
 
 	count := strings.Count(pattern, "%d")
 	if count > 1 {
-		return "", fmt.Errorf("Snapshot pattern may contain '%%d' only once")
+		return "", errors.New("Snapshot pattern may contain '%%d' only once")
 	} else if count == 1 {
 		var i int
 
@@ -1003,7 +1023,7 @@ func NextSnapshotName(s *state.State, inst Instance, defaultPattern string) (str
 
 	// Append '-0', '-1', etc. if the actual pattern/snapshot name already exists
 	if snapshotExists {
-		pattern = fmt.Sprintf("%s-%%d", pattern)
+		pattern = pattern + "-%d"
 
 		var i int
 

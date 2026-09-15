@@ -4,6 +4,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/canonical/lxd/lxd/db/cluster"
@@ -11,18 +12,6 @@ import (
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/version"
 )
-
-// ClusterGroupToAPI is a convenience to convert a ClusterGroup db struct into
-// an API cluster group struct.
-func ClusterGroupToAPI(clusterGroup *cluster.ClusterGroup, nodes []string) *api.ClusterGroup {
-	c := &api.ClusterGroup{
-		Name:        clusterGroup.Name,
-		Description: clusterGroup.Description,
-		Members:     nodes,
-	}
-
-	return c
-}
 
 // GetClusterGroupNodes returns a list of nodes of the given cluster group.
 func (c *ClusterTx) GetClusterGroupNodes(ctx context.Context, groupName string) ([]string, error) {
@@ -50,7 +39,7 @@ WHERE cluster_groups.name = ? ORDER BY cluster_groups.name
 		sql = `SELECT cluster_groups.name FROM cluster_groups ORDER BY cluster_groups.name`
 		args = []any{}
 	} else {
-		return nil, fmt.Errorf("No statement exists for the given Filter")
+		return nil, errors.New("No statement exists for the given Filter")
 	}
 
 	names, err := query.SelectStrings(ctx, c.tx, sql, args...)
@@ -70,12 +59,12 @@ WHERE cluster_groups.name = ? ORDER BY cluster_groups.name
 func (c *ClusterTx) AddNodeToClusterGroup(ctx context.Context, groupName string, nodeName string) error {
 	groupID, err := cluster.GetClusterGroupID(ctx, c.tx, groupName)
 	if err != nil {
-		return fmt.Errorf("Failed to get cluster group ID: %w", err)
+		return fmt.Errorf("Failed getting cluster group ID: %w", err)
 	}
 
 	nodeInfo, err := c.GetNodeByName(ctx, nodeName)
 	if err != nil {
-		return fmt.Errorf("Failed to get node info: %w", err)
+		return fmt.Errorf("Failed getting node info: %w", err)
 	}
 
 	_, err = c.tx.Exec(`INSERT INTO nodes_cluster_groups (node_id, group_id) VALUES(?, ?)`, nodeInfo.ID, groupID)
@@ -90,12 +79,12 @@ func (c *ClusterTx) AddNodeToClusterGroup(ctx context.Context, groupName string,
 func (c *ClusterTx) RemoveNodeFromClusterGroup(ctx context.Context, groupName string, nodeName string) error {
 	groupID, err := cluster.GetClusterGroupID(ctx, c.tx, groupName)
 	if err != nil {
-		return fmt.Errorf("Failed to get cluster group ID: %w", err)
+		return fmt.Errorf("Failed getting cluster group ID: %w", err)
 	}
 
 	nodeInfo, err := c.GetNodeByName(ctx, nodeName)
 	if err != nil {
-		return fmt.Errorf("Failed to get node info: %w", err)
+		return fmt.Errorf("Failed getting node info: %w", err)
 	}
 
 	_, err = c.tx.Exec(`DELETE FROM nodes_cluster_groups WHERE node_id = ? AND group_id = ?`, nodeInfo.ID, groupID)

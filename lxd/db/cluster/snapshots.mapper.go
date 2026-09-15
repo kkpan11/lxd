@@ -73,12 +73,6 @@ var instanceSnapshotDeleteByProjectAndInstanceAndName = RegisterStmt(`
 DELETE FROM instances_snapshots WHERE instance_id = (SELECT instances.id FROM instances JOIN projects ON instances.project_id = projects.id WHERE projects.name = ? AND instances.name = ?) AND name = ?
 `)
 
-// instanceSnapshotColumns returns a string of column names to be used with a SELECT statement for the entity.
-// Use this function when building statements to retrieve database entries matching the InstanceSnapshot entity.
-func instanceSnapshotColumns() string {
-	return "instances_snapshots.id, projects.name AS project, instances.name AS instance, instances_snapshots.name, instances_snapshots.creation_date, instances_snapshots.stateful, coalesce(instances_snapshots.description, ''), instances_snapshots.expiry_date"
-}
-
 // getInstanceSnapshots can be used to run handwritten sql.Stmts to return a slice of objects.
 func getInstanceSnapshots(ctx context.Context, stmt *sql.Stmt, args ...any) ([]InstanceSnapshot, error) {
 	objects := make([]InstanceSnapshot, 0)
@@ -97,7 +91,7 @@ func getInstanceSnapshots(ctx context.Context, stmt *sql.Stmt, args ...any) ([]I
 
 	err := query.SelectObjects(ctx, stmt, dest, args...)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch from \"instances_snapshots\" table: %w", err)
+		return nil, fmt.Errorf("Failed fetching from \"instances_snapshots\" table: %w", err)
 	}
 
 	return objects, nil
@@ -121,7 +115,7 @@ func getInstanceSnapshotsRaw(ctx context.Context, tx *sql.Tx, sql string, args .
 
 	err := query.Scan(ctx, tx, sql, dest, args...)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch from \"instances_snapshots\" table: %w", err)
+		return nil, fmt.Errorf("Failed fetching from \"instances_snapshots\" table: %w", err)
 	}
 
 	return objects, nil
@@ -133,7 +127,7 @@ func GetInstanceSnapshots(ctx context.Context, tx *sql.Tx, filters ...InstanceSn
 	var err error
 
 	// Result slice.
-	objects := make([]InstanceSnapshot, 0)
+	var objects []InstanceSnapshot
 
 	// Pick the prepared statement and arguments to use based on active criteria.
 	var sqlStmt *sql.Stmt
@@ -143,7 +137,7 @@ func GetInstanceSnapshots(ctx context.Context, tx *sql.Tx, filters ...InstanceSn
 	if len(filters) == 0 {
 		sqlStmt, err = Stmt(tx, instanceSnapshotObjects)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to get \"instanceSnapshotObjects\" prepared statement: %w", err)
+			return nil, fmt.Errorf("Failed getting \"instanceSnapshotObjects\" prepared statement: %w", err)
 		}
 	}
 
@@ -153,7 +147,7 @@ func GetInstanceSnapshots(ctx context.Context, tx *sql.Tx, filters ...InstanceSn
 			if len(filters) == 1 {
 				sqlStmt, err = Stmt(tx, instanceSnapshotObjectsByProjectAndInstanceAndName)
 				if err != nil {
-					return nil, fmt.Errorf("Failed to get \"instanceSnapshotObjectsByProjectAndInstanceAndName\" prepared statement: %w", err)
+					return nil, fmt.Errorf("Failed getting \"instanceSnapshotObjectsByProjectAndInstanceAndName\" prepared statement: %w", err)
 				}
 
 				break
@@ -161,7 +155,7 @@ func GetInstanceSnapshots(ctx context.Context, tx *sql.Tx, filters ...InstanceSn
 
 			query, err := StmtString(instanceSnapshotObjectsByProjectAndInstanceAndName)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to get \"instanceSnapshotObjects\" prepared statement: %w", err)
+				return nil, fmt.Errorf("Failed getting \"instanceSnapshotObjects\" prepared statement: %w", err)
 			}
 
 			parts := strings.SplitN(query, "ORDER BY", 2)
@@ -177,7 +171,7 @@ func GetInstanceSnapshots(ctx context.Context, tx *sql.Tx, filters ...InstanceSn
 			if len(filters) == 1 {
 				sqlStmt, err = Stmt(tx, instanceSnapshotObjectsByProjectAndInstance)
 				if err != nil {
-					return nil, fmt.Errorf("Failed to get \"instanceSnapshotObjectsByProjectAndInstance\" prepared statement: %w", err)
+					return nil, fmt.Errorf("Failed getting \"instanceSnapshotObjectsByProjectAndInstance\" prepared statement: %w", err)
 				}
 
 				break
@@ -185,7 +179,7 @@ func GetInstanceSnapshots(ctx context.Context, tx *sql.Tx, filters ...InstanceSn
 
 			query, err := StmtString(instanceSnapshotObjectsByProjectAndInstance)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to get \"instanceSnapshotObjects\" prepared statement: %w", err)
+				return nil, fmt.Errorf("Failed getting \"instanceSnapshotObjects\" prepared statement: %w", err)
 			}
 
 			parts := strings.SplitN(query, "ORDER BY", 2)
@@ -201,7 +195,7 @@ func GetInstanceSnapshots(ctx context.Context, tx *sql.Tx, filters ...InstanceSn
 			if len(filters) == 1 {
 				sqlStmt, err = Stmt(tx, instanceSnapshotObjectsByID)
 				if err != nil {
-					return nil, fmt.Errorf("Failed to get \"instanceSnapshotObjectsByID\" prepared statement: %w", err)
+					return nil, fmt.Errorf("Failed getting \"instanceSnapshotObjectsByID\" prepared statement: %w", err)
 				}
 
 				break
@@ -209,7 +203,7 @@ func GetInstanceSnapshots(ctx context.Context, tx *sql.Tx, filters ...InstanceSn
 
 			query, err := StmtString(instanceSnapshotObjectsByID)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to get \"instanceSnapshotObjects\" prepared statement: %w", err)
+				return nil, fmt.Errorf("Failed getting \"instanceSnapshotObjects\" prepared statement: %w", err)
 			}
 
 			parts := strings.SplitN(query, "ORDER BY", 2)
@@ -221,9 +215,9 @@ func GetInstanceSnapshots(ctx context.Context, tx *sql.Tx, filters ...InstanceSn
 			_, where, _ := strings.Cut(parts[0], "WHERE")
 			queryParts[0] += "OR" + where
 		} else if filter.ID == nil && filter.Project == nil && filter.Instance == nil && filter.Name == nil {
-			return nil, fmt.Errorf("Cannot filter on empty InstanceSnapshotFilter")
+			return nil, errors.New("Cannot filter on empty InstanceSnapshotFilter")
 		} else {
-			return nil, fmt.Errorf("No statement exists for the given Filter")
+			return nil, errors.New("No statement exists for the given Filter")
 		}
 	}
 
@@ -236,7 +230,7 @@ func GetInstanceSnapshots(ctx context.Context, tx *sql.Tx, filters ...InstanceSn
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch from \"instances_snapshots\" table: %w", err)
+		return nil, fmt.Errorf("Failed fetching from \"instances_snapshots\" table: %w", err)
 	}
 
 	return objects, nil
@@ -289,7 +283,7 @@ func GetInstanceSnapshot(ctx context.Context, tx *sql.Tx, project string, instan
 
 	objects, err := GetInstanceSnapshots(ctx, tx, filter)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch from \"instances_snapshots\" table: %w", err)
+		return nil, fmt.Errorf("Failed fetching from \"instances_snapshots\" table: %w", err)
 	}
 
 	switch len(objects) {
@@ -298,7 +292,7 @@ func GetInstanceSnapshot(ctx context.Context, tx *sql.Tx, project string, instan
 	case 1:
 		return &objects[0], nil
 	default:
-		return nil, fmt.Errorf("More than one \"instances_snapshots\" entry matches")
+		return nil, errors.New("More than one \"instances_snapshots\" entry matches")
 	}
 }
 
@@ -307,51 +301,26 @@ func GetInstanceSnapshot(ctx context.Context, tx *sql.Tx, project string, instan
 func GetInstanceSnapshotID(ctx context.Context, tx *sql.Tx, project string, instance string, name string) (int64, error) {
 	stmt, err := Stmt(tx, instanceSnapshotID)
 	if err != nil {
-		return -1, fmt.Errorf("Failed to get \"instanceSnapshotID\" prepared statement: %w", err)
+		return -1, fmt.Errorf("Failed getting \"instanceSnapshotID\" prepared statement: %w", err)
 	}
 
 	row := stmt.QueryRowContext(ctx, project, instance, name)
 	var id int64
 	err = row.Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return -1, api.StatusErrorf(http.StatusNotFound, "InstanceSnapshot not found")
-	}
-
 	if err != nil {
-		return -1, fmt.Errorf("Failed to get \"instances_snapshots\" ID: %w", err)
+		if errors.Is(err, sql.ErrNoRows) {
+			return -1, api.StatusErrorf(http.StatusNotFound, "InstanceSnapshot not found")
+		}
+
+		return -1, fmt.Errorf("Failed getting \"instances_snapshots\" ID: %w", err)
 	}
 
 	return id, nil
 }
 
-// InstanceSnapshotExists checks if a instance_snapshot with the given key exists.
-// generator: instance_snapshot Exists
-func InstanceSnapshotExists(ctx context.Context, tx *sql.Tx, project string, instance string, name string) (bool, error) {
-	_, err := GetInstanceSnapshotID(ctx, tx, project, instance, name)
-	if err != nil {
-		if api.StatusErrorCheck(err, http.StatusNotFound) {
-			return false, nil
-		}
-
-		return false, err
-	}
-
-	return true, nil
-}
-
 // CreateInstanceSnapshot adds a new instance_snapshot to the database.
 // generator: instance_snapshot Create
 func CreateInstanceSnapshot(ctx context.Context, tx *sql.Tx, object InstanceSnapshot) (int64, error) {
-	// Check if a instance_snapshot with the same key exists.
-	exists, err := InstanceSnapshotExists(ctx, tx, object.Project, object.Instance, object.Name)
-	if err != nil {
-		return -1, fmt.Errorf("Failed to check for duplicates: %w", err)
-	}
-
-	if exists {
-		return -1, api.StatusErrorf(http.StatusConflict, "This \"instances_snapshots\" entry already exists")
-	}
-
 	args := make([]any, 7)
 
 	// Populate the statement arguments.
@@ -366,18 +335,22 @@ func CreateInstanceSnapshot(ctx context.Context, tx *sql.Tx, object InstanceSnap
 	// Prepared statement to use.
 	stmt, err := Stmt(tx, instanceSnapshotCreate)
 	if err != nil {
-		return -1, fmt.Errorf("Failed to get \"instanceSnapshotCreate\" prepared statement: %w", err)
+		return -1, fmt.Errorf("Failed getting \"instanceSnapshotCreate\" prepared statement: %w", err)
 	}
 
 	// Execute the statement.
-	result, err := stmt.Exec(args...)
+	result, err := stmt.ExecContext(ctx, args...)
 	if err != nil {
-		return -1, fmt.Errorf("Failed to create \"instances_snapshots\" entry: %w", err)
+		if query.IsConflictErr(err) {
+			return -1, api.NewStatusError(http.StatusConflict, "This \"instances_snapshots\" entry already exists")
+		}
+
+		return -1, fmt.Errorf("Failed creating \"instances_snapshots\" entry: %w", err)
 	}
 
 	id, err := result.LastInsertId()
 	if err != nil {
-		return -1, fmt.Errorf("Failed to fetch \"instances_snapshots\" entry ID: %w", err)
+		return -1, fmt.Errorf("Failed fetching \"instances_snapshots\" entry ID: %w", err)
 	}
 
 	return id, nil
@@ -425,11 +398,15 @@ func CreateInstanceSnapshotConfig(ctx context.Context, tx *sql.Tx, instanceSnaps
 func RenameInstanceSnapshot(ctx context.Context, tx *sql.Tx, project string, instance string, name string, to string) error {
 	stmt, err := Stmt(tx, instanceSnapshotRename)
 	if err != nil {
-		return fmt.Errorf("Failed to get \"instanceSnapshotRename\" prepared statement: %w", err)
+		return fmt.Errorf("Failed getting \"instanceSnapshotRename\" prepared statement: %w", err)
 	}
 
-	result, err := stmt.Exec(to, project, instance, name)
+	result, err := stmt.ExecContext(ctx, to, project, instance, name)
 	if err != nil {
+		if query.IsConflictErr(err) {
+			return api.NewStatusError(http.StatusConflict, "A \"instances_snapshots\" entry already exists with this name")
+		}
+
 		return fmt.Errorf("Rename InstanceSnapshot failed: %w", err)
 	}
 
@@ -450,10 +427,10 @@ func RenameInstanceSnapshot(ctx context.Context, tx *sql.Tx, project string, ins
 func DeleteInstanceSnapshot(ctx context.Context, tx *sql.Tx, project string, instance string, name string) error {
 	stmt, err := Stmt(tx, instanceSnapshotDeleteByProjectAndInstanceAndName)
 	if err != nil {
-		return fmt.Errorf("Failed to get \"instanceSnapshotDeleteByProjectAndInstanceAndName\" prepared statement: %w", err)
+		return fmt.Errorf("Failed getting \"instanceSnapshotDeleteByProjectAndInstanceAndName\" prepared statement: %w", err)
 	}
 
-	result, err := stmt.Exec(project, instance, name)
+	result, err := stmt.ExecContext(ctx, project, instance, name)
 	if err != nil {
 		return fmt.Errorf("Delete \"instances_snapshots\": %w", err)
 	}

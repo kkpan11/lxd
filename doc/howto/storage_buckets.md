@@ -1,169 +1,247 @@
+---
+relatedlinks: "[LXD's&#32;S3&#32;API&#32;-&#32;YouTube](https://youtube.com/watch?v=T1EeXPrjkEY)"
+---
+
 (howto-storage-buckets)=
-# How to manage storage buckets and keys
+# How to manage storage buckets
 
-```{youtube} https://www.youtube.com/watch?v=T1EeXPrjkEY
+{ref}`storage-buckets` store object-based data using non-local `cephobject` storage pools. When used in LXD or MicroCloud clusters, they are available from any cluster member.
+
+Unlike custom storage volumes, storage buckets cannot be attached to instances. Instead, applications access them directly via a URL using the S3 protocol. A {ref}`Ceph RADOS Gateway endpoint <howto-storage-pools-ceph-requirements-radosgw-endpoint>` provides the S3-compatible URL.
+
+(howto-storage-buckets-view)=
+## View storage buckets
+
+`````{tabs}
+````{group-tab} CLI
+
+To list all available storage buckets in a storage pool, run:
+
+```bash
+lxc storage bucket list <pool-name>
 ```
 
-See the following sections for instructions on how to create, configure, view and resize {ref}`storage-buckets` and how to manage storage bucket keys.
+To show detailed information about a specific bucket, run:
 
-## Install requirements for local storage buckets
-
-LXD uses [MinIO](https://min.io) to set up local storage buckets. To use this feature with LXD, you must install both the server and client binaries.
-
-- MinIO Server:
-   - Source:
-      - [MinIO Server on GitHub](https://github.com/minio/minio)
-   - Direct download for various architectures:
-      - [MinIO Server pre-built for `amd64`](https://dl.min.io/server/minio/release/linux-amd64/minio)
-      - [MinIO Server pre-built for `arm64`](https://dl.min.io/server/minio/release/linux-arm64/minio)
-      - [MinIO Server pre-built for `arm`](https://dl.min.io/server/minio/release/linux-arm/minio)
-      - [MinIO Server pre-built for `ppc64le`](https://dl.min.io/server/minio/release/linux-ppc64le/minio)
-      - [MinIO Server pre-built for `s390x`](https://dl.min.io/server/minio/release/linux-s390x/minio)
-
-- MinIO Client:
-   - Source:
-      - [MinIO Client on GitHub](https://github.com/minio/mc)
-   - Direct download for various architectures:
-      - [MinIO Client pre-built for `amd64`](https://dl.min.io/client/mc/release/linux-amd64/mc)
-      - [MinIO Client pre-built for `arm64`](https://dl.min.io/client/mc/release/linux-arm64/mc)
-      - [MinIO Client pre-built for `arm`](https://dl.min.io/client/mc/release/linux-arm/mc)
-      - [MinIO Client pre-built for `ppc64le`](https://dl.min.io/client/mc/release/linux-ppc64le/mc)
-      - [MinIO Client pre-built for `s390x`](https://dl.min.io/client/mc/release/linux-s390x/mc)
-
-If LXD is installed from a Snap, you must configure the snap environment to detect the binaries, and restart LXD.
-Note that the path to the directory containing the binaries must not be under the home directory of any user.
-
-    snap set lxd minio.path=/path/to/directory/containing/both/binaries
-    snap restart lxd
-
-If LXD is installed from another source, both binaries must be included in the `$PATH` that LXD was started with.
-
-## Configure the S3 address
-
-If you want to use storage buckets on local storage (thus in a `dir`, `btrfs`, `lvm`, or `zfs` pool), you must configure the S3 address for your LXD server.
-This is the address that you can then use to access the buckets through the S3 protocol.
-
-To configure the S3 address, set the {config:option}`server-core:core.storage_buckets_address` server configuration option.
-For example:
-
-    lxc config set core.storage_buckets_address :8555
-
-## Manage storage buckets
-
-Storage buckets provide access to object storage exposed using the S3 protocol.
-
-Unlike custom storage volumes, storage buckets are not added to an instance, but applications can instead access them directly via their URL.
-
-See {ref}`storage-buckets` for detailed information.
-
-### Create a storage bucket
-
-Use the following command to create a storage bucket in a storage pool:
-
-    lxc storage bucket create <pool_name> <bucket_name> [configuration_options...]
-
-See the {ref}`storage-drivers` documentation for a list of available storage bucket configuration options for each driver that supports object storage.
-
-To add a storage bucket on a cluster member, add the `--target` flag:
-
-    lxc storage bucket create <pool_name> <bucket_name> --target=<cluster_member> [configuration_options...]
-
-```{note}
-For most storage drivers, storage buckets are not replicated across the cluster and exist only on the member for which they were created.
-This behavior is different for `cephobject` storage pools, where buckets are available from any cluster member.
+```bash
+lxc storage bucket show <pool-name> <bucket-name>
 ```
 
-### Configure storage bucket settings
+````
+````{group-tab} UI
 
-See the {ref}`storage-drivers` documentation for the available configuration options for each storage driver that supports object storage.
+Select {guilabel}`Buckets` from the {guilabel}`Storage` section of the main navigation.
 
+````
+`````
+
+(howto-storage-buckets-requirements)=
+## Requirements
+
+To use storage buckets, your LXD server must have access to a storage pool that uses the {ref}`Ceph Object <storage-cephobject>` driver. You can confirm this by {ref}`viewing your available storage pools <howto-storage-pools-view>`.
+
+If no listed pool uses the `cephobject` storage driver, you must create one. This requires a [Ceph](https://ceph.io) cluster with a RADOS Gateway (`radosgw`) enabled. Refer to our how-to guide for storage pools: {ref}`howto-storage-pools-ceph-requirements`.
+
+(howto-storage-buckets-create)=
+## Create a storage bucket
+
+`````{tabs}
+````{group-tab} CLI
+
+To create a storage bucket, run:
+
+```bash
+lxc storage bucket create <pool-name> <bucket-name> [configuration_options...]
+```
+
+Refer to the {ref}`Ceph Object <storage-cephobject>` documentation for a list of available storage bucket configuration options for the driver.
+
+````
+````{group-tab} UI
+To create a storage bucket, select {guilabel}`Buckets` from the {guilabel}`Storage` section of the main navigation.
+
+On the resulting screen, click {guilabel}`Create bucket` in the upper-right corner.
+
+In the form that appears, set a unique name for the storage bucket and select a storage pool. You can optionally configure the bucket's size and description.
+
+````
+`````
+
+(howto-storage-buckets-configure)=
+## Configure storage bucket settings
+
+`````{tabs}
+````{group-tab} CLI
 Use the following command to set configuration options for a storage bucket:
 
-    lxc storage bucket set <pool_name> <bucket_name> <key> <value>
+```bash
+lxc storage bucket set <pool-name> <bucket-name> <key> <value>
+```
 
-For example, to set the quota size of a bucket, use the following command:
+For example, to set the size (quota) of a bucket, use the following command:
 
-    lxc storage bucket set my-pool my-bucket size 1MiB
+```bash
+lxc storage bucket set my-pool my-bucket size 1MiB
+```
 
 You can also edit the storage bucket configuration by using the following command:
 
-    lxc storage bucket edit <pool_name> <bucket_name>
+```bash
+lxc storage bucket edit <pool-name> <bucket-name>
+```
 
 Use the following command to delete a storage bucket and its keys:
 
-    lxc storage bucket delete <pool_name> <bucket_name>
+```bash
+lxc storage bucket delete <pool-name> <bucket-name>
+```
 
-### View storage buckets
+Refer to the {ref}`Ceph Object <storage-cephobject>` documentation for a list of available storage bucket configuration options for the driver.
 
-You can display a list of all available storage buckets in a storage pool and check their configuration.
+````
+````{group-tab} UI
 
-To list all available storage buckets in a storage pool, use the following command:
+To configure a storage bucket, select {guilabel}`Buckets` from the {guilabel}`Storage` section of the main navigation.
 
-    lxc storage bucket list <pool_name>
+The resulting screen shows a list of existing storage buckets. Click the {guilabel}`Edit` button on the row of the desired bucket to access its details.
 
-To show detailed information about a specific bucket, use the following command:
+After making changes, click the {guilabel}`Save changes` button. This button also displays the number of changes you have made.
+````
+`````
 
-    lxc storage bucket show <pool_name> <bucket_name>
-
-### Resize a storage bucket
+(howto-storage-buckets-resize)=
+## Resize a storage bucket
 
 By default, storage buckets do not have a quota applied.
 
+`````{tabs}
+````{group-tab} CLI
 To set or change a quota for a storage bucket, set its size configuration:
 
-    lxc storage bucket set <pool_name> <bucket_name> size <new_size>
-
-```{important}
-- Growing a storage bucket usually works (if the storage pool has sufficient storage).
-- You cannot shrink a storage bucket below its current used size.
-
+```bash
+lxc storage bucket set <pool-name> <bucket-name> size <new-size>
 ```
 
+````
+````{group-tab} UI
+
+To configure a storage bucket, select {guilabel}`Buckets` from the {guilabel}`Storage` section of the main navigation.
+
+The resulting screen shows a list of existing storage buckets. Change the quota of the bucket by changing the values in the {guilabel}`Size` fields.
+
+After making changes, click the {guilabel}`Save changes` button. This button also displays the number of changes you have made.
+````
+`````
+
+```{admonition} Resizing considerations
+:class: important
+- Growing a storage bucket usually works (if the storage pool has sufficient storage).
+- You cannot shrink a storage bucket below its current used size.
+```
+
+(howto-storage-buckets-keys)=
 ## Manage storage bucket keys
 
-To access a storage bucket, applications must use a set of S3 credentials made up of an *access key* and a *secret key*.
-You can create multiple sets of credentials for a specific bucket.
+To access a storage bucket, applications must use a set of S3 credentials made up of an *access key* and a *secret key*. You can create multiple sets of credentials for a specific bucket.
 
-Each set of credentials is given a key name.
-The key name is used only for reference and does not need to be provided to the application that uses the credentials.
+Each set of credentials is given a key name. The key name is used only for reference and does not need to be provided to the application that uses the credentials.
 
-Each set of credentials has a *role* that specifies what operations they can perform on the bucket.
+Each set of credentials has a *role* that specifies what operations they can perform on the bucket. The available roles are:
 
-The roles available are:
+`admin`
+: Provides full access to the bucket.
 
-- `admin` - Full access to the bucket
-- `read-only` - Read-only access to the bucket (list and get files only)
+`read-only`
+: Default. Provides read-only (view) access to the bucket.
 
-If the role is not specified when creating a bucket key, the role used is `read-only`.
-
-### Create storage bucket keys
-
-Use the following command to create a set of credentials for a storage bucket:
-
-    lxc storage bucket key create <pool_name> <bucket_name> <key_name> [configuration_options...]
-
-Use the following command to create a set of credentials for a storage bucket with a specific role:
-
-    lxc storage bucket key create <pool_name> <bucket_name> <key_name> --role=admin [configuration_options...]
-
-These commands will generate and display a random set of credential keys.
-
-### Edit or delete storage bucket keys
-
-Use the following command to edit an existing bucket key:
-
-    lxc storage bucket key edit <pool_name> <bucket_name> <key_name>
-
-Use the following command to delete an existing bucket key:
-
-    lxc storage bucket key delete <pool_name> <bucket_name> <key_name>
-
+(howto-storage-buckets-keys-view)=
 ### View storage bucket keys
 
-Use the following command to see the keys defined for an existing bucket:
+`````{tabs}
+````{group-tab} CLI
+Use the following command to list the keys defined for an existing bucket:
 
-    lxc storage bucket key list <pool_name> <bucket_name>
+```
+lxc storage bucket key list <pool-name> <bucket-name>
+```
 
-Use the following command to see a specific bucket key:
+Use the following command to show a specific bucket key:
 
-    lxc storage bucket key show <pool_name> <bucket_name> <key_name>
+```
+lxc storage bucket key show <pool-name> <bucket-name> <key-name>
+```
+
+````
+````{group-tab} UI
+
+To view storage bucket keys, select {guilabel}`Buckets` from the {guilabel}`Storage` section of the main navigation.
+
+Click the name of a storage bucket to display its key management page, where you can view and manage a list of keys for that bucket.
+
+````
+`````
+
+(howto-storage-buckets-keys-create)=
+### Create keys
+
+`````{tabs}
+````{group-tab} CLI
+Use the following command to generate and display a set of keys for a storage bucket. The default role is `read-only`. To create credentials with the `admin` role, include the `--role=admin` flag:
+
+```bash
+lxc storage bucket key create <pool-name> <bucket-name> <key-name> [--role=admin] [configuration_options...]
+```
+
+Refer to [`lxc storage bucket key create`](lxc_storage_bucket_key_create.md) for configuration options.
+
+````
+````{group-tab} UI
+
+To create a storage bucket key, go to the {ref}`key management page <howto-storage-buckets-keys-view>` of the desired bucket. 
+
+On the resulting screen, click {guilabel}`Create key` in the upper-right corner. In the form that appears, set a unique name for the key. You can optionally configure its role and description.
+
+While you can enter values for the {guilabel}`Access` and {guilabel}`Secret Key` fields, this is not necessary. You can leave them blank, and LXD will generate random values for those credential keys.
+
+````
+`````
+
+(howto-storage-buckets-keys-edit)=
+### Edit or delete storage bucket keys
+
+`````{tabs}
+````{group-tab} CLI
+To edit an existing bucket key, run:
+
+```bash
+lxc storage bucket key edit <pool-name> <bucket-name> <key-name>
+```
+
+To delete an existing bucket key, run:
+
+```bash
+lxc storage bucket key delete <pool-name> <bucket-name> <key-name>
+```
+
+````
+````{group-tab} UI
+
+You can edit or delete storage bucket keys from the {ref}`key management page <howto-storage-buckets-keys-view>` of the desired bucket.
+
+````
+`````
+
+## Related topics
+
+How-to guides:
+
+- {ref}`howto-storage-pools-ceph-requirements`
+
+Explanation:
+
+- {ref}`storage-buckets`
+
+Reference:
+
+- {ref}`storage-cephobject`
+- {ref}`storage-drivers-object`

@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/canonical/lxd/lxd/db/operationtype"
 	"github.com/canonical/lxd/lxd/operations"
@@ -50,41 +50,43 @@ func instanceSaveCache() error {
 }
 
 func instanceLoadCache() error {
-	if !shared.PathExists(shared.CachePath("instance_types.yaml")) {
-		return nil
-	}
-
-	content, err := os.ReadFile(shared.CachePath("instance_types.yaml"))
+	cacheFile, err := os.Open(shared.CachePath("instance_types.yaml"))
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+
 		return err
 	}
 
-	err = yaml.Unmarshal(content, &instanceTypes)
-	if err != nil {
+	defer func() { _ = cacheFile.Close() }()
+
+	err = yaml.NewDecoder(util.MaxBytesReader(cacheFile, util.MaxYAMLFileBytes)).Decode(&instanceTypes)
+	if err != nil && err != io.EOF {
 		return err
 	}
 
 	return nil
 }
 
-func instanceRefreshTypesTask(d *Daemon) (task.Func, task.Schedule) {
+func instanceRefreshTypesTask(stateFunc func() *state.State) (task.Func, task.Schedule) {
 	f := func(ctx context.Context) {
-		s := d.State()
+		s := stateFunc()
 
-		opRun := func(op *operations.Operation) error {
+		opRun := func(ctx context.Context, op *operations.Operation) error {
 			return instanceRefreshTypes(ctx, s)
 		}
 
-		op, err := operations.OperationCreate(s, "", operations.OperationClassTask, operationtype.InstanceTypesUpdate, nil, nil, opRun, nil, nil, nil)
-		if err != nil {
-			logger.Error("Failed creating instance types update operation", logger.Ctx{"err": err})
-			return
+		args := operations.OperationArgs{
+			Type:    operationtype.InstanceTypesUpdate,
+			Class:   operationtype.OperationClassTask,
+			RunHook: opRun,
 		}
 
 		logger.Info("Updating instance types")
-		err = op.Start()
+		op, err := operations.ScheduleServerOperation(s, args)
 		if err != nil {
-			logger.Error("Failed starting instance types update operation", logger.Ctx{"err": err})
+			logger.Error("Failed creating instance types update operation", logger.Ctx{"err": err})
 			return
 		}
 
@@ -102,15 +104,15 @@ func instanceRefreshTypesTask(d *Daemon) (task.Func, task.Schedule) {
 
 func instanceRefreshTypes(ctx context.Context, s *state.State) error {
 	// Attempt to download the new definitions
-	downloadParse := func(filename string, target any) error {
-		url := fmt.Sprintf("https://images.lxd.canonical.com/meta/instance-types/%s", filename)
+	downloadParse := func(target any) error {
+		url := "https://images.lxd.canonical.com/meta/instance-types/all.yaml"
 
 		httpClient, err := util.HTTPClient("", s.Proxy)
 		if err != nil {
 			return err
 		}
 
-		httpReq, err := http.NewRequest("GET", url, nil)
+		httpReq, err := http.NewRequest(http.MethodGet, url, nil)
 		if err != nil {
 			return err
 		}
@@ -134,7 +136,7 @@ func instanceRefreshTypes(ctx context.Context, s *state.State) error {
 		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("Failed to get %s", url)
+			return fmt.Errorf("Failed getting %s", url)
 		}
 
 		content, err := io.ReadAll(resp.Body)
@@ -155,33 +157,17 @@ func instanceRefreshTypes(ctx context.Context, s *state.State) error {
 		_ = instanceLoadCache()
 	}
 
-	// Get the list of instance type sources
-	sources := map[string]string{}
-	err := downloadParse(".yaml", &sources)
+	// Parse the "all.yaml" file and update the global map
+	err := downloadParse(&instanceTypes)
 	if err != nil {
+		logger.Warn("Failed updating instance types", logger.Ctx{"err": err})
 		return err
 	}
-
-	// Parse the individual files
-	newInstanceTypes := map[string]map[string]*instanceType{}
-	for name, filename := range sources {
-		types := map[string]*instanceType{}
-		err = downloadParse(filename, &types)
-		if err != nil {
-			logger.Warnf("Failed to update instance types: %v", err)
-			return err
-		}
-
-		newInstanceTypes[name] = types
-	}
-
-	// Update the global map
-	instanceTypes = newInstanceTypes
 
 	// And save in the cache
 	err = instanceSaveCache()
 	if err != nil {
-		logger.Warnf("Failed to update instance types cache: %v", err)
+		logger.Warn("Failed updating instance types cache", logger.Ctx{"err": err})
 		return err
 	}
 
@@ -221,10 +207,10 @@ func instanceParseType(value string) (map[string]string, error) {
 		// Check if it's maybe just a resource limit
 		if sourceName == "" && value != "" {
 			newLimits := instanceType{}
-			fields := strings.Split(value, "-")
-			for _, field := range fields {
+			fields := strings.SplitSeq(value, "-")
+			for field := range fields {
 				if len(field) < 2 || (field[0] != 'c' && field[0] != 'm') {
-					return nil, fmt.Errorf("Provided instance type doesn't exist: %s", value)
+					return nil, fmt.Errorf("Provided instance type does not exist: %s", value)
 				}
 
 				floatValue, err := strconv.ParseFloat(field[1:], 32)
@@ -232,9 +218,10 @@ func instanceParseType(value string) (map[string]string, error) {
 					return nil, fmt.Errorf("Bad custom instance type: %s", value)
 				}
 
-				if field[0] == 'c' {
+				switch field[0] {
+				case 'c':
 					newLimits.CPU = float32(floatValue)
-				} else if field[0] == 'm' {
+				case 'm':
 					newLimits.Memory = float32(floatValue)
 				}
 			}
@@ -243,7 +230,7 @@ func instanceParseType(value string) (map[string]string, error) {
 		}
 
 		if limits == nil {
-			return nil, fmt.Errorf("Provided instance type doesn't exist: %s", value)
+			return nil, fmt.Errorf("Provided instance type does not exist: %s", value)
 		}
 	}
 	out := map[string]string{}
@@ -257,7 +244,7 @@ func instanceParseType(value string) (map[string]string, error) {
 
 		cpuTime := int(limits.CPU / float32(cpuCores) * 100.0)
 
-		out["limits.cpu"] = fmt.Sprintf("%d", cpuCores)
+		out["limits.cpu"] = strconv.Itoa(cpuCores)
 		if cpuTime < 100 {
 			out["limits.cpu.allowance"] = fmt.Sprintf("%d%%", cpuTime)
 		}

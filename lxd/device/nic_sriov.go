@@ -1,8 +1,10 @@
 package device
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	deviceConfig "github.com/canonical/lxd/lxd/device/config"
 	"github.com/canonical/lxd/lxd/instance"
@@ -31,7 +33,8 @@ func (d *nicSRIOV) CanMigrate() bool {
 
 // validateConfig checks the supplied config for correctness.
 func (d *nicSRIOV) validateConfig(instConf instance.ConfigReader) error {
-	if !instanceSupported(instConf.Type(), instancetype.Container, instancetype.VM) {
+	instType := instConf.Type()
+	if !instanceSupported(instType, instancetype.Container, instancetype.VM) {
 		return ErrUnsupportedDevType
 	}
 
@@ -43,16 +46,15 @@ func (d *nicSRIOV) validateConfig(instConf instance.ConfigReader) error {
 		"hwaddr",
 		"vlan",
 		"security.mac_filtering",
-		"maas.subnet.ipv4",
-		"maas.subnet.ipv6",
 		"boot.priority",
 	}
 
-	// Check that if network proeperty is set that conflicting keys are not present.
+	// Check that if network property is set that conflicting keys are not present.
 	if d.config["network"] != "" {
 		requiredFields = append(requiredFields, "network")
-
-		bannedKeys := []string{"nictype", "parent", "mtu", "vlan", "maas.subnet.ipv4", "maas.subnet.ipv6"}
+		inheritKeys := make([]string, 0, 6)
+		inheritKeys = append(inheritKeys, "mtu", "vlan")
+		bannedKeys := append(inheritKeys, "nictype", "parent")
 		for _, bannedKey := range bannedKeys {
 			if d.config[bannedKey] != "" {
 				return fmt.Errorf("Cannot use %q property in conjunction with %q property", bannedKey, "network")
@@ -60,7 +62,7 @@ func (d *nicSRIOV) validateConfig(instConf instance.ConfigReader) error {
 		}
 
 		// If network property is specified, lookup network settings and apply them to the device's config.
-		// api.ProjectDefaultName is used here as macvlan networks don't support projects.
+		// api.ProjectDefaultName is used here as sriov networks don't support projects.
 		var err error
 		d.network, err = network.LoadByName(d.state, api.ProjectDefaultName, d.config["network"])
 		if err != nil {
@@ -68,11 +70,11 @@ func (d *nicSRIOV) validateConfig(instConf instance.ConfigReader) error {
 		}
 
 		if d.network.Status() != api.NetworkStatusCreated {
-			return fmt.Errorf("Specified network is not fully created")
+			return errors.New("Specified network is not fully created")
 		}
 
 		if d.network.Type() != "sriov" {
-			return fmt.Errorf("Specified network must be of type macvlan")
+			return errors.New("Specified network must be of type sriov")
 		}
 
 		netConfig := d.network.Config()
@@ -81,7 +83,6 @@ func (d *nicSRIOV) validateConfig(instConf instance.ConfigReader) error {
 		d.config["parent"] = netConfig["parent"]
 
 		// Copy certain keys verbatim from the network's settings.
-		inheritKeys := []string{"mtu", "vlan", "maas.subnet.ipv4", "maas.subnet.ipv6"}
 		for _, inheritKey := range inheritKeys {
 			_, found := netConfig[inheritKey]
 			if found {
@@ -94,7 +95,7 @@ func (d *nicSRIOV) validateConfig(instConf instance.ConfigReader) error {
 	}
 
 	// For VMs only NIC properties that can be specified on the parent's VF settings are controllable.
-	if instConf.Type() == instancetype.Container || instConf.Type() == instancetype.Any {
+	if instType == instancetype.Container || instType == instancetype.Any {
 		optionalFields = append(optionalFields, "mtu")
 	}
 
@@ -123,16 +124,17 @@ func (d *nicSRIOV) PreStartCheck() error {
 
 // validateEnvironment checks the runtime environment for correctness.
 func (d *nicSRIOV) validateEnvironment() error {
-	if d.inst.Type() == instancetype.VM && shared.IsTrue(d.inst.ExpandedConfig()["migration.stateful"]) {
-		return fmt.Errorf("Network SR-IOV devices cannot be used when migration.stateful is enabled")
+	instType := d.inst.Type()
+	if instType == instancetype.VM && shared.IsTrue(d.inst.ExpandedConfig()["migration.stateful"]) {
+		return errors.New("Network SR-IOV devices cannot be used when migration.stateful is enabled")
 	}
 
-	if d.inst.Type() == instancetype.Container && d.config["name"] == "" {
-		return fmt.Errorf("Requires name property to start")
+	if instType == instancetype.Container && d.config["name"] == "" {
+		return errors.New("Requires name property to start")
 	}
 
 	if !network.InterfaceExists(d.config["parent"]) {
-		return fmt.Errorf("Parent device %q doesn't exist", d.config["parent"])
+		return fmt.Errorf("Parent device %q does not exist", d.config["parent"])
 	}
 
 	return nil
@@ -145,10 +147,11 @@ func (d *nicSRIOV) Start() (*deviceConfig.RunConfig, error) {
 		return nil, err
 	}
 
+	instType := d.inst.Type()
 	saveData := make(map[string]string)
 
 	// If VM, then try and load the vfio-pci module first.
-	if d.inst.Type() == instancetype.VM {
+	if instType == instancetype.VM {
 		err = util.LoadModule("vfio-pci")
 		if err != nil {
 			return nil, fmt.Errorf("Error loading %q module: %w", "vfio-pci", err)
@@ -172,7 +175,7 @@ func (d *nicSRIOV) Start() (*deviceConfig.RunConfig, error) {
 
 	network.SRIOVVirtualFunctionMutex.Unlock()
 
-	if d.inst.Type() == instancetype.Container {
+	if instType == instancetype.Container {
 		err := networkSRIOVSetupContainerVFNIC(saveData["host_name"], d.config)
 		if err != nil {
 			return nil, err
@@ -198,12 +201,12 @@ func (d *nicSRIOV) Start() (*deviceConfig.RunConfig, error) {
 		{Key: "hwaddr", Value: d.config["hwaddr"]},
 	}
 
-	if d.inst.Type() == instancetype.VM {
+	if instType == instancetype.VM {
 		runConf.NetworkInterface = append(runConf.NetworkInterface,
 			[]deviceConfig.RunConfigItem{
 				{Key: "devName", Value: d.name},
 				{Key: "pciSlotName", Value: vfPCIDev.SlotName},
-				{Key: "pciIOMMUGroup", Value: fmt.Sprintf("%d", pciIOMMUGroup)},
+				{Key: "pciIOMMUGroup", Value: strconv.FormatUint(pciIOMMUGroup, 10)},
 			}...)
 	}
 

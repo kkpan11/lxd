@@ -1,22 +1,22 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
 	"time"
 
-	"github.com/gorilla/mux"
-
+	"github.com/canonical/lxd/lxd/db"
+	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/db/operationtype"
 	"github.com/canonical/lxd/lxd/instance"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/response"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/version"
 )
@@ -69,34 +69,9 @@ import (
 func instanceState(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	instanceType, err := urlInstanceTypeDetect(r)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	if shared.IsSnapshot(name) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
-	}
-
-	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(s, r, projectName, name, instanceType)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	c, _, _, resp := forwardedInstanceResponseWithInstance(s, r)
 	if resp != nil {
 		return resp
-	}
-
-	c, err := instance.LoadByProjectAndName(s, projectName, name)
-	if err != nil {
-		return response.SmartError(err)
 	}
 
 	hostInterfaces, _ := net.Interfaces()
@@ -143,27 +118,7 @@ func instanceState(d *Daemon, r *http.Request) response.Response {
 func instanceStatePut(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	instanceType, err := urlInstanceTypeDetect(r)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	if shared.IsSnapshot(name) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
-	}
-
-	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(s, r, projectName, name, instanceType)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	projectName, name, resp := forwardedInstanceResponse(s, r)
 	if resp != nil {
 		return resp
 	}
@@ -172,14 +127,36 @@ func instanceStatePut(d *Daemon, r *http.Request) response.Response {
 
 	// We default to -1 (i.e. no timeout) here instead of 0 (instant timeout).
 	req.Timeout = -1
-	err = json.NewDecoder(r.Body).Decode(&req)
+	err := json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
 		return response.BadRequest(err)
 	}
 
 	// Check if the cluster member is evacuated.
 	if s.DB.Cluster.LocalNodeIsEvacuated() && req.Action != "stop" {
-		return response.Forbidden(fmt.Errorf("Cluster member is evacuated"))
+		return response.Forbidden(errors.New("Cluster member is evacuated"))
+	}
+
+	// Block starting instances in a standby replica project.
+	// Instances must not be started until the project is promoted to leader mode.
+	if req.Action == "start" {
+		var replicaMode string
+		err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+			dbProject, err := dbCluster.GetProject(ctx, tx.Tx(), projectName)
+			if err != nil {
+				return err
+			}
+
+			replicaMode = string(dbProject.ReplicaMode)
+			return nil
+		})
+		if err != nil {
+			return response.SmartError(err)
+		}
+
+		if replicaMode == api.ReplicatorProjectModeStandby {
+			return response.Forbidden(errors.New("Cannot start instances in a standby replica project"))
+		}
 	}
 
 	// Don't mess with instances while in setup mode.
@@ -196,20 +173,77 @@ func instanceStatePut(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
-	do := func(op *operations.Operation) error {
-		inst.SetOperation(op)
-
-		return doInstanceStatePut(inst, req)
+	do := func(ctx context.Context, op *operations.Operation) error {
+		return doInstanceStatePut(ctx, inst, req, op)
 	}
 
-	resources := map[string][]api.URL{}
-	resources["instances"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", name)}
-	op, err := operations.OperationCreate(s, projectName, operations.OperationClassTask, opType, resources, nil, do, nil, nil, r)
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.BadRequest(err)
+	}
+
+	if requestor.ClientType().IsClusterOperationNotification() {
+		// If this is a cluster notification from inside another operation,
+		// we should not change the status of the instance when not needed, as that would cause the operation to be marked as failed when it isn't.
+		if !instanceActionNeeded(inst, instancetype.InstanceAction(req.Action)) {
+			return response.EmptySyncResponse
+		}
+
+		// Don't create a new operation, but run the code synchronously.
+		err = do(r.Context(), nil)
+		if err != nil {
+			return response.SmartError(err)
+		}
+
+		return response.EmptySyncResponse
+	}
+
+	args := operations.OperationArgs{
+		ProjectName: projectName,
+		EntityURL:   api.NewURL().Path(version.APIVersion, "instances", name).Project(projectName),
+		Type:        opType,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     do,
+	}
+
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
+}
+
+// instanceActionNeeded checks if the instance is already in the desired state for the given action, and thus whether the action needs to be performed or not.
+func instanceActionNeeded(inst instance.Instance, state instancetype.InstanceAction) bool {
+	switch state {
+	case instancetype.Freeze:
+		if !inst.IsRunning() {
+			return false
+		}
+
+	case instancetype.Restart:
+		if !inst.IsRunning() {
+			return false
+		}
+
+	case instancetype.Start:
+		if !inst.IsFrozen() && inst.IsRunning() {
+			return false
+		}
+
+	case instancetype.Stop:
+		if !inst.IsRunning() {
+			return false
+		}
+
+	case instancetype.Unfreeze:
+		if !inst.IsFrozen() {
+			return false
+		}
+	}
+
+	return true
 }
 
 func instanceActionToOptype(action string) (operationtype.Type, error) {
@@ -226,10 +260,10 @@ func instanceActionToOptype(action string) (operationtype.Type, error) {
 		return operationtype.InstanceUnfreeze, nil
 	}
 
-	return operationtype.Unknown, fmt.Errorf("Unknown action: '%s'", action)
+	return operationtype.Unknown, fmt.Errorf("Unknown action: %q", action)
 }
 
-func doInstanceStatePut(inst instance.Instance, req api.InstanceStatePut) error {
+func doInstanceStatePut(ctx context.Context, inst instance.Instance, req api.InstanceStatePut, op *operations.Operation) error {
 	if req.Force {
 		// A zero timeout indicates to do a forced stop/restart.
 		req.Timeout = 0
@@ -244,29 +278,31 @@ func doInstanceStatePut(inst instance.Instance, req api.InstanceStatePut) error 
 	switch instancetype.InstanceAction(req.Action) {
 	case instancetype.Start:
 		if inst.IsFrozen() {
-			return inst.Unfreeze()
-		} else {
-			return inst.Start(req.Stateful)
+			return inst.Unfreeze(ctx)
 		}
 
+		return inst.Start(ctx, req.Stateful, op)
 	case instancetype.Stop:
 		if req.Stateful {
-			return inst.Stop(req.Stateful)
-		} else if req.Timeout == 0 {
-			return inst.Stop(false)
-		} else if inst.IsFrozen() {
-			return fmt.Errorf("Cannot shutdown frozen instance (try force to stop)")
-		} else {
-			return inst.Shutdown(timeout)
+			return inst.Stop(ctx, req.Stateful)
 		}
 
+		if req.Timeout == 0 {
+			return inst.Stop(ctx, false)
+		}
+
+		if inst.IsFrozen() {
+			return errors.New("Cannot shutdown frozen instance (try force to stop)")
+		}
+
+		return inst.Shutdown(ctx, timeout)
 	case instancetype.Restart:
-		return inst.Restart(timeout)
+		return inst.Restart(ctx, timeout, op)
 	case instancetype.Freeze:
-		return inst.Freeze()
+		return inst.Freeze(ctx)
 	case instancetype.Unfreeze:
-		return inst.Unfreeze()
+		return inst.Unfreeze(ctx)
 	}
 
-	return fmt.Errorf("Unknown action: '%s'", req.Action)
+	return fmt.Errorf("Unknown action: %q", req.Action)
 }

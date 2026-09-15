@@ -1,5 +1,5 @@
 ---
-discourse: 11567
+discourse: lxc:[BGP&#32;address/route&#32;advertisement](11567)
 ---
 
 (network-bgp)=
@@ -12,6 +12,7 @@ See {ref}`network-bgp-ovn` for instructions.
 ```
 
 ```{youtube} https://www.youtube.com/watch?v=C9zU-FEqtTw
+:title: LXD and BGP
 ```
 
 {abbr}`BGP (Border Gateway Protocol)` is a protocol that allows exchanging routing information between autonomous systems.

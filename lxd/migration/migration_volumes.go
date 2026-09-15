@@ -2,15 +2,13 @@ package migration
 
 import (
 	"fmt"
-	"io"
 	"net/http"
+	"slices"
+
+	"google.golang.org/protobuf/proto"
 
 	backupConfig "github.com/canonical/lxd/lxd/backup/config"
-	"github.com/canonical/lxd/lxd/operations"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
-	"github.com/canonical/lxd/shared/ioprogress"
-	"github.com/canonical/lxd/shared/units"
 )
 
 // Info represents the index frame sent if supported.
@@ -23,15 +21,16 @@ type Info struct {
 // But in the future the itention is to use it allow the target to send back additional information to the source
 // about which frames (such as snapshots) it needs for the migration after having inspected the Info index header.
 type InfoResponse struct {
-	StatusCode int
-	Error      string
-	Refresh    *bool // This is used to let the source know whether to actually refresh a volume.
+	// To not break the migration API, the struct tags cannot use the lowercase representation of the struct's fields.
+	StatusCode int    `json:"StatusCode"`
+	Error      string `json:"Error"`
+	Refresh    *bool  `json:"Refresh"` // This is used to let the source know whether to actually refresh a volume.
 }
 
 // Err returns the error of the response.
 func (r *InfoResponse) Err() error {
 	if r.StatusCode != http.StatusOK {
-		return api.StatusErrorf(r.StatusCode, r.Error)
+		return api.NewStatusError(r.StatusCode, r.Error)
 	}
 
 	return nil
@@ -78,6 +77,16 @@ type VolumeTargetArgs struct {
 	ContentType           string
 	VolumeOnly            bool
 	ClusterMoveSourceName string
+
+	// DeferredCustomVolumes holds "pool/name" for the custom volumes the target could not validate yet because
+	// they are missing and expected from the source. The index header must list each of them, or the migration
+	// is refused before any data moves. Only used for instance migration.
+	DeferredCustomVolumes map[string]struct{}
+
+	// AttachedCustomVolumes holds "pool/name" for every custom volume the instance's effective devices on the
+	// target refer to. Every custom volume the index header lists must be in it, or the migration is refused
+	// before any data moves. Only used for instance migration.
+	AttachedCustomVolumes map[string]struct{}
 }
 
 // TypesToHeader converts one or more Types to a MigrationHeader. It uses the first type argument
@@ -104,11 +113,12 @@ func TypesToHeader(types ...Type) *MigrationHeader {
 		}
 
 		for _, feature := range preferredType.Features {
-			if feature == "compress" {
+			switch feature {
+			case "compress":
 				features.Compress = &hasFeature
-			} else if feature == ZFSFeatureMigrationHeader {
+			case ZFSFeatureMigrationHeader:
 				features.MigrationHeader = &hasFeature
-			} else if feature == ZFSFeatureZvolFilesystems {
+			case ZFSFeatureZvolFilesystems:
 				features.HeaderZvols = &hasFeature
 			}
 		}
@@ -124,11 +134,12 @@ func TypesToHeader(types ...Type) *MigrationHeader {
 		}
 
 		for _, feature := range preferredType.Features {
-			if feature == BTRFSFeatureMigrationHeader {
+			switch feature {
+			case BTRFSFeatureMigrationHeader:
 				features.MigrationHeader = &hasFeature
-			} else if feature == BTRFSFeatureSubvolumes {
+			case BTRFSFeatureSubvolumes:
 				features.HeaderSubvolumes = &hasFeature
-			} else if feature == BTRFSFeatureSubvolumeUUIDs {
+			case BTRFSFeatureSubvolumeUUIDs:
 				features.HeaderSubvolumeUuids = &hasFeature
 			}
 		}
@@ -137,8 +148,9 @@ func TypesToHeader(types ...Type) *MigrationHeader {
 	}
 
 	// Check all the types for an Rsync method, if found add its features to the header's RsyncFeatures list.
+	migrationFSTypes := []MigrationFSType{MigrationFSType_RSYNC, MigrationFSType_BLOCK_AND_RSYNC, MigrationFSType_RBD_AND_RSYNC}
 	for _, t := range types {
-		if !shared.ValueInSlice(t.FSType, []MigrationFSType{MigrationFSType_RSYNC, MigrationFSType_BLOCK_AND_RSYNC, MigrationFSType_RBD_AND_RSYNC}) {
+		if !slices.Contains(migrationFSTypes, t.FSType) {
 			continue
 		}
 
@@ -150,13 +162,14 @@ func TypesToHeader(types ...Type) *MigrationHeader {
 		}
 
 		for _, feature := range t.Features {
-			if feature == "xattrs" {
+			switch feature {
+			case "xattrs":
 				features.Xattrs = &hasFeature
-			} else if feature == "delete" {
+			case "delete":
 				features.Delete = &hasFeature
-			} else if feature == "compress" {
+			case "compress":
 				features.Compress = &hasFeature
-			} else if feature == "bidirectional" {
+			case "bidirectional":
 				features.Bidirectional = &hasFeature
 			}
 		}
@@ -194,7 +207,7 @@ func MatchTypes(offer *MigrationHeader, fallbackType MigrationFSType, ourTypes [
 				offeredFeatures = offer.GetZfsFeaturesSlice()
 			} else if offerFSType == MigrationFSType_BTRFS {
 				offeredFeatures = offer.GetBtrfsFeaturesSlice()
-			} else if shared.ValueInSlice(offerFSType, []MigrationFSType{MigrationFSType_RSYNC, MigrationFSType_RBD_AND_RSYNC}) {
+			} else if slices.Contains([]MigrationFSType{MigrationFSType_RSYNC, MigrationFSType_RBD_AND_RSYNC}, offerFSType) {
 				// There are other migration types using rsync like MigrationFSType_BLOCK_AND_RSYNC
 				// for which we cannot set the offered features as an older LXD might ignore those
 				// if the migration type is not MigrationFSType_RSYNC.
@@ -207,19 +220,19 @@ func MatchTypes(offer *MigrationHeader, fallbackType MigrationFSType, ourTypes [
 			// Find common features in both our type and offered type.
 			commonFeatures := []string{}
 			for _, ourFeature := range ourType.Features {
-				if shared.ValueInSlice(ourFeature, offeredFeatures) {
+				if slices.Contains(offeredFeatures, ourFeature) {
 					commonFeatures = append(commonFeatures, ourFeature)
 				}
 			}
 
 			if offer.GetRefresh() {
 				// Optimized refresh with zfs only works if ZfsFeatureMigrationHeader is available.
-				if ourType.FSType == MigrationFSType_ZFS && !shared.ValueInSlice(ZFSFeatureMigrationHeader, commonFeatures) {
+				if ourType.FSType == MigrationFSType_ZFS && !slices.Contains(commonFeatures, ZFSFeatureMigrationHeader) {
 					continue
 				}
 
 				// Optimized refresh with btrfs only works if BtrfsFeatureSubvolumeUUIDs is available.
-				if ourType.FSType == MigrationFSType_BTRFS && !shared.ValueInSlice(BTRFSFeatureSubvolumeUUIDs, commonFeatures) {
+				if ourType.FSType == MigrationFSType_BTRFS && !slices.Contains(commonFeatures, BTRFSFeatureSubvolumeUUIDs) {
 					continue
 				}
 			}
@@ -250,76 +263,25 @@ func MatchTypes(offer *MigrationHeader, fallbackType MigrationFSType, ourTypes [
 	return matchedTypes, nil
 }
 
-func progressWrapperRender(op *operations.Operation, key string, description string, progressInt int64, speedInt int64) {
-	meta := op.Metadata()
-	if meta == nil {
-		meta = make(map[string]any)
+// VolumeSnapshotToProtobuf converts a custom volume snapshot into its migration header representation.
+func VolumeSnapshotToProtobuf(vol *api.StorageVolumeSnapshot) *Snapshot {
+	config := make([]*Config, 0, len(vol.Config))
+	for k, v := range vol.Config {
+		kCopy := string(k)
+		vCopy := string(v)
+		config = append(config, &Config{Key: &kCopy, Value: &vCopy})
 	}
 
-	progress := fmt.Sprintf("%s (%s/s)", units.GetByteSizeString(progressInt, 2), units.GetByteSizeString(speedInt, 2))
-	if description != "" {
-		progress = fmt.Sprintf("%s: %s (%s/s)", description, units.GetByteSizeString(progressInt, 2), units.GetByteSizeString(speedInt, 2))
+	return &Snapshot{
+		Name:         &vol.Name,
+		LocalConfig:  config,
+		Profiles:     []string{},
+		Ephemeral:    new(false),
+		LocalDevices: []*Device{},
+		Architecture: proto.Int32(0),
+		Stateful:     new(false),
+		CreationDate: new(vol.CreatedAt.Unix()),
+		LastUsedDate: proto.Int64(0),
+		ExpiryDate:   proto.Int64(0),
 	}
-
-	if meta[key] != progress {
-		meta[key] = progress
-		_ = op.UpdateMetadata(meta)
-	}
-}
-
-// ProgressReader reports the read progress.
-func ProgressReader(op *operations.Operation, key string, description string) func(io.ReadCloser) io.ReadCloser {
-	return func(reader io.ReadCloser) io.ReadCloser {
-		if op == nil {
-			return reader
-		}
-
-		progress := func(progressInt int64, speedInt int64) {
-			progressWrapperRender(op, key, description, progressInt, speedInt)
-		}
-
-		readPipe := &ioprogress.ProgressReader{
-			ReadCloser: reader,
-			Tracker: &ioprogress.ProgressTracker{
-				Handler: progress,
-			},
-		}
-
-		return readPipe
-	}
-}
-
-// ProgressWriter reports the write progress.
-func ProgressWriter(op *operations.Operation, key string, description string) func(io.WriteCloser) io.WriteCloser {
-	return func(writer io.WriteCloser) io.WriteCloser {
-		if op == nil {
-			return writer
-		}
-
-		progress := func(progressInt int64, speedInt int64) {
-			progressWrapperRender(op, key, description, progressInt, speedInt)
-		}
-
-		writePipe := &ioprogress.ProgressWriter{
-			WriteCloser: writer,
-			Tracker: &ioprogress.ProgressTracker{
-				Handler: progress,
-			},
-		}
-
-		return writePipe
-	}
-}
-
-// ProgressTracker returns a migration I/O tracker.
-func ProgressTracker(op *operations.Operation, key string, description string) *ioprogress.ProgressTracker {
-	progress := func(progressInt int64, speedInt int64) {
-		progressWrapperRender(op, key, description, progressInt, speedInt)
-	}
-
-	tracker := &ioprogress.ProgressTracker{
-		Handler: progress,
-	}
-
-	return tracker
 }

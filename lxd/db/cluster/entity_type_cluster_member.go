@@ -2,10 +2,14 @@ package cluster
 
 import (
 	"fmt"
+
+	"github.com/canonical/lxd/lxd/db/query"
 )
 
 // entityTypeClusterMember implements entityTypeDBInfo for a ClusterMember.
-type entityTypeClusterMember struct{}
+type entityTypeClusterMember struct {
+	entityTypeCommon
+}
 
 func (e entityTypeClusterMember) code() int64 {
 	return entityTypeCodeClusterMember
@@ -15,12 +19,8 @@ func (e entityTypeClusterMember) allURLsQuery() string {
 	return fmt.Sprintf(`SELECT %d, nodes.id, '', '', json_array(nodes.name) FROM nodes`, e.code())
 }
 
-func (e entityTypeClusterMember) urlsByProjectQuery() string {
-	return ""
-}
-
-func (e entityTypeClusterMember) urlByIDQuery() string {
-	return fmt.Sprintf(`%s WHERE nodes.id = ?`, e.allURLsQuery())
+func (e entityTypeClusterMember) urlsByIDsQuery(ids ...int64) string {
+	return e.allURLsQuery() + " WHERE nodes.id IN " + query.IntParams(ids...)
 }
 
 func (e entityTypeClusterMember) idFromURLQuery() string {
@@ -33,17 +33,5 @@ WHERE '' = ?
 }
 
 func (e entityTypeClusterMember) onDeleteTriggerSQL() (name string, sql string) {
-	name = "on_node_delete"
-	return name, fmt.Sprintf(`
-CREATE TRIGGER %s
-	AFTER DELETE ON nodes
-	BEGIN
-	DELETE FROM auth_groups_permissions 
-		WHERE entity_type = %d 
-		AND entity_id = OLD.id;
-	DELETE FROM warnings
-		WHERE entity_type_code = %d
-		AND entity_id = OLD.id;
-	END
-`, name, e.code(), e.code())
+	return standardOnDeleteTriggerSQL("on_node_delete", "nodes", e.code())
 }

@@ -1,26 +1,33 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
-
-	"github.com/canonical/lxd/shared"
+	"sync"
 )
 
 // Schema defines the available keys of a config Map, along with the types
 // and options for their values, expressed using Key objects.
-type Schema map[string]Key
+type Schema struct {
+	sync.RWMutex
+	Types map[string]Key
+}
 
 // Keys returns all keys defined in the schema.
-func (s Schema) Keys() []string {
-	keys := make([]string, len(s))
+func (s *Schema) Keys() []string {
+	s.RLock()
+	keys := make([]string, len(s.Types))
 	i := 0
-	for key := range s {
+	for key := range s.Types {
 		keys[i] = key
 		i++
 	}
+
+	s.RUnlock()
 
 	sort.Strings(keys)
 	return keys
@@ -28,18 +35,23 @@ func (s Schema) Keys() []string {
 
 // Defaults returns a map of all key names in the schema along with their default
 // values.
-func (s Schema) Defaults() map[string]any {
-	values := make(map[string]any, len(s))
-	for name, key := range s {
+func (s *Schema) Defaults() map[string]any {
+	s.RLock()
+	values := make(map[string]any, len(s.Types))
+	for name, key := range s.Types {
 		values[name] = key.Default
 	}
+
+	s.RUnlock()
 
 	return values
 }
 
 // Get the Key associated with the given name, or panic.
-func (s Schema) mustGetKey(name string) Key {
-	key, ok := s[name]
+func (s *Schema) mustGetKey(name string) Key {
+	s.RLock()
+	key, ok := s.Types[name]
+	s.RUnlock()
 	if !ok {
 		panic(fmt.Sprintf("Attempt to access unknown key %q", name))
 	}
@@ -49,7 +61,7 @@ func (s Schema) mustGetKey(name string) Key {
 
 // Assert that the Key with the given name as the given type. Panic if no Key
 // with such name exists, or if it does not match the tiven type.
-func (s Schema) assertKeyType(name string, code Type) {
+func (s *Schema) assertKeyType(name string, code Type) {
 	key := s.mustGetKey(name)
 	if key.Type != code {
 		panic(fmt.Sprintf("Key %q has type code %d, not %d", name, key.Type, code))
@@ -75,7 +87,7 @@ type Key struct {
 	Setter func(string) (string, error)
 }
 
-// Type is a numeric code indetifying a node value type.
+// Type is a numeric code identifying a node value type.
 type Type int
 
 // Possible Value types.
@@ -101,14 +113,14 @@ func (v *Key) validate(value string) error {
 	switch v.Type {
 	case String:
 	case Bool:
-		if !shared.ValueInSlice(strings.ToLower(value), booleans) {
-			return fmt.Errorf("Invalid boolean")
+		if !slices.Contains(booleans, strings.ToLower(value)) {
+			return errors.New("Invalid boolean")
 		}
 
 	case Int64:
 		_, err := strconv.ParseInt(value, 10, 64)
 		if err != nil {
-			return fmt.Errorf("Invalid integer")
+			return errors.New("Invalid integer")
 		}
 
 	default:

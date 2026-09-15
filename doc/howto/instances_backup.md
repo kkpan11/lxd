@@ -54,7 +54,9 @@ Use the following command to create a snapshot of an instance:
 ```
 
 For virtual machines, you can add the `--stateful` flag to capture not only the data included in the instance volume but also the running state of the instance.
-Note that this feature is not fully supported for containers because of CRIU limitations.
+Stateful snapshots are not supported for containers.
+
+By default, instance snapshots include a snapshot of the instance's root disk volume only. To include snapshots of attached storage volumes, set the `--disk-volumes` flag to "all-exclusive".
 ````
 ````{group-tab} API
 To create a snapshot of an instance, send a POST request to the `snapshots` endpoint:
@@ -71,7 +73,9 @@ To retain a specific snapshot even if a general expiry time is set, set the `exp
 If you want to replace an existing snapshot, {ref}`delete it <instances-snapshots-delete>` first and then create another snapshot with the same name.
 
 For virtual machines, you can add `"stateful": true` to the request data to capture not only the data included in the instance volume but also the running state of the instance.
-Note that this feature is not fully supported for containers because of CRIU limitations.
+Stateful snapshots are not supported for containers.
+
+By default, instance snapshots include a snapshot of the instance's root disk volume only. To include snapshots of attached storage volumes, set the `disk_volumes_mode` flag to "all-exclusive" in the request data.
 
 See [`POST /1.0/instances/{name}/snapshots`](swagger:/instances/instance_snapshots_post) for more information.
 ````
@@ -118,6 +122,8 @@ Other changes to the configuration are silently ignored.
 To delete a snapshot, use the following command:
 
     lxc delete <instance_name>/<snapshot_name>
+
+By default, only the instance's root disk volume snapshot is deleted. To also delete snapshots of attached storage volumes, set the `--disk-volumes` flag to "all-exclusive".
 ````
 ````{group-tab} API
 To retrieve the snapshots for an instance, send a GET request to the `snapshots` endpoint:
@@ -143,6 +149,8 @@ Other changes to the configuration are silently ignored.
 To delete a snapshot, send a DELETE request:
 
     lxc query --request DELETE /1.0/instances/<instance_name>/snapshots/<snapshot_name>
+
+By default, only the instance's root disk volume snapshot is deleted. To also delete snapshots of attached storage volumes, set the `disk-volumes` query parameter to "all-exclusive" in the request.
 
 See [`GET /1.0/instances/{name}/snapshots`](swagger:/instances/instance_snapshots_get), [`GET /1.0/instances/{name}/snapshots/{snapshot}`](swagger:/instances/instance_snapshot_get), [`PATCH /1.0/instances/{name}/snapshots/{snapshot}`](swagger:/instances/instance_snapshot_patch), and [`DELETE /1.0/instances/{name}/snapshots/{snapshot}`](swagger:/instances/instance_snapshot_delete) for more information.
 
@@ -214,6 +222,8 @@ To restore an instance to a snapshot, use the following command:
     lxc restore <instance_name> <snapshot_name>
 
 If the snapshot is stateful (which means that it contains information about the running state of the instance), you can add the `--stateful` flag to restore the state.
+
+By default, instance snapshot restores include a snapshot of the instance's root disk volume only. To also restore snapshots of attached storage volumes, set the `--disk-volumes` flag to "all-exclusive".
 ```
 ```{group-tab} API
 To restore an instance to a snapshot, send a PUT request to the instance:
@@ -229,10 +239,12 @@ If the snapshot is stateful (which means that it contains information about the 
       "stateful": true
     }'
 
+By default, instance snapshot restores include a snapshot of the instance's root disk volume only. To also restore snapshots of attached storage volumes, set the `restore_disk_volumes_mode` flag to "all-exclusive" in the request data.
+
 See [`PUT /1.0/instances/{name}`](swagger:/instances/instance_put) for more information.
 ```
 ```{group-tab} UI
-To restore an instance to a snapshot, click the {guilabel}`Restore snapshot` button ({{restore_button}}) next to the snapshot that you want to restore.
+To restore an instance to a snapshot, click the restore button {{restore_button}} next to the snapshot that you want to restore.
 
 If the snapshot is stateful (which means that it contains information about the running state of the instance), select {guilabel}`Restore the instance state` if you want to restore the state.
 ```
@@ -243,10 +255,6 @@ If the snapshot is stateful (which means that it contains information about the 
 
 You can export the full content of your instance to a standalone file that can be stored at any location.
 For highest reliability, store the backup file on a different file system to ensure that it does not get lost or corrupted.
-
-```{note}
-The UI does not currently support exporting and importing instances.
-```
 
 (instances-backup-export-instance)=
 ### Export an instance
@@ -292,7 +300,7 @@ You can add any of the following fields to the request data:
   In this case, the backup can only be used with pools that use the same storage driver.
 
   Exporting a volume in optimized mode is usually quicker than exporting the individual files.
-  Snapshots are exported as differences from the main volume, which decreases their size and makes them easily accessible.
+  Snapshots are exported as differences from the main volume, which decreases their size (quota) and makes them easily accessible.
 
 `"instance-only": true`
 : By default, the backup contains all snapshots of the instance.
@@ -307,6 +315,13 @@ Remember to delete the backup when you don't need it anymore:
     lxc query --request DELETE /1.0/instances/<instance_name>/backups/<backup_name>
 
 See [`POST /1.0/instances/{name}/backups`](swagger:/instances/instance_backups_post), [`GET /1.0/instances/{name}/backups/{backup}/export`](swagger:/instances/instance_backup_export), and [`DELETE /1.0/instances/{name}/backups/{backup}`](swagger:/instances/instance_backup_delete) for more information.
+````
+````{group-tab} UI
+From the instance detail page, click {guilabel}`Export`.
+
+Modify the default settings if necessary, then export the instance.
+
+Download will start automatically once the export is ready.
 ````
 `````
 
@@ -330,13 +345,24 @@ Add the `--storage` flag to specify which storage pool to use, or the `--device`
 ```{group-tab} API
 To import an export file, post it to the `/1.0/instances` endpoint:
 
-    curl -X POST -H "Content-Type: application/octet-stream" -T <file_path> \
+    curl -X POST -H "Content-Type: application/octet-stream" --data-binary @<file_path> \
     --unix-socket /var/snap/lxd/common/lxd/unix.socket lxd/1.0/instances
 
 If an instance with that name already (or still) exists in the specified storage pool, the command returns an error.
 In this case, delete the existing instance before importing the backup.
 
 See [`POST /1.0/instances`](swagger:/instances/instances_post) for more information.
+```
+```{group-tab} UI
+To import an export file, go to the instance list and click {guilabel}`Create instance`.
+
+From the resulting modal, upload the instance file.
+The instance name and description fields are optional. If you don’t specify the instance name, the name of the export file is used, appended with `-tar-import`.
+
+Click {guilabel}`Choose file`.
+Select the export file, then click {guilabel}`Upload and create`.
+
+The newly created instance will appear in the instance list.
 ```
 ````
 
@@ -345,4 +371,4 @@ See [`POST /1.0/instances`](swagger:/instances/instances_post) for more informat
 
 You can copy an instance to a secondary backup server to back it up.
 
-See {ref}`secondary-backup-server` for more information, and {ref}`move-instances` for instructions.
+See {ref}`secondary-backup-server` for more information, and {ref}`howto-instances-migrate` for instructions.

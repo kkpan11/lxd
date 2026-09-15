@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,6 +16,7 @@ import (
 	"github.com/canonical/lxd/lxd/db/warningtype"
 	"github.com/canonical/lxd/lxd/instance"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
+	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/project"
 	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/lxd/warnings"
@@ -27,25 +27,19 @@ import (
 )
 
 var instancesCmd = APIEndpoint{
-	Name: "instances",
-	Path: "instances",
-	Aliases: []APIEndpointAlias{
-		{Name: "containers", Path: "containers"},
-		{Name: "vms", Path: "virtual-machines"},
-	},
+	Path:            "instances",
+	MetricsType:     entity.TypeInstance,
+	ProjectSpecific: true,
 
-	Get:  APIEndpointAction{Handler: instancesGet, AccessHandler: allowProjectResourceList},
-	Post: APIEndpointAction{Handler: instancesPost, AccessHandler: allowPermission(entity.TypeProject, auth.EntitlementCanCreateInstances)},
-	Put:  APIEndpointAction{Handler: instancesPut, AccessHandler: allowProjectResourceList},
+	Get:  APIEndpointAction{Handler: instancesGet, AccessHandler: allowAuthenticated, AllProjectsMode: allProjectsModeDisallowRestrictedTLSClients},
+	Post: APIEndpointAction{Handler: instancesPost, AccessHandler: allowPermission(entity.TypeProject, auth.EntitlementCanCreateInstances), ContentTypes: []string{"application/json", "application/octet-stream"}},
+	Put:  APIEndpointAction{Handler: instancesPut, AccessHandler: allowAuthenticated},
 }
 
 var instanceCmd = APIEndpoint{
-	Name: "instance",
-	Path: "instances/{name}",
-	Aliases: []APIEndpointAlias{
-		{Name: "container", Path: "containers/{name}"},
-		{Name: "vm", Path: "virtual-machines/{name}"},
-	},
+	Path:            "instances/{name}",
+	MetricsType:     entity.TypeInstance,
+	ProjectSpecific: true,
 
 	Get:    APIEndpointAction{Handler: instanceGet, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanView, "name")},
 	Put:    APIEndpointAction{Handler: instancePut, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanEdit, "name")},
@@ -55,98 +49,75 @@ var instanceCmd = APIEndpoint{
 }
 
 var instanceUEFIVarsCmd = APIEndpoint{
-	Name: "instanceUEFIVars",
-	Path: "instances/{name}/uefi-vars",
-	Aliases: []APIEndpointAlias{
-		{Name: "vmUEFIVars", Path: "virtual-machines/{name}/uefi-vars"},
-	},
+	Path:            "instances/{name}/uefi-vars",
+	MetricsType:     entity.TypeInstance,
+	ProjectSpecific: true,
 
 	Get: APIEndpointAction{Handler: instanceUEFIVarsGet, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanView, "name")},
 	Put: APIEndpointAction{Handler: instanceUEFIVarsPut, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanEdit, "name")},
 }
 
 var instanceRebuildCmd = APIEndpoint{
-	Name: "instanceRebuild",
-	Path: "instances/{name}/rebuild",
-	Aliases: []APIEndpointAlias{
-		{Name: "containerRebuild", Path: "containers/{name}/rebuild"},
-		{Name: "vmRebuild", Path: "virtual-machines/{name}/rebuild"},
-	},
+	Path:            "instances/{name}/rebuild",
+	MetricsType:     entity.TypeInstance,
+	ProjectSpecific: true,
 
 	Post: APIEndpointAction{Handler: instanceRebuildPost, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanEdit, "name")},
 }
 
 var instanceStateCmd = APIEndpoint{
-	Name: "instanceState",
-	Path: "instances/{name}/state",
-	Aliases: []APIEndpointAlias{
-		{Name: "containerState", Path: "containers/{name}/state"},
-		{Name: "vmState", Path: "virtual-machines/{name}/state"},
-	},
+	Path:            "instances/{name}/state",
+	MetricsType:     entity.TypeInstance,
+	ProjectSpecific: true,
 
 	Get: APIEndpointAction{Handler: instanceState, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanView, "name")},
 	Put: APIEndpointAction{Handler: instanceStatePut, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanUpdateState, "name")},
 }
 
 var instanceSFTPCmd = APIEndpoint{
-	Name: "instanceFile",
-	Path: "instances/{name}/sftp",
-	Aliases: []APIEndpointAlias{
-		{Name: "containerFile", Path: "containers/{name}/sftp"},
-		{Name: "vmFile", Path: "virtual-machines/{name}/sftp"},
-	},
+	Path:            "instances/{name}/sftp",
+	MetricsType:     entity.TypeInstance,
+	ProjectSpecific: true,
 
 	Get: APIEndpointAction{Handler: instanceSFTPHandler, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanConnectSFTP, "name")},
 }
 
 var instanceFileCmd = APIEndpoint{
-	Name: "instanceFile",
-	Path: "instances/{name}/files",
-	Aliases: []APIEndpointAlias{
-		{Name: "containerFile", Path: "containers/{name}/files"},
-		{Name: "vmFile", Path: "virtual-machines/{name}/files"},
-	},
+	Path:            "instances/{name}/files",
+	MetricsType:     entity.TypeInstance,
+	ProjectSpecific: true,
 
 	Get:    APIEndpointAction{Handler: instanceFileHandler, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanAccessFiles, "name")},
 	Head:   APIEndpointAction{Handler: instanceFileHandler, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanAccessFiles, "name")},
-	Post:   APIEndpointAction{Handler: instanceFileHandler, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanAccessFiles, "name")},
+	Post:   APIEndpointAction{Handler: instanceFileHandler, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanAccessFiles, "name"), ContentTypes: []string{"application/octet-stream"}},
 	Delete: APIEndpointAction{Handler: instanceFileHandler, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanAccessFiles, "name")},
 }
 
 var instanceSnapshotsCmd = APIEndpoint{
-	Name: "instanceSnapshots",
-	Path: "instances/{name}/snapshots",
-	Aliases: []APIEndpointAlias{
-		{Name: "containerSnapshots", Path: "containers/{name}/snapshots"},
-		{Name: "vmSnapshots", Path: "virtual-machines/{name}/snapshots"},
-	},
+	Path:            "instances/{name}/snapshots",
+	MetricsType:     entity.TypeInstance,
+	ProjectSpecific: true,
 
 	Get:  APIEndpointAction{Handler: instanceSnapshotsGet, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanView, "name")},
 	Post: APIEndpointAction{Handler: instanceSnapshotsPost, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanManageSnapshots, "name")},
 }
 
 var instanceSnapshotCmd = APIEndpoint{
-	Name: "instanceSnapshot",
-	Path: "instances/{name}/snapshots/{snapshotName}",
-	Aliases: []APIEndpointAlias{
-		{Name: "containerSnapshot", Path: "containers/{name}/snapshots/{snapshotName}"},
-		{Name: "vmSnapshot", Path: "virtual-machines/{name}/snapshots/{snapshotName}"},
-	},
+	Path:            "instances/{name}/snapshots/{snapshotName}",
+	MetricsType:     entity.TypeInstance,
+	ProjectSpecific: true,
 
-	Get:    APIEndpointAction{Handler: instanceSnapshotHandler, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanView, "name")},
-	Post:   APIEndpointAction{Handler: instanceSnapshotHandler, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanManageSnapshots, "name")},
-	Delete: APIEndpointAction{Handler: instanceSnapshotHandler, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanManageSnapshots, "name")},
-	Patch:  APIEndpointAction{Handler: instanceSnapshotHandler, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanManageSnapshots, "name")},
-	Put:    APIEndpointAction{Handler: instanceSnapshotHandler, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanManageSnapshots, "name")},
+	Get:    APIEndpointAction{Handler: instanceSnapshotHandler, AccessHandler: allowPermission(entity.TypeInstanceSnapshot, auth.EntitlementCanView, "name", "snapshotName")},
+	Post:   APIEndpointAction{Handler: instanceSnapshotHandler, AccessHandler: allowPermission(entity.TypeInstanceSnapshot, auth.EntitlementCanEdit, "name", "snapshotName")},
+	Delete: APIEndpointAction{Handler: instanceSnapshotHandler, AccessHandler: allowPermission(entity.TypeInstanceSnapshot, auth.EntitlementCanDelete, "name", "snapshotName")},
+	Patch:  APIEndpointAction{Handler: instanceSnapshotHandler, AccessHandler: allowPermission(entity.TypeInstanceSnapshot, auth.EntitlementCanEdit, "name", "snapshotName")},
+	Put:    APIEndpointAction{Handler: instanceSnapshotHandler, AccessHandler: allowPermission(entity.TypeInstanceSnapshot, auth.EntitlementCanEdit, "name", "snapshotName")},
 }
 
 var instanceConsoleCmd = APIEndpoint{
-	Name: "instanceConsole",
-	Path: "instances/{name}/console",
-	Aliases: []APIEndpointAlias{
-		{Name: "containerConsole", Path: "containers/{name}/console"},
-		{Name: "vmConsole", Path: "virtual-machines/{name}/console"},
-	},
+	Path:            "instances/{name}/console",
+	MetricsType:     entity.TypeInstance,
+	ProjectSpecific: true,
 
 	Get:    APIEndpointAction{Handler: instanceConsoleLogGet, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanView, "name")},
 	Post:   APIEndpointAction{Handler: instanceConsolePost, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanAccessConsole, "name")},
@@ -154,23 +125,17 @@ var instanceConsoleCmd = APIEndpoint{
 }
 
 var instanceExecCmd = APIEndpoint{
-	Name: "instanceExec",
-	Path: "instances/{name}/exec",
-	Aliases: []APIEndpointAlias{
-		{Name: "containerExec", Path: "containers/{name}/exec"},
-		{Name: "vmExec", Path: "virtual-machines/{name}/exec"},
-	},
+	Path:            "instances/{name}/exec",
+	MetricsType:     entity.TypeInstance,
+	ProjectSpecific: true,
 
 	Post: APIEndpointAction{Handler: instanceExecPost, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanExec, "name")},
 }
 
 var instanceMetadataCmd = APIEndpoint{
-	Name: "instanceMetadata",
-	Path: "instances/{name}/metadata",
-	Aliases: []APIEndpointAlias{
-		{Name: "containerMetadata", Path: "containers/{name}/metadata"},
-		{Name: "vmMetadata", Path: "virtual-machines/{name}/metadata"},
-	},
+	Path:            "instances/{name}/metadata",
+	MetricsType:     entity.TypeInstance,
+	ProjectSpecific: true,
 
 	Get:   APIEndpointAction{Handler: instanceMetadataGet, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanView, "name")},
 	Patch: APIEndpointAction{Handler: instanceMetadataPatch, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanEdit, "name")},
@@ -178,52 +143,40 @@ var instanceMetadataCmd = APIEndpoint{
 }
 
 var instanceMetadataTemplatesCmd = APIEndpoint{
-	Name: "instanceMetadataTemplates",
-	Path: "instances/{name}/metadata/templates",
-	Aliases: []APIEndpointAlias{
-		{Name: "containerMetadataTemplates", Path: "containers/{name}/metadata/templates"},
-		{Name: "vmMetadataTemplates", Path: "virtual-machines/{name}/metadata/templates"},
-	},
+	Path:            "instances/{name}/metadata/templates",
+	MetricsType:     entity.TypeInstance,
+	ProjectSpecific: true,
 
 	Get:    APIEndpointAction{Handler: instanceMetadataTemplatesGet, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanView, "name")},
-	Post:   APIEndpointAction{Handler: instanceMetadataTemplatesPost, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanEdit, "name")},
+	Post:   APIEndpointAction{Handler: instanceMetadataTemplatesPost, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanEdit, "name"), ContentTypes: []string{"application/octet-stream"}},
 	Delete: APIEndpointAction{Handler: instanceMetadataTemplatesDelete, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanEdit, "name")},
 }
 
 var instanceBackupsCmd = APIEndpoint{
-	Name: "instanceBackups",
-	Path: "instances/{name}/backups",
-	Aliases: []APIEndpointAlias{
-		{Name: "containerBackups", Path: "containers/{name}/backups"},
-		{Name: "vmBackups", Path: "virtual-machines/{name}/backups"},
-	},
+	Path:            "instances/{name}/backups",
+	MetricsType:     entity.TypeInstance,
+	ProjectSpecific: true,
 
 	Get:  APIEndpointAction{Handler: instanceBackupsGet, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanView, "name")},
 	Post: APIEndpointAction{Handler: instanceBackupsPost, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanManageBackups, "name")},
 }
 
 var instanceBackupCmd = APIEndpoint{
-	Name: "instanceBackup",
-	Path: "instances/{name}/backups/{backupName}",
-	Aliases: []APIEndpointAlias{
-		{Name: "containerBackup", Path: "containers/{name}/backups/{backupName}"},
-		{Name: "vmBackup", Path: "virtual-machines/{name}/backups/{backupName}"},
-	},
+	Path:            "instances/{name}/backups/{backupName}",
+	MetricsType:     entity.TypeInstance,
+	ProjectSpecific: true,
 
-	Get:    APIEndpointAction{Handler: instanceBackupGet, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanView, "name")},
-	Post:   APIEndpointAction{Handler: instanceBackupPost, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanManageBackups, "name")},
-	Delete: APIEndpointAction{Handler: instanceBackupDelete, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanManageBackups, "name")},
+	Get:    APIEndpointAction{Handler: instanceBackupGet, AccessHandler: allowPermission(entity.TypeInstanceBackup, auth.EntitlementCanView, "name", "backupName")},
+	Post:   APIEndpointAction{Handler: instanceBackupPost, AccessHandler: allowPermission(entity.TypeInstanceBackup, auth.EntitlementCanEdit, "name", "backupName")},
+	Delete: APIEndpointAction{Handler: instanceBackupDelete, AccessHandler: allowPermission(entity.TypeInstanceBackup, auth.EntitlementCanEdit, "name", "backupName")},
 }
 
 var instanceBackupExportCmd = APIEndpoint{
-	Name: "instanceBackupExport",
-	Path: "instances/{name}/backups/{backupName}/export",
-	Aliases: []APIEndpointAlias{
-		{Name: "containerBackupExport", Path: "containers/{name}/backups/{backupName}/export"},
-		{Name: "vmBackupExport", Path: "virtual-machines/{name}/backups/{backupName}/export"},
-	},
+	Path:            "instances/{name}/backups/{backupName}/export",
+	MetricsType:     entity.TypeInstance,
+	ProjectSpecific: true,
 
-	Get: APIEndpointAction{Handler: instanceBackupExportGet, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanManageBackups, "name")},
+	Get: APIEndpointAction{Handler: instanceBackupExportGet, AccessHandler: allowPermission(entity.TypeInstanceBackup, auth.EntitlementCanView, "name", "backupName")},
 }
 
 type instanceAutostartList []instance.Instance
@@ -264,7 +217,7 @@ func instanceShouldAutoStart(inst instance.Instance) bool {
 	return shared.IsFalseOrEmpty(protectStart) && (shared.IsTrue(autoStart) || (autoStart == "" && lastState == instance.PowerStateRunning))
 }
 
-func instancesStart(s *state.State, instances []instance.Instance) {
+func instancesStart(ctx context.Context, s *state.State, instances []instance.Instance) {
 	// Check if the cluster is currently evacuated.
 	if s.DB.Cluster.LocalNodeIsEvacuated() {
 		return
@@ -301,7 +254,9 @@ func instancesStart(s *state.State, instances []instance.Instance) {
 		var attempt = 0
 		for {
 			attempt++
-			err := inst.Start(false)
+
+			// Don't track progress here as there is no client to return the updates to.
+			err := inst.Start(ctx, false, nil)
 			if err != nil {
 				if api.StatusErrorCheck(err, http.StatusServiceUnavailable) {
 					break // Don't log or retry instances that are not ready to start yet.
@@ -312,13 +267,13 @@ func instancesStart(s *state.State, instances []instance.Instance) {
 				if attempt >= maxAttempts {
 					warnErr := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 						// If unable to start after 3 tries, record a warning.
-						return tx.UpsertWarningLocalNode(ctx, inst.Project().Name, entity.TypeInstance, inst.ID(), warningtype.InstanceAutostartFailure, fmt.Sprintf("%v", err))
+						return tx.UpsertWarningLocalNode(ctx, inst.Project().Name, entity.TypeInstance, inst.ID(), warningtype.InstanceAutostartFailure, err.Error())
 					})
 					if warnErr != nil {
-						instLogger.Warn("Failed to create instance autostart failure warning", logger.Ctx{"err": warnErr})
+						instLogger.Warn("Failed creating instance autostart failure warning", logger.Ctx{"err": warnErr})
 					}
 
-					instLogger.Error("Failed to auto start instance", logger.Ctx{"err": err})
+					instLogger.Error("Failed auto-starting instance", logger.Ctx{"err": err})
 
 					break
 				}
@@ -331,7 +286,7 @@ func instancesStart(s *state.State, instances []instance.Instance) {
 			// Resolve any previous warning.
 			warnErr := warnings.ResolveWarningsByLocalNodeAndProjectAndTypeAndEntity(s.DB.Cluster, inst.Project().Name, warningtype.InstanceAutostartFailure, entity.TypeInstance, inst.ID())
 			if warnErr != nil {
-				instLogger.Warn("Failed to resolve instance autostart failure warning", logger.Ctx{"err": warnErr})
+				instLogger.Warn("Failed resolving instance autostart failure warning", logger.Ctx{"err": warnErr})
 			}
 
 			// Wait the auto-start delay if set.
@@ -417,6 +372,7 @@ func instancesOnDisk(s *state.State) ([]instance.Instance, error) {
 					Type:    instanceType,
 					Project: projectName,
 					Name:    instanceName,
+					Node:    s.ServerName, // Set Node field to local node.
 					Config:  make(map[string]string),
 				}
 
@@ -438,7 +394,71 @@ func instancesOnDisk(s *state.State) ([]instance.Instance, error) {
 	return instances, nil
 }
 
-func instancesShutdown(instances []instance.Instance) {
+// isInstanceBusy checks if the instance is currently busy: if it has an associated operation that is in a running state.
+func isInstanceBusy(inst instance.Instance, instanceOperations map[string]map[string][]*operations.Operation, instancesToOpsMu *sync.Mutex) bool {
+	if len(instanceOperations) == 0 {
+		return false
+	}
+
+	instancesToOpsMu.Lock()
+	defer instancesToOpsMu.Unlock()
+
+	projectInstances, ok := instanceOperations[inst.Project().Name]
+	if !ok {
+		return false
+	}
+
+	for _, op := range projectInstances[inst.Name()] {
+		if op.IsRunning() {
+			return true
+		}
+	}
+
+	return false
+}
+
+// instancesShutdown orchestrates a controlled, priority-based shutdown of multiple instances while handling
+// concurrent operations, timeouts, and potential cancellation.
+//
+// Algorithm overview:
+// 1. Instances are sorted by their `boot.stop.priority`.
+// 2. Shutdown concurrency is limited to min(number of instances, CPU cores).
+// 3. Instances are processed in batches of the same priority.
+// 4. Each batch completes before starting the next lower priority batch.
+// 5. Worker goroutines handle instance shutdown operations. This pool is fed through the `instShutdownCh` channel.
+// 6. Busy instances (with running operations) are tracked in a separate goroutine which is fed through the `busyInstCh“ channel and resend for shutdown (sent to `instShutdownCh`) once operation completes.
+// 7. Context cancellation send the remaining instances to the workers to be shutdown.
+//
+// Examples:
+//
+// 1. Normal priority-based shutdown (boot.stop.priority values: 2, 1, 0)
+//   - All priority 2 instances shut down concurrently
+//   - After all priority 2 instances complete, priority 1 instances start
+//   - After all priority 1 instances complete, priority 0 instances start
+//
+// 2. Busy instance handling:
+//   - Instance has running operation (e.g., backup, snapshot, etc.)
+//   - Instance is sent to busyInstancesCh and tracked by the busy instance tracker goroutine
+//   - Tracker periodically checks if operation completed
+//   - Once no longer busy, instance is sent back to instShutdownCh for shutdown
+//
+// 3. Context cancellation (e.g., during daemon shutdown timeout):
+//   - Main context cancelled
+//   - Cancellation of context is handled in the tracking goroutine and send remaining instances to instShutdownCh for shutdown.
+//
+// 4. Custom timeout handling:
+//   - Each instance can specify boot.host_shutdown_timeout
+//   - Instances get graceful shutdown with their specified timeout
+//   - If graceful shutdown fails, fallback to force stop
+//
+// 5. Power state tracking:
+//   - Each instance shutdown preserves the last power state as "RUNNING"
+//   - Ensures instances restart when LXD daemon comes back up
+func instancesShutdown(ctx context.Context, instances []instance.Instance) {
+	// List all pending operations tied to instances.
+	instancesToOpsMu := sync.Mutex{}
+	instancesToOps := runningInstanceOperations()
+
 	sort.Sort(instanceStopList(instances))
 
 	// Limit shutdown concurrency to number of instances or number of CPU cores (which ever is less).
@@ -450,9 +470,55 @@ func instancesShutdown(instances []instance.Instance) {
 		maxConcurrent = instCount
 	}
 
-	for i := 0; i < maxConcurrent; i++ {
+	// Start the busy instance tracker if instancesToOps is provided.
+	busyInstancesCh := make(chan instance.Instance)
+	if len(instancesToOps) > 0 {
+		go func() {
+			// Map to track busy instances
+			busyInstances := make(map[string]instance.Instance)
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+
+			var lastWaitingLog time.Time
+
+			for {
+				select {
+				case inst, ok := <-busyInstancesCh:
+					if !ok {
+						logger.Debug("Finishing busy instances tracking")
+						return
+					}
+
+					logger.Debug("Instance received for busy tracking", logger.Ctx{"project": inst.Project().Name, "instance": inst.Name()})
+					instanceURL := entity.InstanceURL(inst.Project().Name, inst.Name()).String()
+					busyInstances[instanceURL] = inst
+				case <-ticker.C:
+					ctxErr := ctx.Err()
+					if ctxErr != nil {
+						logger.Info("Skipping waiting for instance operations to finish")
+					} else if time.Since(lastWaitingLog) > (time.Second * 10) {
+						logger.Info("Waiting for instance operations to finish", logger.Ctx{"instances": len(busyInstances)})
+						lastWaitingLog = time.Now()
+					}
+
+					for instanceURL, inst := range busyInstances {
+						if ctxErr != nil || !isInstanceBusy(inst, instancesToOps, &instancesToOpsMu) {
+							delete(busyInstances, instanceURL)
+							logger.Debug("Instance removed from busy tracking, sending to shutdown channel", logger.Ctx{"project": inst.Project().Name, "instance": inst.Name()})
+							instShutdownCh <- inst
+						}
+					}
+				}
+			}
+		}()
+	}
+
+	for range maxConcurrent {
 		go func(instShutdownCh <-chan instance.Instance) {
 			for inst := range instShutdownCh {
+				l := logger.AddContext(logger.Ctx{"project": inst.Project().Name, "instance": inst.Name()})
+
+				l.Debug("Instance received for shutdown")
 				// Determine how long to wait for the instance to shutdown cleanly.
 				timeoutSeconds := 30
 				value, ok := inst.ExpandedConfig()["boot.host_shutdown_timeout"]
@@ -460,12 +526,12 @@ func instancesShutdown(instances []instance.Instance) {
 					timeoutSeconds, _ = strconv.Atoi(value)
 				}
 
-				err := inst.Shutdown(time.Second * time.Duration(timeoutSeconds))
+				err := inst.Shutdown(ctx, time.Second*time.Duration(timeoutSeconds))
 				if err != nil {
-					logger.Warn("Failed shutting down instance, forcefully stopping", logger.Ctx{"project": inst.Project().Name, "instance": inst.Name(), "err": err})
-					err = inst.Stop(false)
+					l.Warn("Failed shutting down instance, forcefully stopping", logger.Ctx{"err": err})
+					err = inst.Stop(ctx, false)
 					if err != nil {
-						logger.Warn("Failed forcefully stopping instance", logger.Ctx{"project": inst.Project().Name, "instance": inst.Name(), "err": err})
+						l.Warn("Failed forcefully stopping instance", logger.Ctx{"err": err})
 					}
 				}
 
@@ -473,10 +539,14 @@ func instancesShutdown(instances []instance.Instance) {
 					// If DB was available then the instance shutdown process will have set
 					// the last power state to STOPPED, so set that back to RUNNING so that
 					// when LXD restarts the instance will be started again.
-					_ = inst.VolatileSet(map[string]string{"volatile.last_state.power": instance.PowerStateRunning})
+					err = inst.VolatileSet(map[string]string{"volatile.last_state.power": instance.PowerStateRunning})
+					if err != nil {
+						l.Warn("Failed updating volatile.last_state.power", logger.Ctx{"err": err})
+					}
 				}
 
 				wg.Done()
+				l.Debug("Instance shutdown complete")
 			}
 		}(instShutdownCh)
 	}
@@ -485,6 +555,13 @@ func instancesShutdown(instances []instance.Instance) {
 	for i, inst := range instances {
 		// Skip stopped instances.
 		if !inst.IsRunning() {
+			// Stopped containers could still have a forkfile daemon running which could make
+			// the storage busy, causing unmount to fail, so make sure it is stopped.
+			c, isContainer := inst.(instance.Container)
+			if isContainer {
+				c.StopForkFile(true)
+			}
+
 			continue
 		}
 
@@ -495,14 +572,20 @@ func instancesShutdown(instances []instance.Instance) {
 			currentBatchPriority = priority
 
 			// Wait for instances with higher priority to finish before starting next batch.
+			logger.Debug("Waiting for instances to be shutdown", logger.Ctx{"stopPriority": currentBatchPriority})
 			wg.Wait()
 			logger.Info("Stopping instances", logger.Ctx{"stopPriority": currentBatchPriority})
 		}
 
 		wg.Add(1)
-		instShutdownCh <- inst
+		if ctx.Err() == nil && isInstanceBusy(inst, instancesToOps, &instancesToOpsMu) {
+			busyInstancesCh <- inst
+		} else {
+			instShutdownCh <- inst
+		}
 	}
 
 	wg.Wait()
 	close(instShutdownCh)
+	close(busyInstancesCh)
 }

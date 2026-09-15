@@ -1,19 +1,18 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/user"
 	"path"
-	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/canonical/lxd/lxc/config"
-	"github.com/canonical/lxd/shared"
-	"github.com/canonical/lxd/shared/i18n"
 )
 
 var numberedArgRegex = regexp.MustCompile(`@ARG(\d+)@`)
@@ -24,14 +23,15 @@ var defaultAliases = map[string]string{
 	"shell": "exec @ARGS@ -- su -l",
 }
 
-func findAlias(aliases map[string]string, origArgs []string) ([]string, []string, bool) {
-	foundAlias := false
-	aliasKey := []string{}
-	aliasValue := []string{}
+func findAlias(aliases map[string]string, origArgs []string) (aliasKey []string, aliasValue []string, foundAlias bool) {
+	foundAlias = false
+	aliasKey = []string{}
+	aliasValue = []string{}
 
 	for k, v := range aliases {
+		parts := strings.Split(k, " ")
 		foundAlias = true
-		for i, key := range strings.Split(k, " ") {
+		for i, key := range parts {
 			if len(origArgs) <= i+1 || origArgs[i+1] != key {
 				foundAlias = false
 				break
@@ -39,7 +39,7 @@ func findAlias(aliases map[string]string, origArgs []string) ([]string, []string
 		}
 
 		if foundAlias {
-			aliasKey = strings.Split(k, " ")
+			aliasKey = parts
 			aliasValue = strings.Split(v, " ")
 			break
 		}
@@ -51,7 +51,7 @@ func findAlias(aliases map[string]string, origArgs []string) ([]string, []string
 func expandAlias(conf *config.Config, args []string) ([]string, bool, error) {
 	var completion = false
 	var completionFragment string
-	var newArgs []string
+	var newArgs []string //nolint:prealloc
 	var origArgs []string
 
 	for _, arg := range args[1:] {
@@ -101,11 +101,11 @@ func expandAlias(conf *config.Config, args []string) ([]string, bool, error) {
 			argNoStr := match[1]
 			argNo, err := strconv.Atoi(argNoStr)
 			if err != nil {
-				return nil, false, fmt.Errorf(i18n.G("Invalid argument %q"), match[0])
+				return nil, false, fmt.Errorf("Invalid argument %q", match[0])
 			}
 
 			if argNo > len(atArgs) {
-				return nil, false, fmt.Errorf(i18n.G("Found alias %q references an argument outside the given number"), strings.Join(aliasKey, " "))
+				return nil, false, fmt.Errorf("Found alias %q references an argument outside the given number", strings.Join(aliasKey, " "))
 			}
 
 			numberedArgsMap[argNo] = atArgs[argNo-1]
@@ -113,10 +113,10 @@ func expandAlias(conf *config.Config, args []string) ([]string, bool, error) {
 	}
 
 	// Remove directly referenced arguments from @ARGS@
-	for i := len(atArgs) - 1; i >= 0; i-- {
+	for i := range slices.Backward(atArgs) {
 		_, ok := numberedArgsMap[i+1]
 		if ok {
-			atArgs = append(atArgs[:i], atArgs[i+1:]...)
+			atArgs = slices.Delete(atArgs, i, i+1)
 		}
 	}
 
@@ -144,11 +144,11 @@ func expandAlias(conf *config.Config, args []string) ([]string, bool, error) {
 				argNoStr := match[1]
 				argNo, err := strconv.Atoi(argNoStr)
 				if err != nil {
-					return nil, false, fmt.Errorf(i18n.G("Invalid argument %q"), match[0])
+					return nil, false, fmt.Errorf("Invalid argument %q", match[0])
 				}
 
 				replacement := numberedArgsMap[argNo]
-				newArg = strings.Replace(newArg, match[0], replacement, -1)
+				newArg = strings.ReplaceAll(newArg, match[0], replacement)
 			}
 
 			newArgs = append(newArgs, newArg)
@@ -182,31 +182,34 @@ func execIfAliases() error {
 
 	// Figure out the config directory and config path
 	var configDir string
-	if os.Getenv("LXD_CONF") != "" {
-		configDir = os.Getenv("LXD_CONF")
-	} else if os.Getenv("HOME") != "" {
-		configDir = path.Join(os.Getenv("HOME"), ".config", "lxc")
+	lxdConf := os.Getenv("LXD_CONF")
+	if lxdConf != "" {
+		configDir = lxdConf
 	} else {
-		user, err := user.Current()
-		if err != nil {
-			return nil
+		homeDir := os.Getenv("HOME")
+		if homeDir == "" {
+			user, err := user.Current()
+			if err != nil {
+				return nil
+			}
+
+			homeDir = user.HomeDir
 		}
 
-		configDir = path.Join(user.HomeDir, ".config", "lxc")
+		configDir = path.Join(homeDir, ".config", "lxc")
 	}
 
 	confPath := os.ExpandEnv(path.Join(configDir, "config.yml"))
 
 	// Load the configuration
 	var conf *config.Config
-	var err error
-	if shared.PathExists(confPath) {
-		conf, err = config.LoadConfig(confPath)
-		if err != nil {
-			return nil
+	conf, err := config.LoadConfig(confPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
-	} else {
-		conf = config.NewConfig(filepath.Dir(confPath), true)
+
+		conf = config.NewConfig(configDir, true)
 	}
 
 	// Expand the aliases
@@ -220,12 +223,12 @@ func execIfAliases() error {
 	// Look for the executable
 	path, err := exec.LookPath(newArgs[0])
 	if err != nil {
-		return fmt.Errorf(i18n.G("Processing aliases failed: %s"), err)
+		return fmt.Errorf("Processing aliases failed: %w", err)
 	}
 
 	// Re-exec
 	environ := getEnviron()
 	environ = append(environ, "LXC_ALIASES=1")
 	ret := doExec(path, newArgs, environ)
-	return fmt.Errorf(i18n.G("Processing aliases failed: %s"), ret)
+	return fmt.Errorf("Processing aliases failed: %w", ret)
 }

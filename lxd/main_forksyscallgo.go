@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"debug/elf"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -60,12 +61,12 @@ func (c *cmdFinitModuleParse) Command() *cobra.Command {
 func (c *cmdFinitModuleParse) Run(cmd *cobra.Command, args []string) error {
 	moduleFD, err := strconv.Atoi(args[2])
 	if err != nil {
-		return fmt.Errorf("Unable to extract module_fd: %w", err)
+		return fmt.Errorf("Cannot extract module_fd: %w", err)
 	}
 
 	f := os.NewFile(uintptr(moduleFD), "/proc/self/fd/<module_fd>")
 	if f == nil {
-		return fmt.Errorf("Can't open module file: %w", err)
+		return fmt.Errorf("Cannot open module file: %w", err)
 	}
 
 	defer func() { _ = f.Close() }()
@@ -77,32 +78,30 @@ func (c *cmdFinitModuleParse) Run(cmd *cobra.Command, args []string) error {
 
 	sec := elfFile.Section(".modinfo")
 	if sec == nil {
-		return fmt.Errorf("module's ELF file has no .modinfo section")
+		return errors.New("module's ELF file has no .modinfo section")
 	}
 
 	secData, err := sec.Data()
 	if err != nil {
-		return fmt.Errorf("Can't read .modinfo section: %w", err)
+		return fmt.Errorf("Cannot read .modinfo section: %w", err)
 	}
 
-	secNameDataIdx := bytes.Index(secData, []byte("name="))
-	if secNameDataIdx == -1 {
-		return fmt.Errorf(`.modinfo section data looks wrong: can't find "name="`)
+	_, secNameStart, ok := bytes.Cut(secData, []byte("name="))
+	if !ok {
+		return errors.New(`.modinfo section data looks wrong: cannot find "name="`)
 	}
 
-	secNameStart := secData[secNameDataIdx+5:]
 	if len(secNameStart) == 0 {
-		return fmt.Errorf(`.modinfo section data looks wrong: no data after "name="`)
+		return errors.New(`.modinfo section data looks wrong: no data after "name="`)
 	}
 
-	secNameIdxEnd := bytes.Index(secNameStart, []byte("\x00"))
-	if secNameIdxEnd == -1 {
-		return fmt.Errorf(".modinfo section data looks wrong: can't find terminating NULL-byte")
+	secName, _, ok := bytes.Cut(secNameStart, []byte("\x00"))
+	if !ok {
+		return errors.New(".modinfo section data looks wrong: cannot find terminating NULL-byte")
 	}
 
-	secName := secNameStart[:secNameIdxEnd]
 	if len(secName) == 0 {
-		return fmt.Errorf(".modinfo section data looks wrong: module name is empty")
+		return errors.New(".modinfo section data looks wrong: module name is empty")
 	}
 
 	// print extracted module name so we can use it in the seccomp.go

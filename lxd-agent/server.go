@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
-
-	"github.com/gorilla/mux"
+	"time"
 
 	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/lxd/util"
@@ -17,36 +17,39 @@ import (
 )
 
 func restServer(tlsConfig *tls.Config, cert *x509.Certificate, d *Daemon) *http.Server {
-	mux := mux.NewRouter()
-	mux.StrictSlash(false) // Don't redirect to URL with trailing slash.
-	mux.UseEncodedPath()   // Allow encoded values in path segments.
+	router := http.NewServeMux()
 
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	router.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = response.SyncResponse(true, []string{"/1.0"}).Render(w, r)
 	})
 
 	for _, c := range api10 {
-		createCmd(mux, "1.0", c, cert, d)
+		createCmd(router, "1.0", c, cert, d)
 	}
 
-	return &http.Server{Handler: mux, TLSConfig: tlsConfig}
+	return &http.Server{
+		Handler:           router,
+		TLSConfig:         tlsConfig,
+		IdleTimeout:       30 * time.Second,
+		ReadHeaderTimeout: 3 * time.Second,
+	}
 }
 
-func createCmd(restAPI *mux.Router, version string, c APIEndpoint, cert *x509.Certificate, d *Daemon) {
+func createCmd(restAPI *http.ServeMux, version string, c APIEndpoint, cert *x509.Certificate, d *Daemon) {
 	var uri string
 	if c.Path == "" {
-		uri = fmt.Sprintf("/%s", version)
+		uri = "/" + version
 	} else {
-		uri = fmt.Sprintf("/%s/%s", version, c.Path)
+		uri = "/" + version + "/" + c.Path
 	}
 
-	route := restAPI.HandleFunc(uri, func(w http.ResponseWriter, r *http.Request) {
+	restAPI.HandleFunc(uri, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
 		if !authenticate(r, cert) {
 			logger.Error("Not authorized")
-			_ = response.InternalError(fmt.Errorf("Not authorized")).Render(w, r)
+			_ = response.InternalError(errors.New("Not authorized")).Render(w, r)
 			return
 		}
 
@@ -100,12 +103,6 @@ func createCmd(restAPI *mux.Router, version string, c APIEndpoint, cert *x509.Ce
 			}
 		}
 	})
-
-	// If the endpoint has a canonical name then record it so it can be used to build URLS
-	// and accessed in the context of the request by the handler function.
-	if c.Name != "" {
-		route.Name(c.Name)
-	}
 }
 
 func authenticate(r *http.Request, cert *x509.Certificate) bool {

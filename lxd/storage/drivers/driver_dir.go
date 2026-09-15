@@ -1,6 +1,8 @@
 package drivers
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,10 +10,10 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/storage/filesystem"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
+	"github.com/canonical/lxd/shared/ioprogress"
 )
 
 type dir struct {
@@ -27,6 +29,7 @@ func (d *dir) load() error {
 		"storage_delete_old_snapshot_records":                nil,
 		"storage_zfs_drop_block_volume_filesystem_extension": nil,
 		"storage_prefix_bucket_names_with_project":           nil,
+		"storage_zfs_remove_local_bucket_datasets":           nil,
 	}
 
 	return nil
@@ -37,17 +40,19 @@ func (d *dir) Info() Info {
 	return Info{
 		Name:                         "dir",
 		Version:                      "1",
+		DefaultBlockSize:             d.defaultBlockVolumeSize(),
 		DefaultVMBlockFilesystemSize: d.defaultVMBlockFilesystemSize(),
 		OptimizedImages:              false,
 		PreservesInodes:              false,
 		Remote:                       d.isRemote(),
-		VolumeTypes:                  []VolumeType{VolumeTypeBucket, VolumeTypeCustom, VolumeTypeImage, VolumeTypeContainer, VolumeTypeVM},
+		VolumeTypes:                  []VolumeType{VolumeTypeCustom, VolumeTypeImage, VolumeTypeContainer, VolumeTypeVM},
 		BlockBacking:                 false,
 		RunningCopyFreeze:            true,
 		DirectIO:                     true,
 		IOUring:                      true,
 		MountedRoot:                  true,
-		Buckets:                      true,
+		Buckets:                      false,
+		PopulateParentVolumeUUID:     false,
 	}
 }
 
@@ -61,18 +66,22 @@ func (d *dir) FillConfig() error {
 	return nil
 }
 
-// Create is called during pool creation and is effectively using an empty driver struct.
-// WARNING: The Create() function cannot rely on any of the struct attributes being set.
-func (d *dir) Create() error {
-	err := d.FillConfig()
-	if err != nil {
-		return err
+// SourceIdentifier returns the underlying source.
+func (d *dir) SourceIdentifier() (string, error) {
+	source := d.config["source"]
+	if source != "" {
+		return source, nil
 	}
 
+	return "", errors.New("Cannot derive identifier from empty source")
+}
+
+// ValidateSource checks whether the required config keys are valid to access the underlying source.
+func (d *dir) ValidateSource() error {
 	sourcePath := shared.HostPath(d.config["source"])
 
 	if !shared.PathExists(sourcePath) {
-		return fmt.Errorf("Source path %q doesn't exist", sourcePath)
+		return fmt.Errorf("Source path %q does not exist", sourcePath)
 	}
 
 	// Check that if within LXD_DIR, we're at our expected spot.
@@ -80,6 +89,14 @@ func (d *dir) Create() error {
 	if strings.HasPrefix(cleanSource, shared.VarPath()) && cleanSource != GetPoolMountPath(d.name) {
 		return fmt.Errorf("Source path %q is within the LXD directory", cleanSource)
 	}
+
+	return nil
+}
+
+// Create is called during pool creation and is effectively using an empty driver struct.
+// WARNING: The Create() function cannot rely on any of the struct attributes being set.
+func (d *dir) Create() error {
+	sourcePath := shared.HostPath(d.config["source"])
 
 	// Check that the path is currently empty.
 	isEmpty, err := shared.PathIsEmpty(sourcePath)
@@ -91,17 +108,17 @@ func (d *dir) Create() error {
 		// If directory is not empty, the "lost+found" subdirectory is acceptable when
 		// the source path is the root of a mounted filesystem.
 		if !filesystem.IsMountPoint(sourcePath) {
-			return fmt.Errorf("Source path %q isn't empty", sourcePath)
+			return fmt.Errorf("Source path %q is not empty", sourcePath)
 		}
 
 		entries, err := os.ReadDir(sourcePath)
 		if err != nil {
-			return fmt.Errorf("Failed to read directory content of source path %q", sourcePath)
+			return fmt.Errorf("Failed reading directory content of source path %q", sourcePath)
 		}
 
 		for _, e := range entries {
 			if e.Name() != "lost+found" {
-				return fmt.Errorf("Source path %q isn't empty", sourcePath)
+				return fmt.Errorf("Source path %q is not empty", sourcePath)
 			}
 		}
 	}
@@ -110,7 +127,7 @@ func (d *dir) Create() error {
 }
 
 // Delete removes the storage pool from the storage device.
-func (d *dir) Delete(op *operations.Operation) error {
+func (d *dir) Delete(progressReporter ioprogress.ProgressReporter) error {
 	// On delete, wipe everything in the directory.
 	err := wipeDirectory(GetPoolMountPath(d.name))
 	if err != nil {
@@ -128,7 +145,8 @@ func (d *dir) Delete(op *operations.Operation) error {
 
 // Validate checks that all provide keys are supported and that no conflicting or missing configuration is present.
 func (d *dir) Validate(config map[string]string) error {
-	return d.validatePool(config, nil, nil)
+	// Use common local pool rules.
+	return d.validatePool(config, d.commonRules.LocalPoolRules(), nil)
 }
 
 // Update applies any driver changes required from a configuration change.
@@ -152,7 +170,7 @@ func (d *dir) Mount() (bool, error) {
 	}
 
 	// Setup the bind-mount.
-	err := TryMount(sourcePath, path, "none", unix.MS_BIND, "")
+	err := TryMount(context.TODO(), sourcePath, path, "none", unix.MS_BIND, "")
 	if err != nil {
 		return false, err
 	}

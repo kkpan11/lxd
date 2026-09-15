@@ -11,6 +11,9 @@ import (
 
 var sysBusPci = "/sys/bus/pci/devices"
 
+// isDir returns true if the given path exists and is a directory.
+// Note: it is identical to `shared.IsDir` but we want to avoid importing the
+// whole `shared` package here.
 func isDir(name string) bool {
 	stat, err := os.Stat(name)
 	if err != nil {
@@ -48,9 +51,18 @@ func readInt(path string) (int64, error) {
 	return value, nil
 }
 
-func sysfsExists(path string) bool {
+func pathExists(path string) bool {
 	_, err := os.Lstat(path)
 	return err == nil
+}
+
+func pathIsDir(path string) bool {
+	f, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+
+	return f.IsDir()
 }
 
 func sysfsNumaNode(path string) (uint64, error) {
@@ -64,9 +76,8 @@ func sysfsNumaNode(path string) (uint64, error) {
 	for _, entry := range entries {
 		entryName := entry.Name()
 
-		if strings.HasPrefix(entryName, "node") && sysfsExists(filepath.Join(path, entryName, "numastat")) {
-			node := strings.TrimPrefix(entryName, "node")
-
+		node, ok := strings.CutPrefix(entryName, "node")
+		if ok && pathExists(filepath.Join(path, entryName, "numastat")) {
 			nodeNumber, err := strconv.ParseUint(node, 10, 64)
 			if err != nil {
 				return 0, err
@@ -98,12 +109,12 @@ func udevDecode(s string) (string, error) {
 		if s[i] == '\\' && i+4 <= len(s) && s[i+1] == 'x' {
 			hexValue := s[i+2 : i+4]
 			strValue, err := hex.DecodeString(hexValue)
-			if err == nil {
-				ret += string(strValue)
-				i += 3
-			} else {
+			if err != nil {
 				return ret, err
 			}
+
+			ret += string(strValue)
+			i += 3
 		} else {
 			ret += s[i : i+1]
 		}
@@ -119,20 +130,21 @@ func pciAddress(devicePath string) (string, error) {
 	}
 
 	// Check if we have a subsystem listed at all.
-	if !sysfsExists(filepath.Join(deviceDeviceDir, "subsystem")) {
+	subsystemPath := filepath.Join(deviceDeviceDir, "subsystem")
+	if !pathExists(subsystemPath) {
 		return "", nil
 	}
 
 	// Track down the device.
 	linkTarget, err := filepath.EvalSymlinks(deviceDeviceDir)
 	if err != nil {
-		return "", fmt.Errorf("Failed to find %q: %w", deviceDeviceDir, err)
+		return "", fmt.Errorf("Failed finding %q: %w", deviceDeviceDir, err)
 	}
 
 	// Extract the subsystem.
 	subsystemTarget, err := filepath.EvalSymlinks(filepath.Join(linkTarget, "subsystem"))
 	if err != nil {
-		return "", fmt.Errorf("Failed to find %q: %w", filepath.Join(deviceDeviceDir, "subsystem"), err)
+		return "", fmt.Errorf("Failed finding %q: %w", subsystemPath, err)
 	}
 
 	subsystem := filepath.Base(subsystemTarget)
@@ -142,7 +154,7 @@ func pciAddress(devicePath string) (string, error) {
 		linkTarget = filepath.Dir(linkTarget)
 		subsystemTarget, err := filepath.EvalSymlinks(filepath.Join(linkTarget, "subsystem"))
 		if err != nil {
-			return "", fmt.Errorf("Failed to find %q: %w", filepath.Join(deviceDeviceDir, "subsystem"), err)
+			return "", fmt.Errorf("Failed finding %q: %w", subsystemPath, err)
 		}
 
 		subsystem = filepath.Base(subsystemTarget)
@@ -161,7 +173,7 @@ func usbAddress(devicePath string) (string, error) {
 	// Resolve symlink.
 	devicePath, err := filepath.EvalSymlinks(devicePath)
 	if err != nil {
-		return "", fmt.Errorf("Failed to resolve device symlink: %w", err)
+		return "", fmt.Errorf("Failed resolving device symlink: %w", err)
 	}
 
 	// Check if it looks like a USB device.
@@ -177,7 +189,7 @@ func usbAddress(devicePath string) (string, error) {
 		}
 
 		// Check if we found a usb device path.
-		if !sysfsExists(filepath.Join(path, "busnum")) || !sysfsExists(filepath.Join(path, "devnum")) {
+		if !pathExists(filepath.Join(path, "busnum")) || !pathExists(filepath.Join(path, "devnum")) {
 			path = filepath.Dir(path)
 			continue
 		}
@@ -185,13 +197,13 @@ func usbAddress(devicePath string) (string, error) {
 		// Bus address.
 		bus, err := readUint(filepath.Join(path, "busnum"))
 		if err != nil {
-			return "", fmt.Errorf("Unable to parse USB bus addr: %w", err)
+			return "", fmt.Errorf("Cannot parse USB bus addr: %w", err)
 		}
 
 		// Device address.
 		dev, err := readUint(filepath.Join(path, "devnum"))
 		if err != nil {
-			return "", fmt.Errorf("Unable to parse USB device addr: %w", err)
+			return "", fmt.Errorf("Cannot parse USB device addr: %w", err)
 		}
 
 		return fmt.Sprintf("%d:%d", bus, dev), nil
@@ -208,7 +220,7 @@ func getDeviceDir(devicePath string) (string, error) {
 		if os.IsNotExist(err) {
 			break
 		} else if err != nil {
-			return "", fmt.Errorf("Unable to get file info for %q: %w", deviceDir, err)
+			return "", fmt.Errorf("Cannot get file info for %q: %w", deviceDir, err)
 		} else if fileInfo.Mode().IsRegular() {
 			break
 		}

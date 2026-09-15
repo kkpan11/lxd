@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/canonical/lxd/lxd/db/query"
 )
@@ -35,7 +34,7 @@ var testStringsErrorCases = []struct {
 func TestStrings(t *testing.T) {
 	tx := newTxForSlices(t)
 	values, err := query.SelectStrings(context.Background(), tx, "SELECT name FROM test ORDER BY name")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, []string{"bar", "foo"}, values)
 }
 
@@ -63,20 +62,8 @@ var testIntegersErrorCases = []struct {
 func TestIntegers(t *testing.T) {
 	tx := newTxForSlices(t)
 	values, err := query.SelectIntegers(context.Background(), tx, "SELECT id FROM test ORDER BY id")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, []int{0, 1}, values)
-}
-
-// Insert new rows in bulk.
-func TestInsertStrings(t *testing.T) {
-	tx := newTxForSlices(t)
-
-	err := query.InsertStrings(tx, "INSERT INTO test(name) VALUES %s", []string{"xx", "yy"})
-	require.NoError(t, err)
-
-	values, err := query.SelectStrings(context.Background(), tx, "SELECT name FROM test ORDER BY name DESC LIMIT 2")
-	require.NoError(t, err)
-	assert.Equal(t, values, []string{"yy", "xx"})
 }
 
 // Return a new transaction against an in-memory SQLite database with a single

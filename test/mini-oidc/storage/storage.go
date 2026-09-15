@@ -2,10 +2,10 @@ package storage
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
-	"fmt"
 	"math/big"
 	"strings"
 	"sync"
@@ -39,11 +39,11 @@ type Storage struct {
 	lock          sync.Mutex
 	authRequests  map[string]*AuthRequest
 	codes         map[string]string
-	tokens        map[string]*Token
+	tokens        map[string]*token
 	clients       map[string]*Client
 	userStore     UserStore
 	services      map[string]Service
-	refreshTokens map[string]*RefreshToken
+	refreshTokens map[string]*refreshToken
 	signingKey    signingKey
 	deviceCodes   map[string]deviceAuthorizationEntry
 	userCodes     map[string]string
@@ -95,14 +95,49 @@ func (s *publicKey) Key() any {
 	return &s.key.PublicKey
 }
 
+// testRSA2048 is an insecure, test-only key from RFC 9500, Section 2.1.
+// It can be used in tests to avoid slow key generation.
+// Inspired by https://pkg.go.dev/crypto/rsa#example-GenerateKey-TestKey
+var testRSA2048 = func() *rsa.PrivateKey {
+	block, _ := pem.Decode([]byte(strings.ReplaceAll(
+		`-----BEGIN RSA TESTING KEY-----
+MIIEowIBAAKCAQEAsPnoGUOnrpiSqt4XynxA+HRP7S+BSObI6qJ7fQAVSPtRkqso
+tWxQYLEYzNEx5ZSHTGypibVsJylvCfuToDTfMul8b/CZjP2Ob0LdpYrNH6l5hvFE
+89FU1nZQF15oVLOpUgA7wGiHuEVawrGfey92UE68mOyUVXGweJIVDdxqdMoPvNNU
+l86BU02vlBiESxOuox+dWmuVV7vfYZ79Toh/LUK43YvJh+rhv4nKuF7iHjVjBd9s
+B6iDjj70HFldzOQ9r8SRI+9NirupPTkF5AKNe6kUhKJ1luB7S27ZkvB3tSTT3P59
+3VVJvnzOjaA1z6Cz+4+eRvcysqhrRgFlwI9TEwIDAQABAoIBAEEYiyDP29vCzx/+
+dS3LqnI5BjUuJhXUnc6AWX/PCgVAO+8A+gZRgvct7PtZb0sM6P9ZcLrweomlGezI
+FrL0/6xQaa8bBr/ve/a8155OgcjFo6fZEw3Dz7ra5fbSiPmu4/b/kvrg+Br1l77J
+aun6uUAs1f5B9wW+vbR7tzbT/mxaUeDiBzKpe15GwcvbJtdIVMa2YErtRjc1/5B2
+BGVXyvlJv0SIlcIEMsHgnAFOp1ZgQ08aDzvilLq8XVMOahAhP1O2A3X8hKdXPyrx
+IVWE9bS9ptTo+eF6eNl+d7htpKGEZHUxinoQpWEBTv+iOoHsVunkEJ3vjLP3lyI/
+fY0NQ1ECgYEA3RBXAjgvIys2gfU3keImF8e/TprLge1I2vbWmV2j6rZCg5r/AS0u
+pii5CvJ5/T5vfJPNgPBy8B/yRDs+6PJO1GmnlhOkG9JAIPkv0RBZvR0PMBtbp6nT
+Y3yo1lwamBVBfY6rc0sLTzosZh2aGoLzrHNMQFMGaauORzBFpY5lU50CgYEAzPHl
+u5DI6Xgep1vr8QvCUuEesCOgJg8Yh1UqVoY/SmQh6MYAv1I9bLGwrb3WW/7kqIoD
+fj0aQV5buVZI2loMomtU9KY5SFIsPV+JuUpy7/+VE01ZQM5FdY8wiYCQiVZYju9X
+Wz5LxMNoz+gT7pwlLCsC4N+R8aoBk404aF1gum8CgYAJ7VTq7Zj4TFV7Soa/T1eE
+k9y8a+kdoYk3BASpCHJ29M5R2KEA7YV9wrBklHTz8VzSTFTbKHEQ5W5csAhoL5Fo
+qoHzFFi3Qx7MHESQb9qHyolHEMNx6QdsHUn7rlEnaTTyrXh3ifQtD6C0yTmFXUIS
+CW9wKApOrnyKJ9nI0HcuZQKBgQCMtoV6e9VGX4AEfpuHvAAnMYQFgeBiYTkBKltQ
+XwozhH63uMMomUmtSG87Sz1TmrXadjAhy8gsG6I0pWaN7QgBuFnzQ/HOkwTm+qKw
+AsrZt4zeXNwsH7QXHEJCFnCmqw9QzEoZTrNtHJHpNboBuVnYcoueZEJrP8OnUG3r
+UjmopwKBgAqB2KYYMUqAOvYcBnEfLDmyZv9BTVNHbR2lKkMYqv5LlvDaBxVfilE0
+2riO4p6BaAdvzXjKeRrGNEKoHNBpOSfYCOM16NjL8hIZB1CaV3WbT5oY+jp7Mzd5
+7d56RZOE+ERK2uz/7JX9VSsM/LbH9pJibd4e8mikDS9ntciqOH/3
+-----END RSA TESTING KEY-----`, "TESTING KEY", "PRIVATE KEY")))
+	key, _ := x509.ParsePKCS1PrivateKey(block.Bytes)
+	return key
+}()
+
 // NewStorage returns a new storage struct.
 func NewStorage(userStore UserStore) *Storage {
-	key, _ := rsa.GenerateKey(rand.Reader, 2048)
 	return &Storage{
 		authRequests:  make(map[string]*AuthRequest),
 		codes:         make(map[string]string),
-		tokens:        make(map[string]*Token),
-		refreshTokens: make(map[string]*RefreshToken),
+		tokens:        make(map[string]*token),
+		refreshTokens: make(map[string]*refreshToken),
 		clients:       clients,
 		userStore:     userStore,
 		services: map[string]Service{
@@ -115,7 +150,7 @@ func NewStorage(userStore UserStore) *Storage {
 		signingKey: signingKey{
 			id:        uuid.NewString(),
 			algorithm: jose.RS256,
-			key:       key,
+			key:       testRSA2048,
 		},
 		deviceCodes: make(map[string]deviceAuthorizationEntry),
 		userCodes:   make(map[string]string),
@@ -138,7 +173,7 @@ func (s *Storage) CheckUsernamePassword(username, password, id string) error {
 	defer s.lock.Unlock()
 	request, ok := s.authRequests[id]
 	if !ok {
-		return fmt.Errorf("request not found")
+		return errors.New("request not found")
 	}
 
 	// for demonstration purposes we'll check we'll have a simple user store and
@@ -156,7 +191,7 @@ func (s *Storage) CheckUsernamePassword(username, password, id string) error {
 		request.done = true
 		return nil
 	}
-	return fmt.Errorf("username or password wrong")
+	return errors.New("username or password wrong")
 }
 
 // CheckUsernamePasswordSimple checks username and password.
@@ -168,7 +203,7 @@ func (s *Storage) CheckUsernamePasswordSimple(username, password string) error {
 	if user != nil && user.Password == password {
 		return nil
 	}
-	return fmt.Errorf("username or password wrong")
+	return errors.New("username or password wrong")
 }
 
 // CreateAuthRequest implements the op.Storage interface
@@ -203,7 +238,7 @@ func (s *Storage) AuthRequestByID(ctx context.Context, id string) (op.AuthReques
 	defer s.lock.Unlock()
 	request, ok := s.authRequests[id]
 	if !ok {
-		return nil, fmt.Errorf("request not found")
+		return nil, errors.New("request not found")
 	}
 	return request, nil
 }
@@ -219,7 +254,7 @@ func (s *Storage) AuthRequestByCode(ctx context.Context, code string) (op.AuthRe
 		return requestID, ok
 	}()
 	if !ok {
-		return nil, fmt.Errorf("code invalid or expired")
+		return nil, errors.New("code invalid or expired")
 	}
 	return s.AuthRequestByID(ctx, requestID)
 }
@@ -335,7 +370,7 @@ func (s *Storage) TokenRequestByRefreshToken(ctx context.Context, refreshToken s
 	defer s.lock.Unlock()
 	token, ok := s.refreshTokens[refreshToken]
 	if !ok {
-		return nil, fmt.Errorf("invalid refresh_token")
+		return nil, errors.New("invalid refresh_token")
 	}
 	return RefreshTokenRequestFromBusiness(token), nil
 }
@@ -432,7 +467,7 @@ func (s *Storage) GetClientByClientID(ctx context.Context, clientID string) (op.
 	defer s.lock.Unlock()
 	client, ok := s.clients[clientID]
 	if !ok {
-		return nil, fmt.Errorf("client not found")
+		return nil, errors.New("client not found")
 	}
 	return RedirectGlobsClient(client), nil
 }
@@ -444,12 +479,12 @@ func (s *Storage) AuthorizeClientIDSecret(ctx context.Context, clientID, clientS
 	defer s.lock.Unlock()
 	client, ok := s.clients[clientID]
 	if !ok {
-		return fmt.Errorf("client not found")
+		return errors.New("client not found")
 	}
 	// for this example we directly check the secret
 	// obviously you would not have the secret in plain text, but rather hashed and salted (e.g. using bcrypt)
 	if client.secret != clientSecret {
-		return fmt.Errorf("invalid secret")
+		return errors.New("invalid secret")
 	}
 	return nil
 }
@@ -470,14 +505,14 @@ func (s *Storage) SetUserinfoFromRequest(ctx context.Context, userinfo *oidc.Use
 // SetUserinfoFromToken implements the op.Storage interface
 // it will be called for the userinfo endpoint, so we read the token and pass the information from that to the private function.
 func (s *Storage) SetUserinfoFromToken(ctx context.Context, userinfo *oidc.UserInfo, tokenID, subject, origin string) error {
-	token, ok := func() (*Token, bool) {
+	token, ok := func() (*token, bool) {
 		s.lock.Lock()
 		defer s.lock.Unlock()
 		token, ok := s.tokens[tokenID]
 		return token, ok
 	}()
 	if !ok {
-		return fmt.Errorf("token is invalid or has expired")
+		return errors.New("token is invalid or has expired")
 	}
 	// the userinfo endpoint should support CORS. If it's not possible to specify a specific origin in the CORS handler,
 	// and you have to specify a wildcard (*) origin, then you could also check here if the origin which called the userinfo endpoint here directly
@@ -498,14 +533,14 @@ func (s *Storage) SetUserinfoFromToken(ctx context.Context, userinfo *oidc.UserI
 // SetIntrospectionFromToken implements the op.Storage interface
 // it will be called for the introspection endpoint, so we read the token and pass the information from that to the private function.
 func (s *Storage) SetIntrospectionFromToken(ctx context.Context, introspection *oidc.IntrospectionResponse, tokenID, subject, clientID string) error {
-	token, ok := func() (*Token, bool) {
+	token, ok := func() (*token, bool) {
 		s.lock.Lock()
 		defer s.lock.Unlock()
 		token, ok := s.tokens[tokenID]
 		return token, ok
 	}()
 	if !ok {
-		return fmt.Errorf("token is invalid or has expired")
+		return errors.New("token is invalid or has expired")
 	}
 	// check if the client is part of the requested audience
 	for _, aud := range token.Audience {
@@ -528,7 +563,7 @@ func (s *Storage) SetIntrospectionFromToken(ctx context.Context, introspection *
 			return nil
 		}
 	}
-	return fmt.Errorf("token is not valid for this client")
+	return errors.New("token is not valid for this client")
 }
 
 // GetPrivateClaimsFromScopes implements the op.Storage interface
@@ -554,11 +589,11 @@ func (s *Storage) GetKeyByIDAndClientID(ctx context.Context, keyID, clientID str
 	defer s.lock.Unlock()
 	service, ok := s.services[clientID]
 	if !ok {
-		return nil, fmt.Errorf("clientID not found")
+		return nil, errors.New("clientID not found")
 	}
 	key, ok := service.keys[keyID]
 	if !ok {
-		return nil, fmt.Errorf("key not found")
+		return nil, errors.New("key not found")
 	}
 	return &jose.JSONWebKey{
 		KeyID: keyID,
@@ -585,10 +620,10 @@ func (s *Storage) Health(ctx context.Context) error {
 }
 
 // createRefreshToken will store a refresh_token in-memory based on the provided information.
-func (s *Storage) createRefreshToken(accessToken *Token, amr []string, authTime time.Time) (string, error) {
+func (s *Storage) createRefreshToken(accessToken *token, amr []string, authTime time.Time) (string, error) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	token := &RefreshToken{
+	token := &refreshToken{
 		ID:            accessToken.RefreshTokenID,
 		Token:         accessToken.RefreshTokenID,
 		AuthTime:      authTime,
@@ -609,7 +644,7 @@ func (s *Storage) renewRefreshToken(currentRefreshToken string) (token string, r
 	defer s.lock.Unlock()
 	refreshToken, ok := s.refreshTokens[currentRefreshToken]
 	if !ok {
-		return "", "", fmt.Errorf("invalid refresh token")
+		return "", "", errors.New("invalid refresh token")
 	}
 	// deletes the refresh token and all access tokens which were issued based on this refresh token
 	delete(s.refreshTokens, currentRefreshToken)
@@ -628,10 +663,10 @@ func (s *Storage) renewRefreshToken(currentRefreshToken string) (token string, r
 }
 
 // accessToken will store an access_token in-memory based on the provided information.
-func (s *Storage) accessToken(applicationID, refreshTokenID, subject string, audience, scopes []string) (*Token, error) {
+func (s *Storage) accessToken(applicationID, refreshTokenID, subject string, audience, scopes []string) (*token, error) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	token := &Token{
+	token := &token{
 		ID:             uuid.NewString(),
 		ApplicationID:  applicationID,
 		RefreshTokenID: refreshTokenID,
@@ -650,7 +685,7 @@ func (s *Storage) setUserinfo(ctx context.Context, userInfo *oidc.UserInfo, user
 	defer s.lock.Unlock()
 	user := s.userStore.GetUserByID(userID)
 	if user == nil {
-		return fmt.Errorf("user not found")
+		return errors.New("user not found")
 	}
 	for _, scope := range scopes {
 		switch scope {
@@ -667,7 +702,7 @@ func (s *Storage) setUserinfo(ctx context.Context, userInfo *oidc.UserInfo, user
 			userInfo.Locale = oidc.NewLocale(user.PreferredLanguage)
 		case oidc.ScopePhone:
 			userInfo.PhoneNumber = user.Phone
-			userInfo.PhoneNumberVerified = user.PhoneVerified
+			userInfo.PhoneNumberVerified = oidc.Bool(user.PhoneVerified)
 		case CustomScope:
 			// you can also have a custom scope and assert public or custom claims based on that
 			userInfo.AppendClaims(CustomClaim, customClaim(clientID))
@@ -690,7 +725,7 @@ func (s *Storage) ValidateTokenExchangeRequest(ctx context.Context, request op.T
 
 	// Check impersonation permissions
 	if request.GetExchangeActor() == "" && !s.userStore.GetUserByID(request.GetExchangeSubject()).IsAdmin {
-		return errors.New("user doesn't have impersonation permission")
+		return errors.New("user does not have impersonation permission")
 	}
 
 	allowedScopes := make([]string, 0)
@@ -699,8 +734,8 @@ func (s *Storage) ValidateTokenExchangeRequest(ctx context.Context, request op.T
 			continue
 		}
 
-		if strings.HasPrefix(scope, CustomScopeImpersonatePrefix) {
-			subject := strings.TrimPrefix(scope, CustomScopeImpersonatePrefix)
+		subject, found := strings.CutPrefix(scope, CustomScopeImpersonatePrefix)
+		if found {
 			request.SetSubject(subject)
 		}
 

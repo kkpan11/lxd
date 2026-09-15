@@ -4,19 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"net/http"
-	"net/url"
-
-	"github.com/gorilla/mux"
 
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/db/cluster"
 	deviceConfig "github.com/canonical/lxd/lxd/device/config"
 	"github.com/canonical/lxd/lxd/instance"
 	"github.com/canonical/lxd/lxd/project/limits"
-	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared"
@@ -61,29 +57,7 @@ func instancePatch(d *Daemon, r *http.Request) response.Response {
 
 	s := d.State()
 
-	instanceType, err := urlInstanceTypeDetect(r)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	projectName := request.ProjectParam(r)
-
-	// Get the container
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	if shared.IsSnapshot(name) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
-	}
-
-	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(s, r, projectName, name, instanceType)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	projectName, name, resp := forwardedInstanceResponse(s, r)
 	if resp != nil {
 		return resp
 	}
@@ -128,7 +102,7 @@ func instancePatch(d *Daemon, r *http.Request) response.Response {
 	}
 
 	if req.Restore != "" {
-		return response.BadRequest(fmt.Errorf("Can't call PATCH in restore mode"))
+		return response.BadRequest(errors.New("Cannot call PATCH in restore mode"))
 	}
 
 	// Check if architecture was passed
@@ -175,24 +149,43 @@ func instancePatch(d *Daemon, r *http.Request) response.Response {
 	if req.Devices == nil {
 		req.Devices = c.LocalDevices().CloneNative()
 	} else {
+		// Retain devices that are not present in the request.
 		for k, v := range c.LocalDevices() {
 			_, ok := req.Devices[k]
 			if !ok {
 				req.Devices[k] = v
 			}
 		}
+
+		// Once the devices are merged, remove devices whose
+		// value is nil.
+		for k, v := range req.Devices {
+			if v == nil {
+				delete(req.Devices, k)
+			}
+		}
 	}
 
 	// Check project limits.
 	apiProfiles := make([]api.Profile, 0, len(req.Profiles))
-	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err = s.DB.Cluster.Transaction(s.ShutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
 		profiles, err := cluster.GetProfilesIfEnabled(ctx, tx.Tx(), projectName, req.Profiles)
 		if err != nil {
 			return err
 		}
 
+		profileConfigs, err := cluster.GetConfig(ctx, tx.Tx(), "profile")
+		if err != nil {
+			return err
+		}
+
+		profileDevices, err := cluster.GetDevices(ctx, tx.Tx(), "profile")
+		if err != nil {
+			return err
+		}
+
 		for _, profile := range profiles {
-			apiProfile, err := profile.ToAPI(ctx, tx.Tx())
+			apiProfile, err := profile.ToAPI(ctx, tx.Tx(), profileConfigs, profileDevices)
 			if err != nil {
 				return err
 			}
@@ -200,7 +193,7 @@ func instancePatch(d *Daemon, r *http.Request) response.Response {
 			apiProfiles = append(apiProfiles, *apiProfile)
 		}
 
-		return limits.AllowInstanceUpdate(s.GlobalConfig, tx, projectName, name, req, c.LocalConfig())
+		return limits.AllowInstanceUpdate(ctx, s.GlobalConfig, tx, projectName, name, req, c.LocalConfig())
 	})
 	if err != nil {
 		return response.SmartError(err)
@@ -217,7 +210,7 @@ func instancePatch(d *Daemon, r *http.Request) response.Response {
 		Project:      projectName,
 	}
 
-	err = c.Update(args, true)
+	err = c.Update(r.Context(), args, instance.UpdateActionUser)
 	if err != nil {
 		return response.SmartError(err)
 	}

@@ -1,6 +1,7 @@
 package device
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -34,7 +35,7 @@ var unixMutex sync.Mutex
 // unixRegisterHandler registers a handler function to be called whenever a Unix device event occurs.
 func unixRegisterHandler(s *state.State, inst instance.Instance, deviceName, path string, handler func(UnixEvent) (*deviceConfig.RunConfig, error)) error {
 	if path == "" || handler == nil {
-		return fmt.Errorf("Invalid subscription")
+		return errors.New("Invalid subscription")
 	}
 
 	unixMutex.Lock()
@@ -58,7 +59,7 @@ func unixRegisterHandler(s *state.State, inst instance.Instance, deviceName, pat
 		return true
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to add %q to watch targets: %w", path, err)
+		return fmt.Errorf("Failed adding %q to watch targets: %w", path, err)
 	}
 
 	logger.Debug("Added watch target", logger.Ctx{"path": path})
@@ -86,7 +87,7 @@ func unixUnregisterHandler(s *state.State, inst instance.Instance, deviceName st
 
 	err := s.DevMonitor.Unwatch(sub.Path, identifier)
 	if err != nil {
-		return fmt.Errorf("Failed to remove %q from inotify targets: %w", sub.Path, err)
+		return fmt.Errorf("Failed removing %q from inotify targets: %w", sub.Path, err)
 	}
 
 	return nil

@@ -14,23 +14,23 @@ const (
 	MissingCGroupBlkioWeight
 	// MissingCGroupCPUController represents the missing CGroup CPU controller warning.
 	MissingCGroupCPUController
-	// MissingCGroupCPUsetController represents the missing GCgroup CPUset controller warning.
+	// MissingCGroupCPUsetController represents the missing CGroup CPUset controller warning.
 	MissingCGroupCPUsetController
-	// MissingCGroupCPUacctController represents the missing GCgroup CPUacct controller warning.
+	// MissingCGroupCPUacctController represents the missing CGroup CPUacct controller warning.
 	MissingCGroupCPUacctController
-	// MissingCGroupDevicesController represents the missing GCgroup devices controller warning.
+	// MissingCGroupDevicesController represents the missing CGroup devices controller warning.
 	MissingCGroupDevicesController
-	// MissingCGroupFreezerController represents the missing GCgroup freezer controller warning.
+	// MissingCGroupFreezerController represents the missing CGroup freezer controller warning.
 	MissingCGroupFreezerController
-	// MissingCGroupHugetlbController represents the missing GCgroup hugetlb controller warning.
+	// MissingCGroupHugetlbController represents the missing CGroup hugetlb controller warning.
 	MissingCGroupHugetlbController
-	// MissingCGroupMemoryController represents the missing GCgroup memory controller warning.
+	// MissingCGroupMemoryController represents the missing CGroup memory controller warning.
 	MissingCGroupMemoryController
-	// MissingCGroupNetworkPriorityController represents the missing GCgroup network priority controller warning.
+	// MissingCGroupNetworkPriorityController represents the missing CGroup network priority controller warning.
 	MissingCGroupNetworkPriorityController
-	// MissingCGroupPidsController represents the missing GCgroup pids controller warning.
+	// MissingCGroupPidsController represents the missing CGroup pids controller warning.
 	MissingCGroupPidsController
-	// MissingCGroupMemorySwapAccounting represents the missing GCgroup memory swap accounting warning.
+	// MissingCGroupMemorySwapAccounting represents the missing CGroup memory swap accounting warning.
 	MissingCGroupMemorySwapAccounting
 	// ClusterTimeSkew represents the cluster time skew warning.
 	ClusterTimeSkew
@@ -38,7 +38,7 @@ const (
 	AppArmorNotAvailable
 	// MissingVirtiofsd represents the missing virtiofsd warning.
 	MissingVirtiofsd
-	// UnableToConnectToMAAS represents the unable to connect to MAAS warning.
+	// UnableToConnectToMAAS is deprecated and kept for backwards compatibility to preserve warning type codes.
 	UnableToConnectToMAAS
 	// AppArmorDisabledDueToRawDnsmasq represents the disabled AppArmor due to raw.dnsmasq warning.
 	AppArmorDisabledDueToRawDnsmasq
@@ -58,36 +58,43 @@ const (
 	StoragePoolUnvailable
 	// UnableToUpdateClusterCertificate represents the unable to update cluster certificate warning.
 	UnableToUpdateClusterCertificate
+	// OIDCAuthenticationUnavailable warnings are created when OIDC is configured on LXD but LXD is unable to use those
+	// settings to initialize the OIDC verifier.
+	OIDCAuthenticationUnavailable
+	// ReplicatorRunFailure represents a replicator run that did not complete successfully.
+	ReplicatorRunFailure
 )
 
 // TypeNames associates a warning code to its name.
 var TypeNames = map[Type]string{
 	Undefined:                              "Undefined warning",
-	MissingCGroupBlkio:                     "Couldn't find the CGroup blkio",
-	MissingCGroupBlkioWeight:               "Couldn't find the CGroup blkio.weight",
-	MissingCGroupCPUController:             "Couldn't find the CGroup CPU controller",
-	MissingCGroupCPUsetController:          "Couldn't find the CGroup CPUset controller",
-	MissingCGroupCPUacctController:         "Couldn't find the CGroup CPUacct controller",
-	MissingCGroupDevicesController:         "Couldn't find the CGroup devices controller",
-	MissingCGroupFreezerController:         "Couldn't find the CGroup freezer controller",
-	MissingCGroupHugetlbController:         "Couldn't find the CGroup hugetlb controller",
-	MissingCGroupMemoryController:          "Couldn't find the CGroup memory controller",
-	MissingCGroupNetworkPriorityController: "Couldn't find the CGroup network priority controller",
-	MissingCGroupPidsController:            "Couldn't find the CGroup pids controller",
-	MissingCGroupMemorySwapAccounting:      "Couldn't find the CGroup memory swap accounting",
+	MissingCGroupBlkio:                     "Could not find the CGroup blkio",
+	MissingCGroupBlkioWeight:               "Could not find the CGroup blkio.weight",
+	MissingCGroupCPUController:             "Could not find the CGroup CPU controller",
+	MissingCGroupCPUsetController:          "Could not find the CGroup CPUset controller",
+	MissingCGroupCPUacctController:         "Could not find the CGroup CPUacct controller",
+	MissingCGroupDevicesController:         "Could not find the CGroup devices controller",
+	MissingCGroupFreezerController:         "Could not find the CGroup freezer controller",
+	MissingCGroupHugetlbController:         "Could not find the CGroup hugetlb controller",
+	MissingCGroupMemoryController:          "Could not find the CGroup memory controller",
+	MissingCGroupNetworkPriorityController: "Could not find the CGroup network priority controller",
+	MissingCGroupPidsController:            "Could not find the CGroup pids controller",
+	MissingCGroupMemorySwapAccounting:      "Could not find the CGroup memory swap accounting",
 	ClusterTimeSkew:                        "Time skew detected between leader and local",
 	AppArmorNotAvailable:                   "AppArmor support has been disabled",
 	MissingVirtiofsd:                       "Missing virtiofsd",
-	UnableToConnectToMAAS:                  "Unable to connect to MAAS",
+	UnableToConnectToMAAS:                  "Cannot connect to MAAS",
 	AppArmorDisabledDueToRawDnsmasq:        "Skipping AppArmor for dnsmasq due to raw.dnsmasq being set",
-	LargerIPv6PrefixThanSupported:          "IPv6 networks with a prefix larger than 64 aren't properly supported by dnsmasq",
+	LargerIPv6PrefixThanSupported:          "IPv6 networks with a prefix larger than 64 are not properly supported by dnsmasq",
 	ProxyBridgeNetfilterNotEnabled:         "Proxy bridge netfilter not enabled",
 	NetworkUnvailable:                      "Network unavailable",
 	OfflineClusterMember:                   "Offline cluster member",
-	InstanceAutostartFailure:               "Failed to autostart instance",
+	InstanceAutostartFailure:               "Failed autostarting instance",
 	InstanceTypeNotOperational:             "Instance type not operational",
 	StoragePoolUnvailable:                  "Storage pool unavailable",
-	UnableToUpdateClusterCertificate:       "Unable to update cluster certificate",
+	UnableToUpdateClusterCertificate:       "Cannot update cluster certificate",
+	OIDCAuthenticationUnavailable:          "Failed applying OIDC settings",
+	ReplicatorRunFailure:                   "Replicator run failed",
 }
 
 // Severity returns the severity of the warning type.
@@ -145,6 +152,10 @@ func (t Type) Severity() Severity {
 		return SeverityHigh
 	case UnableToUpdateClusterCertificate:
 		return SeverityLow
+	case OIDCAuthenticationUnavailable:
+		return SeverityModerate
+	case ReplicatorRunFailure:
+		return SeverityHigh
 	}
 
 	return SeverityLow

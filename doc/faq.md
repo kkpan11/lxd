@@ -1,5 +1,5 @@
 ---
-discourse: 14705
+discourse: lxc:[Cgroup2&#32;related&#32;issue](14705)
 ---
 
 # Frequently asked questions
@@ -54,6 +54,7 @@ But that's also the cause of most of the security issues with such privileged co
 ## How can I run Docker inside a LXD container?
 
 ```{youtube} https://www.youtube.com/watch?v=_fCSSEyiGro
+:title: Running Docker inside of a LXD container
 ```
 
 To run Docker inside a LXD container, set the {config:option}`instance-security:security.nesting` option of the container to `true`:
@@ -120,17 +121,33 @@ The easiest fix for this problem is to stop the VPN client and unmount the `net_
 If you need to keep the VPN client running, mount the `net_cls` cgroup1 in another location and reconfigure your VPN client accordingly.
 See [this Discourse post](https://discuss.linuxcontainers.org/t/help-help-help-cgroup2-related-issue-on-ubuntu-jammy-with-mullvad-and-privateinternetaccess-vpn/14705/18) for instructions for Mullvad VPN.
 
-## Why does LXD not start on Ubuntu 20.04 LTS or earlier?
+## Why does LXD not start on Ubuntu 22.04 LTS or earlier?
 
-If you are running LXD on Ubuntu 20.04 LTS or earlier, you might be missing support for ZFS 2.1 in the kernel (see the {ref}`requirements <requirements-zfs>`).
+If you are running LXD on Ubuntu 22.04 LTS or earlier, you might be missing support for ZFS 2.2 in the kernel (see the {ref}`requirements <requirements-zfs>`).
 
 If LXD fails to start, check the `/var/snap/lxd/common/lxd/logs/lxd.log` log file for the following error to see if the reason is missing ZFS support:
 
     Error: Required tool ‘zpool’ is missing
 
-If you are on Ubuntu 20.04 LTS, you can resolve the issue by installing the HWE kernel and rebooting the nodes to provide the required kernel drivers for ZFS 2.1:
+If you are on Ubuntu 22.04 LTS, you can resolve the issue by installing the HWE kernel and rebooting the nodes to provide the required kernel drivers for ZFS 2.2:
 
     sudo apt-get update
-    sudo apt-get install linux-generic-hwe-20.04
+    sudo apt-get install linux-generic-hwe-22.04
 
 If you are on earlier versions of Ubuntu, you should use a compatible LTS release of LXD.
+
+(faq-gpu-passthrough-stop)=
+## Why does my VM stop responding when I try to pass through a GPU?
+
+If you try to pass through a GPU with a large amount of VRAM, the VM might stop responding during boot or fail to start. This is often caused by the default {abbr}`MMIO (Memory-Mapped Input/Output)` window size in QEMU being too small to map the GPU's memory.
+
+To resolve this, stop the instance, then increase the available 64-bit PCI MMIO address space by setting the following values in {config:option}`instance-raw:raw.qemu`:
+
+```bash
+lxc config set <vm-name> raw.qemu='
+-global q35-pcihost.pci-hole64-size=2048G
+-fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=65536
+'
+```
+
+These settings reserve sufficient 64-bit MMIO space in both the QEMU host and the guest firmware ({abbr}`OVMF (Open Virtual Machine Firmware)`), which is required for GPUs with large {abbr}`BARs (Base Address Registers)`.

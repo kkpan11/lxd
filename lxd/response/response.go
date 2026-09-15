@@ -4,16 +4,20 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"mime/multipart"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/lxd/metrics"
+	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/ucred"
 	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared/api"
@@ -23,9 +27,19 @@ import (
 
 var debug bool
 
-// Init sets the debug variable to the provided value.
-func Init(d bool) {
+// Init sets the debug variable to the provided value and registers any additional smart error mappings.
+func Init(d bool, smartErrors map[int][]error) {
 	debug = d
+
+	for code, additionalErrors := range smartErrors {
+		existingErrs, ok := httpResponseErrors[code]
+		if ok {
+			httpResponseErrors[code] = append(existingErrs, additionalErrors...)
+			continue
+		}
+
+		httpResponseErrors[code] = additionalErrors
+	}
 }
 
 // Response represents an API response.
@@ -34,20 +48,60 @@ type Response interface {
 	String() string
 }
 
-// Devlxd response.
-type devLxdResponse struct {
+// devLXDResponse represents a devLXD API response.
+type devLXDResponse struct {
 	content     any
 	code        int
+	etag        string
 	contentType string
+	err         error
 }
 
 // Render renders a response for requests against the /dev/lxd socket.
-func (r *devLxdResponse) Render(w http.ResponseWriter, req *http.Request) error {
-	var err error
+func (r *devLXDResponse) Render(w http.ResponseWriter, req *http.Request) (err error) {
+	// Track metrics after response is rendered.
+	defer func() {
+		if r.err == nil {
+			metrics.UseMetricsCallback(req, metrics.Success)
+			return
+		}
 
+		if r.code < 500 {
+			metrics.UseMetricsCallback(req, metrics.ErrorClient)
+			return
+		}
+
+		metrics.UseMetricsCallback(req, metrics.ErrorServer)
+	}()
+
+	// Handle response when interacting over vsock (LXD Agent running in a VM).
+	// In such case, the response must be returned in api.Response format.
+	isDevLXDOverVsock, _ := req.Context().Value(request.CtxDevLXDOverVsock).(bool)
+	if isDevLXDOverVsock {
+		if r.code != http.StatusOK {
+			return SmartError(r.err).Render(w, req)
+		}
+
+		// Set ETag header if ETag is provided.
+		if r.etag != "" {
+			w.Header().Set("ETag", r.etag)
+		}
+
+		return SyncResponse(true, r.content).Render(w, req)
+	}
+
+	// From this point on, we are responding to a request over unix socket.
 	if r.code != http.StatusOK {
-		http.Error(w, fmt.Sprintf("%s", r.content), r.code)
-	} else if r.contentType == "json" {
+		http.Error(w, r.err.Error(), r.code)
+		return nil
+	}
+
+	// Set ETag header if ETag is provided.
+	if r.etag != "" {
+		w.Header().Set("ETag", r.etag)
+	}
+
+	if r.contentType == "json" {
 		w.Header().Set("Content-Type", "application/json")
 
 		var debugLogger logger.Logger
@@ -55,21 +109,24 @@ func (r *devLxdResponse) Render(w http.ResponseWriter, req *http.Request) error 
 			debugLogger = logger.Logger(logger.Log)
 		}
 
-		err = util.WriteJSON(w, r.content, debugLogger)
-	} else if r.contentType != "websocket" {
-		w.Header().Set("Content-Type", "application/octet-stream")
-
-		_, err = fmt.Fprint(w, r.content.(string))
+		return util.WriteJSON(w, r.content, debugLogger)
 	}
 
-	if err != nil {
-		return err
+	if r.contentType != "websocket" {
+		w.Header().Set("Content-Type", "application/octet-stream")
+
+		if r.content != nil {
+			_, err = fmt.Fprint(w, fmt.Sprint(r.content))
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
 }
 
-func (r *devLxdResponse) String() string {
+func (r *devLXDResponse) String() string {
 	if r.code == http.StatusOK {
 		return "success"
 	}
@@ -77,27 +134,54 @@ func (r *devLxdResponse) String() string {
 	return "failure"
 }
 
-// DevLxdErrorResponse returns an error response. If rawResponse is true, a api.ResponseRaw will be sent instead of a minimal devLxdResponse.
-func DevLxdErrorResponse(err error, rawResponse bool) Response {
-	if rawResponse {
-		return SmartError(err)
-	}
-
+// DevLXDErrorResponse returns an error response.
+func DevLXDErrorResponse(err error) Response {
 	code, ok := api.StatusErrorMatch(err)
-	if ok {
-		return &devLxdResponse{content: err.Error(), code: code, contentType: "raw"}
+	if !ok {
+		code = http.StatusInternalServerError
 	}
 
-	return &devLxdResponse{content: err.Error(), code: http.StatusInternalServerError, contentType: "raw"}
+	return &devLXDResponse{
+		code:        code,
+		contentType: "raw",
+		err:         err,
+	}
 }
 
-// DevLxdResponse represents a devLxdResponse. If rawResponse is true, a api.ResponseRaw will be sent instead of a minimal devLxdResponse.
-func DevLxdResponse(code int, content any, contentType string, rawResponse bool) Response {
-	if rawResponse {
-		return SyncResponse(true, content)
+// DevLXDResponse represents a devLXDResponse.
+func DevLXDResponse(code int, content any, contentType string) Response {
+	return &devLXDResponse{
+		code:        code,
+		content:     content,
+		contentType: contentType,
+	}
+}
+
+// DevLXDResponseETag returns a devLXDResponse with the provided ETag configured.
+// If ETag is not empty, it will be set in the response headers.
+func DevLXDResponseETag(code int, content any, contentType string, etag string) Response {
+	return &devLXDResponse{
+		code:        code,
+		content:     content,
+		contentType: contentType,
+		etag:        etag,
+	}
+}
+
+// DevLXDOperationResponse converts [api.Operation] into [api.DevLXDOperation] and returns it as devLXDResponse.
+func DevLXDOperationResponse(op api.Operation) Response {
+	respOp := api.DevLXDOperation{
+		ID:         op.ID,
+		Status:     op.Status,
+		StatusCode: op.StatusCode,
+		Err:        op.Err,
 	}
 
-	return &devLxdResponse{content: content, code: code, contentType: contentType}
+	return &devLXDResponse{
+		code:        http.StatusOK,
+		content:     respOp,
+		contentType: "json",
+	}
 }
 
 // Sync response.
@@ -119,6 +203,11 @@ var EmptySyncResponse = &syncResponse{success: true, metadata: make(map[string]a
 // set to the provided values.
 func SyncResponse(success bool, metadata any) Response {
 	return &syncResponse{success: success, metadata: metadata}
+}
+
+// SyncResponseCompressed returns a new syncResponse with gzip compressed JSON output.
+func SyncResponseCompressed(success bool, metadata any) Response {
+	return &syncResponse{success: success, metadata: metadata, compress: true}
 }
 
 // SyncResponseETag returns a new syncResponse with an etag.
@@ -148,12 +237,12 @@ func SyncResponsePlain(success bool, compress bool, metadata string) Response {
 }
 
 // Render renders a synchronous response.
-func (r *syncResponse) Render(w http.ResponseWriter, req *http.Request) (err error) {
+func (r *syncResponse) Render(w http.ResponseWriter, req *http.Request) error {
 	// Set an appropriate ETag header
 	if r.etag != nil {
 		etag, err := util.EtagHash(r.etag)
 		if err == nil {
-			w.Header().Set("ETag", fmt.Sprintf("\"%s\"", etag))
+			w.Header().Set("ETag", `"`+etag+`"`)
 		}
 	}
 
@@ -172,25 +261,6 @@ func (r *syncResponse) Render(w http.ResponseWriter, req *http.Request) (err err
 		}
 	}
 
-	// Handle plain text headers.
-	if r.plaintext {
-		w.Header().Set("Content-Type", "text/plain")
-	}
-
-	// Handle compression.
-	if r.compress {
-		w.Header().Set("Content-Encoding", "gzip")
-	}
-
-	// Write header and status code.
-	if code == 0 {
-		code = http.StatusOK
-	}
-
-	if w.Header().Get("Connection") != "keep-alive" {
-		w.WriteHeader(code)
-	}
-
 	// Prepare the JSON response
 	status := api.Success
 	if !r.success {
@@ -204,15 +274,35 @@ func (r *syncResponse) Render(w http.ResponseWriter, req *http.Request) (err err
 		}
 	}
 
+	// Handle plain text headers.
+	if r.plaintext {
+		w.Header().Set("Content-Type", "text/plain")
+	} else if w.Header().Get("Content-Type") == "" {
+		// If Content-Type is not set, default to "application/json".
+		w.Header().Set("Content-Type", "application/json")
+	}
+
+	// Handle compression.
+	if r.compress {
+		w.Header().Set("Content-Encoding", "gzip")
+		addVaryHeader(w.Header(), "Accept-Encoding")
+	}
+
+	// Write header and status code.
+	if code == 0 {
+		code = http.StatusOK
+	}
+
+	if w.Header().Get("Connection") != "keep-alive" {
+		w.WriteHeader(code)
+	}
+
 	// defer calling the callback function after possibly considering the response a SmartError.
 	defer func() {
-		// If there was an error on Render, the callback function will be called during the error handling.
-		if err == nil {
-			if r.success {
-				metrics.UseMetricsCallback(req, metrics.Success)
-			} else {
-				metrics.UseMetricsCallback(req, metrics.ErrorServer)
-			}
+		if r.success {
+			metrics.UseMetricsCallback(req, metrics.Success)
+		} else {
+			metrics.UseMetricsCallback(req, metrics.ErrorServer)
 		}
 	}()
 
@@ -221,14 +311,14 @@ func (r *syncResponse) Render(w http.ResponseWriter, req *http.Request) (err err
 		if r.metadata != nil {
 			if r.compress {
 				comp := gzip.NewWriter(w)
-				defer comp.Close()
+				_, writeErr := comp.Write([]byte(r.metadata.(string)))
+				closeErr := comp.Close()
 
-				_, err = comp.Write([]byte(r.metadata.(string)))
-				if err != nil {
-					return err
+				if writeErr != nil || closeErr != nil {
+					return errors.Join(writeErr, closeErr)
 				}
 			} else {
-				_, err = w.Write([]byte(r.metadata.(string)))
+				_, err := w.Write([]byte(r.metadata.(string)))
 				if err != nil {
 					return err
 				}
@@ -251,9 +341,20 @@ func (r *syncResponse) Render(w http.ResponseWriter, req *http.Request) (err err
 		debugLogger = logger.AddContext(logger.Ctx{"http_code": code})
 	}
 
-	err = util.WriteJSON(w, resp, debugLogger)
+	// Handle JSON compression to gzip if needed.
+	if r.compress {
+		comp := gzip.NewWriter(w)
+		writeErr := util.WriteJSON(comp, resp, debugLogger)
+		closeErr := comp.Close()
 
-	return err
+		if writeErr != nil || closeErr != nil {
+			return errors.Join(writeErr, closeErr)
+		}
+
+		return nil
+	}
+
+	return util.WriteJSON(w, resp, debugLogger)
 }
 
 func (r *syncResponse) String() string {
@@ -266,83 +367,67 @@ func (r *syncResponse) String() string {
 
 // Error response.
 type errorResponse struct {
-	code int    // Code to return in both the HTTP header and Code field of the response body.
-	msg  string // Message to return in the Error field of the response body.
+	code int   // Code to return in both the HTTP header and Code field of the response body.
+	err  error // Error whose string representation will be returned in the Error field of the response body.
 }
 
 // ErrorResponse returns an error response with the given code and msg.
 func ErrorResponse(code int, msg string) Response {
-	return &errorResponse{code, msg}
+	return &errorResponse{code, errors.New(msg)}
 }
 
 // BadRequest returns a bad request response (400) with the given error.
 func BadRequest(err error) Response {
-	return &errorResponse{http.StatusBadRequest, err.Error()}
+	return &errorResponse{code: http.StatusBadRequest, err: err}
 }
 
 // Conflict returns a conflict response (409) with the given error.
 func Conflict(err error) Response {
-	message := "already exists"
-	if err != nil {
-		message = err.Error()
-	}
-
-	return &errorResponse{http.StatusConflict, message}
+	return &errorResponse{code: http.StatusConflict, err: err}
 }
 
 // Forbidden returns a forbidden response (403) with the given error.
 func Forbidden(err error) Response {
-	message := "not authorized"
-	if err != nil {
-		message = err.Error()
-	}
-
-	return &errorResponse{http.StatusForbidden, message}
+	return &errorResponse{code: http.StatusForbidden, err: err}
 }
 
 // InternalError returns an internal error response (500) with the given error.
 func InternalError(err error) Response {
-	return &errorResponse{http.StatusInternalServerError, err.Error()}
+	return &errorResponse{code: http.StatusInternalServerError, err: err}
 }
 
 // NotFound returns a not found response (404) with the given error.
 func NotFound(err error) Response {
-	message := "not found"
-	if err != nil {
-		message = err.Error()
-	}
-
-	return &errorResponse{http.StatusNotFound, message}
+	return &errorResponse{code: http.StatusNotFound, err: err}
 }
 
 // NotImplemented returns a not implemented response (501) with the given error.
 func NotImplemented(err error) Response {
-	message := "not implemented"
-	if err != nil {
-		message = err.Error()
-	}
-
-	return &errorResponse{http.StatusNotImplemented, message}
+	return &errorResponse{code: http.StatusNotImplemented, err: err}
 }
 
 // PreconditionFailed returns a precondition failed response (412) with the
 // given error.
 func PreconditionFailed(err error) Response {
-	return &errorResponse{http.StatusPreconditionFailed, err.Error()}
+	return &errorResponse{code: http.StatusPreconditionFailed, err: err}
 }
 
 // Unavailable return an unavailable response (503) with the given error.
 func Unavailable(err error) Response {
-	message := "unavailable"
-	if err != nil {
-		message = err.Error()
-	}
+	return &errorResponse{code: http.StatusServiceUnavailable, err: err}
+}
 
-	return &errorResponse{http.StatusServiceUnavailable, message}
+// Unauthorized return an unauthorized response (401) with the given error.
+func Unauthorized(err error) Response {
+	return &errorResponse{code: http.StatusUnauthorized, err: err}
 }
 
 func (r *errorResponse) String() string {
-	return r.msg
+	if r.err != nil {
+		return r.err.Error()
+	}
+
+	return http.StatusText(r.code)
 }
 
 // Render renders a response that indicates an error on the request handling.
@@ -359,7 +444,7 @@ func (r *errorResponse) Render(w http.ResponseWriter, req *http.Request) error {
 
 	resp := api.ResponseRaw{
 		Type:  api.ErrorResponse,
-		Error: r.msg,
+		Error: r.String(),
 		Code:  r.code, // Set the error code in the Code field of the response body.
 	}
 
@@ -426,13 +511,14 @@ func FileResponse(files []FileResponseEntry, headers map[string]string) Response
 }
 
 // Render renders a file response.
-func (r *fileResponse) Render(w http.ResponseWriter, req *http.Request) (err error) {
+func (r *fileResponse) Render(w http.ResponseWriter, req *http.Request) error {
 	if r.headers != nil {
 		for k, v := range r.headers {
 			w.Header().Set(k, v)
 		}
 	}
 
+	var err error
 	defer func() {
 		if err == nil {
 			// If there was an error on Render, the callback function will be called during the error handling.
@@ -448,8 +534,8 @@ func (r *fileResponse) Render(w http.ResponseWriter, req *http.Request) (err err
 	// For a single file, return it inline
 	if len(r.files) == 1 {
 		remoteConn := ucred.GetConnFromContext(req.Context())
-		remoteTCP, _ := tcp.ExtractConn(remoteConn)
-		if remoteTCP != nil {
+		remoteTCP, err := tcp.ExtractConn(remoteConn)
+		if err == nil && remoteTCP != nil {
 			// Apply TCP timeouts if remote connection is TCP (rather than Unix).
 			err = tcp.SetTimeouts(remoteTCP, 10*time.Second)
 			if err != nil {
@@ -490,8 +576,8 @@ func (r *fileResponse) Render(w http.ResponseWriter, req *http.Request) (err err
 		}
 
 		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", sz))
-		w.Header().Set("Content-Disposition", fmt.Sprintf("inline;filename=%s", r.files[0].Filename))
+		w.Header().Set("Content-Length", strconv.FormatInt(sz, 10))
+		w.Header().Set("Content-Disposition", "inline;filename="+r.files[0].Filename)
 
 		http.ServeContent(w, req, r.files[0].Filename, mt, rs)
 
@@ -527,7 +613,7 @@ func (r *fileResponse) Render(w http.ResponseWriter, req *http.Request) (err err
 			return err
 		}
 
-		_, err = io.Copy(fw, rd)
+		_, err := io.Copy(fw, rd)
 		if err != nil {
 			return err
 		}
@@ -543,7 +629,7 @@ func (r *fileResponse) Render(w http.ResponseWriter, req *http.Request) (err err
 }
 
 func (r *fileResponse) String() string {
-	return fmt.Sprintf("%d files", len(r.files))
+	return strconv.FormatInt(int64(len(r.files)), 10) + " files"
 }
 
 type forwardedResponse struct {
@@ -551,8 +637,8 @@ type forwardedResponse struct {
 }
 
 // ForwardedResponse takes a request directed to a node and forwards it to
-// another node, writing back the response it gegs.
-func ForwardedResponse(client lxd.InstanceServer, request *http.Request) Response {
+// another node, writing back the response it gets.
+func ForwardedResponse(client lxd.InstanceServer) Response {
 	return &forwardedResponse{
 		client: client,
 	}
@@ -565,7 +651,7 @@ func (r *forwardedResponse) Render(w http.ResponseWriter, req *http.Request) err
 		return err
 	}
 
-	url := fmt.Sprintf("%s%s", info.Addresses[0], req.URL.RequestURI())
+	url := info.Addresses[0] + req.URL.RequestURI()
 	forwarded, err := http.NewRequest(req.Method, url, req.Body)
 	if err != nil {
 		return err
@@ -626,12 +712,18 @@ func (r *manualResponse) String() string {
 	return "unknown"
 }
 
-// Unauthorized return an unauthorized response (401) with the given error.
-func Unauthorized(err error) Response {
-	message := "unauthorized"
-	if err != nil {
-		message = err.Error()
+// addVaryHeader adds a value to the Vary header if it is not already present.
+// It matches existing Vary entries case-insensitively, including comma-separated values.
+func addVaryHeader(header http.Header, value string) {
+	for _, vary := range header.Values("Vary") {
+		values := strings.SplitSeq(vary, ",")
+
+		for varyValue := range values {
+			if strings.EqualFold(strings.TrimSpace(varyValue), value) {
+				return
+			}
+		}
 	}
 
-	return &errorResponse{http.StatusUnauthorized, message}
+	header.Add("Vary", value)
 }

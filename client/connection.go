@@ -3,15 +3,17 @@ package lxd
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 
 	"github.com/canonical/lxd/shared"
@@ -19,6 +21,16 @@ import (
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/simplestreams"
 )
+
+// ClientBearerTokenClaims represents the claims of a client bearer token.
+// They extend standard [jwt.RegisteredClaims] with custom LXD claims.
+type ClientBearerTokenClaims struct {
+	jwt.RegisteredClaims
+
+	// Optional server certificate fingerprint used when connecting with a bearer token.
+	// If provided, the fingerprint is compared against the server's certificate during the TLS handshake.
+	ServerFingerprint string `json:"server_cert_fingerprint,omitempty"`
+}
 
 // ConnectionArgs represents a set of common connection properties.
 type ConnectionArgs struct {
@@ -64,6 +76,9 @@ type ConnectionArgs struct {
 	// Caching support for image servers
 	CachePath   string
 	CacheExpiry time.Duration
+
+	// Bearer token for authenticating as a bearer identity.
+	BearerToken string
 }
 
 // ConnectLXD lets you connect to a remote LXD daemon over HTTPs.
@@ -116,14 +131,13 @@ func ConnectLXDHTTPWithContext(ctx context.Context, args *ConnectionArgs, client
 
 	// Initialize the client struct
 	server := ProtocolLXD{
-		ctx:                ctx,
-		httpBaseURL:        *httpBaseURL,
-		httpProtocol:       "custom",
-		httpUserAgent:      args.UserAgent,
-		ctxConnected:       ctxConnected,
-		ctxConnectedCancel: ctxConnectedCancel,
-		eventConns:         make(map[string]*websocket.Conn),
-		eventListeners:     make(map[string][]*EventListener),
+		ctx:                  ctx,
+		httpBaseURL:          *httpBaseURL,
+		httpProtocol:         "custom",
+		httpUserAgent:        args.UserAgent,
+		ctxConnected:         ctxConnected,
+		ctxConnectedCancel:   ctxConnectedCancel,
+		eventListenerManager: newEventListenerManager(ctx),
 	}
 
 	// Setup the HTTP client
@@ -175,15 +189,14 @@ func ConnectLXDUnixWithContext(ctx context.Context, path string, args *Connectio
 
 	// Initialize the client struct
 	server := ProtocolLXD{
-		ctx:                ctx,
-		httpBaseURL:        *httpBaseURL,
-		httpUnixPath:       path,
-		httpProtocol:       "unix",
-		httpUserAgent:      args.UserAgent,
-		ctxConnected:       ctxConnected,
-		ctxConnectedCancel: ctxConnectedCancel,
-		eventConns:         make(map[string]*websocket.Conn),
-		eventListeners:     make(map[string][]*EventListener),
+		ctx:                  ctx,
+		httpBaseURL:          *httpBaseURL,
+		httpUnixPath:         path,
+		httpProtocol:         "unix",
+		httpUserAgent:        args.UserAgent,
+		ctxConnected:         ctxConnected,
+		ctxConnectedCancel:   ctxConnectedCancel,
+		eventListenerManager: newEventListenerManager(ctx),
 	}
 
 	// Determine the socket path.
@@ -267,7 +280,7 @@ func ConnectSimpleStreams(url string, args *ConnectionArgs) (ImageServer, error)
 	}
 
 	// Setup the HTTP client
-	httpClient, err := tlsHTTPClient(args.HTTPClient, args.TLSClientCert, args.TLSClientKey, args.TLSCA, args.TLSServerCert, args.InsecureSkipVerify, args.Proxy, args.TransportWrapper)
+	httpClient, err := tlsHTTPClient(args.HTTPClient, args.TLSClientCert, args.TLSClientKey, args.TLSCA, args.TLSServerCert, args.InsecureSkipVerify, args.Proxy, args.TransportWrapper, "")
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +294,7 @@ func ConnectSimpleStreams(url string, args *ConnectionArgs) (ImageServer, error)
 	// Setup the cache
 	if args.CachePath != "" {
 		if !shared.PathExists(args.CachePath) {
-			return nil, fmt.Errorf("Cache directory %q doesn't exist", args.CachePath)
+			return nil, fmt.Errorf("Cache directory %q does not exist", args.CachePath)
 		}
 
 		hashedURL := fmt.Sprintf("%x", sha256.Sum256([]byte(url)))
@@ -292,14 +305,119 @@ func ConnectSimpleStreams(url string, args *ConnectionArgs) (ImageServer, error)
 			cacheExpiry = time.Hour
 		}
 
-		if !shared.PathExists(cachePath) {
-			err := os.Mkdir(cachePath, 0755)
-			if err != nil {
-				return nil, err
-			}
+		err := os.Mkdir(cachePath, 0755)
+		if err != nil && !errors.Is(err, os.ErrExist) {
+			return nil, err
 		}
 
 		ssClient.SetCache(cachePath, cacheExpiry)
+	}
+
+	return &server, nil
+}
+
+// ConnectDevLXD lets you connect to a LXD agent over a local unix socket.
+func ConnectDevLXD(socketPath string, args *ConnectionArgs) (DevLXDServer, error) {
+	return ConnectDevLXDWithContext(context.Background(), socketPath, args)
+}
+
+// ConnectDevLXDWithContext lets you connect to a LXD agent over a local unix socket.
+func ConnectDevLXDWithContext(ctx context.Context, socketPath string, args *ConnectionArgs) (DevLXDServer, error) {
+	logger.Debug("Connecting to a devLXD over a Unix socket")
+
+	if args == nil {
+		args = &ConnectionArgs{}
+	}
+
+	socketPath = shared.HostPath(socketPath)
+
+	// Verify provided socket path.
+	socketInfo, err := os.Stat(socketPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if socketInfo.Mode()&os.ModeSocket == 0 {
+		return nil, fmt.Errorf("Invalid unix socket path %q: Not a socket", socketPath)
+	}
+
+	// Base LXD agent url.
+	baseURL, err := url.Parse("http://lxd")
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a new HTTP client.
+	client, err := unixHTTPClient(args, socketPath, args.TransportWrapper)
+	if err != nil {
+		return nil, err
+	}
+
+	useragent := "devlxd"
+	if args.UserAgent != "" {
+		useragent = args.UserAgent
+	}
+
+	ctxConnected, ctxConnectedCancel := context.WithCancel(context.Background())
+
+	return &ProtocolDevLXD{
+		ctx:                  ctx,
+		ctxConnected:         ctxConnected,
+		ctxConnectedCancel:   ctxConnectedCancel,
+		http:                 client,
+		httpBaseURL:          *baseURL,
+		httpUnixPath:         socketPath,
+		httpUserAgent:        useragent,
+		eventListenerManager: newEventListenerManager(ctx),
+		bearerToken:          args.BearerToken,
+	}, nil
+}
+
+// ConnectDevLXDHTTPWithContext lets you connect to devLXD over a VM socket.
+func ConnectDevLXDHTTPWithContext(ctx context.Context, args *ConnectionArgs, client *http.Client) (DevLXDServer, error) {
+	logger.Debug("Connecting to a devLXD over a VM socket")
+
+	// Use empty args if not specified.
+	if args == nil {
+		args = &ConnectionArgs{}
+	}
+
+	httpBaseURL, err := url.Parse("https://custom.socket")
+	if err != nil {
+		return nil, err
+	}
+
+	ctxConnected, ctxConnectedCancel := context.WithCancel(context.Background())
+
+	// Initialize the client.
+	server := ProtocolDevLXD{
+		ctx:                  ctx,
+		httpBaseURL:          *httpBaseURL,
+		httpUserAgent:        args.UserAgent,
+		ctxConnected:         ctxConnected,
+		ctxConnectedCancel:   ctxConnectedCancel,
+		eventListenerManager: newEventListenerManager(ctx),
+		bearerToken:          args.BearerToken,
+	}
+
+	// Setup the HTTP client.
+	if client != nil {
+		// If the http.Transport has a TLSClientConfig, it indicates that the
+		// connection is using vsock.
+		transport, ok := client.Transport.(*http.Transport)
+		if ok && transport != nil && transport.TLSClientConfig != nil {
+			server.isDevLXDOverVsock = true
+		}
+
+		server.http = client
+	}
+
+	// Test the connection.
+	if !args.SkipGetServer {
+		_, err := server.GetState()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &server, nil
@@ -321,23 +439,36 @@ func httpsLXD(ctx context.Context, requestURL string, args *ConnectionArgs) (Ins
 
 	// Initialize the client struct
 	server := ProtocolLXD{
-		ctx:                ctx,
-		httpCertificate:    args.TLSServerCert,
-		httpBaseURL:        *httpBaseURL,
-		httpProtocol:       "https",
-		httpUserAgent:      args.UserAgent,
-		ctxConnected:       ctxConnected,
-		ctxConnectedCancel: ctxConnectedCancel,
-		eventConns:         make(map[string]*websocket.Conn),
-		eventListeners:     make(map[string][]*EventListener),
+		ctx:                  ctx,
+		httpCertificate:      args.TLSServerCert,
+		httpBaseURL:          *httpBaseURL,
+		httpProtocol:         "https",
+		httpUserAgent:        args.UserAgent,
+		ctxConnected:         ctxConnected,
+		ctxConnectedCancel:   ctxConnectedCancel,
+		eventListenerManager: newEventListenerManager(ctx),
+		bearerToken:          args.BearerToken,
 	}
 
-	if shared.ValueInSlice(args.AuthType, []string{api.AuthenticationMethodOIDC}) {
+	if slices.Contains([]string{api.AuthenticationMethodOIDC}, args.AuthType) {
 		server.RequireAuthenticated(true)
 	}
 
+	var serverFingerprint string
+	if args.TLSServerCert == "" && args.BearerToken != "" {
+		// If server certificate is not provided and bearer token is used for authentication,
+		// try to extract the server certificate fingerprint from the token.
+		var claims ClientBearerTokenClaims
+		_, _, err := jwt.NewParser().ParseUnverified(args.BearerToken, &claims)
+		if err != nil {
+			return nil, fmt.Errorf("Failed parsing bearer token: %w", err)
+		}
+
+		serverFingerprint = claims.ServerFingerprint
+	}
+
 	// Setup the HTTP client
-	httpClient, err := tlsHTTPClient(args.HTTPClient, args.TLSClientCert, args.TLSClientKey, args.TLSCA, args.TLSServerCert, args.InsecureSkipVerify, args.Proxy, args.TransportWrapper)
+	httpClient, err := tlsHTTPClient(args.HTTPClient, args.TLSClientCert, args.TLSClientKey, args.TLSCA, args.TLSServerCert, args.InsecureSkipVerify, args.Proxy, args.TransportWrapper, serverFingerprint)
 	if err != nil {
 		return nil, err
 	}

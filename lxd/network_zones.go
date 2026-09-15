@@ -3,17 +3,16 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
-
-	"github.com/gorilla/mux"
 
 	"github.com/canonical/lxd/lxd/auth"
-	clusterRequest "github.com/canonical/lxd/lxd/cluster/request"
 	"github.com/canonical/lxd/lxd/db"
+	"github.com/canonical/lxd/lxd/db/operationtype"
 	"github.com/canonical/lxd/lxd/lifecycle"
 	"github.com/canonical/lxd/lxd/network/zone"
+	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/project"
 	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/response"
@@ -25,14 +24,18 @@ import (
 )
 
 var networkZonesCmd = APIEndpoint{
-	Path: "network-zones",
+	Path:            "network-zones",
+	MetricsType:     entity.TypeNetwork,
+	ProjectSpecific: true,
 
-	Get:  APIEndpointAction{Handler: networkZonesGet, AccessHandler: allowProjectResourceList},
-	Post: APIEndpointAction{Handler: networkZonesPost, AccessHandler: allowPermission(entity.TypeProject, auth.EntitlementCanCreateNetworkZones)},
+	Get:  APIEndpointAction{Handler: networkZonesGet, AccessHandler: allowAuthenticated, AllProjectsMode: allProjectsModeDisallowRestrictedTLSClients},
+	Post: APIEndpointAction{Handler: networkZonesPost, AccessHandler: networkZoneAccessHandler(auth.EntitlementCanCreateNetworkZones)},
 }
 
 var networkZoneCmd = APIEndpoint{
-	Path: "network-zones/{zone}",
+	Path:            "network-zones/{zone}",
+	MetricsType:     entity.TypeNetwork,
+	ProjectSpecific: true,
 
 	Delete: APIEndpointAction{Handler: networkZoneDelete, AccessHandler: networkZoneAccessHandler(auth.EntitlementCanDelete)},
 	Get:    APIEndpointAction{Handler: networkZoneGet, AccessHandler: networkZoneAccessHandler(auth.EntitlementCanView)},
@@ -50,45 +53,33 @@ type networkZoneDetails struct {
 	requestProject api.Project
 }
 
-// addNetworkZoneDetailsToRequestContext sets request.CtxEffectiveProjectName (string) and ctxNetworkZoneDetails (networkZoneDetails)
-// in the request context.
-func addNetworkZoneDetailsToRequestContext(s *state.State, r *http.Request) error {
-	zoneName, err := url.PathUnescape(mux.Vars(r)["zone"])
-	if err != nil {
-		return err
-	}
-
-	requestProjectName := request.ProjectParam(r)
-	effectiveProjectName, requestProject, err := project.NetworkZoneProject(s.DB.Cluster, requestProjectName)
-	if err != nil {
-		return fmt.Errorf("Failed to check project %q network feature: %w", requestProjectName, err)
-	}
-
-	request.SetCtxValue(r, request.CtxEffectiveProjectName, effectiveProjectName)
-	request.SetCtxValue(r, ctxNetworkZoneDetails, networkZoneDetails{
-		zoneName:       zoneName,
-		requestProject: *requestProject,
-	})
-
-	return nil
-}
-
-// profileAccessHandler calls addNetworkZoneDetailsToRequestContext, then uses the details to perform an access check with
+// networkZoneAccessHandler calls addNetworkZoneDetailsToRequestContext, then uses the details to perform an access check with
 // the given auth.Entitlement.
 func networkZoneAccessHandler(entitlement auth.Entitlement) func(d *Daemon, r *http.Request) response.Response {
 	return func(d *Daemon, r *http.Request) response.Response {
 		s := d.State()
-		err := addNetworkZoneDetailsToRequestContext(s, r)
+		requestProjectName := request.ProjectParam(r)
+		effectiveProjectName, requestProject, err := project.NetworkZoneProject(s.DB.Cluster, requestProjectName)
 		if err != nil {
-			return response.SmartError(err)
+			return response.SmartError(fmt.Errorf("Failed checking project %q network feature: %w", requestProjectName, err))
 		}
 
-		details, err := request.GetCtxValue[networkZoneDetails](r.Context(), ctxNetworkZoneDetails)
-		if err != nil {
-			return response.SmartError(err)
+		request.SetContextValue(r, request.CtxEffectiveProjectName, effectiveProjectName)
+
+		var u *api.URL
+		switch entitlement {
+		case auth.EntitlementCanCreateNetworkZones:
+			u = entity.ProjectURL(effectiveProjectName)
+		default:
+			zoneName := r.PathValue("zone")
+			u = entity.NetworkZoneURL(effectiveProjectName, zoneName)
+			request.SetContextValue(r, ctxNetworkZoneDetails, networkZoneDetails{
+				zoneName:       zoneName,
+				requestProject: *requestProject,
+			})
 		}
 
-		err = s.Authorizer.CheckPermission(r.Context(), entity.NetworkZoneURL(details.requestProject.Name, details.zoneName), entitlement)
+		err = s.Authorizer.CheckPermission(r.Context(), u, entitlement)
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -114,6 +105,11 @@ func networkZoneAccessHandler(entitlement auth.Entitlement) func(d *Daemon, r *h
 //      description: Project name
 //      type: string
 //      example: default
+//    - in: query
+//      name: all-projects
+//      description: Retrieve network zones from all projects
+//      type: boolean
+//      example: true
 //  responses:
 //    "200":
 //      description: API endpoints
@@ -163,6 +159,11 @@ func networkZoneAccessHandler(entitlement auth.Entitlement) func(d *Daemon, r *h
 //	    description: Project name
 //	    type: string
 //	    example: default
+//	  - in: query
+//	    name: all-projects
+//	    description: Retrieve network zones from all projects
+//	    type: boolean
+//	    example: true
 //	responses:
 //	  "200":
 //	    description: API endpoints
@@ -194,19 +195,46 @@ func networkZoneAccessHandler(entitlement auth.Entitlement) func(d *Daemon, r *h
 func networkZonesGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	requestProjectName := request.ProjectParam(r)
-	effectiveProjectName, _, err := project.NetworkZoneProject(s.DB.Cluster, requestProjectName)
+	requestProjectName, allProjects, err := request.ProjectParams(r)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	recursion := util.IsRecursionRequest(r)
+	var effectiveProjectName string
+	if !allProjects {
+		// Project specific requests require an effective project, when "features.networks.zones" is enabled this is the requested project, otherwise it is the default project.
+		effectiveProjectName, _, err = project.NetworkZoneProject(s.DB.Cluster, requestProjectName)
+		if err != nil {
+			return response.SmartError(err)
+		}
 
-	var zoneNames []string
+		// If the request is project specific, then set effective project name in the request context so that the authorizer can generate the correct URL.
+		request.SetContextValue(r, request.CtxEffectiveProjectName, effectiveProjectName)
+	}
 
+	recursion, _ := util.IsRecursionRequest(r)
+	withEntitlements, err := extractEntitlementsFromQuery(r, entity.TypeNetworkZone, true)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	var zoneNamesMap map[string]string
 	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
-		// Get list of Network zones.
-		zoneNames, err = tx.GetNetworkZonesByProject(ctx, effectiveProjectName)
+		if allProjects {
+			zoneNamesMap, err = tx.GetNetworkZones(ctx)
+		} else {
+			// Get list of Network zones.
+			zoneNames, err := tx.GetNetworkZonesByProject(ctx, effectiveProjectName)
+			if err != nil {
+				return err
+			}
+
+			// Network zones should be mapped to the requested project for project specific requests.
+			zoneNamesMap = make(map[string]string, len(zoneNames))
+			for _, zoneName := range zoneNames {
+				zoneNamesMap[zoneName] = effectiveProjectName
+			}
+		}
 
 		return err
 	})
@@ -214,37 +242,55 @@ func networkZonesGet(d *Daemon, r *http.Request) response.Response {
 		return response.InternalError(err)
 	}
 
-	request.SetCtxValue(r, request.CtxEffectiveProjectName, effectiveProjectName)
 	userHasPermission, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeNetworkZone)
 	if err != nil {
 		return response.InternalError(err)
 	}
 
 	resultString := []string{}
-	resultMap := []api.NetworkZone{}
-	for _, zoneName := range zoneNames {
-		if !userHasPermission(entity.NetworkZoneURL(requestProjectName, zoneName)) {
+	resultMap := []*api.NetworkZone{}
+	urlToNetworkZone := make(map[*api.URL]auth.EntitlementReporter)
+	for zoneName, projectName := range zoneNamesMap {
+		if !userHasPermission(entity.NetworkZoneURL(projectName, zoneName)) {
 			continue
 		}
 
-		if !recursion {
+		if recursion == 0 {
 			resultString = append(resultString, api.NewURL().Path(version.APIVersion, "network-zones", zoneName).String())
 		} else {
-			netzone, err := zone.LoadByNameAndProject(s, effectiveProjectName, zoneName)
+			var netzone zone.NetworkZone
+			if !allProjects {
+				netzone, err = zone.LoadByNameAndProject(r.Context(), s, effectiveProjectName, zoneName)
+			} else {
+				netzone, err = zone.LoadByNameAndProject(r.Context(), s, projectName, zoneName)
+			}
+
 			if err != nil {
-				continue
+				return response.SmartError(err)
 			}
 
 			netzoneInfo := netzone.Info()
-			netzoneInfo.UsedBy, _ = netzone.UsedBy() // Ignore errors in UsedBy, will return nil.
-			netzoneInfo.UsedBy = project.FilterUsedBy(s.Authorizer, r, netzoneInfo.UsedBy)
+			netzoneInfo.UsedBy, _ = netzone.UsedBy(r.Context()) // Ignore errors in UsedBy, will return nil.
+			netzoneInfo.UsedBy = project.FilterUsedBy(r.Context(), s.Authorizer, netzoneInfo.UsedBy)
+			netzoneInfo.Project = projectName
+			if !allProjects {
+				netzoneInfo.Project = requestProjectName
+			}
 
-			resultMap = append(resultMap, *netzoneInfo)
+			resultMap = append(resultMap, netzoneInfo)
+			urlToNetworkZone[entity.NetworkZoneURL(projectName, zoneName)] = netzoneInfo
 		}
 	}
 
-	if !recursion {
+	if recursion == 0 {
 		return response.SyncResponse(true, resultString)
+	}
+
+	if len(withEntitlements) > 0 {
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeNetworkZone, withEntitlements, urlToNetworkZone)
+		if err != nil {
+			return response.SmartError(err)
+		}
 	}
 
 	return response.SyncResponse(true, resultMap)
@@ -274,8 +320,8 @@ func networkZonesGet(d *Daemon, r *http.Request) response.Response {
 //	    schema:
 //	      $ref: "#/definitions/NetworkZonesPost"
 //	responses:
-//	  "200":
-//	    $ref: "#/responses/EmptySyncResponse"
+//	  "202":
+//	    $ref: "#/responses/Operation"
 //	  "400":
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
@@ -285,7 +331,7 @@ func networkZonesGet(d *Daemon, r *http.Request) response.Response {
 func networkZonesPost(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	projectName, _, err := project.NetworkZoneProject(s.DB.Cluster, request.ProjectParam(r))
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -298,26 +344,48 @@ func networkZonesPost(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
-	// Create the zone.
-	err = zone.Exists(s, req.Name)
+	// Check the zone doesn't already exist.
+	err = zone.Exists(r.Context(), s, req.Name)
 	if err == nil {
-		return response.BadRequest(fmt.Errorf("The network zone already exists"))
+		return response.BadRequest(errors.New("The network zone already exists"))
 	}
 
-	err = zone.Create(s, projectName, &req)
+	run := func(ctx context.Context, op *operations.Operation) error {
+		err = zone.Create(ctx, s, effectiveProjectName, &req)
+		if err != nil {
+			return err
+		}
+
+		netzone, err := zone.LoadByNameAndProject(ctx, s, effectiveProjectName, req.Name)
+		if err != nil {
+			return err
+		}
+
+		requestor := request.CreateRequestor(ctx)
+		lc := lifecycle.NetworkZoneCreated.Event(netzone, requestor, nil)
+		s.Events.SendLifecycle(effectiveProjectName, lc)
+
+		return nil
+	}
+
+	requestProjectName := request.ProjectParam(r)
+	args := operations.OperationArgs{
+		ProjectName: requestProjectName,
+		Type:        operationtype.NetworkZoneCreate,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     run,
+		EntityURL:   entity.ProjectURL(effectiveProjectName),
+		Metadata: map[string]any{
+			api.MetadataEntityURL: entity.NetworkZoneURL(requestProjectName, req.Name).String(),
+		},
+	}
+
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
-		return response.SmartError(err)
+		return response.InternalError(err)
 	}
 
-	netzone, err := zone.LoadByNameAndProject(s, projectName, req.Name)
-	if err != nil {
-		return response.BadRequest(err)
-	}
-
-	lc := lifecycle.NetworkZoneCreated.Event(netzone, request.CreateRequestor(r), nil)
-	s.Events.SendLifecycle(projectName, lc)
-
-	return response.SyncResponseLocation(true, nil, lc.Source)
+	return response.OperationResponse(op)
 }
 
 // swagger:operation DELETE /1.0/network-zones/{zone} network-zones network_zone_delete
@@ -336,40 +404,70 @@ func networkZonesPost(d *Daemon, r *http.Request) response.Response {
 //	    type: string
 //	    example: default
 //	responses:
-//	  "200":
-//	    $ref: "#/responses/EmptySyncResponse"
+//	  "202":
+//	    $ref: "#/responses/Operation"
 //	  "400":
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func networkZoneDelete(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	effectiveProjectName, err := request.GetCtxValue[string](r.Context(), request.CtxEffectiveProjectName)
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	details, err := request.GetCtxValue[networkZoneDetails](r.Context(), ctxNetworkZoneDetails)
+	details, err := request.GetContextValue[networkZoneDetails](r.Context(), ctxNetworkZoneDetails)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	netzone, err := zone.LoadByNameAndProject(s, effectiveProjectName, details.zoneName)
+	// Ensure network zone exists before creating new operation.
+	_, err = zone.LoadByNameAndProject(r.Context(), s, effectiveProjectName, details.zoneName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	err = netzone.Delete()
-	if err != nil {
-		return response.SmartError(err)
+	run := func(ctx context.Context, op *operations.Operation) error {
+		return doNetworkZoneDelete(ctx, s, details.zoneName, effectiveProjectName)
 	}
 
-	s.Events.SendLifecycle(effectiveProjectName, lifecycle.NetworkZoneDeleted.Event(netzone, request.CreateRequestor(r), nil))
+	args := operations.OperationArgs{
+		ProjectName: details.requestProject.Name,
+		Type:        operationtype.NetworkZoneDelete,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     run,
+		EntityURL:   entity.NetworkZoneURL(effectiveProjectName, details.zoneName),
+	}
 
-	return response.EmptySyncResponse
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
+	if err != nil {
+		return response.InternalError(err)
+	}
+
+	return response.OperationResponse(op)
+}
+
+// doNetworkZoneDelete deletes the named network zone in the given project.
+func doNetworkZoneDelete(ctx context.Context, s *state.State, zoneName string, projectName string) error {
+	netzone, err := zone.LoadByNameAndProject(ctx, s, projectName, zoneName)
+	if err != nil {
+		return err
+	}
+
+	err = netzone.Delete(ctx)
+	if err != nil {
+		return fmt.Errorf("Failed deleting network zone %q: %w", zoneName, err)
+	}
+
+	s.Events.SendLifecycle(projectName, lifecycle.NetworkZoneDeleted.Event(netzone, request.CreateRequestor(ctx), nil))
+
+	return nil
 }
 
 // swagger:operation GET /1.0/network-zones/{zone} network-zones network_zone_get
@@ -415,28 +513,40 @@ func networkZoneDelete(d *Daemon, r *http.Request) response.Response {
 func networkZoneGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	effectiveProjectName, err := request.GetCtxValue[string](r.Context(), request.CtxEffectiveProjectName)
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	details, err := request.GetCtxValue[networkZoneDetails](r.Context(), ctxNetworkZoneDetails)
+	details, err := request.GetContextValue[networkZoneDetails](r.Context(), ctxNetworkZoneDetails)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	netzone, err := zone.LoadByNameAndProject(s, effectiveProjectName, details.zoneName)
+	withEntitlements, err := extractEntitlementsFromQuery(r, entity.TypeNetworkZone, false)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	netzone, err := zone.LoadByNameAndProject(r.Context(), s, effectiveProjectName, details.zoneName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	info := netzone.Info()
-	info.UsedBy, err = netzone.UsedBy()
+	info.UsedBy, err = netzone.UsedBy(r.Context())
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	info.UsedBy = project.FilterUsedBy(s.Authorizer, r, info.UsedBy)
+	info.UsedBy = project.FilterUsedBy(r.Context(), s.Authorizer, info.UsedBy)
+
+	if len(withEntitlements) > 0 {
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeNetworkZone, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.NetworkZoneURL(effectiveProjectName, details.zoneName): info})
+		if err != nil {
+			return response.SmartError(err)
+		}
+	}
 
 	return response.SyncResponseETag(true, info, netzone.Etag())
 }
@@ -465,12 +575,14 @@ func networkZoneGet(d *Daemon, r *http.Request) response.Response {
 //      schema:
 //        $ref: "#/definitions/NetworkZonePut"
 //  responses:
-//    "200":
-//      $ref: "#/responses/EmptySyncResponse"
+//    "202":
+//      $ref: "#/responses/Operation"
 //    "400":
 //      $ref: "#/responses/BadRequest"
 //    "403":
 //      $ref: "#/responses/Forbidden"
+//    "404":
+//      $ref: "#/responses/NotFound"
 //    "412":
 //      $ref: "#/responses/PreconditionFailed"
 //    "500":
@@ -500,10 +612,12 @@ func networkZoneGet(d *Daemon, r *http.Request) response.Response {
 //	    schema:
 //	      $ref: "#/definitions/NetworkZonePut"
 //	responses:
-//	  "200":
-//	    $ref: "#/responses/EmptySyncResponse"
+//	  "202":
+//	    $ref: "#/responses/Operation"
 //	  "400":
 //	    $ref: "#/responses/BadRequest"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
 //	  "412":
@@ -513,18 +627,18 @@ func networkZoneGet(d *Daemon, r *http.Request) response.Response {
 func networkZonePut(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	effectiveProjectName, err := request.GetCtxValue[string](r.Context(), request.CtxEffectiveProjectName)
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	details, err := request.GetCtxValue[networkZoneDetails](r.Context(), ctxNetworkZoneDetails)
+	details, err := request.GetContextValue[networkZoneDetails](r.Context(), ctxNetworkZoneDetails)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	// Get the existing Network zone.
-	netzone, err := zone.LoadByNameAndProject(s, effectiveProjectName, details.zoneName)
+	netzone, err := zone.LoadByNameAndProject(r.Context(), s, effectiveProjectName, details.zoneName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -554,14 +668,50 @@ func networkZonePut(d *Daemon, r *http.Request) response.Response {
 		}
 	}
 
-	clientType := clusterRequest.UserAgentClientType(r.Header.Get("User-Agent"))
-
-	err = netzone.Update(&req, clientType)
+	requestor, err := request.GetRequestor(r.Context())
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	s.Events.SendLifecycle(effectiveProjectName, lifecycle.NetworkZoneUpdated.Event(netzone, request.CreateRequestor(r), nil))
+	clientType := requestor.ClientType()
+	entityURL := entity.NetworkZoneURL(effectiveProjectName, details.zoneName)
 
-	return response.EmptySyncResponse
+	run := func(ctx context.Context, op *operations.Operation) error {
+		err = netzone.Update(&req, clientType)
+		if err != nil {
+			return err
+		}
+
+		if !clientType.IsClusterOperationNotification() {
+			requestor := request.CreateRequestor(ctx)
+			s.Events.SendLifecycle(effectiveProjectName, lifecycle.NetworkZoneUpdated.Event(netzone, requestor, nil))
+		}
+
+		return nil
+	}
+
+	if clientType.IsClusterOperationNotification() {
+		// Handle cluster operation notification synchronously.
+		err := run(r.Context(), nil)
+		if err != nil {
+			return response.SmartError(err)
+		}
+
+		return response.EmptySyncResponse
+	}
+
+	args := operations.OperationArgs{
+		ProjectName: details.requestProject.Name,
+		Type:        operationtype.NetworkZoneUpdate,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     run,
+		EntityURL:   entityURL,
+	}
+
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
+	if err != nil {
+		return response.InternalError(err)
+	}
+
+	return response.OperationResponse(op)
 }

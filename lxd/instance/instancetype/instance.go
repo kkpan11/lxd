@@ -28,6 +28,22 @@ const (
 // ConfigVolatilePrefix indicates the prefix used for volatile config keys.
 const ConfigVolatilePrefix = "volatile."
 
+// TargetClusterGroupPrefix indicates the prefix used for target cluster group names.
+const TargetClusterGroupPrefix = "@"
+
+// Boot mode configuration values.
+const (
+	BootModeUEFISecureBoot   = "uefi-secureboot"
+	BootModeUEFINoSecureBoot = "uefi-nosecureboot"
+	BootModeBIOS             = "bios"
+)
+
+// ConfigKeyPrefixesAny indicates valid prefixes for configuration options.
+var ConfigKeyPrefixesAny = []string{"environment.", "user.", "image.", "cloud-init.ssh-keys."}
+
+// ConfigKeyPrefixesContainer indicates valid prefixes for container configuration options.
+var ConfigKeyPrefixesContainer = []string{"linux.sysctl.", "limits.kernel."}
+
 // ValidName validates an instance name. There are different validation rules for instance snapshot names
 // so it takes an argument indicating whether the name is to be used for a snapshot or not.
 func ValidName(instanceName string, isSnapshot bool) error {
@@ -38,19 +54,11 @@ func ValidName(instanceName string, isSnapshot bool) error {
 			return fmt.Errorf("Invalid instance name %q: %w", parentName, err)
 		}
 
-		// Snapshot part is more flexible, but doesn't allow "..", space or / characters.
-		if snapshotName == ".." {
-			return fmt.Errorf("Invalid instance snapshot name %q", snapshotName)
-		}
-
-		if strings.ContainsAny(snapshotName, " /") {
-			return fmt.Errorf("Invalid instance snapshot name %q: Cannot contain spaces or slashes", snapshotName)
+		err = ValidSnapName(snapshotName)
+		if err != nil {
+			return fmt.Errorf("Invalid instance snapshot name %q: %w", snapshotName, err)
 		}
 	} else {
-		if strings.Contains(instanceName, shared.SnapshotDelimiter) {
-			return fmt.Errorf("Invalid instance name %q: Cannot contain slashes", instanceName)
-		}
-
 		err := validate.IsHostname(instanceName)
 		if err != nil {
 			return fmt.Errorf("Invalid instance name %q: %w", instanceName, err)
@@ -60,45 +68,21 @@ func ValidName(instanceName string, isSnapshot bool) error {
 	return nil
 }
 
-// IsRootDiskDevice returns true if the given device representation is configured as root disk for
-// an instance. It typically get passed a specific entry of api.Instance.Devices.
-func IsRootDiskDevice(device map[string]string) bool {
-	// Root disk devices also need a non-empty "pool" property, but we can't check that here
-	// because this function is used with clients talking to older servers where there was no
-	// concept of a storage pool, and also it is used for migrating from old to new servers.
-	// The validation of the non-empty "pool" property is done inside the disk device itself.
-	if device["type"] == "disk" && device["path"] == "/" && device["source"] == "" {
-		return true
+// ValidSnapName validates a snnapshot instance name which must not include the instance prefix.
+func ValidSnapName(snapshotName string) error {
+	if snapshotName == "" {
+		return errors.New("Invalid instance snapshot name, cannot be empty")
 	}
 
-	return false
-}
-
-// ErrNoRootDisk means there is no root disk device found.
-var ErrNoRootDisk = fmt.Errorf("No root device could be found")
-
-// GetRootDiskDevice returns the instance device that is configured as root disk.
-// Returns the device name and device config map.
-func GetRootDiskDevice(devices map[string]map[string]string) (string, map[string]string, error) {
-	var devName string
-	var dev map[string]string
-
-	for n, d := range devices {
-		if IsRootDiskDevice(d) {
-			if devName != "" {
-				return "", nil, fmt.Errorf("More than one root device found")
-			}
-
-			devName = n
-			dev = d
-		}
+	if snapshotName == ".." {
+		return fmt.Errorf("Invalid instance snapshot name %q", snapshotName)
 	}
 
-	if devName != "" {
-		return devName, dev, nil
+	if strings.ContainsAny(snapshotName, "* /\\") {
+		return fmt.Errorf("Invalid instance snapshot name %q: Cannot contain *, spaces, forward or back slashes", snapshotName)
 	}
 
-	return "", nil, ErrNoRootDisk
+	return nil
 }
 
 // HugePageSizeKeys is a list of known hugepage size configuration keys.
@@ -110,7 +94,9 @@ var HugePageSizeSuffix = [...]string{"64KB", "1MB", "2MB", "1GB"}
 // InstanceConfigKeysAny is a map of config key to validator. (keys applying to containers AND virtual machines).
 var InstanceConfigKeysAny = map[string]func(value string) error{
 	// lxdmeta:generate(entities=instance; group=boot; key=boot.autostart)
-	// If set to `false`, restore the last state.
+	// If set to `true`, the instance will always be auto-started, unless `security.protection.start` is also enabled.
+	// If set to `false`, the instance will not be started on LXD start up.
+	// If this option is not set, the instance will be restored to its last known state.
 	// ---
 	//  type: bool
 	//  liveupdate: no
@@ -121,7 +107,7 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 	// The number of seconds to wait after the instance started before starting the next one.
 	// ---
 	//  type: integer
-	//  defaultdesc: "0"
+	//  defaultdesc: `0`
 	//  liveupdate: no
 	//  shortdesc: Delay after starting the instance
 	"boot.autostart.delay": validate.Optional(validate.IsInt64),
@@ -130,7 +116,7 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 	// The instance with the highest value is started first.
 	// ---
 	//  type: integer
-	//  defaultdesc: "0"
+	//  defaultdesc: `0`
 	//  liveupdate: no
 	//  shortdesc: What order to start the instances in
 	"boot.autostart.priority": validate.Optional(validate.IsInt64),
@@ -139,7 +125,7 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 	// The instance with the highest value is shut down first.
 	// ---
 	//  type: integer
-	//  defaultdesc: "0"
+	//  defaultdesc: `0`
 	//  liveupdate: no
 	//  shortdesc: What order to shut down the instances in
 	"boot.stop.priority": validate.Optional(validate.IsInt64),
@@ -148,7 +134,7 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 	// Number of seconds to wait for the instance to shut down before it is force-stopped.
 	// ---
 	//  type: integer
-	//  defaultdesc: "30"
+	//  defaultdesc: `30`
 	//  liveupdate: yes
 	//  shortdesc: How long to wait for the instance to shut down
 	"boot.host_shutdown_timeout": validate.Optional(validate.IsInt64),
@@ -211,20 +197,17 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 	//  shortdesc: Legacy version of `cloud-init.vendor-data`
 
 	// lxdmeta:generate(entities=instance; group=miscellaneous; key=cluster.evacuate)
-	// The `cluster.evacuate` provides control over how instances are handled when a cluster member is being
-	// evacuated.
+	// The `cluster.evacuate` provides control over how instances are handled when a cluster member is being evacuated.
 	//
 	// Available Modes:
-	//   - `auto` *(default)*: The system will automatically decide the best evacuation method based on the
-	//      instance's type and configured devices:
+	//   - `auto` *(default)*: The system will automatically decide the best evacuation method based on the instance's type and configured devices:
 	//     + If any device is not suitable for migration, the instance will not be migrated (only stopped).
-	//     + Live migration will be used only for virtual machines with the `migration.stateful` setting
-	//       enabled and for which all its devices can be migrated as well.
-	//   - `live-migrate`: Instances are live-migrated to another node. This means the instance remains running
-	//      and operational during the migration process, ensuring minimal disruption.
-	//   - `migrate`: In this mode, instances are migrated to another node in the cluster. The migration
-	//      process will not be live, meaning there will be a brief downtime for the instance during the
-	//      migration.
+	//     + Live migration will be used only for virtual machines with the `migration.stateful` setting enabled and for which all its devices can be migrated as well.
+	//   - `live-migrate`: Eligible instances are live-migrated to another node. This means the instance remains running and operational during the migration process, ensuring minimal disruption.
+	//     Note: Live migration is supported for virtual machines only.
+	//     If no target member is available, an instance is skipped.
+	//     If a live migration attempt fails, the evacuation operation fails.
+	//   - `migrate`: In this mode, instances are migrated to another node in the cluster. The migration process will not be live, meaning there will be a brief downtime for the instance during the migration.
 	//   -  `stop`: Instances are not migrated. Instead, they are stopped on the current node.
 	//
 	// See {ref}`cluster-evacuate` for more information.
@@ -233,7 +216,7 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 	//  defaultdesc: `auto`
 	//  liveupdate: no
 	//  shortdesc: What to do when evacuating the instance
-	"cluster.evacuate": validate.Optional(validate.IsOneOf("auto", "migrate", "live-migrate", "stop")),
+	"cluster.evacuate": validate.Optional(validate.IsOneOf(api.ClusterEvacuateModeAuto, api.ClusterEvacuateModeMigrate, api.ClusterEvacuateModeLiveMigrate, api.ClusterEvacuateModeStop)),
 
 	// lxdmeta:generate(entities=instance; group=resource-limits; key=limits.cpu)
 	// A number or a specific range of CPUs to expose to the instance.
@@ -282,14 +265,15 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 			return nil
 		}
 
-		if strings.HasSuffix(value, "%") {
-			num, err := strconv.ParseInt(strings.TrimSuffix(value, "%"), 10, 64)
+		before, ok := strings.CutSuffix(value, "%")
+		if ok {
+			num, err := strconv.ParseInt(before, 10, 64)
 			if err != nil {
 				return err
 			}
 
 			if num == 0 {
-				return errors.New("Memory limit can't be 0%")
+				return errors.New("Memory limit cannot be 0%")
 			}
 
 			return nil
@@ -300,17 +284,28 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 			return err
 		}
 
-		if num == 0 {
-			return fmt.Errorf("Memory limit can't be 0")
+		if num < 1024*1024 {
+			return errors.New("Memory limit is too low (minimum 1MiB)")
 		}
 
 		return nil
 	},
 
+	// lxdmeta:generate(entities=instance; group=placement; key=placement.group)
+	// Specifies the placement group that determines where this instance is scheduled within the cluster.
+	// The placement group defines the placement policy (e.g. spread or compact) and rigor (e.g. strict or permissive)
+	// used to determine eligible cluster members during LXD scheduling events.
+	// ---
+	// type: string
+	// liveupdate: yes
+	// shortdesc: Placement group controlling instance scheduling
+	"placement.group": validate.IsDeviceName,
+
 	// Caller is responsible for full validation of any raw.* value.
 
 	// lxdmeta:generate(entities=instance; group=raw; key=raw.apparmor)
 	// The specified entries are appended to the generated profile.
+	// This is a low-level option and is not recommended for production use, as it allows for unsupported configurations that may cease to work in future versions.
 	// ---
 	//  type: blob
 	//  liveupdate: yes
@@ -322,7 +317,6 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 	// ---
 	//  type: blob
 	//  liveupdate: no
-	//  condition: unprivileged container
 	//  shortdesc: Raw idmap configuration
 	"raw.idmap": validate.IsAny,
 
@@ -340,16 +334,25 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 	// ---
 	//  type: bool
 	//  defaultdesc: `false`
-	//  liveupdate: no
+	//  liveupdate: yes
 	//  shortdesc: Controls the availability of the `/1.0/images` API over `devlxd`
 	"security.devlxd.images": validate.Optional(validate.IsBool),
+
+	// lxdmeta:generate(entities=instance; group=security; key=security.devlxd.management.volumes)
+	//
+	// ---
+	//  type: bool
+	//  defaultdesc: `false`
+	//  liveupdate: yes
+	//  shortdesc: Controls the availability of the volume management API over `devlxd`
+	"security.devlxd.management.volumes": validate.Optional(validate.IsBool),
 
 	// lxdmeta:generate(entities=instance; group=security; key=security.protection.delete)
 	//
 	// ---
 	//  type: bool
 	//  defaultdesc: `false`
-	//  liveupdate: yes
+	//  liveupdate: container
 	//  shortdesc: Whether to prevent the instance from being deleted
 	"security.protection.delete": validate.Optional(validate.IsBool),
 
@@ -358,7 +361,7 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 	// ---
 	//  type: bool
 	//  defaultdesc: `false`
-	//  liveupdate: yes
+	//  liveupdate: container
 	//  shortdesc: Whether to prevent the instance from being started
 	"security.protection.start": validate.Optional(validate.IsBool),
 
@@ -398,7 +401,7 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 	// ---
 	//  type: string
 	//  liveupdate: no
-	//  shortdesc: When snapshots are to be deleted
+	//  shortdesc: Time until snapshots are deleted
 	"snapshots.expiry": func(value string) error {
 		// Validate expression
 		_, err := shared.GetExpiry(time.Time{}, value)
@@ -407,12 +410,8 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 
 	// lxdmeta:generate(entities=instance; group=miscellaneous; key=ubuntu_pro.guest_attach)
 	// Indicate whether the guest should auto-attach Ubuntu Pro at start up.
-	// The allowed values are `off`, `on`, and `available`.
-	// If set to `off`, it will not be possible for the Ubuntu Pro client in the guest to obtain guest token via `devlxd`.
-	// If set to `available`, attachment via guest token is possible but will not be performed automatically by the Ubuntu Pro client in the guest at startup.
-	// If set to `on`, attachment will be performed automatically by the Ubuntu Pro client in the guest at startup.
-	// To allow guest attachment, the host must be an Ubuntu machine that is Pro attached, and guest attachment must be enabled via the Pro client.
-	// To do this, run `pro config set lxd_guest_attach=on`.
+	//
+	// See {ref}`instances-ubuntu-pro-attach` for more information.
 	// ---
 	// type: string
 	// liveupdate: no
@@ -427,6 +426,16 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 	//  type: string
 	//  shortdesc: Template hook
 	"volatile.apply_template": validate.IsAny,
+
+	// lxdmeta:generate(entities=instance; group=volatile; key=volatile.attached_volumes)
+	// JSON-serialized map of attached volume device names to the UUIDs of their corresponding
+	// snapshots, created as part of a multi-volume snapshot.
+	//
+	// ---
+	//   type: string
+	//   shortdesc: JSON-serialized map of attached volume device names to the UUIDs of their corresponding snapshots.
+	//   condition: snapshot
+	"volatile.attached_volumes": validate.IsAny,
 
 	// lxdmeta:generate(entities=instance; group=volatile; key=volatile.base_image)
 	// The hash of the image that the instance was created from (empty if the instance was not created from an image).
@@ -448,6 +457,13 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 	//  type: string
 	//  shortdesc: The origin of the evacuated instance
 	"volatile.evacuate.origin": validate.IsAny,
+
+	// lxdmeta:generate(entities=instance; group=volatile; key=volatile.cluster.group)
+	// The target cluster group at instance creation or migration time. This is used during scheduling events such as evacuation to ensure the instance is placed correctly.
+	// ---
+	// type: string
+	// shortdesc: The target cluster group
+	"volatile.cluster.group": validate.Optional(validate.IsClusterGroupName),
 
 	// lxdmeta:generate(entities=instance; group=volatile; key=volatile.last_state.power)
 	//
@@ -491,9 +507,10 @@ var InstanceConfigKeysContainer = map[string]func(value string) error{
 			return nil
 		}
 
-		if strings.HasSuffix(value, "%") {
+		before, ok := strings.CutSuffix(value, "%")
+		if ok {
 			// Percentage based allocation
-			_, err := strconv.Atoi(strings.TrimSuffix(value, "%"))
+			_, err := strconv.Atoi(before)
 			if err != nil {
 				return err
 			}
@@ -674,48 +691,11 @@ var InstanceConfigKeysContainer = map[string]func(value string) error{
 	//  shortdesc: Percentage of memory to have in sync before stopping the instance
 	"migration.incremental.memory.goal": validate.Optional(validate.IsUint32),
 
-	// lxdmeta:generate(entities=instance; group=nvidia; key=nvidia.runtime)
-	//
-	// ---
-	//  type: bool
-	//  defaultdesc: `false`
-	//  liveupdate: no
-	//  condition: container
-	//  shortdesc: Whether to pass the host NVIDIA and CUDA runtime libraries into the instance
-	"nvidia.runtime": validate.Optional(validate.IsBool),
-
-	// lxdmeta:generate(entities=instance; group=nvidia; key=nvidia.driver.capabilities)
-	// The specified driver capabilities are used to set `libnvidia-container NVIDIA_DRIVER_CAPABILITIES`.
-	// ---
-	//  type: string
-	//  defaultdesc: `compute,utility`
-	//  liveupdate: no
-	//  condition: container
-	//  shortdesc: What driver capabilities the instance needs
-	"nvidia.driver.capabilities": validate.IsAny,
-
-	// lxdmeta:generate(entities=instance; group=nvidia; key=nvidia.require.cuda)
-	// The specified version expression is used to set `libnvidia-container NVIDIA_REQUIRE_CUDA`.
-	// ---
-	//  type: string
-	//  liveupdate: no
-	//  condition: container
-	//  shortdesc: Required CUDA version
-	"nvidia.require.cuda": validate.IsAny,
-
-	// lxdmeta:generate(entities=instance; group=nvidia; key=nvidia.require.driver)
-	// The specified version expression is used to set `libnvidia-container NVIDIA_REQUIRE_DRIVER`.
-	// ---
-	//  type: string
-	//  liveupdate: no
-	//  condition: container
-	//  shortdesc: Required driver version
-	"nvidia.require.driver": validate.IsAny,
-
 	// Caller is responsible for full validation of any raw.* value.
 
 	// lxdmeta:generate(entities=instance; group=raw; key=raw.lxc)
-	//
+	// Additional LXC configuration is appended to the generated configuration.
+	// This is a low-level option and is not recommended for production use, as it allows for unsupported configurations that may cease to work in future versions.
 	// ---
 	//  type: blob
 	//  liveupdate: no
@@ -724,7 +704,8 @@ var InstanceConfigKeysContainer = map[string]func(value string) error{
 	"raw.lxc": validate.IsAny,
 
 	// lxdmeta:generate(entities=instance; group=raw; key=raw.seccomp)
-	//
+	// Additional Seccomp configuration is appended to the generated policy.
+	// This is a low-level option and is not recommended for production use, as it allows for unsupported configurations that may cease to work in future versions.
 	// ---
 	//  type: blob
 	//  liveupdate: no
@@ -929,32 +910,106 @@ var InstanceConfigKeysContainer = map[string]func(value string) error{
 	//  shortdesc: Whether to handle the `sysinfo` system call
 	"security.syscalls.intercept.sysinfo": validate.Optional(validate.IsBool),
 
-	// lxdmeta:generate(entities=instance; group=volatile; key=volatile.last_state.idmap)
+	// lxdmeta:generate(entities=instance; group=security; key=security.delegate_bpf)
+	// This option enables BPF functionality delegation mechanism (using BPF Token).
+	//
+	// Note: `security.delegate_bpf.cmd_types`, `security.delegate_bpf.map_types`,
+	// `security.delegate_bpf.prog_types`, `security.delegate_bpf.attach_types`
+	// need to be configured depending on BPF workload in the container.
+	//
+	// See {ref}`bpf-delegation-token` for more information.
 	//
 	// ---
+	//  type: bool
+	//  defaultdesc: `false`
+	//  liveupdate: no
+	//  condition: unprivileged container
+	//  shortdesc: Whether to enable eBPF delegation using BPF Token mechanism
+	"security.delegate_bpf": validate.Optional(validate.IsBool),
+
+	// lxdmeta:generate(entities=instance; group=security; key=security.delegate_bpf.cmd_types)
+	// Which eBPF commands to allow with delegation mechanism. Syntax follows a kernel one for `delegate_cmds`
+	// bpffs mount option. A number (bitmask) or `:`-separated list of commands to allow can be specified.
+	// For example, `prog_load:map_create` allows eBPF programs loading and eBPF maps creation.
+	// Notice: `security.delegate_bpf.prog_types` and `security.delegate_bpf.map_types` still need to
+	// be configured accordingly.
+	// ---
+	//  type: bool
+	//  defaultdesc: `false`
+	//  liveupdate: no
+	//  condition: unprivileged container
+	//  shortdesc: Which eBPF commands to allow with delegation mechanism
+	"security.delegate_bpf.cmd_types": validate.Optional(validate.IsBPFDelegationOption("cmds")),
+
+	// lxdmeta:generate(entities=instance; group=security; key=security.delegate_bpf.map_types)
+	// Which eBPF maps to allow with delegation mechanism. Syntax follows a kernel one for `delegate_maps`
+	// bpffs mount option. A number (bitmask) or `:`-separated list of map types to allow can be specified.
+	// For example, `ringbuf` allows `BPF_MAP_TYPE_RINGBUF` map.
+	// ---
+	//  type: bool
+	//  defaultdesc: `false`
+	//  liveupdate: no
+	//  condition: unprivileged container
+	//  shortdesc: Which eBPF maps to allow with delegation mechanism
+	"security.delegate_bpf.map_types": validate.Optional(validate.IsBPFDelegationOption("maps")),
+
+	// lxdmeta:generate(entities=instance; group=security; key=security.delegate_bpf.prog_types)
+	// Which eBPF program types to allow with delegation mechanism. Syntax follows a kernel one for `delegate_progs`
+	// bpffs mount option. A number (bitmask) or `:`-separated list of program types to allow can be specified.
+	// For example, `socket_filter` allows `BPF_PROG_TYPE_SOCKET_FILTER` program type.
+	// ---
+	//  type: bool
+	//  defaultdesc: `false`
+	//  liveupdate: no
+	//  condition: unprivileged container
+	//  shortdesc: Which eBPF program types to allow with delegation mechanism
+	"security.delegate_bpf.prog_types": validate.Optional(validate.IsBPFDelegationOption("progs")),
+
+	// lxdmeta:generate(entities=instance; group=security; key=security.delegate_bpf.attach_types)
+	// Which eBPF program attachment types to allow with delegation mechanism. Syntax follows
+	// a kernel one for `delegate_attachs` bpffs mount option.
+	// A number (bitmask) or `:`-separated list of attachment types to allow can be specified.
+	// For example, `cgroup_inet_ingress` allows `BPF_CGROUP_INET_INGRESS` attachment type.
+	// ---
+	//  type: bool
+	//  defaultdesc: `false`
+	//  liveupdate: no
+	//  condition: unprivileged container
+	//  shortdesc: Which eBPF attach types to allow with delegation mechanism
+	"security.delegate_bpf.attach_types": validate.Optional(validate.IsBPFDelegationOption("attachs")),
+
+	// lxdmeta:generate(entities=instance; group=volatile; key=volatile.last_state.idmap)
+	// The UID/GID map that has been applied to the container's underlying storage.
+	// This is usually set for containers created on older kernels that don't
+	// support idmapped mounts.
+	// ---
 	//  type: string
-	//  shortdesc: Serialized instance UID/GID map
+	//  condition: container
+	//  shortdesc: On-disk UID/GID map for the container's rootfs
 	"volatile.last_state.idmap": validate.IsAny,
 
 	// lxdmeta:generate(entities=instance; group=volatile; key=volatile.idmap.base)
 	//
 	// ---
 	//  type: integer
-	//  shortdesc: The first ID in the instance's primary idmap range
+	//  condition: container
+	//  shortdesc: The first ID in the container's primary idmap range
 	"volatile.idmap.base": validate.IsAny,
 
 	// lxdmeta:generate(entities=instance; group=volatile; key=volatile.idmap.current)
 	//
 	// ---
 	//  type: string
-	//  shortdesc: The idmap currently in use by the instance
+	//  condition: container
+	//  shortdesc: The idmap currently in use by the container
 	"volatile.idmap.current": validate.IsAny,
 
 	// lxdmeta:generate(entities=instance; group=volatile; key=volatile.idmap.next)
 	//
 	// ---
 	//  type: string
-	//  shortdesc: The idmap to use the next time the instance starts
+	//  condition: container
+	//  shortdesc: The idmap to use the next time the container starts
 	"volatile.idmap.next": validate.IsAny,
 }
 
@@ -970,6 +1025,29 @@ var InstanceConfigKeysVM = map[string]func(value string) error{
 	//  shortdesc: Whether to back the instance using huge pages
 	"limits.memory.hugepages": validate.Optional(validate.IsBool),
 
+	// lxdmeta:generate(entities=instance; group=resource-limits; key=limits.cpu.pin_strategy)
+	// Specify the strategy for VM CPU auto pinning.
+	// Possible values: `none` (disables CPU auto pinning) and `auto` (enables CPU auto pinning).
+	//
+	// See {ref}`instance-options-limits-cpu-vm` for more information.
+	// ---
+	//  type: string
+	//  defaultdesc: `none`
+	//  liveupdate: no
+	//	condition: virtual machine
+	//  shortdesc: VM CPU auto pinning strategy
+	"limits.cpu.pin_strategy": validate.Optional(validate.IsOneOf("none", "auto")),
+
+	// lxdmeta:generate(entities=instance; group=resource-limits; key=limits.max_bus_ports)
+	// Total number of user configurable PCI/PCIe devices that can be attached to the VM.
+	// ---
+	//  type: integer
+	//  defaultdesc: `8`
+	//  liveupdate: no
+	//  condition: virtual machine
+	//  shortdesc: Limit of allowed PCI/PCIe devices
+	"limits.max_bus_ports": validate.Optional(validate.IsUint8),
+
 	// lxdmeta:generate(entities=instance; group=migration; key=migration.stateful)
 	// Enabling this option prevents the use of some features that are incompatible with it.
 	// ---
@@ -983,7 +1061,8 @@ var InstanceConfigKeysVM = map[string]func(value string) error{
 	// Caller is responsible for full validation of any raw.* value.
 
 	// lxdmeta:generate(entities=instance; group=raw; key=raw.qemu)
-	//
+	// Additional QEMU command line configuration is appended to the generated command line.
+	// This is a low-level option and is not recommended for production use, as it allows for unsupported configurations that may cease to work in future versions.
 	// ---
 	//  type: blob
 	//  liveupdate: no
@@ -992,6 +1071,7 @@ var InstanceConfigKeysVM = map[string]func(value string) error{
 	"raw.qemu": validate.IsAny,
 
 	// lxdmeta:generate(entities=instance; group=raw; key=raw.qemu.conf)
+	// This is a low-level option and is not recommended for production use, as it allows for unsupported configurations that may cease to work in future versions.
 	// See {ref}`instance-options-qemu` for more information.
 	// ---
 	//  type: blob
@@ -1010,25 +1090,17 @@ var InstanceConfigKeysVM = map[string]func(value string) error{
 	//  shortdesc: Whether the `lxd-agent` is queried for state information and metrics
 	"security.agent.metrics": validate.Optional(validate.IsBool),
 
-	// lxdmeta:generate(entities=instance; group=security; key=security.csm)
-	// When enabling this option, set {config:option}`instance-security:security.secureboot` to `false`.
+	// lxdmeta:generate(entities=instance; group=boot; key=boot.mode)
+	// The `uefi-secureboot` mode uses UEFI firmware with secure boot enabled.
+	// The `uefi-nosecureboot` mode uses UEFI firmware with secure boot disabled.
+	// The `bios` mode is supported only on `x86_64` (`amd64`).
 	// ---
-	//  type: bool
-	//  defaultdesc: `false`
+	//  type: string
+	//  defaultdesc: `uefi-secureboot`
 	//  liveupdate: no
 	//  condition: virtual machine
-	//  shortdesc: Whether to use a firmware that supports UEFI-incompatible operating systems
-	"security.csm": validate.Optional(validate.IsBool),
-
-	// lxdmeta:generate(entities=instance; group=security; key=security.secureboot)
-	// When disabling this option, consider enabling {config:option}`instance-security:security.csm`.
-	// ---
-	//  type: bool
-	//  defaultdesc: `true`
-	//  liveupdate: no
-	//  condition: virtual machine
-	//  shortdesc: Whether UEFI secure boot is enabled with the default Microsoft keys
-	"security.secureboot": validate.Optional(validate.IsBool),
+	//  shortdesc: Boot firmware mode for the VM (uefi-secureboot, uefi-nosecureboot or bios)
+	"boot.mode": validate.Optional(validate.IsOneOf(BootModeUEFISecureBoot, BootModeUEFINoSecureBoot, BootModeBIOS)),
 
 	// lxdmeta:generate(entities=instance; group=security; key=security.sev)
 	//
@@ -1058,7 +1130,7 @@ var InstanceConfigKeysVM = map[string]func(value string) error{
 	//  liveupdate: no
 	//  condition: virtual machine
 	//  shortdesc: The guest owner's `base64`-encoded Diffie-Hellman key
-	"security.sev.session.dh": validate.Optional(validate.IsAny),
+	"security.sev.session.dh": validate.IsAny,
 
 	// lxdmeta:generate(entities=instance; group=security; key=security.sev.session.data)
 	//
@@ -1068,7 +1140,7 @@ var InstanceConfigKeysVM = map[string]func(value string) error{
 	//  liveupdate: no
 	//  condition: virtual machine
 	//  shortdesc: The guest owner's `base64`-encoded session blob
-	"security.sev.session.data": validate.Optional(validate.IsAny),
+	"security.sev.session.data": validate.IsAny,
 
 	// lxdmeta:generate(entities=instance; group=miscellaneous; key=user.*)
 	// User keys can be used in search.
@@ -1078,8 +1150,7 @@ var InstanceConfigKeysVM = map[string]func(value string) error{
 	//  shortdesc: Free-form user key/value storage
 
 	// lxdmeta:generate(entities=instance; group=miscellaneous; key=agent.nic_config)
-	// For containers, the name and MTU of the default network interfaces is used for the instance devices.
-	// For virtual machines, set this option to `true` to set the name and MTU of the default network interfaces to be the same as the instance devices.
+	// When set to true, the name and MTU of the default network interfaces inside the virtual machine will match those of the instance devices.
 	// ---
 	//  type: bool
 	//  defaultdesc: `false`
@@ -1094,6 +1165,13 @@ var InstanceConfigKeysVM = map[string]func(value string) error{
 	//  type: bool
 	//  shortdesc: Whether to regenerate VM NVRAM the next time the instance starts
 	"volatile.apply_nvram": validate.Optional(validate.IsBool),
+
+	// lxdmeta:generate(entities=instance; group=volatile; key=volatile.bus.mode)
+	// Set to `persistent` when persistent bus allocation mode is enabled.
+	// ---
+	//  type: string
+	//  shortdesc: Device bus allocation mode
+	"volatile.bus.mode": validate.Optional(validate.IsOneOf("persistent")),
 
 	// lxdmeta:generate(entities=instance; group=volatile; key=volatile.vsock_id)
 	//
@@ -1137,6 +1215,21 @@ func ConfigKeyChecker(key string, instanceType Type) (func(value string) error, 
 		}
 	}
 
+	// lxdmeta:generate(entities=instance; group=cloud-init; key=cloud-init.ssh-keys.KEYNAME)
+	// Represents an additional SSH public key to be merged into existing `cloud-init` seed data
+	// and injected into an instance. Has the format `{user}:{key}`, where {user} is a Linux username and
+	// {key} can be either a pure SSH public key or an import ID for a key hosted elsewhere.
+	// // For example: `root:gh:githubUser`, `myUser:ssh-keyAlg publicKeyHash`
+	// ---
+	//  type: string
+	//  liveupdate: no
+	//  condition: If supported by image
+	//  shortdesc: Additional SSH key to be injected on the instance by `cloud-init`
+	sshKeyName := strings.TrimPrefix(key, "cloud-init.ssh-keys.")
+	if sshKeyName != key && sshKeyName != "" {
+		return validate.Optional(validate.IsUserSSHKey), nil
+	}
+
 	if strings.HasPrefix(key, ConfigVolatilePrefix) {
 		// lxdmeta:generate(entities=instance; group=volatile; key=volatile.<name>.last_state.hwaddr)
 		// The original MAC that was used when moving a physical device into an instance.
@@ -1169,7 +1262,7 @@ func ConfigKeyChecker(key string, instanceType Type) (func(value string) error, 
 		}
 
 		// lxdmeta:generate(entities=instance; group=volatile; key=volatile.<name>.host_name)
-		//
+		// Network device name on the host.
 		// ---
 		//  type: string
 		//  shortdesc: Network device name on the host
@@ -1189,10 +1282,10 @@ func ConfigKeyChecker(key string, instanceType Type) (func(value string) error, 
 		// lxdmeta:generate(entities=instance; group=volatile; key=volatile.<name>.last_state.created)
 		// Possible values are `true` or `false`.
 		// ---
-		//  type: string
+		//  type: bool
 		//  shortdesc: Whether the network device physical device was created
 		if strings.HasSuffix(key, ".created") {
-			return validate.IsAny, nil
+			return validate.Optional(validate.IsBool), nil
 		}
 
 		// lxdmeta:generate(entities=instance; group=volatile; key=volatile.<name>.last_state.vf.id)
@@ -1236,7 +1329,7 @@ func ConfigKeyChecker(key string, instanceType Type) (func(value string) error, 
 		}
 
 		// lxdmeta:generate(entities=instance; group=volatile; key=volatile.<name>.ceph_rbd)
-		//
+		// RBD device path for Ceph disk devices.
 		// ---
 		//  type: string
 		//  shortdesc: RBD device path for Ceph disk devices
@@ -1244,25 +1337,30 @@ func ConfigKeyChecker(key string, instanceType Type) (func(value string) error, 
 			return validate.IsAny, nil
 		}
 
-		if strings.HasSuffix(key, ".driver") {
+		// lxdmeta:generate(entities=instance; group=volatile; key=volatile.<name>.last_state.pci.driver)
+		// Name of driver device was using on host.
+		// --
+		//  type: string
+		//  shortdesc: Name of driver device was using on host
+		if strings.HasSuffix(key, ".last_state.pci.driver") {
 			return validate.IsAny, nil
 		}
 
-		// lxdmeta:generate(entities=network-physical; group=volatile; key=volatile.last_state.usb.bus)
-		//
+		// lxdmeta:generate(entities=network-physical; group=volatile; key=volatile.<name>.last_state.usb.bus)
+		// USB Bus Number.
 		// --
 		//  type: string
 		//  shortdesc: USB Bus Number
-		if strings.HasSuffix(key, ".bus") {
+		if strings.HasSuffix(key, ".last_state.usb.bus") {
 			return validate.IsAny, nil
 		}
 
-		// lxdmeta:generate(entities=network-physical; group=volatile; key=volatile.last_state.usb.device)
-		//
+		// lxdmeta:generate(entities=network-physical; group=volatile; key=volatile.<name>.last_state.usb.device)
+		// USB Device Number.
 		// --
 		//  type: string
 		//  shortdesc: USB Device Number
-		if strings.HasSuffix(key, ".device") {
+		if strings.HasSuffix(key, ".last_state.usb.device") {
 			return validate.IsAny, nil
 		}
 
@@ -1273,47 +1371,51 @@ func ConfigKeyChecker(key string, instanceType Type) (func(value string) error, 
 		if strings.HasSuffix(key, ".last_state.ready") {
 			return validate.IsBool, nil
 		}
+
+		// lxdmeta:generate(entities=instance; group=volatile; key=volatile.<name>.bus)
+		// Persistent VM bus number.
+		// ---
+		//  type: integer
+		//  shortdesc: Persistent VM bus number
+		if strings.HasSuffix(key, ".bus") {
+			return validate.Optional(validate.IsUint8), nil
+		}
+
+		// lxdmeta:generate(entities=instance; group=volatile; key=volatile.<name>.devlxd.owner)
+		// ID of the DevLXD identity that owns the device. It is used by DevLXD to restrict
+		// access of an identity to devices that were created by that identity.
+		// ---
+		//  type: string
+		//  shortdesc: DevLXD identity ID that owns the device.
+		if strings.HasSuffix(key, ".devlxd.owner") {
+			return validate.IsAny, nil
+		}
 	}
 
+	// lxdmeta:generate(entities=instance; group=miscellaneous; key=environment.*)
+	// Extra environment variables to set on boot (for containers) and during exec.
+	// ---
+	//  type: string
+	//  liveupdate: yes
+	//  shortdesc: Free-form environment key/value
 	if strings.HasPrefix(key, "environment.") {
+		return func(val string) error {
+			if strings.Contains(val, "\n") {
+				return errors.New("Environment variables cannot contain line breaks")
+			}
+
+			return nil
+		}, nil
+	}
+
+	if (instanceType == Any || instanceType == Container) && strings.HasPrefix(key, "linux.sysctl.") {
 		return validate.IsAny, nil
 	}
 
-	if strings.HasPrefix(key, "user.") {
+	knownPrefixes := append(ConfigKeyPrefixesAny, ConfigKeyPrefixesContainer...)
+	if shared.StringHasPrefix(key, knownPrefixes...) {
 		return validate.IsAny, nil
 	}
 
-	if strings.HasPrefix(key, "image.") {
-		return validate.IsAny, nil
-	}
-
-	if strings.HasPrefix(key, "limits.kernel.") &&
-		(len(key) > len("limits.kernel.")) {
-		return validate.IsAny, nil
-	}
-
-	if (instanceType == Any || instanceType == Container) &&
-		strings.HasPrefix(key, "linux.sysctl.") {
-		return validate.IsAny, nil
-	}
-
-	return nil, fmt.Errorf("Unknown configuration key: %s", key)
-}
-
-// InstanceIncludeWhenCopying is used to decide whether to include a config item or not when copying an instance.
-// The remoteCopy argument indicates if the copy is remote (i.e between LXD nodes) as this affects the keys kept.
-func InstanceIncludeWhenCopying(configKey string, remoteCopy bool) bool {
-	if configKey == "volatile.base_image" {
-		return true // Include volatile.base_image always as it can help optimize copies.
-	}
-
-	if configKey == "volatile.last_state.idmap" && !remoteCopy {
-		return true // Include volatile.last_state.idmap when doing local copy to avoid needless remapping.
-	}
-
-	if strings.HasPrefix(configKey, ConfigVolatilePrefix) {
-		return false // Exclude all other volatile keys.
-	}
-
-	return true // Keep all other keys.
+	return nil, fmt.Errorf("Unknown configuration key: %q", key)
 }

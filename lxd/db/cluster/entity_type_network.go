@@ -2,10 +2,14 @@ package cluster
 
 import (
 	"fmt"
+
+	"github.com/canonical/lxd/lxd/db/query"
 )
 
 // entityTypeNetwork implements entityTypeDBInfo for a Network.
-type entityTypeNetwork struct{}
+type entityTypeNetwork struct {
+	entityTypeCommon
+}
 
 func (e entityTypeNetwork) code() int64 {
 	return entityTypeCodeNetwork
@@ -19,35 +23,17 @@ JOIN projects ON networks.project_id = projects.id`, e.code())
 }
 
 func (e entityTypeNetwork) urlsByProjectQuery() string {
-	return fmt.Sprintf(`%s WHERE projects.name = ?`, e.allURLsQuery())
+	return e.allURLsQuery() + " WHERE projects.name = ?"
 }
 
-func (e entityTypeNetwork) urlByIDQuery() string {
-	return fmt.Sprintf(`%s WHERE networks.id = ?`, e.allURLsQuery())
+func (e entityTypeNetwork) urlsByIDsQuery(ids ...int64) string {
+	return e.allURLsQuery() + " WHERE networks.id IN " + query.IntParams(ids...)
 }
 
 func (e entityTypeNetwork) idFromURLQuery() string {
-	return `
-SELECT ?, networks.id 
-FROM networks 
-JOIN projects ON networks.project_id = projects.id 
-WHERE projects.name = ? 
-	AND '' = ? 
-	AND networks.name = ?`
+	return projectEntityIDFromURLQuery("networks")
 }
 
 func (e entityTypeNetwork) onDeleteTriggerSQL() (name string, sql string) {
-	name = "on_network_delete"
-	return name, fmt.Sprintf(`
-CREATE TRIGGER %s
-	AFTER DELETE ON networks
-	BEGIN
-	DELETE FROM auth_groups_permissions 
-		WHERE entity_type = %d 
-		AND entity_id = OLD.id;
-	DELETE FROM warnings
-		WHERE entity_type_code = %d
-		AND entity_id = OLD.id;
-	END
-`, name, e.code(), e.code())
+	return standardOnDeleteTriggerSQL("on_network_delete", "networks", e.code())
 }

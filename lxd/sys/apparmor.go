@@ -3,18 +3,20 @@
 package sys
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 
-	"github.com/syndtr/gocapability/capability"
+	"github.com/moby/sys/capability"
 
 	"github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/db/warningtype"
 	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/logger"
+	"github.com/canonical/lxd/shared/version"
 )
 
 // Initialize AppArmor-specific attributes.
@@ -24,29 +26,54 @@ func (s *OS) initAppArmor() []cluster.Warning {
 	/* Detect AppArmor availability */
 	_, err := exec.LookPath("apparmor_parser")
 	if shared.IsFalse(os.Getenv("LXD_SECURITY_APPARMOR")) {
-		logger.Warnf("AppArmor support has been manually disabled")
+		logger.Warn("AppArmor support has been manually disabled")
 		dbWarnings = append(dbWarnings, cluster.Warning{
 			TypeCode:    warningtype.AppArmorNotAvailable,
 			LastMessage: "Manually disabled",
 		})
 	} else if !shared.IsDir("/sys/kernel/security/apparmor") {
-		logger.Warnf("AppArmor support has been disabled because of lack of kernel support")
+		logger.Warn("AppArmor support has been disabled because of lack of kernel support")
 		dbWarnings = append(dbWarnings, cluster.Warning{
 			TypeCode:    warningtype.AppArmorNotAvailable,
 			LastMessage: "Disabled because of lack of kernel support",
 		})
 	} else if err != nil {
-		logger.Warnf("AppArmor support has been disabled because 'apparmor_parser' couldn't be found")
+		logger.Warn("AppArmor support has been disabled because 'apparmor_parser' could not be found")
 		dbWarnings = append(dbWarnings, cluster.Warning{
 			TypeCode:    warningtype.AppArmorNotAvailable,
-			LastMessage: "Disabled because 'apparmor_parser' couldn't be found",
+			LastMessage: "Disabled because 'apparmor_parser' could not be found",
 		})
 	} else {
-		s.AppArmorAvailable = true
+		/* Detect AppArmor version */
+		s.AppArmorVersion, err = appArmorGetVersion()
+		if err != nil {
+			logger.Warn("AppArmor support has been disabled because the version could not be determined", logger.Ctx{"err": err})
+			dbWarnings = append(dbWarnings, cluster.Warning{
+				TypeCode:    warningtype.AppArmorNotAvailable,
+				LastMessage: "Disabled because the version could not be determined",
+			})
+		} else {
+			logger.Info("AppArmor support is enabled", logger.Ctx{"version": s.AppArmorVersion})
+			s.AppArmorAvailable = true
+		}
 	}
 
 	/* Detect AppArmor stacking support */
 	s.AppArmorStacking = appArmorCanStack()
+
+	// Detect AppArmor cache directories.
+	s.AppArmorCacheLoc = shared.VarPath("security", "apparmor", "cache")
+	if s.AppArmorAvailable {
+		s.AppArmorCacheDir, err = appArmorGetCacheDir(s.AppArmorCacheLoc)
+		if err != nil {
+			logger.Warn("AppArmor feature cache directory detection failed", logger.Ctx{"err": err})
+		} else {
+			logger.Debug("AppArmor feature cache directory detected", logger.Ctx{"cache_dir": s.AppArmorCacheDir})
+		}
+	} else {
+		// If AppArmor is not available, use the base cache location that doesn't need apparmor_parser to determine.
+		s.AppArmorCacheDir = s.AppArmorCacheLoc
+	}
 
 	/* Detect existing AppArmor stack */
 	if shared.PathExists("/sys/kernel/security/apparmor/.ns_stacked") {
@@ -59,11 +86,11 @@ func (s *OS) initAppArmor() []cluster.Warning {
 	/* Detect AppArmor admin support */
 	if !haveMacAdmin() {
 		if s.AppArmorAvailable {
-			logger.Warnf("Per-container AppArmor profiles are disabled because the mac_admin capability is missing")
+			logger.Warn("Per-container AppArmor profiles are disabled because the mac_admin capability is missing")
 		}
 	} else if s.RunningInUserNS && !s.AppArmorStacked {
 		if s.AppArmorAvailable {
-			logger.Warnf("Per-container AppArmor profiles are disabled because LXD is running in an unprivileged container without stacking")
+			logger.Warn("Per-container AppArmor profiles are disabled because LXD is running in an unprivileged container without stacking")
 		}
 	} else {
 		s.AppArmorAdmin = true
@@ -102,11 +129,30 @@ func haveMacAdmin() bool {
 		return false
 	}
 
-	if c.Get(capability.EFFECTIVE, capability.CAP_MAC_ADMIN) {
-		return true
+	return c.Get(capability.EFFECTIVE, capability.CAP_MAC_ADMIN)
+}
+
+// getVersion reads and parses the AppArmor version.
+func appArmorGetVersion() (*version.DottedVersion, error) {
+	out, err := shared.RunCommand(context.TODO(), "apparmor_parser", "--version")
+	if err != nil {
+		return nil, err
 	}
 
-	return false
+	fields := strings.Fields(strings.SplitN(out, "\n", 2)[0])
+	return version.Parse(fields[len(fields)-1])
+}
+
+// appArmorGetCacheDir returns the AppArmor cache directory based on the cache location.
+func appArmorGetCacheDir(cacheLoc string) (string, error) {
+	// `--print-cache-dir` (added in Apparmor v2.13) returns a subdirectory under `--cache-loc`.
+	// The subdirectory used will be influenced by the features available and enabled.
+	out, err := shared.RunCommand(context.TODO(), "apparmor_parser", "--cache-loc", cacheLoc, "--print-cache-dir")
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(out), nil
 }
 
 // Returns true if AppArmor stacking support is available.
@@ -127,9 +173,8 @@ func appArmorCanStack() bool {
 
 	content := string(contentBytes)
 
-	parts := strings.Split(strings.TrimSpace(content), ".")
-
-	if len(parts) == 0 {
+	parts := strings.SplitN(strings.TrimSpace(content), ".", 3)
+	if len(parts) < 2 {
 		logger.Warn("Unknown apparmor domain version", logger.Ctx{"version": content})
 		return false
 	}
@@ -140,13 +185,10 @@ func appArmorCanStack() bool {
 		return false
 	}
 
-	minor := 0
-	if len(parts) == 2 {
-		minor, err = strconv.Atoi(parts[1])
-		if err != nil {
-			logger.Warn("Unknown apparmor domain version", logger.Ctx{"version": content})
-			return false
-		}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		logger.Warn("Unknown apparmor domain version", logger.Ctx{"version": content})
+		return false
 	}
 
 	return major >= 1 && minor >= 2

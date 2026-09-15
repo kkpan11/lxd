@@ -1,12 +1,10 @@
 package metrics
 
 import (
-	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
-
-	"github.com/canonical/lxd/shared"
 )
 
 // NewMetricSet returns a new MetricSet.
@@ -40,7 +38,7 @@ func (m *MetricSet) FilterSamples(permissionCheck func(labels map[string]string)
 
 // AddSamples adds samples of the type metricType to the MetricSet.
 func (m *MetricSet) AddSamples(metricType MetricType, samples ...Sample) {
-	for i := 0; i < len(samples); i++ {
+	for i := range samples {
 		// Add global labels to samples
 		for labelName, labelValue := range m.labels {
 			// Ensure we always have a valid Labels map
@@ -78,7 +76,7 @@ func (m *MetricSet) Merge(metricSet *MetricSet) {
 
 func (m *MetricSet) String() string {
 	var out strings.Builder
-	metricTypes := []MetricType{}
+	metricTypes := make([]MetricType, 0, len(m.set))
 
 	// Sort output by metric type name
 	for metricType := range m.set {
@@ -96,59 +94,62 @@ func (m *MetricSet) String() string {
 		GoHeapObjects,
 		Instances,
 		APIOngoingRequests,
+		Replicators,
+		ReplicatorLastRunStatus,
+		ReplicatorLastSuccessTimestamp,
+		ReplicatorLastSuccessOldestSnapshotTimestamp,
 	}
 
 	for _, metricType := range metricTypes {
-		// Add HELP message as specified by OpenMetrics
-		_, err := out.WriteString(MetricHeaders[metricType] + "\n")
-		if err != nil {
-			return ""
-		}
-
-		metricTypeName := ""
-
 		// ProcsTotal is a gauge according to the OpenMetrics spec as its value can decrease.
-		if shared.ValueInSlice(metricType, gaugeMetrics) {
-			metricTypeName = "gauge"
-		} else if strings.HasSuffix(MetricNames[metricType], "_total") || strings.HasSuffix(MetricNames[metricType], "_seconds") {
-			metricTypeName = "counter"
-		} else if strings.HasSuffix(MetricNames[metricType], "_bytes") {
-			metricTypeName = "gauge"
+		metricTypeNameSuffix := " counter\n"
+		if slices.Contains(gaugeMetrics, metricType) || strings.HasSuffix(MetricNames[metricType], "_bytes") {
+			metricTypeNameSuffix = " gauge\n"
 		}
 
-		// Add TYPE message as specified by OpenMetrics
-		_, err = out.WriteString(fmt.Sprintf("# TYPE %s %s\n", MetricNames[metricType], metricTypeName))
+		// Add HELP and TYPE messages as specified by OpenMetrics
+		_, err := out.WriteString(MetricHeaders[metricType] + "\n# TYPE " + MetricNames[metricType] + metricTypeNameSuffix)
 		if err != nil {
 			return ""
 		}
 
 		for _, sample := range m.set[metricType] {
 			firstLabel := true
-			labels := ""
-			labelNames := []string{}
+			var labels strings.Builder
+			labelNames := make([]string, 0, len(sample.Labels))
 
-			// Add and sort labels if there are any
-			for labelName := range sample.Labels {
+			// Add and sort labels if there are any, accumulating the total
+			// label string size to pre-size the builder.
+			labelSize := len(sample.Labels) - 1 // commas between labels
+			for labelName, labelValue := range sample.Labels {
 				labelNames = append(labelNames, labelName)
+				labelSize += len(labelName) + 3 + len(labelValue) // name="value"
+			}
+
+			if labelSize > 0 {
+				labels.Grow(labelSize)
 			}
 
 			sort.Strings(labelNames)
 
 			for _, labelName := range labelNames {
 				if !firstLabel {
-					labels += ","
+					labels.WriteString(",")
 				}
 
-				labels += fmt.Sprintf(`%s="%s"`, labelName, sample.Labels[labelName])
+				labels.WriteString(labelName)
+				labels.WriteString(`="`)
+				labels.WriteString(sample.Labels[labelName])
+				labels.WriteString(`"`)
 				firstLabel = false
 			}
 
 			valueStr := strconv.FormatFloat(sample.Value, 'g', -1, 64)
 
-			if labels != "" {
-				_, err = out.WriteString(fmt.Sprintf("%s{%s} %s\n", MetricNames[metricType], labels, valueStr))
+			if labels.Len() > 0 {
+				_, err = out.WriteString(MetricNames[metricType] + "{" + labels.String() + "} " + valueStr + "\n")
 			} else {
-				_, err = out.WriteString(fmt.Sprintf("%s %s\n", MetricNames[metricType], valueStr))
+				_, err = out.WriteString(MetricNames[metricType] + " " + valueStr + "\n")
 			}
 
 			if err != nil {
@@ -173,13 +174,8 @@ func MetricSetFromAPI(metrics *Metrics, labels map[string]string) (*MetricSet, e
 	for dev, stats := range metrics.CPU {
 		getLabels := func(mode string) map[string]string {
 			labels := map[string]string{"mode": mode}
-			cpu := ""
-
-			if dev != "cpu" {
-				_, _ = fmt.Sscanf(dev, "cpu%s", &cpu)
-			}
-
-			if cpu != "" {
+			cpu, found := strings.CutPrefix(dev, "cpu")
+			if found {
 				labels["cpu"] = cpu
 			}
 
@@ -261,6 +257,7 @@ func MetricSetFromAPI(metrics *Metrics, labels map[string]string) (*MetricSet, e
 	set.AddSamples(MemoryMemTotalBytes, Sample{Value: float64(metrics.Memory.MemTotalBytes)})
 	set.AddSamples(MemoryRSSBytes, Sample{Value: float64(metrics.Memory.RSSBytes)})
 	set.AddSamples(MemoryShmemBytes, Sample{Value: float64(metrics.Memory.ShmemBytes)})
+	set.AddSamples(MemorySReclaimableBytes, Sample{Value: float64(metrics.Memory.SReclaimableBytes)})
 	set.AddSamples(MemorySwapBytes, Sample{Value: float64(metrics.Memory.SwapBytes)})
 	set.AddSamples(MemoryUnevictableBytes, Sample{Value: float64(metrics.Memory.UnevictableBytes)})
 	set.AddSamples(MemoryWritebackBytes, Sample{Value: float64(metrics.Memory.WritebackBytes)})

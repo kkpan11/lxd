@@ -2,10 +2,14 @@ package cluster
 
 import (
 	"fmt"
+
+	"github.com/canonical/lxd/lxd/db/query"
 )
 
 // entityTypeStorageBucket implements entityTypeDBInfo for a StorageBucket.
-type entityTypeStorageBucket struct{}
+type entityTypeStorageBucket struct {
+	entityTypeCommon
+}
 
 func (e entityTypeStorageBucket) code() int64 {
 	return entityTypeCodeStorageBucket
@@ -23,11 +27,11 @@ FROM storage_buckets
 }
 
 func (e entityTypeStorageBucket) urlsByProjectQuery() string {
-	return fmt.Sprintf(`%s WHERE projects.name = ?`, e.allURLsQuery())
+	return e.allURLsQuery() + " WHERE projects.name = ?"
 }
 
-func (e entityTypeStorageBucket) urlByIDQuery() string {
-	return fmt.Sprintf(`%s WHERE storage_buckets.id = ?`, e.allURLsQuery())
+func (e entityTypeStorageBucket) urlsByIDsQuery(ids ...int64) string {
+	return e.allURLsQuery() + " WHERE storage_buckets.id IN " + query.IntParams(ids...)
 }
 
 func (e entityTypeStorageBucket) idFromURLQuery() string {
@@ -45,17 +49,5 @@ WHERE projects.name = ?
 }
 
 func (e entityTypeStorageBucket) onDeleteTriggerSQL() (name string, sql string) {
-	name = "on_storage_bucket_delete"
-	return name, fmt.Sprintf(`
-CREATE TRIGGER %s
-	AFTER DELETE ON storage_buckets
-	BEGIN
-	DELETE FROM auth_groups_permissions 
-		WHERE entity_type = %d 
-		AND entity_id = OLD.id;
-	DELETE FROM warnings
-		WHERE entity_type_code = %d
-		AND entity_id = OLD.id;
-	END
-`, name, e.code(), e.code())
+	return standardOnDeleteTriggerSQL("on_storage_bucket_delete", "storage_buckets", e.code())
 }

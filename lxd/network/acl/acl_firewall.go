@@ -9,11 +9,10 @@ import (
 	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
-	"github.com/canonical/lxd/shared/logger"
 )
 
 // FirewallApplyACLRules applies ACL rules to network firewall.
-func FirewallApplyACLRules(s *state.State, logger logger.Logger, aclProjectName string, aclNet NetworkACLUsage) error {
+func FirewallApplyACLRules(ctx context.Context, s *state.State, aclProjectName string, aclNet NetworkACLUsage) error {
 	var dropRules []firewallDrivers.ACLRule
 	var rejectRules []firewallDrivers.ACLRule
 	var allowRules []firewallDrivers.ACLRule
@@ -43,12 +42,12 @@ func FirewallApplyACLRules(s *state.State, logger logger.Logger, aclProjectName 
 				firewallACLRule.LogName = fmt.Sprintf("%s-%s-%d", logPrefix, direction, ruleIndex)
 			}
 
-			switch {
-			case rule.Action == "drop":
+			switch rule.Action {
+			case "drop":
 				dropRules = append(dropRules, firewallACLRule)
-			case rule.Action == "reject":
+			case "reject":
 				rejectRules = append(rejectRules, firewallACLRule)
-			case rule.Action == "allow":
+			case "allow":
 				allowRules = append(allowRules, firewallACLRule)
 			default:
 				return fmt.Errorf("Unrecognised action %q", rule.Action)
@@ -64,7 +63,7 @@ func FirewallApplyACLRules(s *state.State, logger logger.Logger, aclProjectName 
 	for _, aclName := range shared.SplitNTrimSpace(aclNet.Config["security.acls"], ",", -1, true) {
 		var aclInfo *api.NetworkACL
 
-		err := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		err := s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 			var err error
 
 			_, aclInfo, err = tx.GetNetworkACL(ctx, aclProjectName, aclName)
@@ -86,7 +85,7 @@ func FirewallApplyACLRules(s *state.State, logger logger.Logger, aclProjectName 
 		}
 	}
 
-	var rules []firewallDrivers.ACLRule
+	var rules = make([]firewallDrivers.ACLRule, 0, len(dropRules)+len(rejectRules)+len(allowRules)+2)
 	rules = append(rules, dropRules...)
 	rules = append(rules, rejectRules...)
 	rules = append(rules, allowRules...)
@@ -99,14 +98,14 @@ func FirewallApplyACLRules(s *state.State, logger logger.Logger, aclProjectName 
 		Direction: "egress",
 		Action:    egressAction,
 		Log:       egressLogged,
-		LogName:   fmt.Sprintf("%s-egress", logPrefix),
+		LogName:   logPrefix + "-egress",
 	})
 
 	rules = append(rules, firewallDrivers.ACLRule{
 		Direction: "ingress",
 		Action:    ingressAction,
 		Log:       ingressLogged,
-		LogName:   fmt.Sprintf("%s-ingress", logPrefix),
+		LogName:   logPrefix + "-ingress",
 	})
 
 	return s.Firewall.NetworkApplyACLRules(aclNet.Name, rules)

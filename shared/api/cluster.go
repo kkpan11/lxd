@@ -6,6 +6,34 @@ import (
 	"time"
 )
 
+const (
+	// ClusterLinkTypeBidirectional indicates that the cluster link can be used by both clusters.
+	ClusterLinkTypeBidirectional = "bidirectional"
+
+	// ClusterLinkTypeUnidirectional indicates a one-way trust relationship (the remote cluster trusts the cluster where the unidirectional link is defined).
+	//
+	// API extension: cluster_links_unidirectional.
+	ClusterLinkTypeUnidirectional = "unidirectional"
+
+	// ClusterLinkTypePublic indicates that only the local cluster can use the link and no client certificate is presented.
+	//
+	// API extension: cluster_links_public.
+	ClusterLinkTypePublic = "public"
+)
+
+// ClusterLinkTypePresentsClientCertificate reports whether a cluster link of the given type presents
+// a client certificate when connecting to the remote cluster, which is what allows the remote to
+// authenticate the connection. Types are matched explicitly so that an unrecognised type is reported
+// as not presenting one rather than being assumed to.
+func ClusterLinkTypePresentsClientCertificate(clusterLinkType string) bool {
+	switch clusterLinkType {
+	case ClusterLinkTypeBidirectional, ClusterLinkTypeUnidirectional:
+		return true
+	}
+
+	return false
+}
+
 // Cluster represents high-level information about a LXD cluster.
 //
 // swagger:model
@@ -81,12 +109,6 @@ type ClusterPut struct {
 	//
 	// API extension: clustering_join
 	ServerAddress string `json:"server_address" yaml:"server_address"`
-
-	// The trust password of the cluster you're trying to join (deprecated, use cluster_token)
-	// Example: blah
-	//
-	// API extension: clustering_join
-	ClusterPassword string `json:"cluster_password" yaml:"cluster_password"` // Deprecated, use ClusterToken.
 
 	// The cluster join token for the cluster you're trying to join
 	// Example: blah
@@ -168,7 +190,7 @@ type ClusterMember struct {
 	// Example: https://10.0.0.1:8443
 	URL string `json:"url" yaml:"url"`
 
-	// Whether the cluster member is a database server
+	// Whether the cluster member is a database server (database-leader, database-voter, or database-standby)
 	// Example: true
 	Database bool `json:"database" yaml:"database"`
 
@@ -280,6 +302,32 @@ type ClusterCertificatePut struct {
 	ClusterCertificateKey string `json:"cluster_certificate_key" yaml:"cluster_certificate_key"`
 }
 
+const (
+	// ClusterEvacuateModeStop indicates that all instances on the evacuated member should be stopped.
+	ClusterEvacuateModeStop = "stop"
+
+	// ClusterEvacuateModeMigrate indicates that all instances on the evacuated member should be migrated to other members.
+	ClusterEvacuateModeMigrate = "migrate"
+
+	// ClusterEvacuateModeLiveMigrate indicates that all instances on the evacuated member should be live-migrated to other members.
+	ClusterEvacuateModeLiveMigrate = "live-migrate"
+
+	// ClusterEvacuateModeAuto indicates that the system should automatically choose the best evacuation method for the instance based on instance type and device capabilities.
+	ClusterEvacuateModeAuto = "auto"
+
+	// ClusterEvacuateModeHeal is used internally to indicate that instances should be evacuated during automatic cluster healing.
+	ClusterEvacuateModeHeal = "heal"
+
+	// ClusterRestoreModeSkip indicates that cluster member status should be restored without starting local instances or migrating back evacuated instances.
+	ClusterRestoreModeSkip = "skip"
+
+	// ClusterMemberActionEvacuate indicates the member should be evacuated.
+	ClusterMemberActionEvacuate = "evacuate"
+
+	// ClusterMemberActionRestore indicates the member should be restored.
+	ClusterMemberActionRestore = "restore"
+)
+
 // ClusterMemberStatePost represents the fields required to evacuate a cluster member.
 //
 // swagger:model
@@ -291,10 +339,18 @@ type ClusterMemberStatePost struct {
 	Action string `json:"action" yaml:"action"`
 
 	// Override the configured evacuation mode.
+	// Valid modes for the "evacuate" action are "stop", "migrate", and "live-migrate".
+	// Valid modes for the "restore" action are "skip".
 	// Example: stop
 	//
-	// API extension: clustering_evacuate_mode
+	// API extension: clustering_evacuation_mode
 	Mode string `json:"mode" yaml:"mode"`
+
+	// Permit evacuation even if it would drop the cluster below the required voter majority.
+	// Example: false
+	//
+	// API extension: clustering_evacuation_force
+	Force bool `json:"force" yaml:"force"`
 }
 
 // ClusterGroupsPost represents the fields available for a new cluster group.
@@ -327,6 +383,11 @@ type ClusterGroup struct {
 	// List of members in this group
 	// Example: ["node1", "node3"]
 	Members []string `json:"members" yaml:"members"`
+
+	// UsedBy is a list or LXD entity URLs that reference the cluster group.
+	//
+	// API extension: clustering_groups_used_by
+	UsedBy []string `json:"used_by" yaml:"used_by"`
 }
 
 // ClusterGroupPost represents the fields required to rename a cluster group.
@@ -367,4 +428,161 @@ func (c *ClusterGroup) Writable() ClusterGroupPut {
 func (c *ClusterGroup) SetWritable(put ClusterGroupPut) {
 	c.Description = put.Description
 	c.Members = put.Members
+}
+
+// ClusterLink represents high-level information about a cluster link.
+//
+// swagger:model
+//
+// API extension: cluster_links.
+type ClusterLink struct {
+	WithEntitlements `yaml:",inline"`
+
+	// Name of the cluster link.
+	// Example: lxd02
+	Name string `json:"name" yaml:"name"`
+
+	// Description of the cluster link.
+	// Example: Backup LXD cluster
+	Description string `json:"description" yaml:"description"`
+
+	// Type of cluster link.
+	// Example: bidirectional
+	Type string `json:"type" yaml:"type"`
+
+	// Cluster link configuration map (refer to doc/clustering.md).
+	// Example: {"user.*": ""}
+	Config map[string]string `json:"config" yaml:"config"`
+
+	// UsedBy is a list of LXD entity URLs that reference the cluster link.
+	// Example: ["/1.0/replicators/my-replicator?project=default"]
+	//
+	// API extension: cluster_links_used_by
+	UsedBy []string `json:"used_by" yaml:"used_by"`
+}
+
+// ClusterLinkPut represents the modifiable fields of a cluster link.
+//
+// swagger:model
+//
+// API extension: cluster_links.
+type ClusterLinkPut struct {
+	// lxdmeta:generate(entities=cluster-link; group=properties; key=description)
+	//
+	// ---
+	//  type: string
+	//  required: no
+	//  shortdesc: Description of the cluster link
+
+	// Description of the cluster link.
+	// Example: Linked cluster.
+	Description string `json:"description" yaml:"description"`
+
+	// lxdmeta:generate(entities=cluster-link; group=properties; key=config)
+	//
+	// ---
+	//  type: string set
+	//  required: no
+	//  shortdesc: Cluster link configuration map
+
+	// Cluster link configuration map (refer to doc/clustering.md).
+	// Example: {"user.*": ""}
+	Config map[string]string `json:"config" yaml:"config"`
+}
+
+// ClusterLinksPost represents the fields available for a new cluster link.
+//
+// swagger:model
+//
+// API extension: cluster_links.
+type ClusterLinksPost struct {
+	ClusterLinkPut `yaml:",inline"`
+
+	// lxdmeta:generate(entities=cluster-link; group=properties; key=name)
+	//
+	// ---
+	//  type: string
+	//  required: yes
+	//  shortdesc: Name of the cluster link
+
+	// Name of the cluster.
+	// Example: lxd02
+	Name string `json:"name" yaml:"name"`
+
+	// lxdmeta:generate(entities=cluster-link; group=properties; key=type)
+	//
+	// ---
+	//  type: string
+	//  required: yes
+	//  shortdesc: Type of the cluster link
+
+	// Type of the cluster link.
+	// Currently only "bidirectional" is supported.
+	// Example: bidirectional
+	Type string `json:"type" yaml:"type"`
+
+	// TrustToken for creating a cluster link. This is included in requests to create an active cluster link on the local cluster and activate a pending cluster link on the linked cluster.
+	// API extension: explicit_trust_token
+	TrustToken string `json:"trust_token" yaml:"trust_token"`
+
+	// List of auth groups this cluster link belongs to.
+	// Example: ["foo", "bar"]
+	AuthGroups []string `json:"auth_groups" yaml:"auth_groups"`
+
+	// The certificate (X509 PEM encoded) for the linked cluster. This is included in server-side POST requests to activate the pending cluster link on the linked cluster that generated the trust token.
+	// Example: X509 PEM certificate
+	ClusterCertificate string `json:"cluster_certificate" yaml:"cluster_certificate"`
+
+	// Fingerprint of the remote cluster's certificate, echoed back to confirm a pending public
+	// cluster link. It must match the fingerprint returned when the pending link was created; the
+	// certificate itself is not resubmitted, as the server pins the copy it already holds.
+	// Example: a1b2c3d4...
+	// API extension: cluster_links_public.
+	Fingerprint string `json:"fingerprint,omitempty" yaml:"fingerprint,omitempty"`
+
+	// RemoteAddress is the address of the remote cluster, used for public links. It is the address
+	// contacted when creating a pending public cluster link, and is required for that request only.
+	// Confirming the link pins the address recorded when the pending link was created, so the link
+	// always points at the address that was verified; setting this field on a confirm request is
+	// rejected.
+	// Example: 10.0.0.1:8443
+	RemoteAddress string `json:"remote_address,omitempty" yaml:"remote_address,omitempty"`
+}
+
+// ClusterLinkCertificate represents a remote cluster certificate fetched for user verification.
+// It is returned when creating a pending public cluster link, and its fingerprint must be submitted
+// back as ClusterLinksPost.Fingerprint to confirm and pin the certificate.
+//
+// swagger:model
+//
+// API extension: cluster_links_public.
+type ClusterLinkCertificate struct {
+	// SHA-256 fingerprint of the certificate.
+	// Example: a1b2c3d4...
+	Fingerprint string `json:"fingerprint" yaml:"fingerprint"`
+}
+
+// ClusterLinkPost represents the fields available for renaming a cluster link.
+//
+// swagger:model
+//
+// API extension: cluster_links.
+type ClusterLinkPost struct {
+	// Name of the cluster link.
+	// Example: lxd02
+	Name string `json:"name" yaml:"name"`
+}
+
+// Writable converts a full ClusterLink struct into a [ClusterLinkPut] struct (filters read-only fields).
+func (clusterLink *ClusterLink) Writable() ClusterLinkPut {
+	return ClusterLinkPut{
+		Description: clusterLink.Description,
+		Config:      clusterLink.Config,
+	}
+}
+
+// SetWritable sets applicable values from [ClusterLinkPut] struct to [ClusterLink] struct.
+func (clusterLink *ClusterLink) SetWritable(put ClusterLinkPut) {
+	clusterLink.Description = put.Description
+	clusterLink.Config = put.Config
 }

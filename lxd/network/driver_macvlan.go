@@ -2,9 +2,13 @@ package network
 
 import (
 	"fmt"
+	"math"
+	"net/http"
+	"strconv"
 
-	"github.com/canonical/lxd/lxd/cluster/request"
 	"github.com/canonical/lxd/lxd/db"
+	"github.com/canonical/lxd/lxd/request"
+	"github.com/canonical/lxd/lxd/resources"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/revert"
@@ -21,6 +25,53 @@ func (n *macvlan) DBType() db.NetworkType {
 	return db.NetworkTypeMacvlan
 }
 
+// State returns the network state.
+func (n *macvlan) State() (*api.NetworkState, error) {
+	parentState, err := resources.GetNetworkState(GetHostDevice(n.config["parent"], n.config["vlan"]))
+	if err != nil {
+		// If the parent is not found, return a response indicating the network is unavailable.
+		if api.StatusErrorCheck(err, http.StatusNotFound) {
+			return &api.NetworkState{
+				State: "unavailable",
+				Type:  "unknown",
+			}, nil
+		}
+
+		// In all other cases, return the original error.
+		return nil, err
+	}
+
+	var mtu int
+
+	configMTU := n.config["mtu"]
+	if configMTU != "" {
+		uintMTU, err := strconv.ParseUint(configMTU, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("Invalid MTU specified %q: %w", configMTU, err)
+		}
+
+		// Bound check the MTU value before converting to int.
+		if uintMTU > math.MaxInt32 {
+			mtu = math.MaxInt32
+		} else if uintMTU > 0 {
+			mtu = int(uintMTU)
+		} else {
+			mtu = 1500
+		}
+	} else {
+		mtu = parentState.Mtu
+	}
+
+	return &api.NetworkState{
+		Addresses: []api.NetworkStateAddress{},
+		Counters:  api.NetworkStateCounters{},
+		Hwaddr:    parentState.Hwaddr,
+		Mtu:       mtu,
+		State:     parentState.State,
+		Type:      "broadcast",
+	}, nil
+}
+
 // Validate network config.
 func (n *macvlan) Validate(config map[string]string) error {
 	rules := map[string]func(value string) error{
@@ -29,18 +80,21 @@ func (n *macvlan) Validate(config map[string]string) error {
 		// ---
 		//  type: string
 		//  shortdesc: Parent interface to create `macvlan` NICs on
+		//  scope: local
 		"parent": validate.Required(validate.IsNotEmpty, validate.IsInterfaceName),
 		// lxdmeta:generate(entities=network-macvlan; group=network-conf; key=mtu)
 		//
 		// ---
 		//  type: integer
 		//  shortdesc: MTU of the new interface
+		//  scope: global
 		"mtu": validate.Optional(validate.IsNetworkMTU),
 		// lxdmeta:generate(entities=network-macvlan; group=network-conf; key=vlan)
 		//
 		// ---
 		//  type: integer
 		//  shortdesc: VLAN ID to attach to
+		//  scope: global
 		"vlan": validate.Optional(validate.IsNetworkVLAN),
 		// lxdmeta:generate(entities=network-macvlan; group=network-conf; key=gvrp)
 		// This option specifies whether to register the VLAN using the GARP VLAN Registration Protocol.
@@ -48,27 +102,14 @@ func (n *macvlan) Validate(config map[string]string) error {
 		//  type: bool
 		//  defaultdesc: `false`
 		//  shortdesc: Whether to use GARP VLAN Registration Protocol
+		//  scope: global
 		"gvrp": validate.Optional(validate.IsBool),
-		// lxdmeta:generate(entities=network-macvlan; group=network-conf; key=maas.subnet.ipv4)
-		//
-		// ---
-		//  type: string
-		//  condition: IPv4 address; using the `network` property on the NIC
-		//  shortdesc: MAAS IPv4 subnet to register instances in
-		"maas.subnet.ipv4": validate.IsAny,
-		// lxdmeta:generate(entities=network-macvlan; group=network-conf; key=maas.subnet.ipv6)
-		//
-		// ---
-		//  type: string
-		//  condition: IPv4 address; using the `network` property on the NIC
-		//  shortdesc: MAAS IPv6 subnet to register instances in
-		"maas.subnet.ipv6": validate.IsAny,
-
 		// lxdmeta:generate(entities=network-macvlan; group=network-conf; key=user.*)
 		//
 		// ---
 		//  type: string
 		//  shortdesc: User-provided free-form key/value pairs
+		//  scope: global
 	}
 
 	err := n.validate(config, rules)
@@ -83,7 +124,7 @@ func (n *macvlan) Validate(config map[string]string) error {
 func (n *macvlan) Delete(clientType request.ClientType) error {
 	n.logger.Debug("Delete", logger.Ctx{"clientType": clientType})
 
-	return n.common.delete()
+	return n.delete()
 }
 
 // Rename renames a network.
@@ -91,7 +132,7 @@ func (n *macvlan) Rename(newName string) error {
 	n.logger.Debug("Rename", logger.Ctx{"newName": newName})
 
 	// Rename common steps.
-	err := n.common.rename(newName)
+	err := n.rename(newName)
 	if err != nil {
 		return err
 	}
@@ -132,7 +173,7 @@ func (n *macvlan) Stop() error {
 func (n *macvlan) Update(newNetwork api.NetworkPut, targetNode string, clientType request.ClientType) error {
 	n.logger.Debug("Update", logger.Ctx{"clientType": clientType, "newNetwork": newNetwork})
 
-	dbUpdateNeeded, _, oldNetwork, err := n.common.configChanged(newNetwork)
+	dbUpdateNeeded, _, oldNetwork, err := n.configChanged(newNetwork)
 	if err != nil {
 		return err
 	}
@@ -145,7 +186,7 @@ func (n *macvlan) Update(newNetwork api.NetworkPut, targetNode string, clientTyp
 	// pending, then don't apply the new settings to the node, just to the database record (ready for the
 	// actual global create request to be initiated).
 	if n.Status() == api.NetworkStatusPending || n.LocalStatus() == api.NetworkStatusPending {
-		return n.common.update(newNetwork, targetNode, clientType)
+		return n.update(newNetwork, targetNode, clientType)
 	}
 
 	revert := revert.New()
@@ -154,11 +195,11 @@ func (n *macvlan) Update(newNetwork api.NetworkPut, targetNode string, clientTyp
 	// Define a function which reverts everything.
 	revert.Add(func() {
 		// Reset changes to all nodes and database.
-		_ = n.common.update(oldNetwork, targetNode, clientType)
+		_ = n.update(oldNetwork, targetNode, clientType)
 	})
 
-	// Apply changes to all nodes and databse.
-	err = n.common.update(newNetwork, targetNode, clientType)
+	// Apply changes to all nodes and database.
+	err = n.update(newNetwork, targetNode, clientType)
 	if err != nil {
 		return err
 	}

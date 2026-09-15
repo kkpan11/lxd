@@ -25,13 +25,7 @@ type MethodSignature struct {
 
 // Slice returns the type name of a slice of items of the given type.
 func Slice(typ string) string {
-	return fmt.Sprintf("[]%s", typ)
-}
-
-// Element is the reverse of Slice, returning the element type name the slice
-// with given type.
-func Element(typ string) string {
-	return typ[len("[]"):]
+	return "[]" + typ
 }
 
 // Star adds a "*" prefix to the given string.

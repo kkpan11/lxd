@@ -1,6 +1,7 @@
 package device
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -65,7 +66,7 @@ func (d *gpuSRIOV) validateConfig(instConf instance.ConfigReader) error {
 // validateEnvironment checks the runtime environment for correctness.
 func (d *gpuSRIOV) validateEnvironment() error {
 	if d.inst.Type() == instancetype.VM && shared.IsTrue(d.inst.ExpandedConfig()["migration.stateful"]) {
-		return fmt.Errorf("GPU devices cannot be used when migration.stateful is enabled")
+		return errors.New("GPU devices cannot be used when migration.stateful is enabled")
 	}
 
 	return validatePCIDevice(d.config["pci"])
@@ -105,13 +106,13 @@ func (d *gpuSRIOV) Start() (*deviceConfig.RunConfig, error) {
 
 		pciParentDev, err = pcidev.ParseUeventFile(filepath.Join(devicePath, "uevent"))
 		if err != nil {
-			err = fmt.Errorf("Failed to get PCI device info for GPU %q: %w", parentPCIAddress, err)
+			err = fmt.Errorf("Failed getting PCI device info for GPU %q: %w", parentPCIAddress, err)
 			continue
 		}
 
 		vfID, err = d.findFreeVirtualFunction(pciParentDev)
 		if err != nil {
-			err = fmt.Errorf("Failed to find free virtual function: %w", err)
+			err = fmt.Errorf("Failed finding free virtual function: %w", err)
 			continue
 		}
 
@@ -125,7 +126,7 @@ func (d *gpuSRIOV) Start() (*deviceConfig.RunConfig, error) {
 	}
 
 	if vfID == -1 {
-		return nil, fmt.Errorf("All virtual functions on parent device seem to be in use")
+		return nil, errors.New("All virtual functions on parent device seem to be in use")
 	}
 
 	vfPCIDev, err := d.setupSriovParent(parentPCIAddress, vfID, saveData)
@@ -153,7 +154,7 @@ func (d *gpuSRIOV) getParentPCIAddresses() ([]string, error) {
 		return nil, err
 	}
 
-	var parentPCIAddresses []string
+	parentPCIAddresses := make([]string, 0, len(gpus.Cards))
 
 	for _, gpu := range gpus.Cards {
 		// Skip any cards that are not selected.
@@ -165,7 +166,7 @@ func (d *gpuSRIOV) getParentPCIAddresses() ([]string, error) {
 	}
 
 	if len(parentPCIAddresses) == 0 {
-		return nil, fmt.Errorf("Failed to detect requested GPU device")
+		return nil, errors.New("Failed detecting requested GPU device")
 	}
 
 	return parentPCIAddresses, nil
@@ -178,7 +179,7 @@ func (d *gpuSRIOV) setupSriovParent(parentPCIAddress string, vfID int, volatile 
 	defer revert.Fail()
 
 	volatile["last_state.pci.parent"] = parentPCIAddress
-	volatile["last_state.vf.id"] = fmt.Sprintf("%d", vfID)
+	volatile["last_state.vf.id"] = strconv.Itoa(vfID)
 	volatile["last_state.created"] = "false" // Indicates don't delete device at stop time.
 
 	// Get VF device's PCI Slot Name so we can unbind and rebind it from the host.
@@ -237,7 +238,7 @@ func (d *gpuSRIOV) findFreeVirtualFunction(parentDev pcidev.Device) (int, error)
 
 	vfID := -1
 
-	for i := 0; i < sriovNum; i++ {
+	for i := range sriovNum {
 		pciDev, err := pcidev.ParseUeventFile(fmt.Sprintf("/sys/bus/pci/devices/%s/virtfn%d/uevent", parentDev.SlotName, i))
 		if err != nil {
 			return 0, err

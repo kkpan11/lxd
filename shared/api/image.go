@@ -74,12 +74,14 @@ type ImagesPostSource struct {
 	// Example: pull
 	Mode string `json:"mode" yaml:"mode"`
 
-	// Type of image source (instance, snapshot, image or url)
+	// Type of image source (instance, snapshot, or image)
 	// Example: instance
-	Type string `json:"type" yaml:"type"`
+	Type SourceType `json:"type" yaml:"type"`
 
-	// Source URL (for type "url")
+	// Source URL (deprecated, image download from URL is no longer supported)
 	// Example: https://some-server.com/some-directory/
+	//
+	// Deprecated: Image download from URL is no longer supported.
 	URL string `json:"url" yaml:"url"`
 
 	// Instance name (for type "instance" or "snapshot")
@@ -99,6 +101,12 @@ type ImagesPostSource struct {
 	//
 	// API extension: image_source_project
 	Project string `json:"project" yaml:"project"`
+
+	// Whether to copy aliases from the source image
+	// Example: true
+	//
+	// API extension: image_registries
+	CopyAliases bool `json:"copy_aliases" yaml:"copy_aliases"`
 }
 
 // ImagePut represents the modifiable fields of a LXD image
@@ -134,6 +142,8 @@ type ImagePut struct {
 //
 // swagger:model
 type Image struct {
+	WithEntitlements `yaml:",inline"`
+
 	// List of aliases
 	Aliases []ImageAlias `json:"aliases" yaml:"aliases"`
 
@@ -201,6 +211,24 @@ type Image struct {
 	//
 	// API extension: image_profiles
 	Profiles []string `json:"profiles" yaml:"profiles"`
+
+	// Project name
+	// Example: project1
+	//
+	// API extension: images_all_projects
+	Project string `json:"project" yaml:"project"`
+
+	// OS release codename
+	// Example: jammy
+	//
+	// API extension: image_extended_metadata
+	ReleaseCodename string `json:"release_codename,omitempty" yaml:"release_codename,omitempty"`
+
+	// OS release title
+	// Example: 22.04 LTS
+	//
+	// API extension: image_extended_metadata
+	ReleaseTitle string `json:"release_title,omitempty" yaml:"release_title,omitempty"`
 }
 
 // Writable converts a full Image struct into a ImagePut struct (filters read-only fields).
@@ -266,6 +294,12 @@ type ImageSource struct {
 	//
 	// API extension: image_types
 	ImageType string `json:"image_type" yaml:"image_type"`
+
+	// Image registry name
+	// Example: ubuntu
+	//
+	// API extension: image_registries
+	ImageRegistry string `json:"image_registry" yaml:"image_registry"`
 }
 
 // ImageAliasesPost represents a new LXD image alias
@@ -301,6 +335,8 @@ type ImageAliasesEntryPut struct {
 //
 // swagger:model
 type ImageAliasesEntry struct {
+	WithEntitlements `yaml:",inline"`
+
 	// Alias name
 	// Example: ubuntu-24.04
 	Name string `json:"name" yaml:"name"`

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"strings"
 
@@ -10,9 +9,7 @@ import (
 	"github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/shared"
 	cli "github.com/canonical/lxd/shared/cmd"
-	"github.com/canonical/lxd/shared/i18n"
 	"github.com/canonical/lxd/shared/ioprogress"
-	"github.com/canonical/lxd/shared/units"
 )
 
 type cmdImport struct {
@@ -24,17 +21,29 @@ type cmdImport struct {
 
 func (c *cmdImport) command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("import", i18n.G("[<remote>:] <backup file> [<instance name>]"))
-	cmd.Short = i18n.G("Import instance backups")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Import backups of instances including their snapshots.`))
-	cmd.Example = cli.FormatSection("", i18n.G(
-		`lxc import backup0.tar.gz
-    Create a new instance using backup0.tar.gz as the source.`))
+	cmd.Use = usage("import", "[<remote>:] <backup file> [<instance name>]")
+	cmd.Short = "Import instance backups"
+	cmd.Long = cli.FormatSection("Description", `Import backups of instances including their snapshots.`)
+	cmd.Example = cli.FormatSection("", `lxc import backup0.tar.gz
+    Create a new instance using backup0.tar.gz as the source.`)
 
 	cmd.RunE = c.run
-	cmd.Flags().StringVarP(&c.flagStorage, "storage", "s", "", i18n.G("Storage pool name")+"``")
-	cmd.Flags().StringArrayVarP(&c.flagDevice, "device", "d", nil, i18n.G("New key/value to apply to a specific device")+"``")
+	cmd.Flags().StringVarP(&c.flagStorage, "storage", "s", "", cli.FormatStringFlagLabel("Storage pool name"))
+	cmd.Flags().StringArrayVarP(&c.flagDevice, "device", "d", nil, cli.FormatStringFlagLabel("New key/value to apply to a specific device"))
+
+	cmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]cobra.Completion, cobra.ShellCompDirective) {
+		if len(args) > 1 {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+
+		files, directive := c.global.cmpLocalFiles(toComplete, []string{".tar.gz", ".tar.xz"})
+		if len(args) == 0 {
+			remotes, _ := c.global.cmpRemotes(toComplete, ":", false, instanceServerRemoteCompletionFilters(*c.global.conf)...)
+			return append(files, remotes...), directive
+		}
+
+		return files, directive
+	}
 
 	return cmd
 }
@@ -93,9 +102,11 @@ func (c *cmdImport) run(cmd *cobra.Command, args []string) error {
 	}
 
 	progress := cli.ProgressRenderer{
-		Format: i18n.G("Importing instance: %s"),
+		Format: "Importing instance: %s",
 		Quiet:  c.global.flagQuiet,
 	}
+
+	defer progress.Done("")
 
 	deviceMap, err := parseDeviceOverrides(c.flagDevice)
 	if err != nil {
@@ -103,18 +114,10 @@ func (c *cmdImport) run(cmd *cobra.Command, args []string) error {
 	}
 
 	createArgs := lxd.InstanceBackupArgs{
-		BackupFile: &ioprogress.ProgressReader{
-			ReadCloser: file,
-			Tracker: &ioprogress.ProgressTracker{
-				Length: fstat.Size(),
-				Handler: func(percent int64, speed int64) {
-					progress.UpdateProgress(ioprogress.ProgressData{Text: fmt.Sprintf("%d%% (%s/s)", percent, units.GetByteSizeString(speed, 2))})
-				},
-			},
-		},
-		PoolName: c.flagStorage,
-		Name:     instanceName,
-		Devices:  deviceMap,
+		BackupFile: ioprogress.NewProgressReader(file, ioprogress.WithLength(fstat.Size()), ioprogress.WithProgressUpdater(&progress)),
+		PoolName:   c.flagStorage,
+		Name:       instanceName,
+		Devices:    deviceMap,
 	}
 
 	op, err := resource.server.CreateInstanceFromBackup(createArgs)
@@ -125,11 +128,8 @@ func (c *cmdImport) run(cmd *cobra.Command, args []string) error {
 	// Wait for operation to finish.
 	err = cli.CancelableWait(op, &progress)
 	if err != nil {
-		progress.Done("")
 		return err
 	}
-
-	progress.Done("")
 
 	return nil
 }

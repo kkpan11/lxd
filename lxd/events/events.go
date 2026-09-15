@@ -1,18 +1,17 @@
 package events
 
 import (
-	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
 
-	"github.com/canonical/lxd/lxd/auth"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/cancel"
-	"github.com/canonical/lxd/shared/entity"
 	"github.com/canonical/lxd/shared/logger"
 )
 
@@ -38,13 +37,26 @@ type NotifyFunc func(event api.Event)
 type Server struct {
 	serverCommon
 
-	listeners map[string]*Listener
-	notify    NotifyFunc
-	location  string
+	listeners         map[string]*Listener
+	notify            NotifyFunc
+	location          string
+	clusterIdentifier string
+
+	// logger is a [logger.Logger] that can be used while an event is being processed.
+	// This is necessary because the global [logger.Logger] is configured with a hook that will send logging events to the server.
+	// If the global logger is used while the Server is locked, the Server goes into deadlock. This logger should be used instead.
+	logger logger.Logger
 }
 
 // NewServer returns a new event server.
-func NewServer(debug bool, verbose bool, notify NotifyFunc) *Server {
+// The event server logger mirrors the global logger's syslog configuration but
+// omits the events hook to prevent recursive event emission during broadcast.
+func NewServer(debug bool, verbose bool, notify NotifyFunc) (*Server, error) {
+	eventServerLogger, err := logger.New("", logger.GetSyslogName(), verbose, debug, nil)
+	if err != nil {
+		return nil, fmt.Errorf("Failed instantiating event server logger: %w", err)
+	}
+
 	server := &Server{
 		serverCommon: serverCommon{
 			debug:   debug,
@@ -52,9 +64,10 @@ func NewServer(debug bool, verbose bool, notify NotifyFunc) *Server {
 		},
 		listeners: map[string]*Listener{},
 		notify:    notify,
+		logger:    eventServerLogger,
 	}
 
-	return server
+	return server, nil
 }
 
 // SetLocalLocation sets the local location of this member.
@@ -66,14 +79,28 @@ func (s *Server) SetLocalLocation(location string) {
 	s.location = location
 }
 
-// AddListener creates and returns a new event listener.
-func (s *Server) AddListener(projectName string, allProjects bool, projectPermissionFunc auth.PermissionChecker, connection EventListenerConnection, messageTypes []string, excludeSources []EventSource, recvFunc EventHandler, excludeLocations []string) (*Listener, error) {
+// SetClusterIdentifier records the cluster UUID so that audit events emitted
+// via SendSecurity can default the cluster_identifier field without each call
+// site having to know it.
+func (s *Server) SetClusterIdentifier(clusterIdentifier string) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	s.clusterIdentifier = clusterIdentifier
+}
+
+// AddListener creates and returns a new event listener. The filter argument must return true to include the event and
+// false to omit the event.
+//
+// Warn: The filter must not call the default logger or send any events of its own. Otherwise, the event server will
+// deadlock when it tries to broadcast the logging event.
+func (s *Server) AddListener(projectName string, allProjects bool, filter func(logger.Logger, api.Event) bool, connection EventListenerConnection, messageTypes []string, excludeSources []EventSource, recvFunc EventHandler, excludeLocations []string) (*Listener, error) {
 	if allProjects && projectName != "" {
-		return nil, fmt.Errorf("Cannot specify project name when listening for events on all projects")
+		return nil, errors.New("Cannot specify project name when listening for events on all projects")
 	}
 
-	if projectPermissionFunc == nil {
-		projectPermissionFunc = func(*api.URL) bool {
+	if filter == nil {
+		filter = func(logger.Logger, api.Event) bool {
 			return true
 		}
 	}
@@ -82,16 +109,16 @@ func (s *Server) AddListener(projectName string, allProjects bool, projectPermis
 		listenerCommon: listenerCommon{
 			EventListenerConnection: connection,
 			messageTypes:            messageTypes,
-			done:                    cancel.New(context.Background()),
+			done:                    cancel.New(),
 			id:                      uuid.New().String(),
 			recvFunc:                recvFunc,
 		},
 
-		allProjects:           allProjects,
-		projectName:           projectName,
-		projectPermissionFunc: projectPermissionFunc,
-		excludeSources:        excludeSources,
-		excludeLocations:      excludeLocations,
+		allProjects:      allProjects,
+		projectName:      projectName,
+		filter:           filter,
+		excludeSources:   excludeSources,
+		excludeLocations: excludeLocations,
 	}
 
 	s.lock.Lock()
@@ -108,9 +135,95 @@ func (s *Server) AddListener(projectName string, allProjects bool, projectPermis
 	return listener, nil
 }
 
-// SendLifecycle broadcasts a lifecycle event.
+// SendLifecycle broadcasts a lifecycle event and logs it to syslog.
 func (s *Server) SendLifecycle(projectName string, event api.EventLifecycle) {
+	// Log before Send so the server logger is called outside the broadcast lock.
+	// Use s.logger (no events hook) rather than the global logger to avoid emitting
+	// a spurious logging event for every lifecycle event.
+	ctx := logger.Ctx{"source": event.Source, "project": projectName}
+	if event.Name != "" {
+		ctx["name"] = event.Name
+	}
+
+	// Flatten event.Context so each field is individually queryable
+	// in the syslog output.
+	maps.Copy(ctx, event.Context)
+
+	if event.Requestor != nil {
+		// Spell this "requestor" (matching api.EventLifecycle.Requestor); the legacy
+		// "requester" spelling is retained only in the Loki label for back-compat.
+		ctx["requestor"] = event.Requestor.Protocol + "/" + event.Requestor.Username
+	}
+
+	s.logger.Info(event.Action, ctx)
+
 	_ = s.Send(projectName, api.EventTypeLifecycle, event)
+}
+
+// SendSecurity broadcasts a security event and logs it to syslog.
+//
+// The caller must ensure the event server is ready before invoking this:
+// sys_startup must be emitted after NewServer returns, and sys_shutdown
+// must be emitted before the server is torn down.
+func (s *Server) SendSecurity(event *api.EventSecurity) {
+	s.lock.Lock()
+	clusterMember := s.location
+	clusterIdentifier := s.clusterIdentifier
+	s.lock.Unlock()
+
+	// Flatten the event fields into the logger context so each non-zero
+	// field appears as a discrete key=value on the syslog line. The
+	// cluster identity values are added here for human-readable audit
+	// context; they are not duplicated onto the wire.
+	ctx := logger.Ctx{"name": event.Name}
+	if event.RequestMethod != "" {
+		ctx["request_method"] = event.RequestMethod
+	}
+
+	if event.RequestPath != "" {
+		ctx["request_path"] = event.RequestPath
+	}
+
+	if event.Project != "" {
+		ctx["project"] = event.Project
+	}
+
+	if event.Requestor != nil {
+		if event.Requestor.Username != "" {
+			ctx["requestor_username"] = event.Requestor.Username
+		}
+
+		if event.Requestor.Protocol != "" {
+			ctx["requestor_protocol"] = event.Requestor.Protocol
+		}
+
+		if event.Requestor.Address != "" {
+			ctx["requestor_address"] = event.Requestor.Address
+		}
+
+		if event.Requestor.UserAgent != "" {
+			ctx["requestor_user_agent"] = event.Requestor.UserAgent
+		}
+	}
+
+	if clusterMember != "" {
+		ctx["cluster_member"] = clusterMember
+	}
+
+	if clusterIdentifier != "" {
+		ctx["cluster_identifier"] = clusterIdentifier
+	}
+
+	switch event.Level {
+	case "info":
+		s.logger.Info(event.Description, ctx)
+	default:
+		// "warning" and any unrecognised level default to Warn so unknown
+		// severities surface visibly rather than being silently downgraded.
+		s.logger.Warn(event.Description, ctx)
+	}
+
+	_ = s.Send(event.Project, api.EventTypeSecurity, event)
 }
 
 // Send broadcasts a custom event.
@@ -152,19 +265,13 @@ func (s *Server) Inject(event api.Event, eventSource EventSource) {
 
 	err := s.broadcast(event, eventSource)
 	if err != nil {
-		logger.Warn("Failed to forward event from member", logger.Ctx{"member": event.Location, "err": err})
+		logger.Warn("Failed forwarding event from member", logger.Ctx{"member": event.Location, "err": err})
 	}
 }
 
 func (s *Server) broadcast(event api.Event, eventSource EventSource) error {
 	sourceInSlice := func(source EventSource, sources []EventSource) bool {
-		for _, i := range sources {
-			if source == i {
-				return true
-			}
-		}
-
-		return false
+		return slices.Contains(sources, source)
 	}
 
 	s.lock.Lock()
@@ -181,6 +288,7 @@ func (s *Server) broadcast(event api.Event, eventSource EventSource) error {
 		s.notify(event)
 	}
 
+	filterLogger := s.logger.AddContext(logger.Ctx{"source": eventSource})
 	listeners := s.listeners
 	for _, listener := range listeners {
 		// If the event is project specific, check if the listener is requesting events from that project.
@@ -188,21 +296,21 @@ func (s *Server) broadcast(event api.Event, eventSource EventSource) error {
 			continue
 		}
 
-		// If the event is project specific, ensure we have permission to view it.
-		if event.Project != "" && !listener.projectPermissionFunc(entity.ProjectURL(event.Project)) {
-			continue
-		}
-
 		if sourceInSlice(eventSource, listener.excludeSources) {
 			continue
 		}
 
-		if !shared.ValueInSlice(event.Type, listener.messageTypes) {
+		if !slices.Contains(listener.messageTypes, event.Type) {
 			continue
 		}
 
 		// If the event doesn't come from this member and has been excluded by listener, don't deliver it.
-		if eventSource != EventSourceLocal && shared.ValueInSlice(event.Location, listener.excludeLocations) {
+		if eventSource != EventSourceLocal && slices.Contains(listener.excludeLocations, event.Location) {
+			continue
+		}
+
+		// Apply any further filters.
+		if !listener.filter(filterLogger, event) {
 			continue
 		}
 
@@ -242,9 +350,9 @@ func (s *Server) broadcast(event api.Event, eventSource EventSource) error {
 type Listener struct {
 	listenerCommon
 
-	allProjects           bool
-	projectName           string
-	projectPermissionFunc auth.PermissionChecker
-	excludeSources        []EventSource
-	excludeLocations      []string
+	allProjects      bool
+	projectName      string
+	filter           func(logger.Logger, api.Event) bool
+	excludeSources   []EventSource
+	excludeLocations []string
 }

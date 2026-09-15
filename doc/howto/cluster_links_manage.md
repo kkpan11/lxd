@@ -1,0 +1,196 @@
+---
+myst:
+  html_meta:
+    description: View, configure, and delete LXD cluster links and manage their permissions.
+---
+
+(howto-cluster-links-manage)=
+# How to manage cluster links
+
+(howto-cluster-links-view)=
+## View cluster links
+
+`````{tabs}
+````{group-tab} CLI
+
+To list all cluster links (that you have permission to see), run:
+
+    lxc cluster link list
+
+The `list` view shows each link's addresses, identity status, and type.
+
+To view the full configuration of a specific cluster link, run:
+
+    lxc cluster link show <cluster-link-name>
+
+To view detailed information about the state of a specific cluster link, run:
+
+    lxc cluster link info <cluster-link-name>
+
+The `info` view shows the link type and the status of each linked cluster member.
+
+````
+````{group-tab} API
+
+To list all cluster links (that you have permission to see), send the following request:
+
+    lxc query --request GET /1.0/cluster/links
+
+To display detailed information about each cluster link, use {ref}`rest-api-recursion`:
+
+    lxc query --request GET /1.0/cluster/links?recursion=1
+
+See [`GET /1.0/cluster/links`](swagger:/cluster-links/cluster_links_get) and [`GET /1.0/cluster/links?recursion=1`](swagger:/cluster-links/cluster_links_get_recursion1) for more information.
+
+To view the full configuration of a specific cluster link, run:
+
+    lxc query --request GET /1.0/cluster/links/<name>
+
+See [`GET /1.0/cluster/links/{name}`](swagger:/cluster-links/{name}/cluster_link_get) for more information.
+
+To view detailed information about the state of a specific cluster link, run:
+
+    lxc query --request GET /1.0/cluster/links/<name>/state
+
+See [`GET /1.0/cluster/links/{name}/state`](swagger:/cluster-links/{name}/state/cluster_link_state_get) for more information.
+
+````
+````{group-tab} UI
+   Click {guilabel}`Clustering` in the navigation sidebar, then select {guilabel}`Links` from the expanded drop-down list.
+````
+`````
+
+(howto-cluster-links-permissions)=
+## Manage cluster link permissions
+
+To modify the permissions of a cluster link, add its identity to authentication groups. See {ref}`manage-permissions` for more information.
+
+For example, you can create an authentication group with server viewer permissions and add the cluster link identity to it:
+
+```bash
+lxc auth group create viewers
+lxc auth group permission add viewers server viewer
+lxc auth identity group add tls/<cluster-link-name> viewers
+```
+
+Alternatively, for bidirectional links you can specify an authentication group when creating the link, which will automatically assign the cluster link identity to that group:
+
+```bash
+lxc cluster link create <cluster-link-name> --auth-group <group name>
+```
+
+For unidirectional links, `--auth-group` is not supported on the initiating cluster (Cluster A has no identity for B) when running `lxc cluster link create`. Instead, specify the authentication group on the target cluster (Cluster B) with `--group` when issuing the identity token with `lxc auth identity create`:
+
+```bash
+lxc auth identity create cluster-link/<name-for-cluster-a> --group <group name>
+```
+
+(howto-cluster-links-configure)=
+## Configure a cluster link
+
+See {ref}`ref-cluster-link-config` for more details on cluster link configuration options.
+
+`````{tabs}
+````{group-tab} CLI
+There are multiple ways to update the configuration for a cluster link.
+
+To edit the entire configuration of a cluster link at once in your default text editor, enter the following command:
+
+    lxc cluster link edit <cluster-link-name>
+
+You can also update a single property for a cluster link by using the `set` command with the `--property` flag:
+
+    lxc cluster link set <cluster-link-name> --property <key>=<value>
+
+For example, to update the `description` property:
+
+    lxc cluster link set cluster_b --property description="Backup cluster in data center 2"
+
+Cluster links have the following properties:
+
+% Include content from [../metadata.txt](../metadata.txt)
+```{include} ../metadata.txt
+    :start-after: <!-- config group cluster-link-properties start -->
+    :end-before: <!-- config group cluster-link-properties end -->
+```
+
+You can also update a single configuration option for a cluster link.
+
+    lxc cluster link set <cluster-link-name> <key>=<value>
+
+````
+````{group-tab} API
+There are multiple ways to update the configuration for a cluster link.
+
+To edit the entire configuration of a cluster link at once, send the following request:
+
+    lxc query --request PUT /1.0/cluster/links/<name> --data "<link_configuration>"
+
+See [`PUT /1.0/cluster/links/{name}`](swagger:/cluster-links/{name}/cluster_link_put) for more information.
+
+To modify a specific property of a cluster link, send the following request:
+
+    lxc query --request PATCH /1.0/cluster/links/<name> --data '{"<key>": "<value>"}'
+
+Example:
+
+    lxc query --request PATCH /1.0/cluster/links/cluster_b --data '{"description": "Backup cluster in data center B"}'
+
+See [`PATCH /1.0/cluster/links/{name}`](swagger:/cluster-links/{name}/cluster_link_patch) for more information.
+
+Cluster links have the following properties:
+
+% Include content from [../metadata.txt](../metadata.txt)
+```{include} ../metadata.txt
+    :start-after: <!-- config group cluster-link-properties start -->
+    :end-before: <!-- config group cluster-link-properties end -->
+```
+
+You can also update a single configuration option for a cluster link.
+
+    lxc query --request PATCH /1.0/cluster/links/<name> --data '{"config": <config>}'
+
+See [`PATCH /1.0/cluster/links/{name}`](swagger:/cluster-links/{name}/cluster_link_patch) for more information.
+````
+````{group-tab} UI
+   Click {guilabel}`Clustering` in the navigation sidebar, then select {guilabel}`Links` from the expanded drop-down list.
+
+   To edit a cluster link, click on the pencil icon at the end of that cluster link's row.
+
+````
+`````
+
+(howto-cluster-links-delete)=
+## Delete a cluster link
+
+`````{tabs}
+````{group-tab} CLI
+To delete a cluster link, run:
+
+    lxc cluster link delete <cluster-link-name>
+
+````
+````{group-tab} API
+To delete a cluster link, run:
+
+    lxc query --request DELETE /1.0/cluster/links/<name>
+
+See [`DELETE /1.0/cluster/links/{name}`](swagger:/cluster-links/{name}/cluster_link_delete) for more information.
+````
+````{group-tab} UI
+   Click {guilabel}`Clustering` in the navigation sidebar, then select {guilabel}`Links` from the expanded drop-down list.
+
+   To delete a cluster link, click on the trash can icon at the end of that cluster link's row.
+
+````
+`````
+
+```{admonition} Deletion behavior depends on link type
+:class: note
+
+The effect of deleting a cluster link varies by type:
+
+- **Bidirectional**: Deleting on one cluster removes the trust and identity only on that cluster. The other cluster retains its identity and trust until you also delete the link there. To fully disconnect, run the command on both clusters.
+- **Unidirectional**: Deleting on Cluster A removes only A's link row. Cluster B retains its identity for A until B explicitly revokes it with `lxc auth identity delete cluster-link/<name-for-cluster-a>`.
+- **Public**: Deleting on Cluster A removes A's link row. Since B has no knowledge of the link, no further cleanup is required.
+```

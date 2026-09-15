@@ -17,31 +17,14 @@ import uuid
 
 class FriendlyParser(argparse.ArgumentParser):
     def error(self, message):
-        sys.stderr.write('\nerror: %s\n' % message)
+        sys.stderr.write("\nerror: %s\n" % message)
         self.print_help()
         sys.exit(2)
 
 
-def find_on_path(command):
-    """Is command on the executable search path?"""
-
-    if 'PATH' not in os.environ:
-        return False
-
-    path = os.environ['PATH']
-    for element in path.split(os.pathsep):
-        if not element:
-            continue
-        filename = os.path.join(element, command)
-        if os.path.isfile(filename) and os.access(filename, os.X_OK):
-            return True
-
-    return False
-
-
 class UnixHTTPConnection(http.client.HTTPConnection):
     def __init__(self, path):
-        http.client.HTTPConnection.__init__(self, 'localhost')
+        http.client.HTTPConnection.__init__(self, "localhost")
         self.path = path
 
     def connect(self):
@@ -50,7 +33,7 @@ class UnixHTTPConnection(http.client.HTTPConnection):
         self.sock = sock
 
 
-class LXD(object):
+class LXD:
     workdir = None
 
     def __init__(self, path, project="default"):
@@ -70,8 +53,9 @@ class LXD(object):
             data["project"] = self.project
             self.lxd.request(
                 method,
-                "%s?%s" % "&".join(["%s=%s" % (key, value)
-                                    for key, value in data.items()]), headers)
+                path + "?" + "&".join([f"{key}={value}" for key, value in data.items()]),
+                headers,
+            )
         else:
             path += "?project=%s" % self.project
             self.lxd.request(method, path, data, headers)
@@ -81,17 +65,17 @@ class LXD(object):
         return r.status, d
 
     def aliases_create(self, name, target):
-        data = json.dumps({"target": target,
-                           "name": name})
+        data = json.dumps({"target": target, "name": name})
+        headers = {}
+        headers["Content-Type"] = "application/json"
 
-        status, data = self.rest_call("/1.0/images/aliases", data, "POST")
+        status, data = self.rest_call("/1.0/images/aliases", data, "POST", headers)
 
         if status not in (200, 201):
             raise Exception("Failed to create alias: %s" % name)
 
     def aliases_remove(self, name):
-        status, data = self.rest_call("/1.0/images/aliases/%s" % name,
-                                      method="DELETE")
+        status, data = self.rest_call("/1.0/images/aliases/%s" % name, method="DELETE")
 
         if status != 200:
             raise Exception("Failed to remove alias: %s" % name)
@@ -99,79 +83,85 @@ class LXD(object):
     def aliases_list(self):
         status, data = self.rest_call("/1.0/images/aliases")
 
-        return [alias.split("/1.0/images/aliases/")[-1]
-                for alias in data['metadata']]
+        return [alias.split("/1.0/images/aliases/")[-1] for alias in data["metadata"]]
 
     def images_list(self, recursive=False):
         if recursive:
             status, data = self.rest_call("/1.0/images?recursion=1")
-            return data['metadata']
+            return data["metadata"]
         else:
             status, data = self.rest_call("/1.0/images")
-            return [image.split("/1.0/images/")[-1]
-                    for image in data['metadata']]
+            return [image.split("/1.0/images/")[-1] for image in data["metadata"]]
 
     def images_upload(self, path, public, filename=None):
         headers = {}
         if public:
-            headers['X-LXD-public'] = "1"
+            headers["X-LXD-public"] = "1"
 
         if isinstance(path, str):
-            headers['Content-Type'] = "application/octet-stream"
+            headers["Content-Type"] = "application/octet-stream"
 
-            status, data = self.rest_call("/1.0/images", open(path, "rb"),
-                                          "POST", headers)
+            with open(path, "rb") as f:
+                status, data = self.rest_call(
+                    "/1.0/images", f, "POST", headers
+                )
         else:
             meta_path, rootfs_path = path
             boundary = str(uuid.uuid1())
             filename_entry = " filename=%s" % filename if filename else ""
 
+            if not isinstance(self.workdir, str) or not self.workdir:
+                raise RuntimeError("Temporary working directory is not available")
             upload_path = os.path.join(self.workdir, "upload")
-            body = open(upload_path, "wb+")
-            for name, path in [("metadata", meta_path),
-                               ("rootfs", rootfs_path)]:
-                body.write(bytes("--%s\r\n" % boundary, "utf-8"))
-                body.write(bytes("Content-Disposition: form-data; "
-                                 "name=%s;%s\r\n" % (name, filename_entry),
-                                 "utf-8"))
-                body.write(b"Content-Type: application/octet-stream\r\n")
+            with open(upload_path, "wb+") as body:
+                for name, path in [("metadata", meta_path), ("rootfs", rootfs_path)]:
+                    body.write(bytes("--%s\r\n" % boundary, "utf-8"))
+                    body.write(
+                        bytes(
+                            "Content-Disposition: form-data; "
+                            "name=%s;%s\r\n" % (name, filename_entry),
+                            "utf-8",
+                        )
+                    )
+                    body.write(b"Content-Type: application/octet-stream\r\n")
+                    body.write(b"\r\n")
+                    with open(path, "rb") as fd:
+                        shutil.copyfileobj(fd, body)
+                    body.write(b"\r\n")
+
+                body.write(bytes("--%s--\r\n" % boundary, "utf-8"))
                 body.write(b"\r\n")
-                with open(path, "rb") as fd:
-                    shutil.copyfileobj(fd, body)
-                body.write(b"\r\n")
 
-            body.write(bytes("--%s--\r\n" % boundary, "utf-8"))
-            body.write(b"\r\n")
-            body.close()
+            headers["Content-Type"] = "multipart/form-data; boundary=%s" % boundary
 
-            headers['Content-Type'] = "multipart/form-data; boundary=%s" \
-                % boundary
-
-            status, data = self.rest_call("/1.0/images",
-                                          open(upload_path, "rb"),
-                                          "POST", headers)
+            with open(upload_path, "rb") as f:
+                status, data = self.rest_call(
+                    "/1.0/images", f, "POST", headers
+                )
 
         if status != 202:
-            raise Exception("Failed to upload the image: %s" % status)
+            raise Exception("Failed to upload the image: %s %s" % (status, data.get("error", "")))
 
-        status, data = self.rest_call(data['operation'] + "/wait",
-                                      "", "GET", {})
+        status, data = self.rest_call(data["operation"] + "/wait", "", "GET", {})
         if status != 200:
             raise Exception("Failed to query the operation: %s" % status)
 
-        if data['status_code'] != 200:
-            raise Exception("Failed to import the image: %s" %
-                            data['metadata'])
+        if data["status_code"] != 200:
+            raise Exception("Failed to import the image: %s" % data["metadata"])
 
-        return data['metadata']['metadata']
+        return data["metadata"]["metadata"]
 
 
-class BusyBox(object):
+class BusyBox:
     workdir = None
+    binary_path = None
 
     def __init__(self):
         # Create our workdir
         self.workdir = tempfile.mkdtemp()
+        self.binary_path = shutil.which("busybox")
+        if not self.binary_path:
+            raise RuntimeError("Unable to locate busybox binary in PATH")
         atexit.register(self.cleanup)
 
     def cleanup(self):
@@ -179,83 +169,121 @@ class BusyBox(object):
             shutil.rmtree(self.workdir)
 
     def create_tarball(self, split=False, template=[]):
-        xz = "pxz" if find_on_path("pxz") else "xz"
+        if self.workdir is None:
+            raise RuntimeError("Temporary working directory is not available")
+        workdir = self.workdir
 
-        destination_tar = os.path.join(self.workdir, "busybox.tar")
+        if self.binary_path is None:
+            raise RuntimeError("BusyBox binary path is not set")
+        binary_path = self.binary_path
+
+        destination_tar = os.path.join(workdir, "busybox.tar")
         target_tarball = tarfile.open(destination_tar, "w:")
 
+        destination_tar_rootfs = None
+        target_tarball_rootfs = None
         if split:
-            destination_tar_rootfs = os.path.join(self.workdir,
-                                                  "busybox.rootfs.tar")
+            destination_tar_rootfs = os.path.join(workdir, "busybox.rootfs.tar")
             target_tarball_rootfs = tarfile.open(destination_tar_rootfs, "w:")
 
-        metadata = {'architecture': os.uname()[4],
-                    'creation_date': int(os.stat("/bin/busybox").st_ctime),
-                    'properties': {
-                        'os': "BusyBox",
-                        'architecture': os.uname()[4],
-                        'description': "BusyBox %s" % os.uname()[4],
-                        'name': "busybox-%s" % os.uname()[4]
-                        },
-                    }
+        source_date_epoch = int(os.environ.get("SOURCE_DATE_EPOCH", "0"))
+        busybox_stat = os.stat(binary_path)
+        creation_date = (
+            source_date_epoch if source_date_epoch else int(busybox_stat.st_mtime)
+        )
+
+        def normalized_tarinfo(name, *, mode=0o644, type_=tarfile.REGTYPE, linkname=None, size=0):
+            info = tarfile.TarInfo(name)
+            info.mtime = creation_date
+            info.uid = 0
+            info.gid = 0
+            info.uname = ""
+            info.gname = ""
+            info.mode = mode
+            info.type = type_
+            info.size = size
+            if linkname is not None:
+                info.linkname = linkname
+            return info
+
+        metadata = {
+            "architecture": os.uname()[4],
+            "creation_date": creation_date,
+            "properties": {
+                "os": "BusyBox",
+                "architecture": os.uname()[4],
+                "description": "BusyBox %s" % os.uname()[4],
+                "name": "busybox-%s" % os.uname()[4],
+            },
+        }
 
         # Add busybox
-        with open("/bin/busybox", "rb") as fd:
-            busybox_file = tarfile.TarInfo()
-            busybox_file.size = os.stat("/bin/busybox").st_size
-            busybox_file.mode = 0o755
+        with open(binary_path, "rb") as fd:
+            busybox_file = normalized_tarinfo(
+                "bin/busybox" if split else "rootfs/bin/busybox",
+                mode=0o755,
+                size=busybox_stat.st_size,
+            )
             if split:
-                busybox_file.name = "bin/busybox"
+                assert target_tarball_rootfs is not None
                 target_tarball_rootfs.addfile(busybox_file, fd)
             else:
-                busybox_file.name = "rootfs/bin/busybox"
                 target_tarball.addfile(busybox_file, fd)
 
         # Add symlinks
-        busybox = subprocess.Popen(["/bin/busybox", "--list-full"],
-                                   stdout=subprocess.PIPE,
-                                   universal_newlines=True)
-        busybox.wait()
+        busybox = subprocess.Popen(
+            [binary_path, "--list-full"],
+            stdout=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        output, _ = busybox.communicate()
 
-        for path in busybox.stdout.read().split("\n"):
-            # Prevent filesystem loop
-            if not path.strip() or path.strip() == "bin/busybox":
-                continue
+        symlinks = sorted(
+            {
+                path.strip()
+                for path in output.splitlines()
+                if path.strip() and path.strip() != "bin/busybox"
+            }
+        )
 
-            symlink_file = tarfile.TarInfo()
-            symlink_file.type = tarfile.SYMTYPE
-            symlink_file.linkname = "/bin/busybox"
+        for path in symlinks:
+            symlink_name = path if split else f"rootfs/{path}"
+            symlink_file = normalized_tarinfo(
+                symlink_name,
+                mode=0o777,
+                type_=tarfile.SYMTYPE,
+                linkname="/bin/busybox",
+            )
             if split:
-                symlink_file.name = "%s" % path.strip()
+                assert target_tarball_rootfs is not None
                 target_tarball_rootfs.addfile(symlink_file)
             else:
-                symlink_file.name = "rootfs/%s" % path.strip()
                 target_tarball.addfile(symlink_file)
 
         # Add directories
-        for path in ("dev", "mnt", "proc", "root", "sys", "tmp"):
-            directory_file = tarfile.TarInfo()
-            directory_file.type = tarfile.DIRTYPE
+        for path in sorted(("dev", "mnt", "proc", "root", "sys", "tmp")):
+            directory_name = path if split else f"rootfs/{path}"
+            directory_file = normalized_tarinfo(
+                directory_name, mode=0o755, type_=tarfile.DIRTYPE
+            )
             if split:
-                directory_file.name = "%s" % path
+                assert target_tarball_rootfs is not None
                 target_tarball_rootfs.addfile(directory_file)
             else:
-                directory_file.name = "rootfs/%s" % path
                 target_tarball.addfile(directory_file)
 
         # Deal with templating
         if template:
             metadata["templates"] = {
-                "/template": {
-                    "when": template,
-                    "template": "template.tpl"}}
+                "/template": {"when": template, "template": "template.tpl"}
+            }
 
-            directory_file = tarfile.TarInfo()
-            directory_file.type = tarfile.DIRTYPE
-            directory_file.name = "templates"
+            directory_file = normalized_tarinfo(
+                "templates", mode=0o755, type_=tarfile.DIRTYPE
+            )
             target_tarball.addfile(directory_file)
 
-            template = """name: {{ container.name }}
+            template_content = """name: {{ container.name }}
 architecture: {{ container.architecture }}
 privileged: {{ container.privileged }}
 ephemeral: {{ container.ephemeral }}
@@ -264,63 +292,53 @@ path: {{ path }}
 user.foo: {{ config_get("user.foo", "_unset_") }}
 """
 
-            template_file = tarfile.TarInfo()
-            template_file.size = len(template)
-            template_file.name = "templates/template.tpl"
-            target_tarball.addfile(template_file,
-                                   io.BytesIO(template.encode()))
+            template_file = normalized_tarinfo(
+                "templates/template.tpl",
+                mode=0o644,
+                size=len(template_content),
+            )
+            target_tarball.addfile(
+                template_file, io.BytesIO(template_content.encode())
+            )
 
         # Add the metadata file
-        metadata_yaml = json.dumps(metadata, sort_keys=True,
-                                   indent=4, separators=(',', ': '),
-                                   ensure_ascii=False).encode('utf-8') + b"\n"
+        metadata_yaml = (
+            json.dumps(
+                metadata,
+                sort_keys=True,
+                indent=4,
+                separators=(",", ": "),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
 
-        metadata_file = tarfile.TarInfo()
-        metadata_file.size = len(metadata_yaml)
-        metadata_file.name = "metadata.yaml"
-        target_tarball.addfile(metadata_file,
-                               io.BytesIO(metadata_yaml))
-
-        # Add an /etc/inittab; this is to work around:
-        # http://lists.busybox.net/pipermail/busybox/2015-November/083618.html
-        # Basically, since there are some hardcoded defaults that misbehave, we
-        # just pass an empty inittab so those aren't applied, and then busybox
-        # doesn't spin forever.
-        inittab = tarfile.TarInfo()
-        inittab.size = 1
-        inittab.name = "/rootfs/etc/inittab"
-        target_tarball.addfile(inittab, io.BytesIO(b"\n"))
+        metadata_file = normalized_tarinfo(
+            "metadata.yaml", mode=0o644, size=len(metadata_yaml)
+        )
+        target_tarball.addfile(metadata_file, io.BytesIO(metadata_yaml))
 
         target_tarball.close()
+        os.utime(destination_tar, (creation_date, creation_date))
         if split:
+            assert target_tarball_rootfs is not None
+            assert destination_tar_rootfs is not None
             target_tarball_rootfs.close()
-
-        # Compress the tarball
-        r = subprocess.call([xz, "-9", destination_tar])
-        if r:
-            raise Exception("Failed to compress: %s" % destination_tar)
+            os.utime(destination_tar_rootfs, (creation_date, creation_date))
 
         if split:
-            r = subprocess.call([xz, "-9", destination_tar_rootfs])
-            if r:
-                raise Exception("Failed to compress: %s" %
-                                destination_tar_rootfs)
-            return destination_tar + ".xz", destination_tar_rootfs + ".xz"
+            assert destination_tar_rootfs is not None
+            return destination_tar, destination_tar_rootfs
         else:
-            return destination_tar + ".xz"
+            return destination_tar
 
 
 if __name__ == "__main__":
-    if "LXD_DIR" in os.environ:
-        lxd_socket = os.path.join(os.environ['LXD_DIR'], "unix.socket")
-    else:
-        lxd_socket = "/var/lib/lxd/unix.socket"
-
-    if not os.path.exists(lxd_socket):
-        print("LXD isn't running.")
-        sys.exit(1)
 
     def setup_alias(aliases, fingerprint):
+        if not aliases:
+            return
+
         existing = lxd.aliases_list()
 
         for alias in aliases:
@@ -334,26 +352,41 @@ if __name__ == "__main__":
 
         if args.split:
             meta_path, rootfs_path = busybox.create_tarball(
-                split=True,
-                template=args.template.split(","))
+                split=True, template=args.template.split(",")
+            )
+
+            if args.save_image:
+                shutil.copy(meta_path, "busybox.meta.tar")
+                shutil.copy(rootfs_path, "busybox.rootfs.tar")
+                return
 
             with open(meta_path, "rb") as meta_fd:
                 with open(rootfs_path, "rb") as rootfs_fd:
-                    fingerprint = hashlib.sha256(meta_fd.read() +
-                                                 rootfs_fd.read()).hexdigest()
+                    fingerprint = hashlib.sha256(
+                        meta_fd.read() + rootfs_fd.read()
+                    ).hexdigest()
 
             if fingerprint in lxd.images_list():
                 parser.exit(1, "This image is already in the store.\n")
 
             if args.filename:
-                r = lxd.images_upload((meta_path, rootfs_path), args.public,
-                                      meta_path.split("/")[-1])
+                r = lxd.images_upload(
+                    (meta_path, rootfs_path), args.public, meta_path.split("/")[-1]
+                )
             else:
                 r = lxd.images_upload((meta_path, rootfs_path), args.public)
-            print("Image imported as: %s" % r['fingerprint'])
+            print("Image imported as: %s" % r["fingerprint"])
         else:
             path = busybox.create_tarball(template=args.template.split(","))
 
+            if args.save_image:
+                if not isinstance(path, str):
+                    raise RuntimeError("Unexpected tarball path type")
+                shutil.copy(path, "busybox.tar")
+                return
+
+            if not isinstance(path, str):
+                raise RuntimeError("Unexpected tarball path type")
             with open(path, "rb") as fd:
                 fingerprint = hashlib.sha256(fd.read()).hexdigest()
 
@@ -361,31 +394,58 @@ if __name__ == "__main__":
                 parser.exit(1, "This image is already in the store.\n")
 
             r = lxd.images_upload(path, args.public)
-            print("Image imported as: %s" % r['fingerprint'])
+            print("Image imported as: %s" % r["fingerprint"])
 
         setup_alias(args.alias, fingerprint)
 
     parser = FriendlyParser(description="Import a busybox image")
-    parser.add_argument("--alias", action="append",
-                        default=[], help="Aliases for the image")
-    parser.add_argument("--public", action="store_true",
-                        default=False, help="Make the image public")
-    parser.add_argument("--split", action="store_true",
-                        default=False, help="Whether to create a split image")
-    parser.add_argument("--filename", action="store_true",
-                        default=False, help="Set the split image's filename")
-    parser.add_argument("--template", type=str,
-                        default="", help="Trigger test template")
-    parser.add_argument("--project", type=str,
-                        default="default", help="Project to use")
+    parser.add_argument(
+        "--alias", action="append", default=[], help="Aliases for the image"
+    )
+    parser.add_argument(
+        "--public", action="store_true", default=False, help="Make the image public"
+    )
+    parser.add_argument(
+        "--split",
+        action="store_true",
+        default=False,
+        help="Whether to create a split image",
+    )
+    parser.add_argument(
+        "--filename",
+        action="store_true",
+        default=False,
+        help="Set the split image's filename",
+    )
+    parser.add_argument(
+        "--template", type=str, default="", help="Trigger test template"
+    )
+    parser.add_argument("--project", type=str, default="default", help="Project to use")
+
+    parser.add_argument(
+        "--save-image", action="store_true", default=False, help="Save the image tarball"
+    )
     parser.set_defaults(func=import_busybox)
 
     # Call the function
     args = parser.parse_args()
 
-    lxd = LXD(lxd_socket, project=args.project)
+    if not args.save_image:
+        if "LXD_DIR" in os.environ:
+            lxd_socket = os.path.join(os.environ["LXD_DIR"], "unix.socket")
+        elif os.path.exists("/var/snap/lxd/common/lxd/unix.socket"):
+            lxd_socket = "/var/snap/lxd/common/lxd/unix.socket"
+        else:
+            lxd_socket = "/var/lib/lxd/unix.socket"
+
+        if not os.path.exists(lxd_socket):
+            print("LXD isn't running.")
+            sys.exit(1)
+
+        lxd = LXD(lxd_socket, project=args.project)
 
     try:
         args.func(parser, args)
     except Exception as e:
-        parser.error(e)
+        sys.stderr.write("\nerror: %s\n" % e)
+        sys.exit(1)

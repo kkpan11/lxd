@@ -3,8 +3,11 @@
 package subprocess
 
 import (
-	"fmt"
+	"errors"
 )
 
 // ErrNotRunning is returned when performing an action against a stopped process.
-var ErrNotRunning = fmt.Errorf("The process isn't running")
+var ErrNotRunning = errors.New("The process is not running")
+
+// ErrBadPID is returned when an import file contains a facially incorrect/dangerous PID <= 0.
+var ErrBadPID = errors.New("Invalid PID")

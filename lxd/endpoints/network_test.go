@@ -1,9 +1,7 @@
 package endpoints_test
 
 import (
-	"fmt"
 	"net"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -55,6 +53,7 @@ func TestEndpoints_NetworkSocketBasedActivation(t *testing.T) {
 
 	file, err := listener.File()
 	require.NoError(t, err)
+	defer func() { _ = file.Close() }()
 
 	setupSocketBasedActivation(endpoints, file)
 
@@ -102,9 +101,11 @@ func TestEndpoints_NetworkCreateTCPSocketIPv4(t *testing.T) {
 	require.NoError(t, endpoints.Up(config))
 
 	address, certificate := endpoints.NetworkAddressAndCert()
-	parts := strings.Split(address, ":")
-	ipv6Address := fmt.Sprintf("[::1]:%s", parts[1])
-	ipv4Address := fmt.Sprintf("127.0.0.1:%s", parts[1])
+	_, port, err := net.SplitHostPort(address)
+	require.NoError(t, err)
+
+	ipv6Address := net.JoinHostPort("::1", port)
+	ipv4Address := net.JoinHostPort("127.0.0.1", port)
 
 	// Check accessibility over IPv4 request
 	assert.NoError(t, httpGetOverTLSSocket(ipv4Address, certificate))

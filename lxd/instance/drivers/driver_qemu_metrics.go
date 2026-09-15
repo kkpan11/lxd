@@ -2,9 +2,9 @@ package drivers
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -12,7 +12,6 @@ import (
 	"github.com/canonical/lxd/lxd/instance/drivers/qmp"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/metrics"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/units"
 )
@@ -28,41 +27,41 @@ func (d *qemu) getQemuMetrics() (*metrics.MetricSet, error) {
 
 	cpuStats, err := d.getQemuCPUMetrics(monitor)
 	if err != nil {
-		d.logger.Warn("Failed to get CPU metrics", logger.Ctx{"err": err})
+		d.logger.Warn("Failed getting CPU metrics", logger.Ctx{"err": err})
 	} else {
 		out.CPU = cpuStats
 	}
 
 	memoryStats, err := d.getQemuMemoryMetrics()
 	if err != nil {
-		d.logger.Warn("Failed to get memory metrics", logger.Ctx{"err": err})
+		d.logger.Warn("Failed getting memory metrics", logger.Ctx{"err": err})
 	} else {
 		out.Memory = memoryStats
 	}
 
 	diskStats, err := d.getQemuDiskMetrics(monitor)
 	if err != nil {
-		d.logger.Warn("Failed to get disk metrics", logger.Ctx{"err": err})
+		d.logger.Warn("Failed getting disk metrics", logger.Ctx{"err": err})
 	} else {
 		out.Disk = diskStats
 	}
 
 	networkState, err := d.getNetworkState()
 	if err != nil {
-		d.logger.Warn("Failed to get network metrics", logger.Ctx{"err": err})
+		d.logger.Warn("Failed getting network metrics", logger.Ctx{"err": err})
 	} else {
 		out.Network = make(map[string]metrics.NetworkMetrics)
 
 		for name, state := range networkState {
 			out.Network[name] = metrics.NetworkMetrics{
-				ReceiveBytes:    uint64(state.Counters.BytesReceived),
-				ReceiveDrop:     uint64(state.Counters.PacketsDroppedInbound),
-				ReceiveErrors:   uint64(state.Counters.ErrorsReceived),
-				ReceivePackets:  uint64(state.Counters.PacketsReceived),
-				TransmitBytes:   uint64(state.Counters.BytesSent),
-				TransmitDrop:    uint64(state.Counters.PacketsDroppedOutbound),
-				TransmitErrors:  uint64(state.Counters.ErrorsSent),
-				TransmitPackets: uint64(state.Counters.PacketsSent),
+				ReceiveBytes:    state.Counters.BytesReceived,
+				ReceiveDrop:     state.Counters.PacketsDroppedInbound,
+				ReceiveErrors:   state.Counters.ErrorsReceived,
+				ReceivePackets:  state.Counters.PacketsReceived,
+				TransmitBytes:   state.Counters.BytesSent,
+				TransmitDrop:    state.Counters.PacketsDroppedOutbound,
+				TransmitErrors:  state.Counters.ErrorsSent,
+				TransmitPackets: state.Counters.PacketsSent,
 			}
 		}
 	}
@@ -121,13 +120,13 @@ func (d *qemu) getQemuMemoryMetrics() (metrics.MemoryMetrics, error) {
 		line := scan.Text()
 
 		// We only care about VmRSS.
-		if !strings.HasPrefix(line, "VmRSS:") {
+		value, found := strings.CutPrefix(line, "VmRSS:")
+		if !found {
 			continue
 		}
 
-		// Extract the before last (value) and last (unit) fields
-		fields := strings.Split(line, "\t")
-		value := strings.Replace(fields[len(fields)-1], " ", "", -1)
+		// Clean up whitespace to get a parseable value (e.g. "1234kB")
+		value = strings.ReplaceAll(strings.TrimSpace(value), " ", "")
 
 		// Feed the result to units.ParseByteSizeString to get an int value
 		valueBytes, err := units.ParseByteSizeString(value)
@@ -139,8 +138,13 @@ func (d *qemu) getQemuMemoryMetrics() (metrics.MemoryMetrics, error) {
 		break
 	}
 
+	err = scan.Err()
+	if err != nil {
+		return out, err
+	}
+
 	if memRSS == -1 {
-		return out, fmt.Errorf("Couldn't find VM memory usage")
+		return out, errors.New("Could not find VM memory usage")
 	}
 
 	// Get max memory usage.
@@ -173,35 +177,45 @@ func (d *qemu) getQemuCPUMetrics(monitor *qmp.Monitor) (map[string]metrics.CPUMe
 
 	cpuMetrics := map[string]metrics.CPUMetrics{}
 
+	pid, err := d.pid()
+	if err != nil {
+		return nil, err
+	}
+
+	// A PID of 0 means the process isn't running.
+	if pid < 1 {
+		return nil, fmt.Errorf("Invalid PID %d", pid)
+	}
+
 	for i, threadID := range threadIDs {
-		pid, err := os.ReadFile(d.pidFilePath())
-		if err != nil {
-			return nil, err
-		}
-
-		statFile := filepath.Join("/proc", strings.TrimSpace(string(pid)), "task", strconv.Itoa(threadID), "stat")
-
-		if !shared.PathExists(statFile) {
-			continue
-		}
+		statFile := fmt.Sprintf("/proc/%d/task/%d/stat", pid, threadID)
 
 		content, err := os.ReadFile(statFile)
 		if err != nil {
+			// Ignore PID or TID disappearing.
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+
 			return nil, err
 		}
 
 		fields := strings.Fields(string(content))
 
+		if len(fields) < 43 {
+			return nil, fmt.Errorf("Expected at least 43 fields in %q, got %d", statFile, len(fields))
+		}
+
 		stats := metrics.CPUMetrics{}
 
 		stats.SecondsUser, err = strconv.ParseFloat(fields[13], 64)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to parse %q: %w", fields[13], err)
+			return nil, fmt.Errorf("Failed parsing %q: %w", fields[13], err)
 		}
 
 		guestTime, err := strconv.ParseFloat(fields[42], 64)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to parse %q: %w", fields[42], err)
+			return nil, fmt.Errorf("Failed parsing %q: %w", fields[42], err)
 		}
 
 		// According to proc(5), utime includes guest_time which therefore needs to be subtracted to get the correct time.
@@ -210,7 +224,7 @@ func (d *qemu) getQemuCPUMetrics(monitor *qmp.Monitor) (map[string]metrics.CPUMe
 
 		stats.SecondsSystem, err = strconv.ParseFloat(fields[14], 64)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to parse %q: %w", fields[14], err)
+			return nil, fmt.Errorf("Failed parsing %q: %w", fields[14], err)
 		}
 
 		stats.SecondsSystem /= 100

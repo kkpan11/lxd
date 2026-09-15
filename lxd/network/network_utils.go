@@ -6,14 +6,19 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/big"
 	"math/rand"
 	"net"
+	"net/netip"
 	"os"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/canonical/lxd/lxd/db"
@@ -73,8 +78,8 @@ func RandomDevName(prefix string) string {
 
 // MACDevName returns interface name with prefix 'lxd' and MAC without leading 2 digits.
 func MACDevName(mac net.HardwareAddr) string {
-	devName := strings.Join(strings.Split(mac.String(), ":"), "")
-	return fmt.Sprintf("lxd%s", devName[2:])
+	devName := strings.ReplaceAll(mac.String(), ":", "")
+	return "lxd" + devName[2:]
 }
 
 // UsedByInstanceDevices looks for instance NIC devices using the network and runs the supplied usageFunc for each.
@@ -82,7 +87,7 @@ func MACDevName(mac net.HardwareAddr) string {
 func UsedByInstanceDevices(s *state.State, networkProjectName string, networkName string, networkType string, usageFunc func(inst db.InstanceArgs, nicName string, nicConfig map[string]string) error, filters ...cluster.InstanceFilter) error {
 	// Get the instances.
 	projects := map[string]api.Project{}
-	instances := []db.InstanceArgs{}
+	var instances []db.InstanceArgs
 
 	err := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		return tx.InstanceList(ctx, func(inst db.InstanceArgs, p api.Project) error {
@@ -105,7 +110,7 @@ func UsedByInstanceDevices(s *state.State, networkProjectName string, networkNam
 
 		// Skip instances who's effective network project doesn't match this Network's project.
 		if instNetworkProject != networkProjectName {
-			return nil
+			continue
 		}
 
 		// Look for NIC devices using this network.
@@ -164,7 +169,7 @@ func UsedBy(s *state.State, networkProjectName string, networkID int64, networkN
 			return err
 		})
 		if err != nil {
-			return nil, fmt.Errorf("Failed to load all networks: %w", err)
+			return nil, fmt.Errorf("Failed loading all networks: %w", err)
 		}
 
 		for projectName, networks := range projectNetworks {
@@ -188,17 +193,19 @@ func UsedBy(s *state.State, networkProjectName string, networkID int64, networkN
 
 	// Look for profiles. Next cheapest to do.
 	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		// Get all profiles
 		profiles, err := cluster.GetProfiles(ctx, tx.Tx())
 		if err != nil {
 			return err
 		}
 
-		for _, profile := range profiles {
-			profileDevices, err := cluster.GetProfileDevices(ctx, tx.Tx(), profile.ID)
-			if err != nil {
-				return err
-			}
+		// Get all the profile devices.
+		profileDevices, err := cluster.GetDevices(ctx, tx.Tx(), "profile")
+		if err != nil {
+			return err
+		}
 
+		for _, profile := range profiles {
 			profileProject, err := cluster.GetProject(ctx, tx.Tx(), profile.Project)
 			if err != nil {
 				return err
@@ -209,7 +216,12 @@ func UsedBy(s *state.State, networkProjectName string, networkID int64, networkN
 				return err
 			}
 
-			inUse, err := usedByProfileDevices(profileDevices, apiProfileProject, networkProjectName, networkName, networkType)
+			devices := map[string]cluster.Device{}
+			for _, dev := range profileDevices[profile.ID] {
+				devices[dev.Name] = dev
+			}
+
+			inUse, err := usedByProfileDevices(devices, apiProfileProject, networkProjectName, networkName, networkType)
 			if err != nil {
 				return err
 			}
@@ -353,7 +365,7 @@ func DefaultGatewaySubnetV4() (*net.IPNet, string, error) {
 	}
 
 	if ifaceName == "" {
-		return nil, "", fmt.Errorf("No default gateway for IPv4")
+		return nil, "", errors.New("No default gateway for IPv4")
 	}
 
 	iface, err := net.InterfaceByName(ifaceName)
@@ -379,14 +391,14 @@ func DefaultGatewaySubnetV4() (*net.IPNet, string, error) {
 		}
 
 		if subnet != nil {
-			return nil, "", fmt.Errorf("More than one IPv4 subnet on default interface")
+			return nil, "", errors.New("More than one IPv4 subnet on default interface")
 		}
 
 		subnet = addrNet
 	}
 
 	if subnet == nil {
-		return nil, "", fmt.Errorf("No IPv4 subnet on default interface")
+		return nil, "", errors.New("No IPv4 subnet on default interface")
 	}
 
 	return subnet, ifaceName, nil
@@ -443,7 +455,7 @@ func UpdateDNSMasqStatic(s *state.State, networkName string) error {
 			}
 
 			// Skip devices not connected to managed networks.
-			if !shared.ValueInSlice(d["parent"], networks) {
+			if !slices.Contains(networks, d["parent"]) {
 				continue
 			}
 
@@ -481,36 +493,39 @@ func UpdateDNSMasqStatic(s *state.State, networkName string) error {
 
 	// Update the host files.
 	for _, network := range networks {
-		entries := entries[network]
+		networkPath := shared.VarPath("networks", network)
 
 		// Skip networks we don't manage (or don't have DHCP enabled).
-		if !shared.PathExists(shared.VarPath("networks", network, "dnsmasq.pid")) {
+		if !shared.PathExists(networkPath + "/dnsmasq.pid") {
 			continue
 		}
 
 		// Pass api.ProjectDefaultName here, as currently dnsmasq (bridged) networks do not support projects.
 		n, err := LoadByName(s, api.ProjectDefaultName, network)
 		if err != nil {
-			return fmt.Errorf("Failed to load network %q in project %q for dnsmasq update: %w", api.ProjectDefaultName, network, err)
+			return fmt.Errorf("Failed loading network %q in project %q for dnsmasq update: %w", api.ProjectDefaultName, network, err)
 		}
 
 		config := n.Config()
 
+		hostsPath := networkPath + "/dnsmasq.hosts"
+
 		// Wipe everything clean.
-		files, err := os.ReadDir(shared.VarPath("networks", network, "dnsmasq.hosts"))
+		files, err := os.ReadDir(hostsPath)
 		if err != nil {
 			return err
 		}
 
 		for _, entry := range files {
-			err = os.Remove(shared.VarPath("networks", network, "dnsmasq.hosts", entry.Name()))
+			err = os.Remove(hostsPath + "/" + entry.Name())
 			if err != nil {
 				return err
 			}
 		}
 
 		// Apply the changes.
-		for entryIdx, entry := range entries {
+		networkEntries := entries[network]
+		for entryIdx, entry := range networkEntries {
 			hwaddr := entry[0]
 			projectName := entry[1]
 			cName := entry[2]
@@ -521,7 +536,7 @@ func UpdateDNSMasqStatic(s *state.State, networkName string) error {
 
 			// Look for duplicates.
 			duplicate := false
-			for iIdx, i := range entries {
+			for iIdx, i := range networkEntries {
 				if project.Instance(entry[1], entry[2]) == project.Instance(i[1], i[2]) {
 					// Skip ourselves.
 					continue
@@ -595,48 +610,57 @@ func ForkdnsServersList(networkName string) ([]string, error) {
 	return servers, nil
 }
 
-func randomSubnetV4() (string, error) {
-	for i := 0; i < 100; i++ {
-		cidr := fmt.Sprintf("10.%d.%d.1/24", rand.Intn(255), rand.Intn(255))
-		_, subnet, err := net.ParseCIDR(cidr)
-		if err != nil {
-			continue
-		}
-
-		if inRoutingTable(subnet) {
-			continue
-		}
-
-		if pingSubnet(subnet) {
-			continue
-		}
-
-		return cidr, nil
+// isSubnetUsable checks if a subnet is valid and unused.
+func isSubnetUsable(cidr string) bool {
+	_, subnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return false
 	}
 
-	return "", fmt.Errorf("Failed to automatically find an unused IPv4 subnet, manual configuration required")
+	if inRoutingTable(subnet) {
+		return false
+	}
+
+	if pingSubnet(subnet) {
+		return false
+	}
+
+	return true
+}
+
+func randomSubnetV4() (string, error) {
+	// Generate a random permutation of octets to avoid checking the same subnets every time
+	// which can be slow if the first few are used but not routed.
+	octets := rand.Perm(256)
+
+	iterations := 0
+	for _, y := range octets {
+		x := rand.Intn(256)
+
+		cidr := fmt.Sprintf("10.%d.%d.1/24", x, y)
+		if isSubnetUsable(cidr) {
+			return cidr, nil
+		}
+
+		iterations++
+
+		if iterations >= 100 {
+			break
+		}
+	}
+
+	return "", errors.New("Failed automatically finding an unused IPv4 subnet, manual configuration required")
 }
 
 func randomSubnetV6() (string, error) {
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		cidr := fmt.Sprintf("fd42:%x:%x:%x::1/64", rand.Intn(65535), rand.Intn(65535), rand.Intn(65535))
-		_, subnet, err := net.ParseCIDR(cidr)
-		if err != nil {
-			continue
+		if isSubnetUsable(cidr) {
+			return cidr, nil
 		}
-
-		if inRoutingTable(subnet) {
-			continue
-		}
-
-		if pingSubnet(subnet) {
-			continue
-		}
-
-		return cidr, nil
 	}
 
-	return "", fmt.Errorf("Failed to automatically find an unused IPv6 subnet, manual configuration required")
+	return "", errors.New("Failed automatically finding an unused IPv6 subnet, manual configuration required")
 }
 
 // noAvailableAddressErr is used by randomAddressInSubnet to indicate that the subnet was exhausted while searching for
@@ -716,7 +740,7 @@ func randomAddressInSubnet(ctx context.Context, subnet net.IPNet, validate func(
 		}
 
 		// If we've attempted all possible addresses then return.
-		if big.NewInt(int64(len(attempted))).Cmp(big.NewInt(0).Sub(usableHostsBig, big.NewInt(1))) == 0 {
+		if big.NewInt(int64(len(attempted))).Cmp(usableHostsBig) == 0 {
 			return nil, noAvailableAddressErr{error: fmt.Errorf("No available addresses in subnet %q", subnet.String())}
 		}
 
@@ -766,7 +790,7 @@ func inRoutingTable(subnet *net.IPNet) bool {
 		filename = "ipv6_route"
 	}
 
-	file, err := os.Open(fmt.Sprintf("/proc/net/%s", filename))
+	file, err := os.Open("/proc/net/" + filename)
 	if err != nil {
 		return false
 	}
@@ -840,56 +864,54 @@ func inRoutingTable(subnet *net.IPNet) bool {
 // pingIP sends a single ping packet to the specified IP, returns nil error if IP is reachable.
 // If ctx doesn't have a deadline then the default timeout used is 1s.
 func pingIP(ctx context.Context, ip net.IP) error {
-	cmd := "ping"
-	if ip.To4() == nil {
-		cmd = "ping6"
-	}
-
-	timeout := time.Second * 1
+	timeout := time.Second
 	deadline, ok := ctx.Deadline()
 	if ok {
 		timeout = time.Until(deadline)
 	}
 
-	_, err := shared.RunCommandContext(ctx, cmd, "-n", "-q", ip.String(), "-c", "1", "-w", fmt.Sprintf("%d", int(timeout.Seconds())))
+	_, err := shared.RunCommand(ctx, "ping", "-n", "-q", ip.String(), "-c", "1", "-w", strconv.Itoa(int(timeout.Seconds())))
 
 	return err
 }
 
 func pingSubnet(subnet *net.IPNet) bool {
-	var fail bool
-	var failLock sync.Mutex
+	// Check if we can find a host in the subnet
+	var fail atomic.Bool
 	var wgChecks sync.WaitGroup
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
 
 	ping := func(ip net.IP) {
 		defer wgChecks.Done()
 
-		if pingIP(context.TODO(), ip) != nil {
+		if pingIP(ctx, ip) != nil {
 			return
 		}
 
 		// Remote answered
-		failLock.Lock()
-		fail = true
-		failLock.Unlock()
+		fail.Store(true)
+		cancel()
 	}
 
 	poke := func(ip net.IP) {
 		defer wgChecks.Done()
 
-		addr := fmt.Sprintf("%s:22", ip.String())
+		addr := ip.String() + ":22"
 		if ip.To4() == nil {
 			addr = fmt.Sprintf("[%s]:22", ip.String())
 		}
 
-		_, err := net.DialTimeout("tcp", addr, time.Second)
-		if err == nil {
-			// Remote answered
-			failLock.Lock()
-			fail = true
-			failLock.Unlock()
+		d := net.Dialer{}
+		_, err := d.DialContext(ctx, "tcp", addr)
+		if err != nil {
 			return
 		}
+
+		// Remote answered
+		fail.Store(true)
+		cancel()
 	}
 
 	// Ping first IP
@@ -913,7 +935,7 @@ func pingSubnet(subnet *net.IPNet) bool {
 
 	wgChecks.Wait()
 
-	return fail
+	return fail.Load()
 }
 
 // GetHostDevice returns the interface name to use for a combination of parent device name and VLAN ID.
@@ -927,9 +949,6 @@ func GetHostDevice(parent string, vlan string) string {
 
 	// If no VLANs are configured, use the default pattern
 	defaultVlan := fmt.Sprintf("%s.%s", parent, vlan)
-	if !shared.PathExists("/proc/net/vlan/config") {
-		return defaultVlan
-	}
 
 	// Look for an existing VLAN
 	f, err := os.Open("/proc/net/vlan/config")
@@ -956,6 +975,10 @@ func GetHostDevice(parent string, vlan string) string {
 		}
 	}
 
+	if scanner.Err() != nil {
+		return defaultVlan
+	}
+
 	// Return the default pattern
 	return defaultVlan
 }
@@ -969,7 +992,7 @@ func GetNeighbourIPs(interfaceName string, hwaddr net.HardwareAddr) ([]ip.Neigh,
 	neigh := &ip.Neigh{DevName: interfaceName, MAC: hwaddr}
 	neighbours, err := neigh.Show()
 	if err != nil {
-		return nil, fmt.Errorf("Failed to get IP neighbours for interface %q: %w", interfaceName, err)
+		return nil, fmt.Errorf("Failed getting IP neighbours for interface %q: %w", interfaceName, err)
 	}
 
 	return neighbours, nil
@@ -978,18 +1001,18 @@ func GetNeighbourIPs(interfaceName string, hwaddr net.HardwareAddr) ([]ip.Neigh,
 // GetLeaseAddresses returns the lease addresses for a network and hwaddr.
 func GetLeaseAddresses(networkName string, hwaddr string) ([]net.IP, error) {
 	leaseFile := shared.VarPath("networks", networkName, "dnsmasq.leases")
-	if !shared.PathExists(leaseFile) {
-		return nil, fmt.Errorf("Leases file not found for network %q", networkName)
-	}
-
 	content, err := os.ReadFile(leaseFile)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("Leases file not found for network %q", networkName)
+		}
+
 		return nil, err
 	}
 
 	addresses := []net.IP{}
 
-	for _, lease := range strings.Split(string(content), "\n") {
+	for lease := range strings.SplitSeq(string(content), "\n") {
 		fields := strings.Fields(lease)
 		if len(fields) < 5 {
 			continue
@@ -1078,16 +1101,20 @@ func usesIPv6Firewall(netConfig map[string]string) bool {
 // RandomHwaddr generates a random MAC address from the provided random source.
 func randomHwaddr(r *rand.Rand) string {
 	// Generate a new random MAC address using the usual prefix.
-	ret := bytes.Buffer{}
-	for _, c := range "00:16:3e:xx:xx:xx" {
-		if c == 'x' {
-			ret.WriteString(fmt.Sprintf("%x", r.Int31n(16)))
-		} else {
-			ret.WriteString(string(c))
-		}
+	const hex = "0123456789abcdef"
+
+	// Preallocate exact length: "00:16:3e:xx:xx:xx" = 17 chars
+	b := [17]byte{'0', '0', ':', '1', '6', ':', '3', 'e'}
+
+	pos := 8
+	for range 3 {
+		b[pos] = ':'
+		b[pos+1] = hex[r.Int31n(16)]
+		b[pos+2] = hex[r.Int31n(16)]
+		pos += 3
 	}
 
-	return ret.String()
+	return string(b[:])
 }
 
 // VLANInterfaceCreate creates a VLAN interface on parent interface (if needed).
@@ -1105,7 +1132,7 @@ func VLANInterfaceCreate(parent string, vlanDevice string, vlanID string, gvrp b
 	link := &ip.Link{Name: parent}
 	err := link.SetUp()
 	if err != nil {
-		return false, fmt.Errorf("Failed to bring up parent %q: %w", parent, err)
+		return false, fmt.Errorf("Failed bringing up parent %q: %w", parent, err)
 	}
 
 	vlan := &ip.Vlan{
@@ -1119,12 +1146,12 @@ func VLANInterfaceCreate(parent string, vlanDevice string, vlanID string, gvrp b
 
 	err = vlan.Add()
 	if err != nil {
-		return false, fmt.Errorf("Failed to create VLAN interface %q on %q: %w", vlanDevice, parent, err)
+		return false, fmt.Errorf("Failed creating VLAN interface %q on %q: %w", vlanDevice, parent, err)
 	}
 
 	err = vlan.SetUp()
 	if err != nil {
-		return false, fmt.Errorf("Failed to bring up interface %q: %w", vlanDevice, err)
+		return false, fmt.Errorf("Failed bringing up interface %q: %w", vlanDevice, err)
 	}
 
 	// Attempt to disable IPv6 router advertisement acceptance.
@@ -1143,21 +1170,37 @@ func InterfaceRemove(nic string) error {
 
 // InterfaceExists returns true if network interface exists.
 func InterfaceExists(nic string) bool {
-	if nic != "" && shared.PathExists(fmt.Sprintf("/sys/class/net/%s", nic)) {
+	if nic != "" && shared.PathExists("/sys/class/net/"+nic) {
 		return true
 	}
 
 	return false
 }
 
-// IPInSlice returns true if slice has IP element.
-func IPInSlice(key net.IP, list []net.IP) bool {
-	for _, entry := range list {
-		if entry.Equal(key) {
-			return true
-		}
+// IPIsBroadcast returns true if the IP address is the broadcast address of the given IPv4 subnet.
+func IPIsBroadcast(subnet *net.IPNet, address net.IP) bool {
+	if subnet == nil || address == nil {
+		return false
 	}
-	return false
+
+	addrIPv4 := address.To4()
+	networkIPv4 := subnet.IP.To4()
+
+	if addrIPv4 == nil || networkIPv4 == nil {
+		return false
+	}
+
+	mask := subnet.Mask
+	if len(mask) != net.IPv4len {
+		return false
+	}
+
+	broadcast := make(net.IP, net.IPv4len)
+	for i := range net.IPv4len {
+		broadcast[i] = networkIPv4[i] | ^mask[i]
+	}
+
+	return addrIPv4.Equal(broadcast)
 }
 
 // SubnetContains returns true if outerSubnet contains innerSubnet.
@@ -1283,25 +1326,26 @@ func InterfaceStatus(nicName string) ([]net.IP, bool, error) {
 
 // ParsePortRange validates a port range in the form start-end.
 func ParsePortRange(r string) (base int64, size int64, err error) {
-	entries := strings.Split(r, "-")
-	if len(entries) > 2 {
-		return -1, -1, fmt.Errorf("Invalid port range %q", r)
-	}
+	baseStr, endStr, found := strings.Cut(r, "-")
 
-	base, err = strconv.ParseInt(entries[0], 10, 64)
+	base, err = strconv.ParseInt(baseStr, 10, 64)
 	if err != nil {
 		return -1, -1, err
 	}
 
 	size = int64(1)
-	if len(entries) > 1 {
-		size, err = strconv.ParseInt(entries[1], 10, 64)
+	if found {
+		if strings.Contains(endStr, "-") {
+			return -1, -1, fmt.Errorf("Invalid port range %q", r)
+		}
+
+		size, err = strconv.ParseInt(endStr, 10, 64)
 		if err != nil {
 			return -1, -1, err
 		}
 
 		if size <= base {
-			return -1, -1, fmt.Errorf("End port should be higher than start port")
+			return -1, -1, errors.New("End port should be higher than start port")
 		}
 
 		size -= base
@@ -1374,13 +1418,12 @@ func BridgeNetfilterEnabled(ipVersion uint) error {
 		sysctlName = "ip6tables"
 	}
 
-	sysctlPath := fmt.Sprintf("net/bridge/bridge-nf-call-%s", sysctlName)
+	sysctlPath := "net/bridge/bridge-nf-call-" + sysctlName
 	sysctlVal, err := util.SysctlGet(sysctlPath)
 	if err != nil {
-		return fmt.Errorf("br_netfilter kernel module not loaded")
+		return errors.New("br_netfilter kernel module not loaded")
 	}
 
-	sysctlVal = strings.TrimSpace(sysctlVal)
 	if sysctlVal != "1" {
 		return fmt.Errorf("sysctl net.bridge.bridge-nf-call-%s not enabled", sysctlName)
 	}
@@ -1391,36 +1434,36 @@ func BridgeNetfilterEnabled(ipVersion uint) error {
 // ProxyParseAddr validates a proxy address and parses it into its constituent parts.
 func ProxyParseAddr(data string) (*deviceConfig.ProxyAddress, error) {
 	// Split into <protocol> and <address>.
-	fields := strings.SplitN(data, ":", 2)
+	connType, addr, found := strings.Cut(data, ":")
 
-	if !shared.ValueInSlice(fields[0], []string{"tcp", "udp", "unix"}) {
-		return nil, fmt.Errorf("Unknown protocol type %q", fields[0])
+	if !slices.Contains([]string{"tcp", "udp", "unix"}, connType) {
+		return nil, fmt.Errorf("Unknown protocol type %q", connType)
 	}
 
-	if len(fields) < 2 || fields[1] == "" {
-		return nil, fmt.Errorf("Missing address")
+	if !found || addr == "" {
+		return nil, errors.New("Missing address")
 	}
 
 	newProxyAddr := &deviceConfig.ProxyAddress{
-		ConnType: fields[0],
-		Abstract: strings.HasPrefix(fields[1], "@"),
+		ConnType: connType,
+		Abstract: strings.HasPrefix(addr, "@"),
 	}
 
 	// unix addresses cannot have ports.
 	if newProxyAddr.ConnType == "unix" {
-		newProxyAddr.Address = fields[1]
+		newProxyAddr.Address = addr
 
 		return newProxyAddr, nil
 	}
 
 	// Split <address> into <address> and <ports>.
-	address, port, err := net.SplitHostPort(fields[1])
+	address, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
 	}
 
 	// Validate that it's a valid address.
-	if shared.ValueInSlice(newProxyAddr.ConnType, []string{"udp", "tcp"}) {
+	if slices.Contains([]string{"udp", "tcp"}, newProxyAddr.ConnType) {
 		err := validate.Optional(validate.IsNetworkAddress)(address)
 		if err != nil {
 			return nil, err
@@ -1430,7 +1473,7 @@ func ProxyParseAddr(data string) (*deviceConfig.ProxyAddress, error) {
 	newProxyAddr.Address = address
 
 	// Split <ports> into individual ports and port ranges.
-	ports := strings.SplitN(port, ",", -1)
+	ports := strings.Split(port, ",")
 
 	newProxyAddr.Ports = make([]uint64, 0, len(ports))
 
@@ -1440,14 +1483,150 @@ func ProxyParseAddr(data string) (*deviceConfig.ProxyAddress, error) {
 			return nil, err
 		}
 
-		for i := int64(0); i < portRange; i++ {
+		for i := range portRange {
 			newProxyAddr.Ports = append(newProxyAddr.Ports, uint64(portFirst+i))
 		}
 	}
 
 	if len(newProxyAddr.Ports) <= 0 {
-		return nil, fmt.Errorf("At least one port is required")
+		return nil, errors.New("At least one port is required")
 	}
 
 	return newProxyAddr, nil
+}
+
+// AllowedUplinkNetworks returns a list of allowed networks to use as uplinks based on project restrictions.
+func AllowedUplinkNetworks(ctx context.Context, tx *db.ClusterTx, projectConfig map[string]string) ([]string, error) {
+	var uplinkNetworkNames []string
+
+	// There are no allowed networks if project is restricted and restricted.networks.uplinks is not set.
+	if shared.IsTrue(projectConfig["restricted"]) && projectConfig["restricted.networks.uplinks"] == "" {
+		return []string{}, nil
+	}
+
+	// Uplink networks are always from the default project.
+	networks, err := tx.GetCreatedNetworksByProject(ctx, api.ProjectDefaultName)
+	if err != nil {
+		return nil, fmt.Errorf("Failed getting uplink networks: %w", err)
+	}
+
+	// Add any compatible networks to the uplink network list.
+	for _, network := range networks {
+		if network.Type == "bridge" || network.Type == "physical" {
+			uplinkNetworkNames = append(uplinkNetworkNames, network.Name)
+		}
+	}
+
+	// If project is not restricted, return full network list.
+	if shared.IsFalseOrEmpty(projectConfig["restricted"]) {
+		return uplinkNetworkNames, nil
+	}
+
+	allowedUplinkNetworkNames := []string{}
+
+	// Parse the allowed uplinks and return any that are present in the actual defined networks.
+	allowedRestrictedUplinks := shared.SplitNTrimSpace(projectConfig["restricted.networks.uplinks"], ",", -1, false)
+
+	for _, allowedRestrictedUplink := range allowedRestrictedUplinks {
+		if slices.Contains(uplinkNetworkNames, allowedRestrictedUplink) {
+			allowedUplinkNetworkNames = append(allowedUplinkNetworkNames, allowedRestrictedUplink)
+		}
+	}
+
+	return allowedUplinkNetworkNames, nil
+}
+
+// complementRangesIP4 returns the complement of the provided IPv4 network ranges.
+// Accepts a slice of IPv4 ranges and its network's address as parameters.
+// It calculates the IPv4 ranges that are *not* covered by the input slice and
+// returns the result.
+// Network address is used to find the boundaries of the network (first and last IP),
+// this in turn allows the function to consider the full IP space that the ranges belong to.
+func complementRangesIP4(ranges []*shared.IPRange, netAddr *net.IPNet) ([]shared.IPRange, error) {
+	var complement []shared.IPRange
+
+	// Sort the input slice of IP ranges by their start address from lowest to highest.
+	// This is important because it allows us to find gaps within ranges by making a single linear pass
+	// over the given ranges.
+	sort.Slice(ranges, func(i, j int) bool {
+		return bytes.Compare(ranges[i].Start, ranges[j].Start) < 0
+	})
+
+	ipv4NetPrefix, err := netip.ParsePrefix(netAddr.String())
+	if err != nil {
+		return nil, err
+	}
+
+	// Initialize a cursor to the start of the network.
+	// It tracks the end of the last covered IP range.
+	previousEnd := ipv4NetPrefix.Addr()
+
+	// Iterate over the sorted list of given IP ranges to find the gaps between them.
+	for _, r := range ranges {
+		startAddr, ok := netip.AddrFromSlice(r.Start.To4())
+		if !ok {
+			return nil, fmt.Errorf("Cannot parse IP %q", r.Start)
+		}
+
+		endAddr, ok := netip.AddrFromSlice(r.End.To4())
+		if !ok {
+			return nil, fmt.Errorf("Cannot parse IP %q", r.End)
+		}
+
+		previousEndNext := previousEnd.Next()
+
+		// Check if a gap exists between the last covered range and the current one.
+		// A gap is present only if the start of this range comes *after* the IP
+		// immediately following the previous end (previousEnd.Next()).
+		// This correctly handles adjacent ranges (e.g., ending in .20, starting at .21) by not
+		// flagging them as a gap.
+		if startAddr.Compare(previousEndNext) == 1 {
+			newStart := previousEndNext
+			newEnd := startAddr.Prev()
+			newRange := shared.IPRange{Start: newStart.AsSlice()}
+
+			// Check if the calculated gap is just a single IP or a multi-IP range.
+			if newStart.Compare(newEnd) != 0 {
+				// Gap covers multiple IPs so specify an end IP.
+				newRange.End = newEnd.AsSlice()
+			}
+
+			complement = append(complement, newRange)
+		}
+
+		// Advance the cursor to the end of the current range if it extends further
+		// than the previous one. This correctly handles overlapping ranges.
+		if endAddr.Compare(previousEnd) == 1 {
+			previousEnd = endAddr
+		}
+	}
+
+	broadcastAddr := dhcpalloc.GetIP(netAddr, -1)
+
+	// Set "endAddr" to the end of the network (broadcast address).
+	endAddr, ok := netip.AddrFromSlice(broadcastAddr.To4())
+	if !ok {
+		return nil, fmt.Errorf("Cannot parse IP %q", broadcastAddr)
+	}
+
+	// Check for a final gap between the end of the last processed range
+	// and the end of the network.
+	if previousEnd.Compare(endAddr) == -1 {
+		complement = append(complement, shared.IPRange{Start: previousEnd.Next().AsSlice(), End: endAddr.AsSlice()})
+	}
+
+	return complement, nil
+}
+
+// ipInRanges checks whether the given IP address is contained within any of the
+// provided IP network ranges.
+func ipInRanges(ipAddr net.IP, ipRanges []shared.IPRange) bool {
+	for _, r := range ipRanges {
+		containsIP := r.ContainsIP(ipAddr)
+		if containsIP {
+			return true
+		}
+	}
+
+	return false
 }

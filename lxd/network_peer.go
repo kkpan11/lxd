@@ -5,31 +5,35 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
-
-	"github.com/gorilla/mux"
 
 	"github.com/canonical/lxd/lxd/auth"
 	"github.com/canonical/lxd/lxd/db"
+	"github.com/canonical/lxd/lxd/db/operationtype"
 	"github.com/canonical/lxd/lxd/lifecycle"
 	"github.com/canonical/lxd/lxd/network"
+	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/project"
 	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared/api"
+	"github.com/canonical/lxd/shared/entity"
 	"github.com/canonical/lxd/shared/version"
 )
 
 var networkPeersCmd = APIEndpoint{
-	Path: "networks/{networkName}/peers",
+	Path:            "networks/{networkName}/peers",
+	MetricsType:     entity.TypeNetwork,
+	ProjectSpecific: true,
 
 	Get:  APIEndpointAction{Handler: networkPeersGet, AccessHandler: networkAccessHandler(auth.EntitlementCanView)},
 	Post: APIEndpointAction{Handler: networkPeersPost, AccessHandler: networkAccessHandler(auth.EntitlementCanEdit)},
 }
 
 var networkPeerCmd = APIEndpoint{
-	Path: "networks/{networkName}/peers/{peerName}",
+	Path:            "networks/{networkName}/peers/{peerName}",
+	MetricsType:     entity.TypeNetwork,
+	ProjectSpecific: true,
 
 	Delete: APIEndpointAction{Handler: networkPeerDelete, AccessHandler: networkAccessHandler(auth.EntitlementCanEdit)},
 	Get:    APIEndpointAction{Handler: networkPeerGet, AccessHandler: networkAccessHandler(auth.EntitlementCanView)},
@@ -134,12 +138,12 @@ var networkPeerCmd = APIEndpoint{
 func networkPeersGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	effectiveProjectName, err := request.GetCtxValue[string](r.Context(), request.CtxEffectiveProjectName)
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	details, err := request.GetCtxValue[networkDetails](r.Context(), ctxNetworkDetails)
+	details, err := request.GetContextValue[networkDetails](r.Context(), ctxNetworkDetails)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -158,7 +162,8 @@ func networkPeersGet(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(fmt.Errorf("Network driver %q does not support peering", n.Type()))
 	}
 
-	if util.IsRecursionRequest(r) {
+	recursion, _ := util.IsRecursionRequest(r)
+	if recursion > 0 {
 		var records map[int64]*api.NetworkPeer
 
 		err := s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
@@ -173,7 +178,7 @@ func networkPeersGet(d *Daemon, r *http.Request) response.Response {
 		peers := make([]*api.NetworkPeer, 0, len(records))
 		for _, record := range records {
 			record.UsedBy, _ = n.PeerUsedBy(record.Name)
-			record.UsedBy = project.FilterUsedBy(s.Authorizer, r, record.UsedBy)
+			record.UsedBy = project.FilterUsedBy(r.Context(), s.Authorizer, record.UsedBy)
 			peers = append(peers, record)
 		}
 
@@ -193,7 +198,7 @@ func networkPeersGet(d *Daemon, r *http.Request) response.Response {
 
 	peerURLs := make([]string, 0, len(peerNames))
 	for _, peerName := range peerNames {
-		peerURLs = append(peerURLs, fmt.Sprintf("/%s/networks/%s/peers/%s", version.APIVersion, url.PathEscape(n.Name()), url.PathEscape(peerName)))
+		peerURLs = append(peerURLs, api.NewURL().Path(version.APIVersion, "networks", n.Name(), "peers", peerName).String())
 	}
 
 	return response.SyncResponse(true, peerURLs)
@@ -223,10 +228,8 @@ func networkPeersGet(d *Daemon, r *http.Request) response.Response {
 //	    schema:
 //	      $ref: "#/definitions/NetworkPeersPost"
 //	responses:
-//	  "200":
-//	    $ref: "#/responses/EmptySyncResponse"
 //	  "202":
-//	    $ref: "#/responses/EmptySyncResponse"
+//	    $ref: "#/responses/Operation"
 //	  "400":
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
@@ -236,17 +239,18 @@ func networkPeersGet(d *Daemon, r *http.Request) response.Response {
 func networkPeersPost(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	resp := forwardedResponseIfTargetIsRemote(s, r)
+	target := request.QueryParam(r, "target")
+	resp := forwardedResponseToNode(r.Context(), s, target)
 	if resp != nil {
 		return resp
 	}
 
-	effectiveProjectName, err := request.GetCtxValue[string](r.Context(), request.CtxEffectiveProjectName)
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	details, err := request.GetCtxValue[networkDetails](r.Context(), ctxNetworkDetails)
+	details, err := request.GetContextValue[networkDetails](r.Context(), ctxNetworkDetails)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -272,15 +276,36 @@ func networkPeersPost(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(fmt.Errorf("Network driver %q does not support peering", n.Type()))
 	}
 
-	err = n.PeerCreate(req)
-	if err != nil {
-		return response.SmartError(fmt.Errorf("Failed creating peer: %w", err))
+	run := func(ctx context.Context, op *operations.Operation) error {
+		err = n.PeerCreate(req)
+		if err != nil {
+			return fmt.Errorf("Failed creating peer: %w", err)
+		}
+
+		requestor := request.CreateRequestor(ctx)
+		lc := lifecycle.NetworkPeerCreated.Event(n, req.Name, requestor, nil)
+		s.Events.SendLifecycle(effectiveProjectName, lc)
+
+		return nil
 	}
 
-	lc := lifecycle.NetworkPeerCreated.Event(n, req.Name, request.CreateRequestor(r), nil)
-	s.Events.SendLifecycle(effectiveProjectName, lc)
+	args := operations.OperationArgs{
+		ProjectName: details.requestProject.Name,
+		Type:        operationtype.NetworkPeerCreate,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     run,
+		EntityURL:   entity.NetworkURL(effectiveProjectName, details.networkName),
+		Metadata: map[string]any{
+			api.MetadataEntityURL: entity.NetworkURL(details.requestProject.Name, details.networkName).String(),
+		},
+	}
 
-	return response.SyncResponseLocation(true, nil, lc.Source)
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
+	if err != nil {
+		return response.InternalError(err)
+	}
+
+	return response.OperationResponse(op)
 }
 
 // swagger:operation DELETE /1.0/networks/{networkName}/peers/{peerName} network-peers network_peer_delete
@@ -299,8 +324,8 @@ func networkPeersPost(d *Daemon, r *http.Request) response.Response {
 //	    type: string
 //	    example: default
 //	responses:
-//	  "200":
-//	    $ref: "#/responses/EmptySyncResponse"
+//	  "202":
+//	    $ref: "#/responses/Operation"
 //	  "400":
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
@@ -310,17 +335,18 @@ func networkPeersPost(d *Daemon, r *http.Request) response.Response {
 func networkPeerDelete(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	resp := forwardedResponseIfTargetIsRemote(s, r)
+	target := request.QueryParam(r, "target")
+	resp := forwardedResponseToNode(r.Context(), s, target)
 	if resp != nil {
 		return resp
 	}
 
-	effectiveProjectName, err := request.GetCtxValue[string](r.Context(), request.CtxEffectiveProjectName)
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	details, err := request.GetCtxValue[networkDetails](r.Context(), ctxNetworkDetails)
+	details, err := request.GetContextValue[networkDetails](r.Context(), ctxNetworkDetails)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -339,19 +365,33 @@ func networkPeerDelete(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(fmt.Errorf("Network driver %q does not support peering", n.Type()))
 	}
 
-	peerName, err := url.PathUnescape(mux.Vars(r)["peerName"])
-	if err != nil {
-		return response.SmartError(err)
+	peerName := r.PathValue("peerName")
+	run := func(ctx context.Context, op *operations.Operation) error {
+		err = n.PeerDelete(peerName)
+		if err != nil {
+			return fmt.Errorf("Failed deleting peer: %w", err)
+		}
+
+		requestor := request.CreateRequestor(ctx)
+		s.Events.SendLifecycle(effectiveProjectName, lifecycle.NetworkPeerDeleted.Event(n, peerName, requestor, nil))
+
+		return nil
 	}
 
-	err = n.PeerDelete(peerName)
-	if err != nil {
-		return response.SmartError(fmt.Errorf("Failed deleting peer: %w", err))
+	args := operations.OperationArgs{
+		ProjectName: details.requestProject.Name,
+		Type:        operationtype.NetworkPeerDelete,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     run,
+		EntityURL:   entity.NetworkURL(effectiveProjectName, details.networkName),
 	}
 
-	s.Events.SendLifecycle(effectiveProjectName, lifecycle.NetworkPeerDeleted.Event(n, peerName, request.CreateRequestor(r), nil))
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
+	if err != nil {
+		return response.InternalError(err)
+	}
 
-	return response.EmptySyncResponse
+	return response.OperationResponse(op)
 }
 
 // swagger:operation GET /1.0/networks/{networkName}/peers/{peerName} network-peers network_peer_get
@@ -397,17 +437,18 @@ func networkPeerDelete(d *Daemon, r *http.Request) response.Response {
 func networkPeerGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	resp := forwardedResponseIfTargetIsRemote(s, r)
+	target := request.QueryParam(r, "target")
+	resp := forwardedResponseToNode(r.Context(), s, target)
 	if resp != nil {
 		return resp
 	}
 
-	effectiveProjectName, err := request.GetCtxValue[string](r.Context(), request.CtxEffectiveProjectName)
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	details, err := request.GetCtxValue[networkDetails](r.Context(), ctxNetworkDetails)
+	details, err := request.GetContextValue[networkDetails](r.Context(), ctxNetworkDetails)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -426,11 +467,7 @@ func networkPeerGet(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(fmt.Errorf("Network driver %q does not support peering", n.Type()))
 	}
 
-	peerName, err := url.PathUnescape(mux.Vars(r)["peerName"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	peerName := r.PathValue("peerName")
 	var peer *api.NetworkPeer
 
 	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
@@ -443,7 +480,7 @@ func networkPeerGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	peer.UsedBy, _ = n.PeerUsedBy(peer.Name)
-	peer.UsedBy = project.FilterUsedBy(s.Authorizer, r, peer.UsedBy)
+	peer.UsedBy = project.FilterUsedBy(r.Context(), s.Authorizer, peer.UsedBy)
 
 	return response.SyncResponseETag(true, peer, peer.Etag())
 }
@@ -472,8 +509,8 @@ func networkPeerGet(d *Daemon, r *http.Request) response.Response {
 //      schema:
 //        $ref: "#/definitions/NetworkPeerPut"
 //  responses:
-//    "200":
-//      $ref: "#/responses/EmptySyncResponse"
+//    "202":
+//      $ref: "#/responses/Operation"
 //    "400":
 //      $ref: "#/responses/BadRequest"
 //    "403":
@@ -507,8 +544,8 @@ func networkPeerGet(d *Daemon, r *http.Request) response.Response {
 //	    schema:
 //	      $ref: "#/definitions/NetworkPeerPut"
 //	responses:
-//	  "200":
-//	    $ref: "#/responses/EmptySyncResponse"
+//	  "202":
+//	    $ref: "#/responses/Operation"
 //	  "400":
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
@@ -520,17 +557,18 @@ func networkPeerGet(d *Daemon, r *http.Request) response.Response {
 func networkPeerPut(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	resp := forwardedResponseIfTargetIsRemote(s, r)
+	target := request.QueryParam(r, "target")
+	resp := forwardedResponseToNode(r.Context(), s, target)
 	if resp != nil {
 		return resp
 	}
 
-	effectiveProjectName, err := request.GetCtxValue[string](r.Context(), request.CtxEffectiveProjectName)
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	details, err := request.GetCtxValue[networkDetails](r.Context(), ctxNetworkDetails)
+	details, err := request.GetContextValue[networkDetails](r.Context(), ctxNetworkDetails)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -549,11 +587,7 @@ func networkPeerPut(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(fmt.Errorf("Network driver %q does not support peering", n.Type()))
 	}
 
-	peerName, err := url.PathUnescape(mux.Vars(r)["peerName"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	peerName := r.PathValue("peerName")
 	// Decode the request.
 	req := api.NetworkPeerPut{}
 	err = json.NewDecoder(r.Body).Decode(&req)
@@ -561,12 +595,30 @@ func networkPeerPut(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
-	err = n.PeerUpdate(peerName, req)
-	if err != nil {
-		return response.SmartError(fmt.Errorf("Failed updating peer: %w", err))
+	run := func(ctx context.Context, op *operations.Operation) error {
+		err = n.PeerUpdate(peerName, req)
+		if err != nil {
+			return fmt.Errorf("Failed updating peer: %w", err)
+		}
+
+		requestor := request.CreateRequestor(ctx)
+		s.Events.SendLifecycle(effectiveProjectName, lifecycle.NetworkPeerUpdated.Event(n, peerName, requestor, nil))
+
+		return nil
 	}
 
-	s.Events.SendLifecycle(effectiveProjectName, lifecycle.NetworkPeerUpdated.Event(n, peerName, request.CreateRequestor(r), nil))
+	args := operations.OperationArgs{
+		ProjectName: details.requestProject.Name,
+		Type:        operationtype.NetworkPeerUpdate,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     run,
+		EntityURL:   entity.NetworkURL(effectiveProjectName, details.networkName),
+	}
 
-	return response.EmptySyncResponse
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
+	if err != nil {
+		return response.InternalError(err)
+	}
+
+	return response.OperationResponse(op)
 }

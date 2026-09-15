@@ -1,6 +1,7 @@
 package device
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -48,17 +49,16 @@ func (d *nicMACVLAN) validateConfig(instConf instance.ConfigReader) error {
 		"mtu",
 		"hwaddr",
 		"vlan",
-		"maas.subnet.ipv4",
-		"maas.subnet.ipv6",
 		"boot.priority",
 		"gvrp",
 	}
 
-	// Check that if network proeperty is set that conflicting keys are not present.
+	// Check that if network property is set that conflicting keys are not present.
 	if d.config["network"] != "" {
 		requiredFields = append(requiredFields, "network")
-
-		bannedKeys := []string{"nictype", "parent", "mtu", "vlan", "maas.subnet.ipv4", "maas.subnet.ipv6", "gvrp"}
+		inheritKeys := make([]string, 0, 7)
+		inheritKeys = append(inheritKeys, "mtu", "vlan", "gvrp")
+		bannedKeys := append(inheritKeys, "nictype", "parent")
 		for _, bannedKey := range bannedKeys {
 			if d.config[bannedKey] != "" {
 				return fmt.Errorf("Cannot use %q property in conjunction with %q property", bannedKey, "network")
@@ -74,11 +74,11 @@ func (d *nicMACVLAN) validateConfig(instConf instance.ConfigReader) error {
 		}
 
 		if d.network.Status() != api.NetworkStatusCreated {
-			return fmt.Errorf("Specified network is not fully created")
+			return errors.New("Specified network is not fully created")
 		}
 
 		if d.network.Type() != "macvlan" {
-			return fmt.Errorf("Specified network must be of type macvlan")
+			return errors.New("Specified network must be of type macvlan")
 		}
 
 		netConfig := d.network.Config()
@@ -87,7 +87,6 @@ func (d *nicMACVLAN) validateConfig(instConf instance.ConfigReader) error {
 		d.config["parent"] = netConfig["parent"]
 
 		// Copy certain keys verbatim from the network's settings.
-		inheritKeys := []string{"mtu", "vlan", "maas.subnet.ipv4", "maas.subnet.ipv6", "gvrp"}
 		for _, inheritKey := range inheritKeys {
 			_, found := netConfig[inheritKey]
 			if found {
@@ -125,11 +124,11 @@ func (d *nicMACVLAN) PreStartCheck() error {
 // validateEnvironment checks the runtime environment for correctness.
 func (d *nicMACVLAN) validateEnvironment() error {
 	if d.inst.Type() == instancetype.Container && d.config["name"] == "" {
-		return fmt.Errorf("Requires name property to start")
+		return errors.New("Requires name property to start")
 	}
 
-	if !shared.PathExists(fmt.Sprintf("/sys/class/net/%s", d.config["parent"])) {
-		return fmt.Errorf("Parent device '%s' doesn't exist", d.config["parent"])
+	if !network.InterfaceExists(d.config["parent"]) {
+		return fmt.Errorf("Parent device %q does not exist", d.config["parent"])
 	}
 
 	return nil
@@ -167,7 +166,7 @@ func (d *nicMACVLAN) Start() (*deviceConfig.RunConfig, error) {
 	}
 
 	// Record whether we created the parent device or not so it can be removed on stop.
-	saveData["last_state.created"] = fmt.Sprintf("%t", statusDev != "existing")
+	saveData["last_state.created"] = strconv.FormatBool(statusDev != "existing")
 
 	if shared.IsTrue(saveData["last_state.created"]) {
 		revert.Add(func() {
@@ -234,7 +233,7 @@ func (d *nicMACVLAN) Start() (*deviceConfig.RunConfig, error) {
 		// Disable IPv6 on host interface to avoid getting IPv6 link-local addresses unnecessarily.
 		err = util.SysctlSet(fmt.Sprintf("net/ipv6/conf/%s/disable_ipv6", link.Name), "1")
 		if err != nil && !os.IsNotExist(err) {
-			return nil, fmt.Errorf("Failed to disable IPv6 on host interface %q: %w", link.Name, err)
+			return nil, fmt.Errorf("Failed disabling IPv6 on host interface %q: %w", link.Name, err)
 		}
 	}
 
@@ -292,7 +291,7 @@ func (d *nicMACVLAN) postStop() error {
 	v := d.volatileGet()
 
 	// Delete the detached device.
-	if v["host_name"] != "" && shared.PathExists(fmt.Sprintf("/sys/class/net/%s", v["host_name"])) {
+	if v["host_name"] != "" && shared.PathExists("/sys/class/net/"+v["host_name"]) {
 		err := network.InterfaceRemove(v["host_name"])
 		if err != nil {
 			errs = append(errs, err)

@@ -29,7 +29,13 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   capability dac_read_search,
   capability ipc_lock,
 
-  /sys/devices/**/block/*/queue/max_segments  r,
+  # qemu-img probes for CAP_SYS_ADMIN but works fine without it; deny silently to avoid audit noise.
+  deny capability sys_admin,
+
+  @{PROC}/sys/vm/max_map_count r,
+  /sys/devices/**/block/*/queue/* r,
+  /sys/devices/system/node/ r,
+  /sys/devices/system/node/** r,
 
 {{range $index, $element := .allowedCmdPaths}}
   {{$element}} mixr,
@@ -70,12 +76,16 @@ func (w writerFunc) Write(b []byte) (n int, err error) {
 	return w(b)
 }
 
-func handleWriter(out io.Writer, hand func(int64, int64)) io.Writer {
+func handleWriter(out io.Writer, hand func(int64, int64, int64)) io.Writer {
 	var current int64
 	return writerFunc(func(b []byte) (int, error) {
-		n, _ := out.Write(b)
-		ss := strings.Split(strings.Trim(string(b), "(%) \t\n\v\f\r"), "/")
-		f, err := strconv.ParseFloat(ss[0], 64)
+		n, err := out.Write(b)
+		if err != nil {
+			return n, err
+		}
+
+		numStr, _, _ := strings.Cut(strings.Trim(string(b), "(%) \t\n\v\f\r"), "/")
+		f, err := strconv.ParseFloat(numStr, 64)
 		if err != nil {
 			return n, nil
 		}
@@ -83,7 +93,7 @@ func handleWriter(out io.Writer, hand func(int64, int64)) io.Writer {
 		percent := int64(f)
 		if percent != current {
 			current = percent
-			hand(percent, 0)
+			hand(percent, 0, 0)
 		}
 
 		return n, nil
@@ -102,7 +112,7 @@ func QemuImg(sysOS *sys.OS, cmd []string, imgPath string, dstPath string, tracke
 	for _, c := range allowedCmds {
 		cmdPath, err := exec.LookPath(c)
 		if err != nil {
-			return "", fmt.Errorf("Failed to find executable %q: %w", c, err)
+			return "", fmt.Errorf("Failed finding executable %q: %w", c, err)
 		}
 
 		allowedCmdPaths = append(allowedCmdPaths, cmdPath)
@@ -123,7 +133,7 @@ func QemuImg(sysOS *sys.OS, cmd []string, imgPath string, dstPath string, tracke
 
 	profileName, err := qemuImgProfileLoad(sysOS, imgPath, dstPath, allowedCmdPaths)
 	if err != nil {
-		return "", fmt.Errorf("Failed to load qemu-img profile: %w", err)
+		return "", fmt.Errorf("Failed loading qemu-img profile: %w", err)
 	}
 
 	defer func() {

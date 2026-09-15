@@ -7,10 +7,12 @@ import (
 
 	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/shared/api"
+	"github.com/canonical/lxd/shared/entity"
 )
 
 var metadataConfigurationCmd = APIEndpoint{
-	Path: "metadata/configuration",
+	Path:        "metadata/configuration",
+	MetricsType: entity.TypeServer,
 
 	Get: APIEndpointAction{Handler: metadataConfigurationGet, AllowUntrusted: true},
 }
@@ -22,7 +24,7 @@ var generatedDoc embed.FS
 //
 //	Get the metadata configuration
 //
-//	Returns the generated LXD metadata configuration in YAML format.
+//	Returns the generated LXD metadata configuration in JSON format.
 //
 //	---
 //	produces:

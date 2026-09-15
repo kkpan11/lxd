@@ -20,7 +20,7 @@ type rawConfigKey struct {
 type configMap map[rawConfigKey]string
 
 func sortedConfigKeys(cfgMap configMap) []rawConfigKey {
-	rv := []rawConfigKey{}
+	rv := make([]rawConfigKey, 0, len(cfgMap))
 
 	for k := range cfgMap {
 		rv = append(rv, k)
@@ -65,7 +65,7 @@ func parseConfOverride(confOverride string) configMap {
 			if loc[4] > 0 {
 				i, err := strconv.Atoi(s[loc[4]:loc[5]])
 				if err != nil || i < 0 {
-					panic("failed to parse index")
+					panic("failed parsing index")
 				}
 
 				currentIndex = uint(i)
@@ -112,7 +112,7 @@ func parseConfOverride(confOverride string) configMap {
 }
 
 func updateEntries(entries []cfgEntry, sk rawConfigKey, cfgMap configMap) []cfgEntry {
-	rv := []cfgEntry{}
+	rv := make([]cfgEntry, 0, len(entries))
 
 	for _, entry := range entries {
 		newEntry := cfgEntry{
@@ -221,7 +221,7 @@ func appendSections(newCfg []cfgSection, cfgMap configMap) []cfgSection {
 		tmp[sectionKey] = section
 	}
 
-	rawSections := []rawConfigKey{}
+	rawSections := make([]rawConfigKey, 0, len(tmp))
 	for rawSection := range tmp {
 		rawSections = append(rawSections, rawSection)
 	}

@@ -3,14 +3,15 @@ package query
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 )
 
 // Count returns the number of rows in the given table.
 func Count(ctx context.Context, tx *sql.Tx, table string, where string, args ...any) (int, error) {
-	stmt := fmt.Sprintf("SELECT COUNT(*) FROM %s", table)
+	stmt := "SELECT COUNT(*) FROM " + table
 	if where != "" {
-		stmt += fmt.Sprintf(" WHERE %s", where)
+		stmt += " WHERE " + where
 	}
 
 	rows, err := tx.QueryContext(ctx, stmt, args...)
@@ -22,17 +23,17 @@ func Count(ctx context.Context, tx *sql.Tx, table string, where string, args ...
 
 	// Ensure we read one and only one row.
 	if !rows.Next() {
-		return -1, fmt.Errorf("no rows returned")
+		return -1, errors.New("no rows returned")
 	}
 
 	var count int
 	err = rows.Scan(&count)
 	if err != nil {
-		return -1, fmt.Errorf("failed to scan count column")
+		return -1, errors.New("failed scanning count column")
 	}
 
 	if rows.Next() {
-		return -1, fmt.Errorf("more than one row returned")
+		return -1, errors.New("more than one row returned")
 	}
 
 	err = rows.Err()
@@ -48,14 +49,14 @@ func Count(ctx context.Context, tx *sql.Tx, table string, where string, args ...
 func CountAll(ctx context.Context, tx *sql.Tx) (map[string]int, error) {
 	tables, err := SelectStrings(ctx, tx, "SELECT name FROM sqlite_master WHERE type = 'table'")
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch table names: %w", err)
+		return nil, fmt.Errorf("Failed fetching table names: %w", err)
 	}
 
 	counts := map[string]int{}
 	for _, table := range tables {
 		count, err := Count(ctx, tx, table, "")
 		if err != nil {
-			return nil, fmt.Errorf("Failed to count rows of %s: %w", table, err)
+			return nil, fmt.Errorf("Failed counting rows of %s: %w", table, err)
 		}
 
 		counts[table] = count

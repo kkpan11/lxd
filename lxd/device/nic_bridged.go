@@ -6,11 +6,13 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -86,8 +88,6 @@ func (d *nicBridged) validateConfig(instConf instance.ConfigReader) error {
 		"security.ipv4_filtering",
 		"security.ipv6_filtering",
 		"security.port_isolation",
-		"maas.subnet.ipv4",
-		"maas.subnet.ipv6",
 		"boot.priority",
 		"vlan",
 	}
@@ -95,11 +95,11 @@ func (d *nicBridged) validateConfig(instConf instance.ConfigReader) error {
 	// checkWithManagedNetwork validates the device's settings against the managed network.
 	checkWithManagedNetwork := func(n network.Network) error {
 		if n.Status() != api.NetworkStatusCreated {
-			return fmt.Errorf("Specified network is not fully created")
+			return errors.New("Specified network is not fully created")
 		}
 
 		if n.Type() != "bridge" {
-			return fmt.Errorf("Specified network must be of type bridge")
+			return errors.New("Specified network must be of type bridge")
 		}
 
 		netConfig := n.Config()
@@ -120,7 +120,7 @@ func (d *nicBridged) validateConfig(instConf instance.ConfigReader) error {
 			}
 
 			parentAddress := netConfig["ipv4.address"]
-			if shared.ValueInSlice(parentAddress, []string{"", "none"}) {
+			if slices.Contains([]string{"", "none"}, parentAddress) {
 				return nil
 			}
 
@@ -130,7 +130,7 @@ func (d *nicBridged) validateConfig(instConf instance.ConfigReader) error {
 			}
 
 			if d.config["ipv4.address"] == "none" && shared.IsFalseOrEmpty(d.config["security.ipv4_filtering"]) {
-				return fmt.Errorf("Cannot have ipv4.address as none unless using security.ipv4_filtering")
+				return errors.New("Cannot have ipv4.address as none unless using security.ipv4_filtering")
 			}
 
 			// IP should not be the same as the parent managed network address.
@@ -155,7 +155,7 @@ func (d *nicBridged) validateConfig(instConf instance.ConfigReader) error {
 			}
 
 			parentAddress := netConfig["ipv6.address"]
-			if shared.ValueInSlice(parentAddress, []string{"", "none"}) {
+			if slices.Contains([]string{"", "none"}, parentAddress) {
 				return nil
 			}
 
@@ -165,7 +165,7 @@ func (d *nicBridged) validateConfig(instConf instance.ConfigReader) error {
 			}
 
 			if d.config["ipv6.address"] == "none" && shared.IsFalseOrEmpty(d.config["security.ipv6_filtering"]) {
-				return fmt.Errorf("Cannot have ipv6.address as none unless using security.ipv6_filtering")
+				return errors.New("Cannot have ipv6.address as none unless using security.ipv6_filtering")
 			}
 
 			// IP should not be the same as the parent managed network address.
@@ -176,10 +176,10 @@ func (d *nicBridged) validateConfig(instConf instance.ConfigReader) error {
 
 		// When we know the parent network is managed, we can validate the NIC's VLAN settings based on
 		// on the bridge driver type.
-		if shared.ValueInSlice(netConfig["bridge.driver"], []string{"", "native"}) {
+		if slices.Contains([]string{"", "native"}, netConfig["bridge.driver"]) {
 			// Check VLAN 0 isn't set when using a native Linux managed bridge, as not supported.
 			if d.config["vlan"] == "0" {
-				return fmt.Errorf("VLAN ID 0 is not allowed for native Linux bridges")
+				return errors.New("VLAN ID 0 is not allowed for native Linux bridges")
 			}
 
 			// Check that none of the supplied VLAN IDs are VLAN 0 when using a native Linux managed
@@ -189,21 +189,19 @@ func (d *nicBridged) validateConfig(instConf instance.ConfigReader) error {
 				return err
 			}
 
-			for _, vlanID := range networkVLANList {
-				if vlanID == 0 {
-					return fmt.Errorf("VLAN tagged ID 0 is not allowed for native Linux bridges")
-				}
+			if slices.Contains(networkVLANList, 0) {
+				return errors.New("VLAN tagged ID 0 is not allowed for native Linux bridges")
 			}
 		}
 
 		return nil
 	}
 
-	// Check that if network proeperty is set that conflicting keys are not present.
+	// Check that if network property is set that conflicting keys are not present.
 	if d.config["network"] != "" {
 		requiredFields = append(requiredFields, "network")
-
-		bannedKeys := []string{"nictype", "parent", "mtu", "maas.subnet.ipv4", "maas.subnet.ipv6"}
+		inheritKeys := make([]string, 0, 5)
+		bannedKeys := append(inheritKeys, "nictype", "parent", "mtu")
 		for _, bannedKey := range bannedKeys {
 			if d.config[bannedKey] != "" {
 				return fmt.Errorf("Cannot use %q property in conjunction with %q property", bannedKey, "network")
@@ -235,7 +233,6 @@ func (d *nicBridged) validateConfig(instConf instance.ConfigReader) error {
 		}
 
 		// Copy certain keys verbatim from the network's settings.
-		inheritKeys := []string{"maas.subnet.ipv4", "maas.subnet.ipv6"}
 		for _, inheritKey := range inheritKeys {
 			_, found := netConfig[inheritKey]
 			if found {
@@ -260,23 +257,21 @@ func (d *nicBridged) validateConfig(instConf instance.ConfigReader) error {
 			// parent bridge.
 			if shared.IsTrue(d.config["security.ipv4_filtering"]) {
 				if d.config["ipv4.address"] == "" {
-					return fmt.Errorf("IPv4 filtering requires a manually specified ipv4.address when using an unmanaged parent bridge")
+					return errors.New("IPv4 filtering requires a manually specified ipv4.address when using an unmanaged parent bridge")
 				}
 			} else {
-				// If MAAS isn't being used, then static IP cannot be used with unmanaged parent.
-				if d.config["ipv4.address"] != "" && d.config["maas.subnet.ipv4"] == "" {
-					return fmt.Errorf("Cannot use manually specified ipv4.address when using unmanaged parent bridge")
+				if d.config["ipv4.address"] != "" {
+					return errors.New("Cannot use manually specified ipv4.address when using unmanaged parent bridge")
 				}
 			}
 
 			if shared.IsTrue(d.config["security.ipv6_filtering"]) {
 				if d.config["ipv6.address"] == "" {
-					return fmt.Errorf("IPv6 filtering requires a manually specified ipv6.address when using an unmanaged parent bridge")
+					return errors.New("IPv6 filtering requires a manually specified ipv6.address when using an unmanaged parent bridge")
 				}
 			} else {
-				// If MAAS isn't being used, then static IP cannot be used with unmanaged parent.
-				if d.config["ipv6.address"] != "" && d.config["maas.subnet.ipv6"] == "" {
-					return fmt.Errorf("Cannot use manually specified ipv6.address when using unmanaged parent bridge")
+				if d.config["ipv6.address"] != "" {
+					return errors.New("Cannot use manually specified ipv6.address when using unmanaged parent bridge")
 				}
 			}
 		}
@@ -285,7 +280,7 @@ func (d *nicBridged) validateConfig(instConf instance.ConfigReader) error {
 	// Check that IP filtering isn't being used with VLAN filtering.
 	if shared.IsTrue(d.config["security.ipv4_filtering"]) || shared.IsTrue(d.config["security.ipv6_filtering"]) {
 		if d.config["vlan"] != "" || d.config["vlan.tagged"] != "" {
-			return fmt.Errorf("IP filtering cannot be used with VLAN filtering")
+			return errors.New("IP filtering cannot be used with VLAN filtering")
 		}
 	}
 
@@ -402,6 +397,12 @@ func (d *nicBridged) checkAddressConflict() error {
 		// that has DNS enabled and is connected to the same untagged VLAN.
 		if d.network != nil && d.network.Config()["dns.mode"] != "none" && nicCheckDNSNameConflict(d.inst.Name(), inst.Name) {
 			if sameLogicalInstance {
+				// Skip NICs that are being renamed.
+				_, nicInPendingExpandedDevices := d.inst.ExpandedDevices()[nicName]
+				if !nicInPendingExpandedDevices {
+					return nil
+				}
+
 				return api.StatusErrorf(http.StatusConflict, "Instance DNS name %q conflict between %q and %q because both are connected to same network", strings.ToLower(inst.Name), d.name, nicName)
 			}
 
@@ -439,11 +440,11 @@ func (d *nicBridged) checkAddressConflict() error {
 // validateEnvironment checks the runtime environment for correctness.
 func (d *nicBridged) validateEnvironment() error {
 	if d.inst.Type() == instancetype.Container && d.config["name"] == "" {
-		return fmt.Errorf("Requires name property to start")
+		return errors.New("Requires name property to start")
 	}
 
-	if !shared.PathExists(fmt.Sprintf("/sys/class/net/%s", d.config["parent"])) {
-		return fmt.Errorf("Parent device %q doesn't exist", d.config["parent"])
+	if !shared.PathExists("/sys/class/net/" + d.config["parent"]) {
+		return fmt.Errorf("Parent device %q does not exist", d.config["parent"])
 	}
 
 	return nil
@@ -505,7 +506,9 @@ func (d *nicBridged) Start() (*deviceConfig.RunConfig, error) {
 	var mtu uint32
 
 	// Create veth pair and configure the peer end with custom hwaddr and mtu if supplied.
-	if d.inst.Type() == instancetype.Container {
+	instType := d.inst.Type()
+	switch instType {
+	case instancetype.Container:
 		if saveData["host_name"] == "" {
 			saveData["host_name"], err = d.generateHostName("veth", d.config["hwaddr"])
 			if err != nil {
@@ -513,7 +516,7 @@ func (d *nicBridged) Start() (*deviceConfig.RunConfig, error) {
 			}
 		}
 		peerName, mtu, err = networkCreateVethPair(saveData["host_name"], d.config)
-	} else if d.inst.Type() == instancetype.VM {
+	case instancetype.VM:
 		if saveData["host_name"] == "" {
 			saveData["host_name"], err = d.generateHostName("tap", d.config["hwaddr"])
 			if err != nil {
@@ -547,6 +550,7 @@ func (d *nicBridged) Start() (*deviceConfig.RunConfig, error) {
 	}
 
 	// Apply host-side routes to bridge interface.
+	//nolint:prealloc
 	routes := []string{}
 	routes = append(routes, shared.SplitNTrimSpace(d.config["ipv4.routes"], ",", -1, true)...)
 	routes = append(routes, shared.SplitNTrimSpace(d.config["ipv6.routes"], ",", -1, true)...)
@@ -673,7 +677,7 @@ func (d *nicBridged) Start() (*deviceConfig.RunConfig, error) {
 		runConf.NetworkInterface = append(runConf.NetworkInterface,
 			[]deviceConfig.RunConfigItem{
 				{Key: "devName", Value: d.name},
-				{Key: "mtu", Value: fmt.Sprintf("%d", mtu)},
+				{Key: "mtu", Value: strconv.FormatUint(uint64(mtu), 10)},
 			}...)
 	}
 
@@ -691,7 +695,7 @@ func (d *nicBridged) postStart() error {
 	return nil
 }
 
-// Update applies configuration changes to a started device.
+// Update applies configuration changes to a device.
 func (d *nicBridged) Update(oldDevices deviceConfig.Devices, isRunning bool) error {
 	oldConfig := oldDevices[d.name]
 	v := d.volatileGet()
@@ -728,7 +732,7 @@ func (d *nicBridged) Update(oldDevices deviceConfig.Devices, isRunning bool) err
 		}
 
 		// Remove old host-side routes from bridge interface.
-
+		//nolint:prealloc
 		oldRoutes := []string{}
 		oldRoutes = append(oldRoutes, shared.SplitNTrimSpace(oldConfig["ipv4.routes"], ",", -1, true)...)
 		oldRoutes = append(oldRoutes, shared.SplitNTrimSpace(oldConfig["ipv6.routes"], ",", -1, true)...)
@@ -737,7 +741,8 @@ func (d *nicBridged) Update(oldDevices deviceConfig.Devices, isRunning bool) err
 		networkNICRouteDelete(oldConfig["parent"], oldRoutes...)
 
 		// Apply host-side routes to bridge interface.
-		routes := []string{}
+		//nolint:prealloc
+		routes := make([]string, 0)
 		routes = append(routes, shared.SplitNTrimSpace(d.config["ipv4.routes"], ",", -1, true)...)
 		routes = append(routes, shared.SplitNTrimSpace(d.config["ipv6.routes"], ",", -1, true)...)
 		routes = append(routes, shared.SplitNTrimSpace(d.config["ipv4.routes.external"], ",", -1, true)...)
@@ -771,7 +776,7 @@ func (d *nicBridged) Update(oldDevices deviceConfig.Devices, isRunning bool) err
 	// If an IPv6 address has changed, if the instance is running we should bounce the host-side
 	// veth interface to give the instance a chance to detect the change and re-apply for an
 	// updated lease with new IP address.
-	if d.config["ipv6.address"] != oldConfig["ipv6.address"] && d.config["host_name"] != "" && shared.PathExists(fmt.Sprintf("/sys/class/net/%s", d.config["host_name"])) {
+	if d.config["ipv6.address"] != oldConfig["ipv6.address"] && d.config["host_name"] != "" && shared.PathExists("/sys/class/net/"+d.config["host_name"]) {
 		link := &ip.Link{Name: d.config["host_name"]}
 		err := link.SetDown()
 		if err != nil {
@@ -825,6 +830,12 @@ func (d *nicBridged) Stop() (*deviceConfig.RunConfig, error) {
 
 // postStop is run after the device is removed from the instance.
 func (d *nicBridged) postStop() error {
+	// Handle the case where validation fails but the device still must be removed.
+	bridgeName := d.config["parent"]
+	if bridgeName == "" && d.config["network"] != "" {
+		bridgeName = d.config["network"]
+	}
+
 	defer func() {
 		_ = d.volatileSet(map[string]string{
 			"host_name": "",
@@ -837,25 +848,26 @@ func (d *nicBridged) postStop() error {
 
 	if d.config["host_name"] != "" && network.InterfaceExists(d.config["host_name"]) {
 		// Detach host-side end of veth pair from bridge (required for openvswitch particularly).
-		err := network.DetachInterface(d.config["parent"], d.config["host_name"])
+		err := network.DetachInterface(bridgeName, d.config["host_name"])
 		if err != nil {
-			return fmt.Errorf("Failed to detach interface %q from %q: %w", d.config["host_name"], d.config["parent"], err)
+			return fmt.Errorf("Failed detaching interface %q from %q: %w", d.config["host_name"], bridgeName, err)
 		}
 
 		// Removing host-side end of veth pair will delete the peer end too.
 		err = network.InterfaceRemove(d.config["host_name"])
 		if err != nil {
-			return fmt.Errorf("Failed to remove interface %q: %w", d.config["host_name"], err)
+			return fmt.Errorf("Failed removing interface %q: %w", d.config["host_name"], err)
 		}
 	}
 
 	// Remove host-side routes from bridge interface.
+	//nolint:prealloc
 	routes := []string{}
 	routes = append(routes, shared.SplitNTrimSpace(d.config["ipv4.routes"], ",", -1, true)...)
 	routes = append(routes, shared.SplitNTrimSpace(d.config["ipv6.routes"], ",", -1, true)...)
 	routes = append(routes, shared.SplitNTrimSpace(d.config["ipv4.routes.external"], ",", -1, true)...)
 	routes = append(routes, shared.SplitNTrimSpace(d.config["ipv6.routes.external"], ",", -1, true)...)
-	networkNICRouteDelete(d.config["parent"], routes...)
+	networkNICRouteDelete(bridgeName, routes...)
 
 	if shared.IsTrue(d.config["security.mac_filtering"]) || shared.IsTrue(d.config["security.ipv4_filtering"]) || shared.IsTrue(d.config["security.ipv6_filtering"]) {
 		d.removeFilters(d.config)
@@ -864,27 +876,50 @@ func (d *nicBridged) postStop() error {
 	return nil
 }
 
+// PostMigrateSend is run after an instance is migrated to another cluster member.
+func (d *nicBridged) PostMigrateSend(clusterMoveSourceName string) error {
+	// Only reset leases post-migration if the device was moved from another cluster member.
+	if clusterMoveSourceName != "" {
+		// Populate device config with volatile fields (hwaddr) if needed.
+		networkVethFillFromVolatile(d.config, d.volatileGet())
+
+		// Remove device (removing dnsmasq lease and config). This is required to reset leases post-migration.
+		err := d.Remove()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // Remove is run when the device is removed from the instance or the instance is deleted.
 func (d *nicBridged) Remove() error {
-	if d.config["parent"] != "" {
+	// Handle the case where validation fails but the device still must be removed.
+	bridgeName := d.config["parent"]
+	if bridgeName == "" && d.config["network"] != "" {
+		bridgeName = d.config["network"]
+	}
+
+	if bridgeName != "" {
 		dnsmasq.ConfigMutex.Lock()
 		defer dnsmasq.ConfigMutex.Unlock()
 
-		if network.InterfaceExists(d.config["parent"]) {
-			err := d.networkClearLease(d.inst.Name(), d.config["parent"], d.config["hwaddr"], clearLeaseAll)
+		if network.InterfaceExists(bridgeName) {
+			err := d.networkClearLease(d.inst.Name(), bridgeName, d.config["hwaddr"], clearLeaseAll)
 			if err != nil {
 				return fmt.Errorf("Failed clearing leases: %w", err)
 			}
 		}
 
 		// Remove dnsmasq config if it exists (doesn't return error if file is missing).
-		err := dnsmasq.RemoveStaticEntry(d.config["parent"], d.inst.Project().Name, d.inst.Name(), d.Name())
+		err := dnsmasq.RemoveStaticEntry(bridgeName, d.inst.Project().Name, d.inst.Name(), d.Name())
 		if err != nil {
 			return err
 		}
 
 		// Reload dnsmasq to apply new settings if dnsmasq is running.
-		err = dnsmasq.Kill(d.config["parent"], true)
+		err = dnsmasq.Kill(bridgeName, true)
 		if err != nil {
 			return err
 		}
@@ -934,13 +969,8 @@ func (d *nicBridged) rebuildDnsmasqEntry() error {
 		}
 	}
 
+	// Write the updated host entry. dnsmasq picks it up automatically via inotify on --dhcp-hostsdir.
 	err := dnsmasq.UpdateStaticEntry(d.config["parent"], d.inst.Project().Name, d.inst.Name(), d.Name(), d.network.Config(), d.config["hwaddr"], ipv4Address, ipv6Address)
-	if err != nil {
-		return err
-	}
-
-	// Reload dnsmasq to apply new settings.
-	err = dnsmasq.Kill(d.config["parent"], true)
 	if err != nil {
 		return err
 	}
@@ -986,18 +1016,18 @@ func (d *nicBridged) setupHostFilters(oldConfig deviceConfig.Device) (revert.Hoo
 // removeFilters removes any network level filters defined for the instance.
 func (d *nicBridged) removeFilters(m deviceConfig.Device) {
 	if m["hwaddr"] == "" {
-		d.logger.Error("Failed to remove network filters: hwaddr not defined")
+		d.logger.Error("Failed removing network filters: hwaddr not defined")
 		return
 	}
 
 	if m["host_name"] == "" {
-		d.logger.Error("Failed to remove network filters: host_name not defined")
+		d.logger.Error("Failed removing network filters: host_name not defined")
 		return
 	}
 
 	IPv4Nets, IPv6Nets, err := allowedIPNets(m)
 	if err != nil {
-		d.logger.Error("Failed to calculate static IP network filters", logger.Ctx{"err": err})
+		d.logger.Error("Failed calculating static IP network filters", logger.Ctx{"err": err})
 		return
 	}
 
@@ -1006,7 +1036,7 @@ func (d *nicBridged) removeFilters(m deviceConfig.Device) {
 	d.logger.Debug("Clearing instance firewall static filters", logger.Ctx{"parent": m["parent"], "host_name": m["host_name"], "hwaddr": m["hwaddr"], "IPv4Nets": IPv4Nets, "IPv6Nets": IPv6Nets})
 	err = d.state.Firewall.InstanceClearBridgeFilter(d.inst.Project().Name, d.inst.Name(), d.name, m["parent"], m["host_name"], m["hwaddr"], IPv4Nets, IPv6Nets)
 	if err != nil {
-		d.logger.Error("Failed to remove static IP network filters", logger.Ctx{"err": err})
+		d.logger.Error("Failed removing static IP network filters", logger.Ctx{"err": err})
 	}
 
 	// If allowedIPNets returned nil for IPv4 or IPv6, it is possible that total protocol blocking was set up
@@ -1014,7 +1044,7 @@ func (d *nicBridged) removeFilters(m deviceConfig.Device) {
 	d.logger.Debug("Clearing instance total protocol filters", logger.Ctx{"parent": m["parent"], "host_name": m["host_name"], "hwaddr": m["hwaddr"], "IPv4Nets": IPv4Nets, "IPv6Nets": IPv6Nets})
 	err = d.state.Firewall.InstanceClearBridgeFilter(d.inst.Project().Name, d.inst.Name(), d.name, m["parent"], m["host_name"], m["hwaddr"], make([]*net.IPNet, 0), make([]*net.IPNet, 0))
 	if err != nil {
-		d.logger.Error("Failed to remove total protocol network filters", logger.Ctx{"err": err})
+		d.logger.Error("Failed removing total protocol network filters", logger.Ctx{"err": err})
 	}
 
 	// Read current static DHCP IP allocation configured from dnsmasq host config (if exists).
@@ -1026,16 +1056,16 @@ func (d *nicBridged) removeFilters(m deviceConfig.Device) {
 			return
 		}
 
-		d.logger.Error("Failed to get static IP allocations for filter removal", logger.Ctx{"err": err})
+		d.logger.Error("Failed getting static IP allocations for filter removal", logger.Ctx{"err": err})
 		return
 	}
 
 	// We have already cleared any "ipv{n}.routes" etc. above, so we just need to clear the DHCP allocated IPs.
 	var IPv4AllocNets []*net.IPNet
 	if len(IPv4Alloc.IP) > 0 {
-		_, IPv4AllocNet, err := net.ParseCIDR(fmt.Sprintf("%s/32", IPv4Alloc.IP.String()))
+		_, IPv4AllocNet, err := net.ParseCIDR(IPv4Alloc.IP.String() + "/32")
 		if err != nil {
-			d.logger.Error("Failed to generate subnet from dynamically generated IPv4 address", logger.Ctx{"err": err})
+			d.logger.Error("Failed generating subnet from dynamically generated IPv4 address", logger.Ctx{"err": err})
 		} else {
 			IPv4AllocNets = append(IPv4AllocNets, IPv4AllocNet)
 		}
@@ -1043,9 +1073,9 @@ func (d *nicBridged) removeFilters(m deviceConfig.Device) {
 
 	var IPv6AllocNets []*net.IPNet
 	if len(IPv6Alloc.IP) > 0 {
-		_, IPv6AllocNet, err := net.ParseCIDR(fmt.Sprintf("%s/128", IPv6Alloc.IP.String()))
+		_, IPv6AllocNet, err := net.ParseCIDR(IPv6Alloc.IP.String() + "/128")
 		if err != nil {
-			d.logger.Error("Failed to generate subnet from dynamically generated IPv6Address", logger.Ctx{"err": err})
+			d.logger.Error("Failed generating subnet from dynamically generated IPv6Address", logger.Ctx{"err": err})
 		} else {
 			IPv6AllocNets = append(IPv6AllocNets, IPv6AllocNet)
 		}
@@ -1054,7 +1084,7 @@ func (d *nicBridged) removeFilters(m deviceConfig.Device) {
 	d.logger.Debug("Clearing instance firewall dynamic filters", logger.Ctx{"parent": m["parent"], "host_name": m["host_name"], "hwaddr": m["hwaddr"], "ipv4": IPv4Alloc.IP, "ipv6": IPv6Alloc.IP})
 	err = d.state.Firewall.InstanceClearBridgeFilter(d.inst.Project().Name, d.inst.Name(), d.name, m["parent"], m["host_name"], m["hwaddr"], IPv4AllocNets, IPv6AllocNets)
 	if err != nil {
-		logger.Errorf("Failed to remove DHCP network assigned filters  for %q: %v", d.name, err)
+		logger.Errorf("Failed removing DHCP network assigned filters  for %q: %v", d.name, err)
 	}
 }
 
@@ -1062,15 +1092,15 @@ func (d *nicBridged) removeFilters(m deviceConfig.Device) {
 // These are controlled by the security.mac_filtering, security.ipv4_Filtering and security.ipv6_filtering config keys.
 func (d *nicBridged) setFilters() (err error) {
 	if d.config["hwaddr"] == "" {
-		return fmt.Errorf("Failed to set network filters: require hwaddr defined")
+		return errors.New("Failed setting network filters: require hwaddr defined")
 	}
 
 	if d.config["host_name"] == "" {
-		return fmt.Errorf("Failed to set network filters: require host_name defined")
+		return errors.New("Failed setting network filters: require host_name defined")
 	}
 
 	if d.config["parent"] == "" {
-		return fmt.Errorf("Failed to set network filters: require parent defined")
+		return errors.New("Failed setting network filters: require parent defined")
 	}
 
 	// Parse device config.
@@ -1086,11 +1116,11 @@ func (d *nicBridged) setFilters() (err error) {
 	// If parent bridge is unmanaged check that a manually specified IP is available if IP filtering enabled.
 	if d.network == nil {
 		if shared.IsTrue(d.config["security.ipv4_filtering"]) && d.config["ipv4.address"] == "" {
-			return fmt.Errorf("IPv4 filtering requires a manually specified ipv4.address when using an unmanaged parent bridge")
+			return errors.New("IPv4 filtering requires a manually specified ipv4.address when using an unmanaged parent bridge")
 		}
 
 		if shared.IsTrue(d.config["security.ipv6_filtering"]) && d.config["ipv6.address"] == "" {
-			return fmt.Errorf("IPv6 filtering requires a manually specified ipv6.address when using an unmanaged parent bridge")
+			return errors.New("IPv6 filtering requires a manually specified ipv6.address when using an unmanaged parent bridge")
 		}
 	}
 
@@ -1177,10 +1207,11 @@ func allowedIPNets(config deviceConfig.Device) (IPv4Nets []*net.IPNet, IPv6Nets 
 
 		// Get a CIDR string for the instance address
 		if ipAddr != "" {
-			if ipVersion == 4 {
-				routes = append(routes, fmt.Sprintf("%s/32", ipAddr))
-			} else if ipVersion == 6 {
-				routes = append(routes, fmt.Sprintf("%s/128", ipAddr))
+			switch ipVersion {
+			case 4:
+				routes = append(routes, ipAddr+"/32")
+			case 6:
+				routes = append(routes, ipAddr+"/128")
 			}
 		}
 
@@ -1225,9 +1256,16 @@ func (d *nicBridged) networkClearLease(name string, network string, hwaddr strin
 	leaseFile := shared.VarPath("networks", network, "dnsmasq.leases")
 
 	// Check that we are in fact running a dnsmasq for the network
-	if !shared.PathExists(leaseFile) {
-		return nil
+	file, err := os.Open(leaseFile)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+
+		return err
 	}
+
+	defer func() { _ = file.Close() }()
 
 	// Convert MAC string to bytes to avoid any case comparison issues later.
 	srcMAC, err := net.ParseMAC(hwaddr)
@@ -1265,13 +1303,6 @@ func (d *nicBridged) networkClearLease(name string, network string, hwaddr strin
 	}
 
 	// Iterate the dnsmasq leases file looking for matching leases for this instance to release.
-	file, err := os.Open(leaseFile)
-	if err != nil {
-		return err
-	}
-
-	defer func() { _ = file.Close() }()
-
 	var dstDUID string
 	errs := []error{}
 	scanner := bufio.NewScanner(file)
@@ -1285,13 +1316,13 @@ func (d *nicBridged) networkClearLease(name string, network string, hwaddr strin
 				srcIP := net.ParseIP(fields[2])
 
 				if dstIPv4 == nil {
-					logger.Warnf("Failed to release DHCPv4 lease for instance %q, IP %q, MAC %q, %v", name, srcIP, srcMAC, "No server address found")
+					logger.Warnf("Failed releasing DHCPv4 lease for instance %q, IP %q, MAC %q, %v", name, srcIP, srcMAC, "No server address found")
 					continue // Cant send release packet if no dstIP found.
 				}
 
 				err = d.networkDHCPv4Release(srcMAC, srcIP, dstIPv4)
 				if err != nil {
-					errs = append(errs, fmt.Errorf("Failed to release DHCPv4 lease for instance %q, IP %q, MAC %q, %v", name, srcIP, srcMAC, err))
+					errs = append(errs, fmt.Errorf("Failed releasing DHCPv4 lease for instance %q, IP %q, MAC %q, %v", name, srcIP, srcMAC, err))
 				}
 			} else if (mode == clearLeaseAll || mode == clearLeaseIPv6Only) && name == fields[3] { // Handle IPv6 addresses by matching hostname to lease.
 				IAID := fields[1]
@@ -1304,18 +1335,18 @@ func (d *nicBridged) networkClearLease(name string, network string, hwaddr strin
 				}
 
 				if dstIPv6 == nil {
-					logger.Warnf("Failed to release DHCPv6 lease for instance %q, IP %q, DUID %q, IAID %q: %q", name, srcIP, DUID, IAID, "No server address found")
+					logger.Warnf("Failed releasing DHCPv6 lease for instance %q, IP %q, DUID %q, IAID %q: %q", name, srcIP, DUID, IAID, "No server address found")
 					continue // Cant send release packet if no dstIP found.
 				}
 
 				if dstDUID == "" {
-					errs = append(errs, fmt.Errorf("Failed to release DHCPv6 lease for instance %q, IP %q, DUID %q, IAID %q: %s", name, srcIP, DUID, IAID, "No server DUID found"))
+					errs = append(errs, fmt.Errorf("Failed releasing DHCPv6 lease for instance %q, IP %q, DUID %q, IAID %q: %s", name, srcIP, DUID, IAID, "No server DUID found"))
 					continue // Cant send release packet if no dstDUID found.
 				}
 
 				err = d.networkDHCPv6Release(DUID, IAID, srcIP, dstIPv6, dstDUID)
 				if err != nil {
-					errs = append(errs, fmt.Errorf("Failed to release DHCPv6 lease for instance %q, IP %q, DUID %q, IAID %q: %w", name, srcIP, DUID, IAID, err))
+					errs = append(errs, fmt.Errorf("Failed releasing DHCPv6 lease for instance %q, IP %q, DUID %q, IAID %q: %w", name, srcIP, DUID, IAID, err))
 				}
 			}
 		} else if fieldsLen == 2 && fields[0] == "duid" {
@@ -1339,7 +1370,7 @@ func (d *nicBridged) networkClearLease(name string, network string, hwaddr strin
 
 // networkDHCPv4Release sends a DHCPv4 release packet to a DHCP server.
 func (d *nicBridged) networkDHCPv4Release(srcMAC net.HardwareAddr, srcIP net.IP, dstIP net.IP) error {
-	dstAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:67", dstIP.String()))
+	dstAddr, err := net.ResolveUDPAddr("udp", dstIP.String()+":67")
 	if err != nil {
 		return err
 	}
@@ -1390,7 +1421,7 @@ func (d *nicBridged) networkDHCPv4Release(srcMAC net.HardwareAddr, srcIP net.IP,
 
 // networkDHCPv6Release sends a DHCPv6 release packet to a DHCP server.
 func (d *nicBridged) networkDHCPv6Release(srcDUID string, srcIAID string, srcIP net.IP, dstIP net.IP, dstDUID string) error {
-	dstAddr, err := net.ResolveUDPAddr("udp6", fmt.Sprintf("[%s]:547", dstIP.String()))
+	dstAddr, err := net.ResolveUDPAddr("udp6", "["+dstIP.String()+"]:547")
 	if err != nil {
 		return err
 	}
@@ -1408,13 +1439,13 @@ func (d *nicBridged) networkDHCPv6Release(srcDUID string, srcIAID string, srcIP 
 	}
 
 	// Convert Server DUID from string to byte array
-	dstDUIDRaw, err := hex.DecodeString(strings.Replace(dstDUID, ":", "", -1))
+	dstDUIDRaw, err := hex.DecodeString(strings.ReplaceAll(dstDUID, ":", ""))
 	if err != nil {
 		return err
 	}
 
 	// Convert DUID from string to byte array
-	srcDUIDRaw, err := hex.DecodeString(strings.Replace(srcDUID, ":", "", -1))
+	srcDUIDRaw, err := hex.DecodeString(strings.ReplaceAll(srcDUID, ":", ""))
 	if err != nil {
 		return err
 	}
@@ -1459,7 +1490,7 @@ func (d *nicBridged) networkDHCPv6Release(srcDUID string, srcIAID string, srcIP 
 
 // networkDHCPv6CreateIANA creates a DHCPv6 Identity Association for Non-temporary Address (rfc3315 IA_NA) option.
 func (d *nicBridged) networkDHCPv6CreateIANA(IAID uint32, IAAddr []byte) []byte {
-	data := make([]byte, 12)
+	data := make([]byte, 12, 12+len(IAAddr))
 	binary.BigEndian.PutUint32(data[0:4], IAID)       // Identity Association Identifier
 	binary.BigEndian.PutUint32(data[4:8], uint32(0))  // T1
 	binary.BigEndian.PutUint32(data[8:12], uint32(0)) // T2
@@ -1498,7 +1529,7 @@ func (d *nicBridged) setupNativeBridgePortVLANs(hostName string) error {
 	if d.config["vlan"] != "" {
 		// Reject VLAN ID 0 if specified (as validation allows VLAN ID 0 on unmanaged bridges for OVS).
 		if d.config["vlan"] == "0" {
-			return fmt.Errorf("VLAN ID 0 is not allowed for native Linux bridges")
+			return errors.New("VLAN ID 0 is not allowed for native Linux bridges")
 		}
 
 		// Get default PVID membership on port.
@@ -1535,10 +1566,10 @@ func (d *nicBridged) setupNativeBridgePortVLANs(hostName string) error {
 		for _, vlanID := range networkVLANList {
 			// Reject VLAN ID 0 if specified (as validation allows VLAN ID 0 on unmanaged bridges for OVS).
 			if vlanID == 0 {
-				return fmt.Errorf("VLAN tagged ID 0 is not allowed for native Linux bridges")
+				return errors.New("VLAN tagged ID 0 is not allowed for native Linux bridges")
 			}
 
-			err := link.BridgeVLANAdd(fmt.Sprintf("%d", vlanID), false, false, false)
+			err := link.BridgeVLANAdd(strconv.Itoa(vlanID), false, false, false)
 			if err != nil {
 				return err
 			}
@@ -1555,7 +1586,7 @@ func (d *nicBridged) setupOVSBridgePortVLANs(hostName string) error {
 	// Set port on bridge to specified untagged PVID.
 	if d.config["vlan"] != "" {
 		if d.config["vlan"] == "none" && d.config["vlan.tagged"] == "" {
-			return fmt.Errorf("vlan=none is not supported with openvswitch bridges when not using vlan.tagged")
+			return errors.New("vlan=none is not supported with openvswitch bridges when not using vlan.tagged")
 		}
 
 		// Configure the untagged 'native' membership settings of the port if VLAN ID specified.
@@ -1563,7 +1594,7 @@ func (d *nicBridged) setupOVSBridgePortVLANs(hostName string) error {
 		// Order is important here, as vlan_mode is set to "access", assuming that vlan.tagged is not used.
 		// If vlan.tagged is specified, then we expect it to also change the vlan_mode as needed.
 		if d.config["vlan"] != "none" {
-			err := ovs.BridgePortSet(hostName, "vlan_mode=access", fmt.Sprintf("tag=%s", d.config["vlan"]))
+			err := ovs.BridgePortSet(hostName, "vlan_mode=access", "tag="+string(d.config["vlan"]))
 			if err != nil {
 				return err
 			}
@@ -1593,7 +1624,7 @@ func (d *nicBridged) setupOVSBridgePortVLANs(hostName string) error {
 		// Also set the vlan_mode as needed from above.
 		// Must come after the PortSet command used for setting "vlan" mode above so that the correct
 		// vlan_mode is retained.
-		err = ovs.BridgePortSet(hostName, fmt.Sprintf("vlan_mode=%s", vlanMode), fmt.Sprintf("trunks=%s", strings.Join(vlanIDs, ",")))
+		err = ovs.BridgePortSet(hostName, "vlan_mode="+vlanMode, "trunks="+strings.Join(vlanIDs, ","))
 		if err != nil {
 			return err
 		}
@@ -1634,12 +1665,12 @@ func (d *nicBridged) State() (*api.InstanceStateNetwork, error) {
 
 		if v4subnet != nil {
 			mask, _ := v4subnet.Mask.Size()
-			v4mask = fmt.Sprintf("%d", mask)
+			v4mask = strconv.Itoa(mask)
 		}
 
 		if v6subnet != nil {
 			mask, _ := v6subnet.Mask.Size()
-			v6mask = fmt.Sprintf("%d", mask)
+			v6mask = strconv.Itoa(mask)
 		}
 
 		if d.config["hwaddr"] != "" {
@@ -1675,21 +1706,21 @@ func (d *nicBridged) State() (*api.InstanceStateNetwork, error) {
 
 		// Add any valid-state neighbour IP entries first.
 		for _, neighIP := range neighIPs {
-			if shared.ValueInSlice(string(neighIP.State), validStates) {
+			if slices.Contains(validStates, string(neighIP.State)) {
 				ipStore(neighIP.Addr)
 			}
 		}
 
 		// Add any non-failed-state entries.
 		for _, neighIP := range neighIPs {
-			if neighIP.State != ip.NeighbourIPStateFailed && !shared.ValueInSlice(string(neighIP.State), validStates) {
+			if neighIP.State != ip.NeighbourIPStateFailed && !slices.Contains(validStates, string(neighIP.State)) {
 				ipStore(neighIP.Addr)
 			}
 		}
 	}
 
 	// Convert IPs to InstanceStateNetworkAddresses.
-	addresses := []api.InstanceStateNetworkAddress{}
+	addresses := make([]api.InstanceStateNetworkAddress, 0, len(ips))
 	for _, ip := range ips {
 		addr := api.InstanceStateNetworkAddress{}
 		addr.Address = ip.String()

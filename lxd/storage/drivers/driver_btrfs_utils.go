@@ -3,6 +3,8 @@ package drivers
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -15,11 +17,12 @@ import (
 	"unsafe"
 
 	"github.com/google/uuid"
+	"go.yaml.in/yaml/v2"
 	"golang.org/x/sys/unix"
-	"gopkg.in/yaml.v2"
 
 	"github.com/canonical/lxd/lxd/backup"
 	"github.com/canonical/lxd/lxd/linux"
+	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/ioprogress"
@@ -28,8 +31,8 @@ import (
 )
 
 // Errors.
-var errBtrfsNoQuota = fmt.Errorf("Quotas disabled on filesystem")
-var errBtrfsNoQGroup = fmt.Errorf("Unable to find quota group")
+var errBtrfsNoQuota = errors.New("Quotas disabled on filesystem")
+var errBtrfsNoQGroup = errors.New("Cannot find quota group")
 
 // btrfsISOVolSuffix suffix used for iso content type volumes.
 const btrfsISOVolSuffix = ".iso"
@@ -43,7 +46,7 @@ func setReceivedUUID(path string, UUID string) error {
 
 	f, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("Failed opening %s: %w", path, err)
+		return fmt.Errorf("Failed opening %q: %w", path, err)
 	}
 
 	defer func() { _ = f.Close() }()
@@ -165,11 +168,12 @@ func (d *btrfs) getSubvolumes(path string) ([]string, error) {
 				continue
 			}
 
-			if !strings.HasPrefix(fields[8], path) {
+			subvolPath, found := strings.CutPrefix(fields[8], path)
+			if !found {
 				continue
 			}
 
-			result = append(result, strings.TrimPrefix(fields[8], path))
+			result = append(result, subvolPath)
 		}
 	}
 
@@ -184,7 +188,7 @@ func (d *btrfs) snapshotSubvolume(path string, dest string, recursion bool) (rev
 
 	// Single subvolume creation.
 	snapshot := func(path string, dest string) error {
-		_, err := shared.RunCommand("btrfs", "subvolume", "snapshot", path, dest)
+		_, err := shared.RunCommand(context.TODO(), "btrfs", "subvolume", "snapshot", path, dest)
 		if err != nil {
 			return err
 		}
@@ -238,7 +242,7 @@ func (d *btrfs) deleteSubvolume(rootPath string, recursion bool) error {
 		// Attempt (but don't fail on) to delete any qgroup on the subvolume.
 		qgroup, _, err := d.getQGroup(path)
 		if err == nil {
-			_, _ = shared.RunCommand("btrfs", "qgroup", "destroy", qgroup, path)
+			_, _ = shared.RunCommand(context.TODO(), "btrfs", "qgroup", "destroy", qgroup, path)
 		}
 
 		// Temporarily change ownership & mode to help with nesting.
@@ -246,7 +250,7 @@ func (d *btrfs) deleteSubvolume(rootPath string, recursion bool) error {
 		_ = os.Chown(path, 0, 0)
 
 		// Delete the subvolume itself.
-		_, err = shared.RunCommand("btrfs", "subvolume", "delete", path)
+		_, err = shared.RunCommand(context.TODO(), "btrfs", "subvolume", "delete", path)
 
 		return err
 	}
@@ -304,7 +308,7 @@ func (d *btrfs) deleteSubvolume(rootPath string, recursion bool) error {
 
 func (d *btrfs) getQGroup(path string) (string, int64, error) {
 	// Try to get the qgroup details.
-	output, err := shared.RunCommand("btrfs", "qgroup", "show", "-e", "-f", "--raw", path)
+	output, err := shared.RunCommand(context.TODO(), "btrfs", "qgroup", "show", "-e", "-f", "--raw", path)
 	if err != nil {
 		return "", -1, errBtrfsNoQuota
 	}
@@ -312,7 +316,7 @@ func (d *btrfs) getQGroup(path string) (string, int64, error) {
 	// Parse to extract the qgroup identifier.
 	var qgroup string
 	usage := int64(-1)
-	for _, line := range strings.Split(output, "\n") {
+	for line := range strings.SplitSeq(output, "\n") {
 		// Use case-insensitive field title match because BTRFS tooling changed casing between versions.
 		if line == "" || strings.HasPrefix(strings.ToLower(line), "qgroupid") || strings.HasPrefix(line, "-") {
 			continue
@@ -341,7 +345,7 @@ func (d *btrfs) getQGroup(path string) (string, int64, error) {
 	return qgroup, usage, nil
 }
 
-func (d *btrfs) sendSubvolume(path string, parent string, conn io.ReadWriteCloser, tracker *ioprogress.ProgressTracker) error {
+func (d *btrfs) sendSubvolume(path string, parent string, conn io.ReadWriteCloser, writerWrapper ioprogress.WriterWrapper) error {
 	defer func() { _ = conn.Close() }()
 
 	// Assemble btrfs send command.
@@ -360,11 +364,8 @@ func (d *btrfs) sendSubvolume(path string, parent string, conn io.ReadWriteClose
 
 	// Setup progress tracker.
 	var stdout io.WriteCloser = conn
-	if tracker != nil {
-		stdout = &ioprogress.ProgressWriter{
-			WriteCloser: conn,
-			Tracker:     tracker,
-		}
+	if writerWrapper != nil {
+		stdout = writerWrapper(conn)
 	}
 
 	cmd.Stdout = stdout
@@ -402,9 +403,9 @@ func (d *btrfs) setSubvolumeReadonlyProperty(path string, readonly bool) error {
 		args = append(args, "-f")
 	}
 
-	args = append(args, "-ts", path, "ro", fmt.Sprintf("%t", readonly))
+	args = append(args, "-ts", path, "ro", strconv.FormatBool(readonly))
 
-	_, err := shared.RunCommand("btrfs", args...)
+	_, err := shared.RunCommand(context.TODO(), "btrfs", args...)
 	return err
 }
 
@@ -420,19 +421,10 @@ type BTRFSSubVolume struct {
 // getSubvolumesMetaData retrieves subvolume meta data with paths relative to the root volume.
 // The first item in the returned list is the root subvolume itself.
 func (d *btrfs) getSubvolumesMetaData(vol Volume) ([]BTRFSSubVolume, error) {
-	var subVols []BTRFSSubVolume
-
 	snapName := ""
 	if vol.IsSnapshot() {
 		_, snapName, _ = api.GetParentAndSnapshotName(vol.name)
 	}
-
-	// Add main root volume to subvolumes list first.
-	subVols = append(subVols, BTRFSSubVolume{
-		Snapshot: snapName,
-		Path:     string(filepath.Separator),
-		Readonly: BTRFSSubVolumeIsRo(vol.MountPath()),
-	})
 
 	// Find any subvolumes in volume.
 	subVolPaths, err := d.getSubvolumes(vol.MountPath())
@@ -442,12 +434,20 @@ func (d *btrfs) getSubvolumesMetaData(vol Volume) ([]BTRFSSubVolume, error) {
 
 	sort.Strings(subVolPaths)
 
+	// Add main root volume to subvolumes list first.
+	subVols := make([]BTRFSSubVolume, 0, len(subVolPaths)+1)
+	subVols = append(subVols, BTRFSSubVolume{
+		Snapshot: snapName,
+		Path:     string(filepath.Separator),
+		Readonly: btrfsSubVolumeIsRo(vol.MountPath()),
+	})
+
 	// Add any subvolumes under the root subvolume with relative path to root.
 	for _, subVolPath := range subVolPaths {
 		subVols = append(subVols, BTRFSSubVolume{
 			Snapshot: snapName,
-			Path:     fmt.Sprintf("%s%s", string(filepath.Separator), subVolPath),
-			Readonly: BTRFSSubVolumeIsRo(filepath.Join(vol.MountPath(), subVolPath)),
+			Path:     string(filepath.Separator) + subVolPath,
+			Readonly: btrfsSubVolumeIsRo(filepath.Join(vol.MountPath(), subVolPath)),
 		})
 	}
 
@@ -570,7 +570,7 @@ func (d *btrfs) loadOptimizedBackupHeader(r io.ReadSeeker, mountPath string) (*B
 	header := BTRFSMetaDataHeader{}
 
 	// Extract.
-	tr, cancelFunc, err := backup.TarReader(r, d.state.OS, mountPath)
+	tr, cancelFunc, err := backup.TarReader(d.state, r, mountPath)
 	if err != nil {
 		return nil, err
 	}
@@ -588,7 +588,7 @@ func (d *btrfs) loadOptimizedBackupHeader(r io.ReadSeeker, mountPath string) (*B
 		}
 
 		if hdr.Name == "backup/optimized_header.yaml" {
-			err = yaml.NewDecoder(tr).Decode(&header)
+			err = yaml.NewDecoder(util.MaxBytesReader(tr, util.MaxYAMLFileBytes)).Decode(&header)
 			if err != nil {
 				return nil, fmt.Errorf("Error parsing optimized backup header file: %w", err)
 			}
@@ -598,11 +598,11 @@ func (d *btrfs) loadOptimizedBackupHeader(r io.ReadSeeker, mountPath string) (*B
 		}
 	}
 
-	return nil, fmt.Errorf("Optimized backup header file not found")
+	return nil, errors.New("Optimized backup header file not found")
 }
 
 // receiveSubVolume receives a subvolume from an io.Reader into the receivePath and returns the path to the received subvolume.
-func (d *btrfs) receiveSubVolume(r io.Reader, receivePath string, tracker *ioprogress.ProgressTracker) (string, error) {
+func (d *btrfs) receiveSubVolume(r io.ReadCloser, receivePath string, wrapper ioprogress.ReaderWrapper) (string, error) {
 	files, err := os.ReadDir(receivePath)
 	if err != nil {
 		return "", fmt.Errorf("Failed listing contents of %q: %w", receivePath, err)
@@ -610,11 +610,8 @@ func (d *btrfs) receiveSubVolume(r io.Reader, receivePath string, tracker *iopro
 
 	// Setup progress tracker.
 	stdin := r
-	if tracker != nil {
-		stdin = &ioprogress.ProgressReader{
-			Reader:  r,
-			Tracker: tracker,
-		}
+	if wrapper != nil {
+		stdin = wrapper(r)
 	}
 
 	err = shared.RunCommandWithFds(d.state.ShutdownCtx, stdin, nil, "btrfs", "receive", "-e", receivePath)
@@ -648,10 +645,24 @@ func (d *btrfs) receiveSubVolume(r io.Reader, receivePath string, tracker *iopro
 	}
 
 	if filename == "" {
-		return "", fmt.Errorf("Failed to determine received subvolume")
+		return "", errors.New("Failed determining received subvolume")
 	}
 
 	subVolPath := filepath.Join(receivePath, filename)
 
 	return subVolPath, nil
+}
+
+// getDiskPathFromFSUUID returns the disk hosting the filesystem with the given UUID.
+func (d *btrfs) getDiskPathFromFSUUID(uuid string) (string, error) {
+	uuid, err := shared.RunCommand(context.TODO(), "blkid", "--cache=/dev/null", "--uuid", uuid)
+	if err != nil {
+		return "", fmt.Errorf("Failed locating a device for filesystem UUID %q: %w", uuid, err)
+	}
+
+	if uuid == "" {
+		return "", fmt.Errorf("Failed locating a device for filesystem UUID %q", uuid)
+	}
+
+	return strings.TrimSpace(uuid), nil
 }

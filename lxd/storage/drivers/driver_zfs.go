@@ -1,18 +1,22 @@
 package drivers
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/canonical/lxd/lxd/migration"
-	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
+	"github.com/canonical/lxd/shared/ioprogress"
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/revert"
 	"github.com/canonical/lxd/shared/units"
@@ -50,6 +54,7 @@ func (d *zfs) load() error {
 		"storage_delete_old_snapshot_records":                nil,
 		"storage_zfs_drop_block_volume_filesystem_extension": d.patchDropBlockVolumeFilesystemExtension,
 		"storage_prefix_bucket_names_with_project":           nil,
+		"storage_zfs_remove_local_bucket_datasets":           d.patchRemoveLocalBucketDatasets,
 	}
 
 	// Done if previously loaded.
@@ -63,14 +68,6 @@ func (d *zfs) load() error {
 		return fmt.Errorf("Error loading %q module: %w", "zfs", err)
 	}
 
-	// Validate the needed tools are present.
-	for _, tool := range []string{"zpool", "zfs"} {
-		_, err := exec.LookPath(tool)
-		if err != nil {
-			return fmt.Errorf("Required tool '%s' is missing", tool)
-		}
-	}
-
 	// Get the version information.
 	if zfsVersion == "" {
 		version, err := d.version()
@@ -79,6 +76,30 @@ func (d *zfs) load() error {
 		}
 
 		zfsVersion = version
+	}
+
+	// Validate the needed tools are present.
+	for _, tool := range []string{"zpool", "zfs"} {
+		_, err := exec.LookPath(tool)
+		if err != nil {
+			if shared.InSnap() {
+				// Check if the snap bundles ZFS tools for the loaded module version.
+				// The snap ships versioned directories like zfs-2.2, zfs-2.3, etc.
+				ver, verErr := version.Parse(zfsVersion)
+				if verErr == nil {
+					snapZFSDir := filepath.Join(os.Getenv("SNAP"), fmt.Sprintf("zfs-%d.%d", ver.Major, ver.Minor))
+					if shared.PathExists(snapZFSDir) {
+						// The snap has the right tools but the daemon PATH does not include them yet,
+						// likely because the ZFS kernel module was installed after the snap was started.
+						return fmt.Errorf("Required tool %q is missing. The ZFS kernel module was installed after the LXD snap was started; run 'systemctl reload snap.lxd.daemon.service' to pick up the updated PATH", tool)
+					}
+				}
+
+				return fmt.Errorf("Required tool %q is missing. The snap does not contain ZFS tools matching the module version (%q). Consider installing ZFS tools in the host and use 'snap set lxd zfs.external=true'", tool, zfsVersion)
+			}
+
+			return fmt.Errorf("Required tool %q is missing", tool)
+		}
 	}
 
 	// Decide whether we can use features added by 0.8.0.
@@ -118,17 +139,19 @@ func (d *zfs) Info() Info {
 	info := Info{
 		Name:                         "zfs",
 		Version:                      zfsVersion,
+		DefaultBlockSize:             d.defaultBlockVolumeSize(),
 		DefaultVMBlockFilesystemSize: d.defaultVMBlockFilesystemSize(),
 		OptimizedImages:              true,
 		OptimizedBackups:             true,
 		PreservesInodes:              true,
 		Remote:                       d.isRemote(),
-		VolumeTypes:                  []VolumeType{VolumeTypeBucket, VolumeTypeCustom, VolumeTypeImage, VolumeTypeContainer, VolumeTypeVM},
+		VolumeTypes:                  []VolumeType{VolumeTypeCustom, VolumeTypeImage, VolumeTypeContainer, VolumeTypeVM},
 		BlockBacking:                 shared.IsTrue(d.config["volume.zfs.block_mode"]),
 		RunningCopyFreeze:            false,
 		DirectIO:                     zfsDirectIO,
 		MountedRoot:                  false,
-		Buckets:                      true,
+		Buckets:                      false,
+		PopulateParentVolumeUUID:     false,
 	}
 
 	return info
@@ -140,7 +163,7 @@ func (d *zfs) Info() Info {
 func (d zfs) ensureInitialDatasets(warnOnExistingPolicyApplyError bool) error {
 	properties := make([]string, 0, len(zfsDefaultSettings))
 	for k, v := range zfsDefaultSettings {
-		properties = append(properties, fmt.Sprintf("%s=%s", k, v))
+		properties = append(properties, k+"="+v)
 	}
 
 	properties, err := d.filterRedundantOptions(d.config["zfs.pool_name"], properties...)
@@ -161,11 +184,11 @@ func (d zfs) ensureInitialDatasets(warnOnExistingPolicyApplyError bool) error {
 
 	for _, dataset := range d.initialDatasets() {
 		properties := []string{"mountpoint=legacy"}
-		if shared.ValueInSlice(dataset, []string{"virtual-machines", "deleted/virtual-machines"}) {
+		if slices.Contains([]string{"virtual-machines", "deleted/virtual-machines"}, dataset) {
 			properties = append(properties, "volmode=none")
 		}
 
-		datasetPath := filepath.Join(d.config["zfs.pool_name"], dataset)
+		datasetPath := d.config["zfs.pool_name"] + "/" + dataset
 		exists, err := d.datasetExists(datasetPath)
 		if err != nil {
 			return err
@@ -212,12 +235,12 @@ func (d *zfs) FillConfig() error {
 
 		// Pick a default size of the loop file if not specified.
 		if d.config["size"] == "" {
-			defaultSize, err := loopFileSizeDefault()
+			size, err := loopFileSizeResolve(loopPath, shared.IsTrue(d.config["source.recover"]))
 			if err != nil {
 				return err
 			}
 
-			d.config["size"] = fmt.Sprintf("%dGiB", defaultSize)
+			d.config["size"] = size
 		}
 	} else if filepath.IsAbs(d.config["source"]) {
 		// Set default pool_name.
@@ -240,24 +263,55 @@ func (d *zfs) FillConfig() error {
 	return nil
 }
 
+// SourceIdentifier returns the underlying source.
+func (d *zfs) SourceIdentifier() (string, error) {
+	poolName := d.config["zfs.pool_name"]
+	if poolName != "" {
+		return poolName, nil
+	}
+
+	return "", errors.New("Cannot derive identifier from empty pool name")
+}
+
+// ValidateSource checks whether the required config keys are valid to access the underlying source.
+func (d *zfs) ValidateSource() error {
+	loopPath := loopFilePath(d.name)
+	if d.config["source"] == "" || d.config["source"] == loopPath {
+		// Validate pool_name.
+		if strings.Contains(d.config["zfs.pool_name"], "/") {
+			return errors.New("zfs.pool_name cannot point to a dataset when source is not set")
+		}
+	} else if filepath.IsAbs(d.config["source"]) {
+		// Handle existing block devices.
+		if !shared.IsBlockdevPath(d.config["source"]) {
+			return errors.New("Custom loop file locations are not supported")
+		}
+
+		// Validate pool_name.
+		if strings.Contains(d.config["zfs.pool_name"], "/") {
+			return errors.New("zfs.pool_name cannot point to a dataset when source is not set")
+		}
+	} else {
+		// Validate pool_name.
+		if d.config["zfs.pool_name"] != d.config["source"] {
+			return errors.New("The source must match zfs.pool_name if specified")
+		}
+	}
+
+	return nil
+}
+
 // Create is called during pool creation and is effectively using an empty driver struct.
 // WARNING: The Create() function cannot rely on any of the struct attributes being set.
 func (d *zfs) Create() error {
 	// Store the provided source as we are likely to be mangling it.
 	d.config["volatile.initial_source"] = d.config["source"]
 
-	err := d.FillConfig()
-	if err != nil {
-		return err
-	}
+	revert := revert.New()
+	defer revert.Fail()
 
 	loopPath := loopFilePath(d.name)
 	if d.config["source"] == "" || d.config["source"] == loopPath {
-		// Validate pool_name.
-		if strings.Contains(d.config["zfs.pool_name"], "/") {
-			return fmt.Errorf("zfs.pool_name can't point to a dataset when source isn't set")
-		}
-
 		// Create the loop file itself.
 		size, err := units.ParseByteSizeString(d.config["size"])
 		if err != nil {
@@ -269,47 +323,39 @@ func (d *zfs) Create() error {
 			return err
 		}
 
+		revert.Add(func() { _ = os.Remove(d.config["source"]) })
+
 		// Create the zpool.
-		_, err = shared.RunCommand("zpool", "create", "-m", "none", "-O", "compression=on", d.config["zfs.pool_name"], loopPath)
+		_, err = shared.RunCommand(d.state.ShutdownCtx, "zpool", "create", "-m", "none", "-O", "compression=on", d.config["zfs.pool_name"], loopPath)
 		if err != nil {
 			return err
 		}
 
 		// Apply auto-trim if supported.
 		if zfsTrim {
-			_, err := shared.RunCommand("zpool", "set", "autotrim=on", d.config["zfs.pool_name"])
+			_, err := shared.RunCommand(d.state.ShutdownCtx, "zpool", "set", "autotrim=on", d.config["zfs.pool_name"])
 			if err != nil {
 				return err
 			}
 		}
 	} else if filepath.IsAbs(d.config["source"]) {
-		// Handle existing block devices.
-		if !shared.IsBlockdevPath(d.config["source"]) {
-			return fmt.Errorf("Custom loop file locations are not supported")
-		}
-
-		// Validate pool_name.
-		if strings.Contains(d.config["zfs.pool_name"], "/") {
-			return fmt.Errorf("zfs.pool_name can't point to a dataset when source isn't set")
-		}
-
 		// Wipe if requested.
 		if shared.IsTrue(d.config["source.wipe"]) {
 			err := wipeBlockHeaders(d.config["source"])
 			if err != nil {
-				return fmt.Errorf("Failed to wipe headers from disk %q: %w", d.config["source"], err)
+				return fmt.Errorf("Failed wiping headers from disk %q: %w", d.config["source"], err)
 			}
 
 			d.config["source.wipe"] = ""
 
 			// Create the zpool.
-			_, err = shared.RunCommand("zpool", "create", "-f", "-m", "none", "-O", "compression=on", d.config["zfs.pool_name"], d.config["source"])
+			_, err = shared.RunCommand(d.state.ShutdownCtx, "zpool", "create", "-f", "-m", "none", "-O", "compression=on", d.config["zfs.pool_name"], d.config["source"])
 			if err != nil {
 				return err
 			}
 		} else {
 			// Create the zpool.
-			_, err := shared.RunCommand("zpool", "create", "-m", "none", "-O", "compression=on", d.config["zfs.pool_name"], d.config["source"])
+			_, err := shared.RunCommand(d.state.ShutdownCtx, "zpool", "create", "-m", "none", "-O", "compression=on", d.config["zfs.pool_name"], d.config["source"])
 			if err != nil {
 				return err
 			}
@@ -317,7 +363,7 @@ func (d *zfs) Create() error {
 
 		// Apply auto-trim if supported.
 		if zfsTrim {
-			_, err := shared.RunCommand("zpool", "set", "autotrim=on", d.config["zfs.pool_name"])
+			_, err := shared.RunCommand(d.state.ShutdownCtx, "zpool", "set", "autotrim=on", d.config["zfs.pool_name"])
 			if err != nil {
 				return err
 			}
@@ -326,11 +372,6 @@ func (d *zfs) Create() error {
 		// We don't need to keep the original source path around for import.
 		d.config["source"] = d.config["zfs.pool_name"]
 	} else {
-		// Validate pool_name.
-		if d.config["zfs.pool_name"] != d.config["source"] {
-			return fmt.Errorf("The source must match zfs.pool_name if specified")
-		}
-
 		if strings.Contains(d.config["zfs.pool_name"], "/") {
 			// Handle a dataset.
 			exists, err := d.datasetExists(d.config["zfs.pool_name"])
@@ -359,18 +400,14 @@ func (d *zfs) Create() error {
 		}
 
 		if len(datasets) > 0 {
-			return fmt.Errorf(`Provided ZFS pool (or dataset) isn't empty, run "sudo zfs list -r %s" to see existing entries`, d.config["zfs.pool_name"])
+			return fmt.Errorf(`Provided ZFS pool (or dataset) is not empty, run "sudo zfs list -r %s" to see existing entries`, d.config["zfs.pool_name"])
 		}
 	}
-
-	// Setup revert in case of problems
-	revert := revert.New()
-	defer revert.Fail()
 
 	revert.Add(func() { _ = d.Delete(nil) })
 
 	// Apply our default configuration.
-	err = d.ensureInitialDatasets(false)
+	err := d.ensureInitialDatasets(false)
 	if err != nil {
 		return err
 	}
@@ -380,7 +417,7 @@ func (d *zfs) Create() error {
 }
 
 // Delete removes the storage pool from the storage device.
-func (d *zfs) Delete(op *operations.Operation) error {
+func (d *zfs) Delete(progressReporter ioprogress.ProgressReporter) error {
 	// Check if the dataset/pool is already gone.
 	exists, err := d.datasetExists(d.config["zfs.pool_name"])
 	if err != nil {
@@ -401,25 +438,24 @@ func (d *zfs) Delete(op *operations.Operation) error {
 	for _, dataset := range datasets {
 		dataset = strings.TrimPrefix(dataset, "/")
 
-		if shared.ValueInSlice(dataset, initialDatasets) {
+		if slices.Contains(initialDatasets, dataset) {
 			continue
 		}
 
-		fields := strings.Split(dataset, "/")
-		if len(fields) > 1 {
+		if strings.Contains(dataset, "/") {
 			return fmt.Errorf("ZFS pool has leftover datasets: %s", dataset)
 		}
 	}
 
 	if strings.Contains(d.config["zfs.pool_name"], "/") {
 		// Delete the dataset.
-		_, err := shared.RunCommand("zfs", "destroy", "-r", d.config["zfs.pool_name"])
+		_, err := shared.RunCommand(context.TODO(), "zfs", "destroy", "-r", d.config["zfs.pool_name"])
 		if err != nil {
 			return err
 		}
 	} else {
 		// Delete the pool.
-		_, err := shared.RunCommand("zpool", "destroy", d.config["zfs.pool_name"])
+		_, err := shared.RunCommand(context.TODO(), "zpool", "destroy", d.config["zfs.pool_name"])
 		if err != nil {
 			return err
 		}
@@ -435,7 +471,7 @@ func (d *zfs) Delete(op *operations.Operation) error {
 	loopPath := loopFilePath(d.name)
 	err = os.Remove(loopPath)
 	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("Failed to remove '%s': %w", loopPath, err)
+		return fmt.Errorf("Failed removing %q: %w", loopPath, err)
 	}
 
 	return nil
@@ -451,6 +487,7 @@ func (d *zfs) Validate(config map[string]string) error {
 		//  type: string
 		//  defaultdesc: name of the pool
 		//  shortdesc: Name of the zpool
+		//  scope: local
 		"zfs.pool_name": validate.IsAny,
 		// lxdmeta:generate(entities=storage-zfs; group=pool-conf; key=zfs.clone_copy)
 		// Set this option to `true` or `false` to enable or disable using ZFS lightweight clones rather
@@ -460,6 +497,7 @@ func (d *zfs) Validate(config map[string]string) error {
 		//  type: string
 		//  defaultdesc: `true`
 		//  shortdesc: Whether to use ZFS lightweight clones
+		//  scope: global
 		"zfs.clone_copy": validate.Optional(func(value string) error {
 			if value == "rebase" {
 				return nil
@@ -472,9 +510,13 @@ func (d *zfs) Validate(config map[string]string) error {
 		// ---
 		//  type: bool
 		//  defaultdesc: `true`
-		//  shortdesc: Disable zpool export while an unmount is being performed
+		//  shortdesc: Whether to export the zpool when an unmount is being performed
+		//  scope: global
 		"zfs.export": validate.Optional(validate.IsBool),
 	}
+
+	// Append common local pool rules.
+	maps.Insert(rules, maps.All(d.commonRules.LocalPoolRules()))
 
 	return d.validatePool(config, rules, d.commonVolumeRules())
 }
@@ -483,7 +525,31 @@ func (d *zfs) Validate(config map[string]string) error {
 func (d *zfs) Update(changedConfig map[string]string) error {
 	_, ok := changedConfig["zfs.pool_name"]
 	if ok {
-		return fmt.Errorf("zfs.pool_name cannot be modified")
+		return errors.New("zfs.pool_name cannot be modified")
+	}
+
+	// When volume.zfs.block_mode, volume.block.filesystem, or volume.zfs.blocksize pool
+	// defaults change (including being cleared back to the default), image variants that
+	// no longer match the new defaults and have no clones become stale and can be deleted.
+	// Cleared keys appear in changedConfig with an empty string value, so the existence
+	// check below fires for both updates and deletions.
+	// Note: this runs before the DB commit in backend.Update; if the DB write fails the
+	// variants are already gone and will be rebuilt via slow-unpack on next use.
+	_, blockModeChanged := changedConfig["volume.zfs.block_mode"]
+	_, blockFSChanged := changedConfig["volume.block.filesystem"]
+	_, blocksizeChanged := changedConfig["volume.zfs.blocksize"]
+
+	if blockModeChanged || blockFSChanged || blocksizeChanged {
+		// d.config still holds the old values; merge changedConfig on top to
+		// build the post-change state.
+		newPoolConfig := make(map[string]string, len(d.config))
+		maps.Copy(newPoolConfig, d.config)
+		maps.Copy(newPoolConfig, changedConfig)
+
+		err := d.cleanupStaleImageVariants(newPoolConfig)
+		if err != nil {
+			return err
+		}
 	}
 
 	size, ok := changedConfig["size"]
@@ -492,7 +558,7 @@ func (d *zfs) Update(changedConfig map[string]string) error {
 		loopPath := loopFilePath(d.name)
 
 		if d.config["source"] != loopPath {
-			return fmt.Errorf("Cannot resize non-loopback pools")
+			return errors.New("Cannot resize non-loopback pools")
 		}
 
 		// Resize loop file
@@ -510,7 +576,7 @@ func (d *zfs) Update(changedConfig map[string]string) error {
 			return err
 		}
 
-		_, err = shared.RunCommand("zpool", "online", "-e", d.config["zfs.pool_name"], loopPath)
+		_, err = shared.RunCommand(d.state.ShutdownCtx, "zpool", "online", "-e", d.config["zfs.pool_name"], loopPath)
 		if err != nil {
 			return err
 		}
@@ -536,25 +602,25 @@ func (d *zfs) importPool() (bool, error) {
 	}
 
 	// Check if the pool exists.
-	poolName := strings.Split(d.config["zfs.pool_name"], "/")[0]
+	poolName, _, _ := strings.Cut(d.config["zfs.pool_name"], "/")
 	exists, err = d.datasetExists(poolName)
 	if err != nil {
 		return false, err
 	}
 
 	if exists {
-		return false, fmt.Errorf("ZFS zpool exists but dataset is missing")
+		return false, errors.New("ZFS zpool exists but dataset is missing")
 	}
 
 	// Import the pool.
 	if filepath.IsAbs(d.config["source"]) {
 		disksPath := shared.VarPath("disks")
-		_, err := shared.RunCommand("zpool", "import", "-f", "-d", disksPath, poolName)
+		_, err := shared.RunCommand(d.state.ShutdownCtx, "zpool", "import", "-f", "-d", disksPath, poolName)
 		if err != nil {
 			return false, err
 		}
 	} else {
-		_, err := shared.RunCommand("zpool", "import", poolName)
+		_, err := shared.RunCommand(d.state.ShutdownCtx, "zpool", "import", poolName)
 		if err != nil {
 			return false, err
 		}
@@ -570,7 +636,7 @@ func (d *zfs) importPool() (bool, error) {
 		return true, nil
 	}
 
-	return false, fmt.Errorf("ZFS zpool exists but dataset is missing")
+	return false, errors.New("ZFS zpool exists but dataset is missing")
 }
 
 // Mount mounts the storage pool.
@@ -613,8 +679,8 @@ func (d *zfs) Unmount() (bool, error) {
 	}
 
 	// Export the pool.
-	poolName := strings.Split(d.config["zfs.pool_name"], "/")[0]
-	_, err = shared.RunCommand("zpool", "export", poolName)
+	poolName, _, _ := strings.Cut(d.config["zfs.pool_name"], "/")
+	_, err = shared.RunCommand(context.TODO(), "zpool", "export", poolName)
 	if err != nil {
 		return false, err
 	}
@@ -716,29 +782,54 @@ func (d *zfs) patchDropBlockVolumeFilesystemExtension() error {
 		poolName = d.name
 	}
 
-	out, err := shared.RunCommand("zfs", "list", "-H", "-r", "-o", "name", "-t", "volume", fmt.Sprintf("%s/images", poolName))
+	out, err := shared.RunCommand(d.state.ShutdownCtx, "zfs", "list", "-H", "-r", "-o", "name", "-t", "volume", poolName+"/images")
 	if err != nil {
 		return fmt.Errorf("Failed listing images: %w", err)
 	}
 
-	for _, volume := range strings.Split(out, "\n") {
-		fields := strings.SplitN(volume, fmt.Sprintf("%s/images/", poolName), 2)
-
-		if len(fields) != 2 || fields[1] == "" {
+	for volume := range strings.SplitSeq(out, "\n") {
+		imageName, ok := strings.CutPrefix(volume, poolName+"/images/")
+		if !ok || imageName == "" {
 			continue
 		}
 
 		// Ignore non-block images, and images without filesystem extension
-		if !strings.HasSuffix(fields[1], ".block") || !strings.Contains(fields[1], "_") {
+		if !strings.HasSuffix(imageName, ".block") || !strings.Contains(imageName, "_") {
 			continue
 		}
 
 		// Rename zfs dataset. Snapshots will automatically be renamed.
-		newName := fmt.Sprintf("%s/images/%s.block", poolName, strings.Split(fields[1], "_")[0])
+		baseName, _, _ := strings.Cut(imageName, "_")
+		newName := poolName + "/images/" + baseName + ".block"
 
-		_, err = shared.RunCommand("zfs", "rename", volume, newName)
+		_, err = shared.RunCommand(context.TODO(), "zfs", "rename", volume, newName)
 		if err != nil {
 			return fmt.Errorf("Failed renaming zfs dataset: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// patchRemoveLocalBucketDatasets removes orphaned ZFS datasets left over from before local storage bucket support was
+// dropped. Affected datasets are "<pool>/buckets" and "<pool>/deleted/buckets".
+func (d *zfs) patchRemoveLocalBucketDatasets() error {
+	poolName, ok := d.config["zfs.pool_name"]
+	if !ok {
+		poolName = d.name
+	}
+
+	// Remove deepest-first to avoid dependency conflicts.
+	for _, dataset := range []string{poolName + "/deleted/buckets", poolName + "/buckets"} {
+		_, err := shared.RunCommand(d.state.ShutdownCtx, "zfs", "list", "-H", "-o", "name", dataset)
+		if err != nil {
+			// Dataset does not exist; nothing to do.
+			continue
+		}
+
+		_, err = shared.RunCommand(d.state.ShutdownCtx, "zfs", "destroy", "-r", dataset)
+		if err != nil {
+			return fmt.Errorf("Failed removing ZFS bucket dataset %q: %w", dataset, err)
 		}
 	}
 

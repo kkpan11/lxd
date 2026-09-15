@@ -1,36 +1,25 @@
 ---
-relatedlinks: '[Introduction&#32;to&#32;LXD&#32;projects](https://ubuntu.com/tutorials/introduction-to-lxd-projects)'
+relatedlinks: "[Introduction&#32;to&#32;LXD&#32;projects](https://ubuntu.com/tutorials/introduction-to-lxd-projects)"
+myst:
+  html_meta:
+    description: An index of how-to guides for LXD projects, including creating, configuring, and working with projects, as well as confining users to projects.
 ---
 
 (projects)=
 # Projects
 
-```{only} diataxis
-The following how-to guides cover common operations related to projects:
-```
+LXD projects enable grouping related instances together, as well as setting up multi-user environments where users are restricted to certain projects.
 
-```{filtered-toctree}
+```{toctree}
 :titlesonly:
 
-:diataxis:Create and configure </howto/projects_create>
-:diataxis:Work with projects </howto/projects_work>
-:diataxis:Confine projects to users </howto/projects_confine>
+Create and configure projects </howto/projects_create>
+Work with projects </howto/projects_work>
+Confine users to projects </howto/projects_confine>
 ```
 
 ## Related topics
 
-```{only} diataxis
 {{projects_exp}}
 
 {{projects_ref}}
-```
-
-```{filtered-toctree}
-:maxdepth: 1
-
-:topical:/explanation/projects
-:topical:Create and configure projects </howto/projects_create>
-:topical:Work with different projects </howto/projects_work>
-:topical:Confine projects to users </howto/projects_confine>
-:topical:/reference/projects
-```

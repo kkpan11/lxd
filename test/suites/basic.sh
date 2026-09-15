@@ -8,11 +8,15 @@ test_basic_usage() {
   # Test image export
   sum="$(lxc image info testimage | awk '/^Fingerprint/ {print $2}')"
   lxc image export testimage "${LXD_DIR}/"
-  [ "${sum}" = "$(sha256sum "${LXD_DIR}/${sum}.tar.xz" | cut -d' ' -f1)" ]
+  [ "${sum}" = "$(sha256sum "${LXD_DIR}/${sum}.tar"* | cut -d' ' -f1)" ]
 
   # Test an alias with slashes
   lxc image show "${sum}"
   lxc image alias create a/b/ "${sum}"
+
+  echo "Test using alias with slashes"
+  lxc init a/b/ c1 -d "${SMALL_ROOT_DISK}"
+  lxc delete c1
 
   # Ensure aliased image won't launch with vm flag set
   ! lxc launch a/b/ --vm || false
@@ -22,50 +26,49 @@ test_basic_usage() {
   # Test alias list filtering
   lxc image alias create foo "${sum}"
   lxc image alias create bar "${sum}"
-  lxc image alias list local: | grep -q foo
-  lxc image alias list local: | grep -q bar
-  lxc image alias list local: foo | grep -q -v bar
-  lxc image alias list local: "${sum}" | grep -q foo
-  lxc image alias list local: non-existent | grep -q -v non-existent
+  lxc image alias list local: | grep -wF foo
+  lxc image alias list local: | grep -wF bar
+  ! lxc image alias list local: foo | grep -wF bar || false
+  lxc image alias list local: "${sum}" | grep -wF foo
+  ! lxc image alias list local: non-existent | grep -wF non-existent || false
   lxc image alias delete foo
   lxc image alias delete bar
 
   lxc image alias create foo "${sum}"
   lxc image alias rename foo bar
-  lxc image alias list | grep -qv foo  # the old name is gone
+  ! lxc image alias list | grep -wF foo || false  # the old name is gone
   lxc image alias delete bar
 
   # Test image list output formats (table & json)
-  lxc image list --format table | grep -q testimage
+  lxc image list --format table | grep -wF testimage
   lxc image list --format json \
-    | jq '.[]|select(.alias[0].name="testimage")' \
-    | grep -q '"name": "testimage"'
+    | jq --exit-status '.[]|select(.alias[0].name="testimage").aliases | .[] | .name == "testimage"'
 
   # Test image delete
   lxc image delete testimage
 
   # test GET /1.0, since the client always puts to /1.0/
-  my_curl -f -X GET "https://${LXD_ADDR}/1.0"
-  my_curl -f -X GET "https://${LXD_ADDR}/1.0/containers"
+  my_curl --fail --output /dev/null "https://${LXD_ADDR}/1.0"
+  my_curl --fail --output /dev/null "https://${LXD_ADDR}/1.0/instances"
 
   # Re-import the image
-  mv "${LXD_DIR}/${sum}.tar.xz" "${LXD_DIR}/testimage.tar.xz"
-  lxc image import "${LXD_DIR}/testimage.tar.xz" --alias testimage user.foo=bar --public
-  lxc image show testimage | grep -qF "user.foo: bar"
-  lxc image show testimage | grep -qF "public: true"
+  mv "${LXD_DIR}/${sum}.tar"* "${LXD_DIR}/testimage.tar"
+  lxc image import "${LXD_DIR}/testimage.tar" --alias testimage user.foo=bar --public
+  [ "$(lxc image get-property testimage user.foo)" = "bar" ]
+  lxc image show testimage | grep -xF "public: true"
   lxc image delete testimage
-  lxc image import "${LXD_DIR}/testimage.tar.xz" --alias testimage
-  rm "${LXD_DIR}/testimage.tar.xz"
+  lxc image import "${LXD_DIR}/testimage.tar" --alias testimage
+  rm "${LXD_DIR}/testimage.tar"
 
   # Test filename for image export
   lxc image export testimage "${LXD_DIR}/"
-  [ "${sum}" = "$(sha256sum "${LXD_DIR}/${sum}.tar.xz" | cut -d' ' -f1)" ]
-  rm "${LXD_DIR}/${sum}.tar.xz"
+  [ "${sum}" = "$(sha256sum "${LXD_DIR}/${sum}.tar"* | cut -d' ' -f1)" ]
+  rm "${LXD_DIR}/${sum}.tar"*
 
   # Test custom filename for image export
   lxc image export testimage "${LXD_DIR}/foo"
-  [ "${sum}" = "$(sha256sum "${LXD_DIR}/foo.tar.xz" | cut -d' ' -f1)" ]
-  rm "${LXD_DIR}/foo.tar.xz"
+  [ "${sum}" = "$(sha256sum "${LXD_DIR}/foo.tar"* | cut -d' ' -f1)" ]
+  rm "${LXD_DIR}/foo.tar"*
 
   # Test image export with a split image.
   deps/import-busybox --split --alias splitimage
@@ -73,11 +76,10 @@ test_basic_usage() {
   sum="$(lxc image info splitimage | awk '/^Fingerprint/ {print $2}')"
 
   lxc image export splitimage "${LXD_DIR}"
-  [ "${sum}" = "$(cat "${LXD_DIR}/meta-${sum}.tar.xz" "${LXD_DIR}/${sum}.tar.xz" | sha256sum | cut -d' ' -f1)" ]
+  [ "${sum}" = "$(cat "${LXD_DIR}/meta-${sum}.tar"* "${LXD_DIR}/${sum}.tar"* | sha256sum | cut -d' ' -f1)" ]
 
   # Delete the split image and exported files
-  rm "${LXD_DIR}/${sum}.tar.xz"
-  rm "${LXD_DIR}/meta-${sum}.tar.xz"
+  rm "${LXD_DIR}/meta-${sum}.tar"* "${LXD_DIR}/${sum}.tar"*
   lxc image delete splitimage
 
   # Redo the split image export test, this time with the --filename flag
@@ -86,15 +88,16 @@ test_basic_usage() {
   deps/import-busybox --split --filename --alias splitimage
 
   lxc image export splitimage "${LXD_DIR}"
-  [ "${sum}" = "$(cat "${LXD_DIR}/meta-${sum}.tar.xz" "${LXD_DIR}/${sum}.tar.xz" | sha256sum | cut -d' ' -f1)" ]
+  [ "${sum}" = "$(cat "${LXD_DIR}/meta-${sum}.tar"* "${LXD_DIR}/${sum}.tar"* | sha256sum | cut -d' ' -f1)" ]
 
   # Delete the split image and exported files
-  rm "${LXD_DIR}/${sum}.tar.xz"
-  rm "${LXD_DIR}/meta-${sum}.tar.xz"
+  rm "${LXD_DIR}/${sum}.tar"*
+  rm "${LXD_DIR}/meta-${sum}.tar"*
   lxc image delete splitimage
 
   # Test --no-profiles flag
-  poolName=$(lxc profile device get default root pool)
+  local poolName
+  poolName="lxdtest-$(basename "${LXD_DIR}")"
   ! lxc init testimage foo --no-profiles || false
   lxc init testimage foo --no-profiles -s "${poolName}"
   lxc delete -f foo
@@ -104,51 +107,107 @@ test_basic_usage() {
   lxc list | grep foo | grep STOPPED
   lxc list fo | grep foo | grep STOPPED
 
+  echo "Invalid container names"
+  ! lxc init --empty ".." || false
+  # Escaping `\` multiple times due to `lxc` wrapper script munging the first layer
+  ! lxc init --empty "\\\\" || false
+  ! lxc init --empty "/" || false
+  ! lxc init --empty ";" || false
+
+  echo "Too small containers"
+  ! lxc init --empty c1 -c limits.memory=0 || false
+  ! lxc init --empty c1 -c limits.memory=0% || false
+
+  echo "Containers with snapshots"
+  lxc init testimage c1 -d "${SMALL_ROOT_DISK}"
+  lxc snapshot c1
+  # Invalid snapshot names
+  ! lxc snapshot c1 ".." || false
+  # Escaping `\` multiple times due to `lxc` wrapper script munging the first layer
+  ! lxc snapshot c1 "\\\\" || false
+  ! lxc snapshot c1 "/" || false
+  [ "$(lxc list -f csv -c S c1)" = "1" ]
+  lxc start c1
+  lxc snapshot c1
+  [ "$(lxc list -f csv -c S c1)" = "2" ]
+  lxc delete --force c1
+
+  # Test log directory cleanup after deletion
+  [ ! -d "${LXD_DIR}/logs/c1" ]
+
   # Test list json format
-  lxc list --format json | jq '.[]|select(.name="foo")' | grep '"name": "foo"'
+  lxc list --format json | jq --exit-status '.[] | .name == "foo"'
 
   # Test list with --columns and --fast
   ! lxc list --columns=nsp --fast || false
 
   # Check volatile.apply_template is correct.
-  lxc config get foo volatile.apply_template | grep create
+  [ "$(lxc config get foo volatile.apply_template)" = "create" ]
 
   # Start the instance to clear apply_template.
   lxc start foo
+  [ "$(lxc config get foo volatile.apply_template || echo fail)" = "" ]
+
+  # Check volatile.last_state.power is correct.
+  [ "$(lxc config get foo volatile.last_state.power)" = "RUNNING" ]
+
+  # Check copying instance clears volatile.last_state.power.
+  lxc copy foo bar
+  [ "$(lxc config get bar volatile.last_state.power || echo fail)" = "" ]
+
+  # Check that volatile.uuid is regenerated on copy.
+  [ "$(lxc config get foo volatile.uuid)" != "$(lxc config get bar volatile.uuid)" ]
+
+  # Check that volatile.uuid can be overridden on copy.
+  lxc delete bar
+  barUUID="$(uuidgen)"
+  lxc copy foo bar -c volatile.uuid="${barUUID}"
+  [ "$(lxc config get bar volatile.uuid)" = "${barUUID}" ]
+
+  # Check that volatile.uuid is applied to copy on refresh.
+  lxc copy foo bar --refresh
+  [ "$(lxc config get foo volatile.uuid)" = "$(lxc config get bar volatile.uuid)" ]
+
+  # Check that volatile.last_state.power is cleared even on refresh.
+  [ "$(lxc config get bar volatile.last_state.power || echo fail)" = "" ]
+
+  lxc delete foo -f
+
+  # Test starting container after copy.
+  lxc copy bar foo --start
+  [ "$(lxc list -f csv -c s foo)" = "RUNNING" ]
+
   lxc stop foo -f
+  lxc delete bar
 
   # Test container rename
   lxc move foo bar
+  [ "$(lxc list -c n -f csv)" = "bar" ]
 
   # Check volatile.apply_template is altered during rename.
-  lxc config get bar volatile.apply_template | grep rename
-
-  lxc list | grep -v foo
-  lxc list | grep bar
+  [ "$(lxc config get bar volatile.apply_template)" = "rename" ]
 
   lxc rename bar foo
-  lxc list | grep -v bar
-  lxc list | grep foo
+  [ "$(lxc list -c n -f csv)" = "foo" ]
+
+  # Check volatile.apply_template is kept until applied (instance start).
+  [ "$(lxc config get foo volatile.apply_template)" = "rename" ]
   lxc rename foo bar
 
-  # Test container copy
-  lxc copy bar foo
-  lxc delete foo
-
   # gen untrusted cert
-  gen_cert client3
+  gen_cert_and_key client3
 
   # don't allow requests without a cert to get trusted data
-  [ "$(curl -k -s -o /dev/null -w "%{http_code}" -X GET "https://${LXD_ADDR}/1.0/containers/foo")" = "403" ]
+  [ "$(curl -k -s -o /dev/null -w "%{http_code}" "https://${LXD_ADDR}/1.0/instances/foo")" = "403" ]
 
   # Test unprivileged container publish
   lxc publish bar --alias=foo-image prop1=val1
-  lxc image show foo-image | grep val1
-  CERTNAME="client3" my_curl -X GET "https://${LXD_ADDR}/1.0/images" | grep -F "/1.0/images/" && false
+  [ "$(lxc image get-property foo-image prop1)" = "val1" ]
+  ! CERTNAME="client3" my_curl "https://${LXD_ADDR}/1.0/images" | grep -F "/1.0/images/" || false
   lxc image delete foo-image
 
   # Test container publish with existing alias
-  lxc publish bar --alias=foo-image --alias=foo-image2
+  lxc publish bar --alias=foo-image --alias=bar-image2
   lxc launch testimage baz
   # change the container filesystem so the resulting image is different
   lxc exec baz -- touch /somefile
@@ -158,41 +217,52 @@ test_basic_usage() {
   # publishing another image with same alias and '--reuse' flag should success
   lxc publish baz --alias=foo-image --reuse
   fooImage=$(lxc image list -cF -fcsv foo-image)
-  fooImage2=$(lxc image list -cF -fcsv foo-image2)
+  barImage2=$(lxc image list -cF -fcsv bar-image2)
   lxc delete baz
-  lxc image delete foo-image foo-image2
+  lxc image delete foo-image bar-image2
 
-  # the first image should have foo-image2 alias and the second imgae foo-image alias
-  if [ "$fooImage" = "$fooImage2" ]; then
-    echo "foo-image and foo-image2 aliases should be assigned to two different images"
+  # the first image should have bar-image2 alias and the second image foo-image alias
+  if [ "$fooImage" = "$barImage2" ]; then
+    echo "foo-image and bar-image2 aliases should be assigned to two different images"
     false
   fi
 
 
   # Test container publish with existing alias
-  lxc publish bar --alias=foo-image --alias=foo-image2
+  lxc publish bar --alias=foo-image --alias=bar-image2
   lxc launch testimage baz
   # change the container filesystem so the resulting image is different
   lxc exec baz -- touch /somefile
   lxc stop baz --force
   # publishing another image with same aliases
-  lxc publish baz --alias=foo-image --alias=foo-image2 --reuse
+  lxc publish baz --alias=foo-image --alias=bar-image2 --reuse
   fooImage=$(lxc image list -cF -fcsv foo-image)
-  fooImage2=$(lxc image list -cF -fcsv foo-image2)
+  barImage2=$(lxc image list -cF -fcsv bar-image2)
   lxc delete baz
   lxc image delete foo-image
 
-  # the second image should have foo-image and foo-image2 aliases and the first one should be removed
-  if [ "$fooImage" != "$fooImage2" ]; then
-    echo "foo-image and foo-image2 aliases should be assigned to the same image"
+  # the second image should have foo-image and bar-image2 aliases and the first one should be removed
+  if [ "$fooImage" != "$barImage2" ]; then
+    echo "foo-image and bar-image2 aliases should be assigned to the same image"
     false
   fi
 
+  # Ensure invalid compression algorithm is rejected.
+  [ "$(CLIENT_DEBUG="" SHELL_TRACING="" lxc publish bar --compression=ls 2>&1)" = 'Error: Invalid compression algorithm "ls"' ]
+
+  # Ensure compression algorithm cannot be supplied with dangerous arguments.
+  lxc init testimage c1
+  ! lxc publish c1 --compression="zstd -d -f --pass-through -o ${TEST_DIR}/busybox -- ${LXD_DIR}/containers/c1/rootfs/bin/busybox" || false
+  if [ -e "${TEST_DIR}/busybox" ]; then
+    echo "Custom compression attack successful!" >&2
+    exit 1
+  fi
+  lxc delete c1
 
   # Test image compression on publish
   lxc publish bar --alias=foo-image-compressed --compression=bzip2 prop=val1
-  lxc image show foo-image-compressed | grep val1
-  CERTNAME="client3" my_curl -X GET "https://${LXD_ADDR}/1.0/images" | grep -F "/1.0/images/" && false
+  [ "$(lxc image get-property foo-image-compressed prop)" = "val1" ]
+  ! CERTNAME="client3" my_curl "https://${LXD_ADDR}/1.0/images" | grep -F "/1.0/images/" || false
   lxc image delete foo-image-compressed
 
   # Test compression options
@@ -204,29 +274,54 @@ test_basic_usage() {
   lxc profile set priv security.privileged true
   lxc init testimage barpriv -p default -p priv
   lxc publish barpriv --alias=foo-image prop1=val1
-  lxc image show foo-image | grep val1
-  CERTNAME="client3" my_curl -X GET "https://${LXD_ADDR}/1.0/images" | grep -F "/1.0/images/" && false
+  [ "$(lxc image get-property foo-image prop1)" = "val1" ]
+  ! CERTNAME="client3" my_curl "https://${LXD_ADDR}/1.0/images" | grep -F "/1.0/images/" || false
   lxc image delete foo-image
   lxc delete barpriv
+
+  # make sure that privileged containers are not world-readable
+  lxc init testimage foo2 -p priv -s "lxdtest-$(basename "${LXD_DIR}")"
+  [ "$(stat -L -c "%a" "${LXD_DIR}/containers/foo2")" = "100" ]
+  lxc delete foo2
   lxc profile delete priv
 
   # Test that containers without metadata.yaml are published successfully.
-  # Note that this quick hack won't work for LVM, since it doesn't always mount
-  # the container's filesystem. That's ok though: the logic we're trying to
-  # test here is independent of storage backend, so running it for just one
-  # backend (or all non-lvm backends) is enough.
-  if [ "$lxd_backend" = "lvm" ]; then
-    lxc init testimage nometadata
-    rm -f "${LXD_DIR}/containers/nometadata/metadata.yaml"
-    lxc publish nometadata --alias=nometadata-image
-    lxc image delete nometadata-image
-    lxc delete nometadata
-  fi
+  lxc init testimage nometadata
+  rm -f "${LXD_DIR}/containers/nometadata/metadata.yaml"
+  lxc publish nometadata --alias=nometadata-image
+  lxc image delete nometadata-image
+  lxc delete nometadata
 
   # Test public images
-  lxc publish --public bar --alias=foo-image2
-  CERTNAME="client3" my_curl -X GET "https://${LXD_ADDR}/1.0/images" | grep -F "/1.0/images/"
-  lxc image delete foo-image2
+  lxc publish --public bar --alias=bar-image2
+  CERTNAME="client3" my_curl "https://${LXD_ADDR}/1.0/images" | grep -F "/1.0/images/"
+  lxc image delete bar-image2
+
+  echo "Check that instances can be initialized, launched, and refreshed from private images in non-default projects"
+
+  local LXD2_DIR
+  LXD2_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
+  spawn_lxd "${LXD2_DIR}" true
+
+  lxc project create bar
+  lxc image copy testimage local: --alias testimage --target-project bar
+
+  LXD_DIR="${LXD2_DIR}" lxc project create foo
+  LXD_DIR="${LXD2_DIR}" lxc profile show default | LXD_DIR="${LXD2_DIR}" lxc profile edit default --project foo
+  LXD_DIR="${LXD2_DIR}" lxc init localhost:testimage c1 --project bar --target-project foo
+  LXD_DIR="${LXD2_DIR}" lxc launch localhost:testimage c2 --project bar --target-project foo
+  LXD_DIR="${LXD2_DIR}" lxc file push --quiet "$(command -v devlxd-client)" c2/bin/ --project foo
+  LXD_DIR="${LXD2_DIR}" setup_instance_gocoverage c2 foo
+  LXD_DIR="${LXD2_DIR}" lxc exec c2 --project foo -- devlxd-client get-state
+  LXD_DIR="${LXD2_DIR}" lxc stop c2 --project foo --force
+  LXD_DIR="${LXD2_DIR}" lxc rebuild localhost:testimage c2 --project bar --target-project foo
+  LXD_DIR="${LXD2_DIR}" lxc start c2 --project foo
+  ! LXD_DIR="${LXD2_DIR}" lxc exec c2 --project foo -- devlxd-client get-state || false
+
+  shutdown_lxd "${LXD2_DIR}"
+  rm -rf "${LXD2_DIR}"
+
+  lxc project delete bar --force
 
   # Test invalid instance names
   ! lxc init testimage -abc || false
@@ -240,7 +335,7 @@ test_basic_usage() {
   lxc snapshot bar
   lxc publish bar/snap0 --alias foo
   lxc init foo bar2
-  lxc list | grep bar2
+  lxc list -c n | grep bar2
   lxc delete bar2
   lxc image delete foo
 
@@ -265,7 +360,7 @@ test_basic_usage() {
   echo "  cp: list" >> "${LXD_CONF}/config.yml"
   [ "$(lxc ls)" = "$(lxc cp)" ]
   #   7. User-defined aliases override commands and don't recurse
-  lxc init testimage foo
+  lxc init --empty foo
   LXC_CONFIG_SHOW=$(lxc config show foo --expanded)
   echo "  config show: config show --expanded" >> "${LXD_CONF}/config.yml"
   [ "$(lxc config show foo)" = "$LXC_CONFIG_SHOW" ]
@@ -281,36 +376,34 @@ test_basic_usage() {
   [ ! -d "${LXD_DIR}/snapshots/bar" ]
 
   # Test randomly named container creation
-  lxc launch testimage
-  RDNAME=$(lxc list --format csv --columns n)
-  lxc delete -f "${RDNAME}"
+  RDNAME="$(lxc init --empty --quiet | sed 's/Instance name is: //')"
+  lxc delete "${RDNAME}"
 
   # Test "nonetype" container creation
-  wait_for "${LXD_ADDR}" my_curl -X POST "https://${LXD_ADDR}/1.0/containers" \
-        -d "{\"name\":\"nonetype\",\"source\":{\"type\":\"none\"}}"
+  wait_for "${LXD_ADDR}" my_curl -X POST --fail-with-body -H 'Content-Type: application/json' "https://${LXD_ADDR}/1.0/instances" \
+        -d '{"name":"nonetype","source":{"type":"none"}}'
   lxc delete nonetype
 
   # Test "nonetype" container creation with an LXC config
-  wait_for "${LXD_ADDR}" my_curl -X POST "https://${LXD_ADDR}/1.0/containers" \
-        -d "{\"name\":\"configtest\",\"config\":{\"raw.lxc\":\"lxc.hook.clone=/bin/true\"},\"source\":{\"type\":\"none\"}}"
+  wait_for "${LXD_ADDR}" my_curl -X POST --fail-with-body -H 'Content-Type: application/json' "https://${LXD_ADDR}/1.0/instances" \
+        -d '{"name":"configtest","config":{"raw.lxc":"lxc.hook.clone=/bin/true"},"source":{"type":"none"}}'
   # shellcheck disable=SC2102
-  [ "$(my_curl "https://${LXD_ADDR}/1.0/containers/configtest" | jq -r .metadata.config[\"raw.lxc\"])" = "lxc.hook.clone=/bin/true" ]
+  my_curl "https://${LXD_ADDR}/1.0/instances/configtest" | jq --exit-status '.metadata.config["raw.lxc"] == "lxc.hook.clone=/bin/true"'
   lxc delete configtest
 
   # Test activateifneeded/shutdown
   LXD_ACTIVATION_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
-  chmod +x "${LXD_ACTIVATION_DIR}"
   spawn_lxd "${LXD_ACTIVATION_DIR}" true
   (
     set -e
     # shellcheck disable=SC2030
     LXD_DIR=${LXD_ACTIVATION_DIR}
     ensure_import_testimage
-    lxd activateifneeded --debug 2>&1 | grep -qF "Daemon has core.https_address set, activating..."
+    lxd activateifneeded --debug 2>&1 | grep -F "Daemon has core.https_address set, activating..."
     lxc config unset core.https_address --force-local
-    lxd activateifneeded --debug 2>&1 | grep -qF -v "activating..."
+    ! lxd activateifneeded --debug 2>&1 | grep -F "activating..." || false
     lxc init testimage autostart --force-local
-    lxd activateifneeded --debug 2>&1 | grep -qF -v "activating..."
+    ! lxd activateifneeded --debug 2>&1 | grep -F "activating..." || false
     lxc config set autostart boot.autostart true --force-local
 
     # Restart the daemon, this forces the global database to be dumped to disk.
@@ -318,28 +411,42 @@ test_basic_usage() {
     respawn_lxd "${LXD_DIR}" true
     lxc stop --force autostart --force-local
 
-    lxd activateifneeded --debug 2>&1 | grep -qF "Daemon has auto-started instances, activating..."
+    lxd activateifneeded --debug 2>&1 | grep -F "Daemon has auto-started instances, activating..."
 
     lxc config unset autostart boot.autostart --force-local
-    lxd activateifneeded --debug 2>&1 | grep -qF -v "activating..."
+
+    # Restart the daemon, this forces the global database to be dumped to disk.
+    shutdown_lxd "${LXD_DIR}"
+    respawn_lxd "${LXD_DIR}" true
+
+    ! lxd activateifneeded --debug 2>&1 | grep -F "activating..." || false
 
     lxc start autostart --force-local
-    PID=$(lxc info autostart --force-local | awk '/^PID:/ {print $2}')
+    PID="$(lxc list --force-local -f csv -c p autostart)"
     shutdown_lxd "${LXD_DIR}"
-    [ -d "/proc/${PID}" ] && false
 
-    lxd activateifneeded --debug 2>&1 | grep -qF "Daemon has auto-started instances, activating..."
+    # Stopping LXD should also stop the instances
+    ! [ -d "/proc/${PID}" ] || false
+
+    # `lxd activateifneeded` will error out due to LXD being stopped and not having any Unix socket to wake it up
+    # but it should also log something about the activation status
+    OUTPUT="$(! lxd activateifneeded --debug 2>&1 || false)"
+    echo "${OUTPUT}" | grep -F "Daemon has auto-started instances, activating..."
 
     # shellcheck disable=SC2031
     respawn_lxd "${LXD_DIR}" true
 
-    lxc list --force-local autostart | grep -q RUNNING
+    lxc list --force-local autostart | grep -wF RUNNING
 
     # Check for scheduled instance snapshots
     lxc stop --force autostart --force-local
     lxc config set autostart snapshots.schedule "* * * * *" --force-local
     shutdown_lxd "${LXD_DIR}"
-    lxd activateifneeded --debug 2>&1 | grep -qF "Daemon has scheduled instance snapshots, activating..."
+
+    # `lxd activateifneeded` will error out due to LXD being stopped and not having any Unix socket to wake it up
+    # but it should also log something about the activation status
+    OUTPUT="$(! lxd activateifneeded --debug 2>&1 || false)"
+    echo "${OUTPUT}" | grep -F "Daemon has scheduled instance snapshots, activating..."
 
     # shellcheck disable=SC2031
     respawn_lxd "${LXD_DIR}" true
@@ -352,7 +459,7 @@ test_basic_usage() {
     lxc storage volume create "${storage_pool}" vol --force-local
 
     shutdown_lxd "${LXD_DIR}"
-    lxd activateifneeded --debug 2>&1 | grep -qF -v "activating..."
+    ! lxd activateifneeded --debug 2>&1 | grep -F "activating..." || false
 
     # shellcheck disable=SC2031
     respawn_lxd "${LXD_DIR}" true
@@ -360,7 +467,11 @@ test_basic_usage() {
     lxc storage volume set "${storage_pool}" vol snapshots.schedule="* * * * *" --force-local
 
     shutdown_lxd "${LXD_DIR}"
-    lxd activateifneeded --debug 2>&1 | grep -qF "Daemon has scheduled volume snapshots, activating..."
+
+    # `lxd activateifneeded` will error out due to LXD being stopped and not having any Unix socket to wake it up
+    # but it should also log something about the activation status
+    OUTPUT="$(! lxd activateifneeded --debug 2>&1 || false)"
+    echo "${OUTPUT}" | grep -F "Daemon has scheduled volume snapshots, activating..."
 
     # shellcheck disable=SC2031
     respawn_lxd "${LXD_DIR}" true
@@ -374,86 +485,103 @@ test_basic_usage() {
 
   # Create and start a container
   lxc launch testimage foo
-  lxc list | grep foo | grep RUNNING
-  lxc stop foo --force
-
-  # Test binfmt_misc support
-  lxc start foo
-  lxc exec foo -- mount -t binfmt_misc none /proc/sys/fs/binfmt_misc
-  [ "$(lxc exec foo -- cat /proc/sys/fs/binfmt_misc/status)" = "enabled" ]
-  lxc stop -f foo
-
-  # cycle it a few times
-  lxc start foo
+  [ "$(lxc list -f csv -c ns)" = "foo,RUNNING" ]
+  # Record the MAC address
   mac1=$(lxc exec foo -- cat /sys/class/net/eth0/address)
-  lxc stop foo --force
-  lxc start foo
-  mac2=$(lxc exec foo -- cat /sys/class/net/eth0/address)
 
+  if lxc info | grep -F 'unpriv_binfmt: "true"'; then
+    # Test binfmt_misc support
+    lxc exec foo -- mount -t binfmt_misc none /proc/sys/fs/binfmt_misc
+    [ "$(lxc exec foo -- cat /proc/sys/fs/binfmt_misc/status)" = "enabled" ]
+  fi
+
+  # Reboot to check if the MAC persists across restarts
+  lxc restart foo --force
+  mac2=$(lxc exec foo -- cat /sys/class/net/eth0/address)
   if [ -n "${mac1}" ] && [ -n "${mac2}" ] && [ "${mac1}" != "${mac2}" ]; then
     echo "==> MAC addresses didn't match across restarts (${mac1} vs ${mac2})"
     false
   fi
 
   # Test freeze/pause
-  lxc freeze foo
+  lxc pause foo
+  [ "$(lxc list -f csv -c s foo)" = "FROZEN" ]
   ! lxc stop foo || false
-  lxc stop -f foo
   lxc start foo
-  lxc freeze foo
+  [ "$(lxc list -f csv -c s foo)" = "RUNNING" ]
+  lxc pause foo
+  [ "$(lxc list -f csv -c s foo)" = "FROZEN" ]
+  lxc stop -f foo
   lxc start foo
 
   # Test instance types
-  lxc launch testimage test-limits -t c0.5-m0.2
+  lxc init --empty test-limits -t c0.5-m0.2 -d "${SMALL_ROOT_DISK}"
   [ "$(lxc config get test-limits limits.cpu)" = "1" ]
   [ "$(lxc config get test-limits limits.cpu.allowance)" = "50%" ]
   [ "$(lxc config get test-limits limits.memory)" = "204MiB" ]
-  lxc delete -f test-limits
+  lxc delete test-limits
 
   # Test last_used_at field is working properly
   lxc init testimage last-used-at-test
-  lxc list last-used-at-test  --format json | jq -r '.[].last_used_at' | grep '1970-01-01T00:00:00Z'
+  lxc list last-used-at-test --format json | jq --exit-status '.[].last_used_at == "1970-01-01T00:00:00Z"'
   lxc start last-used-at-test
-  lxc list last-used-at-test  --format json | jq -r '.[].last_used_at' | grep -v '1970-01-01T00:00:00Z'
+  lxc list last-used-at-test --format json | jq --exit-status '.[].last_used_at != "1970-01-01T00:00:00Z"'
   lxc delete last-used-at-test --force
 
   # Test user, group and cwd
-  lxc exec foo -- mkdir /blah
-  [ "$(lxc exec foo --user 1000 -- id -u)" = "1000" ] || false
-  [ "$(lxc exec foo --group 1000 -- id -g)" = "1000" ] || false
-  [ "$(lxc exec foo --cwd /blah -- pwd)" = "/blah" ] || false
+  [ "$(lxc exec foo --user 1000 -- id -u)" = "1000" ]
+  [ "$(lxc exec foo --group 1000 -- id -g)" = "1000" ]
+  [ "$(lxc exec foo --cwd /tmp -- pwd)" = "/tmp" ]
 
-  [ "$(lxc exec foo --user 1234 --group 5678 --cwd /blah -- id -u)" = "1234" ] || false
-  [ "$(lxc exec foo --user 1234 --group 5678 --cwd /blah -- id -g)" = "5678" ] || false
-  [ "$(lxc exec foo --user 1234 --group 5678 --cwd /blah -- pwd)" = "/blah" ] || false
-
+  [ "$(lxc exec foo --user 1234 --group 5678 --cwd /tmp -- id -u)" = "1234" ]
+  [ "$(lxc exec foo --user 1234 --group 5678 --cwd /tmp -- id -g)" = "5678" ]
+  [ "$(lxc exec foo --user 1234 --group 5678 --cwd /tmp -- pwd)" = "/tmp" ]
+  [ "$(lxc exec foo -- pwd)" = "/root" ]
   # check that we can set the environment
-  lxc exec foo -- pwd | grep /root
-  lxc exec --env BEST_BAND=meshuggah foo -- env | grep meshuggah
-  lxc exec foo -- ip link show | grep eth0
+  lxc exec --env BEST_BAND=meshuggah foo -- env | grep -xF BEST_BAND=meshuggah
+
+  # check that environment variables work with profiles
+  lxc profile create clash
+
+  # check that environment variables cannot contain line breaks
+  local invalidEnvValue="foo
+  bar"
+  ! lxc profile set clash environment.INVALID_ENV_VALUE="${invalidEnvValue}" || false
+  ! lxc config set foo environment.INVALID_ENV_VALUE="${invalidEnvValue}" || false
+
+  lxc profile set clash environment.BEST_BAND=clash
+  lxc profile add foo clash
+  lxc exec foo -- env | grep -xF BEST_BAND=clash
+  lxc exec --env BEST_BAND=meshuggah foo -- env | grep -xF BEST_BAND=meshuggah
+  lxc profile remove foo clash
+  ! lxc exec foo -- env | grep -F BEST_BAND= || false
+  lxc exec --env BEST_BAND=meshuggah foo -- env | grep -xF BEST_BAND=meshuggah
+  lxc profile delete clash
 
   # check that we can get the return code for a non- wait-for-websocket exec
-  op=$(my_curl -X POST "https://${LXD_ADDR}/1.0/containers/foo/exec" -d '{"command": ["echo", "test"], "environment": {}, "wait-for-websocket": false, "interactive": false}' | jq -r .operation)
-  [ "$(my_curl "https://${LXD_ADDR}${op}/wait" | jq -r .metadata.metadata.return)" != "null" ]
+  op="$(my_curl -X POST --fail-with-body -H 'Content-Type: application/json' "https://${LXD_ADDR}/1.0/instances/foo/exec" -d '{"command": ["echo", "test"], "environment": {}, "wait-for-websocket": false, "interactive": false}' | jq --exit-status --raw-output .operation)"
+  my_curl "https://${LXD_ADDR}${op}/wait" | jq --exit-status '.metadata.metadata.return != "null"'
 
   # test file transfer
   echo abc > "${LXD_DIR}/in"
 
   lxc file push "${LXD_DIR}/in" foo/root/
-  [ "$(lxc exec foo -- /bin/cat /root/in)" = "abc" ]
-  lxc exec foo -- /bin/rm -f root/in
-
   lxc file push "${LXD_DIR}/in" foo/root/in1
-  [ "$(lxc exec foo -- /bin/cat /root/in1)" = "abc" ]
-  lxc exec foo -- /bin/rm -f root/in1
+  echo def | lxc file push - foo/root/in2
+  [ "$(lxc exec foo -- /bin/cat /root/in)" = "abc" ]
+  [ "$(lxc file pull foo/root/in1 -)" = "abc" ]
+  [ "$(lxc file pull foo/root/in2 -)" = "def" ]
+  lxc file delete foo/root/in foo/root/in1 foo/root/in2
+
+  rm "${LXD_DIR}/in"
 
   # test lxc file edit doesn't change target file's owner and permissions
   echo "content" | lxc file push - foo/tmp/edit_test
-  lxc exec foo -- chown 55.55 /tmp/edit_test
+  lxc exec foo -- chown 55:55 /tmp/edit_test
   lxc exec foo -- chmod 555 /tmp/edit_test
   echo "new content" | lxc file edit foo/tmp/edit_test
   [ "$(lxc exec foo -- cat /tmp/edit_test)" = "new content" ]
-  [ "$(lxc exec foo -- stat -c \"%u %g %a\" /tmp/edit_test)" = "55 55 555" ]
+  [ "$(lxc exec foo -- stat -c '%u %g %a' /tmp/edit_test)" = "55 55 555" ]
 
   # make sure stdin is chowned to our container root uid (Issue #590)
   [ -t 0 ] && [ -t 1 ] && lxc exec foo -- chown 1000:1000 /proc/self/fd/0
@@ -465,75 +593,50 @@ test_basic_usage() {
   lxc exec foo true
 
   # Detect regressions/hangs in exec
-  sum=$(ps aux | tee "${LXD_DIR}/out" | lxc exec foo -- md5sum | cut -d' ' -f1)
-  [ "${sum}" = "$(md5sum "${LXD_DIR}/out" | cut -d' ' -f1)" ]
+  sum=$(ps aux | tee "${LXD_DIR}/out" | lxc exec foo -- md5sum)
+  [ "${sum}" = "$(md5sum < "${LXD_DIR}/out")" ]
   rm "${LXD_DIR}/out"
 
   # FIXME: make this backend agnostic
   if [ "$lxd_backend" = "dir" ]; then
-    content=$(cat "${LXD_DIR}/containers/foo/rootfs/tmp/foo")
-    [ "${content}" = "foo" ]
+    [ "$(< "${LXD_DIR}/containers/foo/rootfs/tmp/foo")" = "foo" ]
   fi
-
-  lxc launch testimage deleterunning
-  my_curl -X DELETE "https://${LXD_ADDR}/1.0/containers/deleterunning" | grep "Instance is running"
-  lxc delete deleterunning -f
 
   # cleanup
   lxc delete foo -f
 
-  if [ -e /sys/module/apparmor/ ]; then
-    # check that an apparmor profile is created for this container, that it is
-    # unloaded on stop, and that it is deleted when the container is deleted
-    lxc launch testimage lxd-apparmor-test
+  lxc launch testimage deleterunning
+  my_curl -X DELETE "https://${LXD_ADDR}/1.0/instances/deleterunning" | grep "Instance is running"
+  lxc delete deleterunning -f
 
-    MAJOR=0
-    MINOR=0
-    if [ -f /sys/kernel/security/apparmor/features/domain/version ]; then
-      MAJOR=$(awk -F. '{print $1}' < /sys/kernel/security/apparmor/features/domain/version)
-      MINOR=$(awk -F. '{print $2}' < /sys/kernel/security/apparmor/features/domain/version)
-    fi
+  # check that an apparmor profile is created for this container, that it is
+  # unloaded on stop, and that it is deleted when the container is deleted
+  lxc launch testimage lxd-apparmor-test
 
-    if [ "${MAJOR}" -gt "1" ] || { [ "${MAJOR}" = "1" ] && [ "${MINOR}" -ge "2" ]; }; then
-      aa_namespace="lxd-lxd-apparmor-test_<$(echo "${LXD_DIR}" | sed -e 's/\//-/g' -e 's/^.//')>"
-      aa-status | grep -q ":${aa_namespace}:unconfined" || aa-status | grep -qF ":${aa_namespace}://unconfined"
-      lxc stop lxd-apparmor-test --force
-      ! aa-status | grep -qF ":${aa_namespace}:" || false
-    else
-      aa-status | grep "lxd-lxd-apparmor-test_<${LXD_DIR}>"
-      lxc stop lxd-apparmor-test --force
-      ! aa-status | grep -qF "lxd-lxd-apparmor-test_<${LXD_DIR}>" || false
-    fi
-    lxc delete lxd-apparmor-test
-    [ ! -f "${LXD_DIR}/security/apparmor/profiles/lxd-lxd-apparmor-test" ]
-  else
-    echo "==> SKIP: apparmor tests (missing kernel support)"
-  fi
+  aa_namespace="lxd-lxd-apparmor-test_<$(echo "${LXD_DIR}" | sed -e 's/\//-/g' -e 's/^.//')>"
+  aa-status | grep -F -e ":${aa_namespace}:unconfined" -e ":${aa_namespace}://unconfined"
+  lxc stop lxd-apparmor-test --force
+  ! aa-status | grep -F ":${aa_namespace}:" || false
+
+  lxc delete lxd-apparmor-test
+  [ ! -f "${LXD_DIR}/security/apparmor/profiles/lxd-lxd-apparmor-test" ]
 
   if [ "$(awk '/^Seccomp:/ {print $2}' "/proc/self/status")" -eq "0" ]; then
     lxc launch testimage lxd-seccomp-test
-    init=$(lxc info lxd-seccomp-test | awk '/^PID:/ {print $2}')
+    init="$(lxc list -f csv -c p lxd-seccomp-test)"
     [ "$(awk '/^Seccomp:/ {print $2}' "/proc/${init}/status")" -eq "2" ]
     lxc stop --force lxd-seccomp-test
     lxc config set lxd-seccomp-test security.syscalls.deny_default false
     lxc start lxd-seccomp-test
-    init=$(lxc info lxd-seccomp-test | awk '/^PID:/ {print $2}')
+    init="$(lxc list -f csv -c p lxd-seccomp-test)"
     [ "$(awk '/^Seccomp:/ {print $2}' "/proc/${init}/status")" -eq "0" ]
     lxc delete --force lxd-seccomp-test
   else
     echo "==> SKIP: seccomp tests (seccomp filtering is externally enabled)"
   fi
 
-  # make sure that privileged containers are not world-readable
-  lxc profile create unconfined
-  lxc profile set unconfined security.privileged true
-  lxc init testimage foo2 -p unconfined -s "lxdtest-$(basename "${LXD_DIR}")"
-  [ "$(stat -L -c "%a" "${LXD_DIR}/containers/foo2")" = "100" ]
-  lxc delete foo2
-  lxc profile delete unconfined
-
   # Test boot.host_shutdown_timeout config setting
-  lxc init testimage configtest --config boot.host_shutdown_timeout=45
+  lxc init --empty configtest --config boot.host_shutdown_timeout=45
   [ "$(lxc config get configtest boot.host_shutdown_timeout)" -eq 45 ]
   lxc config set configtest boot.host_shutdown_timeout 15
   [ "$(lxc config get configtest boot.host_shutdown_timeout)" -eq 15 ]
@@ -552,9 +655,9 @@ test_basic_usage() {
   lxc publish --force c3 --alias=image3
   # Delete multiple images with lxc delete and confirm they're deleted
   lxc image delete local:image1 local:image2 local:image3
-  ! lxc image list | grep -q image1 || false
-  ! lxc image list | grep -q image2 || false
-  ! lxc image list | grep -q image3 || false
+  ! lxc image list | grep -wF image1 || false
+  ! lxc image list | grep -wF image2 || false
+  ! lxc image list | grep -wF image3 || false
   # Cleanup the containers
   lxc delete --force c1 c2 c3
 
@@ -564,6 +667,29 @@ test_basic_usage() {
   lxc start --all
   lxc list | grep c1 | grep RUNNING
   lxc list | grep c2 | grep RUNNING
+
+  # Test --all flag on project with no instances
+  lxc project create p1
+  lxc start --all --project p1
+  lxc project delete p1
+
+  # Find the respective operation
+  bulk_op="$(lxc query -X GET '/1.0/operations?recursion=2' | jq --exit-status '.. | objects | select(.description == "Updating the state of multiple instances")')"
+
+  # There should be 2 child operations under one parent operation, that's 3 operations in total.
+  # Explanation of the jq query:
+  #  - .children? // [] : safely access children (empty array if missing).
+  #  -[., (.children? // [])[]] : create an array containing:
+  #    - the parent object .
+  #    - all its children
+  #  - length — count them.
+  jq --exit-status '([., (.children? // [])[]] | length) == 3' <<< "${bulk_op}"
+
+  # Grab the ID of the parent operation
+  parent_op="$(jq --raw-output --exit-status '.id' <<< "${bulk_op}")"
+
+  # Check there are 3 operations in total when querying the specific operation ID too.
+  lxc query -X GET "/1.0/operations/${parent_op}?recursion=1" | jq --exit-status '.. | objects | select(.description == "Updating the state of multiple instances") | ([., (.children? // [])[]] | length) == 3'
 
   lxc freeze c2
   lxc list | grep c2 | grep FROZEN
@@ -578,14 +704,44 @@ test_basic_usage() {
   # Cleanup the containers
   lxc delete --force c1 c2
 
+  # Test --all flag in a non-default project
+  lxc project create foo
+  ensure_import_testimage foo
+  lxc profile show default | lxc profile edit default --project foo
+  lxc init testimage c1 --project foo
+  lxc init testimage c2 --project foo
+  lxc start --all --project foo
+  lxc list --project foo | grep c1 | grep RUNNING
+  lxc list --project foo | grep c2 | grep RUNNING
+
+  lxc freeze c2 --project foo
+  lxc list --project foo | grep c2 | grep FROZEN
+  lxc start --all --project foo
+  lxc list --project foo | grep c1 | grep RUNNING
+  lxc list --project foo | grep c2 | grep RUNNING
+
+  ! lxc stop --all c1 --project foo || false
+  lxc stop --all --force --project foo
+  lxc list --project foo | grep c1 | grep STOPPED
+  lxc list --project foo | grep c2 | grep STOPPED
+
+  # Cleanup the containers and project
+  lxc delete --force c1 c2 --project foo
+  lxc image delete testimage --project foo
+  lxc project delete foo
+
+  # The `lxd start --all` and `lxc stop --all` tests creation bulk operation with the parent operation of type 72 (InstanceStateUpdateBulk).
+  # Bulk operations are persisted for 24 hours, so we need to clean them up.
+  lxd sql global 'DELETE FROM operations WHERE type=72'
+
   # Ephemeral
-  lxc launch testimage foo -e
-  OLD_INIT=$(lxc info foo | awk '/^PID:/ {print $2}')
+  lxc launch testimage foo --ephemeral
+  OLD_INIT="$(lxc list -f csv -c p foo)"
 
   REBOOTED="false"
 
   for _ in $(seq 60); do
-    NEW_INIT=$(lxc info foo | awk '/^PID:/ {print $2}' || true)
+    NEW_INIT="$(lxc list -f csv -c p foo)"
 
     # If init process is running, check if is old or new process.
     if [ -n "${NEW_INIT}" ]; then
@@ -593,7 +749,7 @@ test_basic_usage() {
         REBOOTED="true"
         break
       else
-        lxc exec foo -- reboot || true  # Signal to running old init process to reboot if not rebooted yet.
+        lxc exec foo -- reboot -f || true  # Signal to running old init process to reboot if not rebooted yet.
       fi
     fi
 
@@ -607,27 +763,27 @@ test_basic_usage() {
 
   lxc restart -f foo
   lxc stop foo --force
-  ! lxc list | grep -q foo || false
+  ! lxc list | grep -wF foo || false
 
   # Test renaming/deletion of the default profile
   ! lxc profile rename default foobar || false
   ! lxc profile delete default || false
 
-  lxc init testimage c1
+  lxc init --empty c1
   result="$(! lxc config device override c1 root pool=bla 2>&1)"
   if ! echo "${result}" | grep "Error: Cannot update root disk device pool name"; then
     echo "Should fail device override because root disk device storage pool cannot be changed."
     false
   fi
 
-  lxc rm -f c1
+  lxc delete c1
 
   # Should fail to override root device storage pool when the new pool does not exist.
   ! lxc init testimage c1 -d root,pool=bla || false
 
   # Should succeed in overriding root device storage pool when the pool does exist and the override occurs at create time.
   lxc storage create bla dir
-  lxc init testimage c1 -d root,pool=bla
+  lxc init --empty c1 -d root,pool=bla
   lxc config show c1 --expanded | grep -Pz '  root:\n    path: /\n    pool: bla\n    type: disk\n'
 
   lxc storage volume create bla vol1
@@ -641,49 +797,61 @@ test_basic_usage() {
     false
   fi
 
-  lxc rm -f c1
+  lxc delete c1
   lxc storage volume delete bla vol1
   lxc storage volume delete bla vol2
   lxc storage delete bla
 
   # Test rebuilding an instance with its original image.
-  lxc init testimage c1
-  lxc start c1
+  lxc launch testimage c1
   lxc exec c1 -- touch /data.txt
-  lxc stop c1
+  lxc exec c1 -- sync
+  lxc stop -f c1
   lxc rebuild testimage c1
   lxc start c1
   ! lxc exec c1 -- stat /data.txt || false
   lxc delete c1 -f
 
-  # Test a forced rebuild
+  # Test a forced rebuild and make sure the volatile.uuid is preserved across the rebuild.
   lxc launch testimage c1
+  ORIGINAL_UUID="$(lxc config get c1 volatile.uuid)"
   ! lxc rebuild testimage c1 || false
   lxc rebuild testimage c1 --force
+  [ "$(lxc config get c1 volatile.uuid)" = "${ORIGINAL_UUID}" ]
   lxc delete c1 -f
 
   # Test rebuilding an instance with a new image.
   lxc init c1 --empty
+  [ "$(lxc config get c1 image.os || echo fail)" = "" ]
   lxc rebuild testimage c1
+  [ "$(lxc config get c1 image.os)" = "BusyBox" ]
   lxc start c1
   lxc delete c1 -f
 
   # Test rebuilding an instance with an empty file system.
   lxc init testimage c1
+  [ "$(lxc config get c1 image.os)" = "BusyBox" ]
   lxc rebuild c1 --empty
-  ! lxc config show c1 | grep -q 'image.*' || false
-  lxc delete c1 -f
+  [ "$(lxc config get c1 image.os || echo fail)" = "" ]
+  lxc delete c1
+
+  # Test that rebuild succeeds after a file operation.
+  lxc init testimage c1
+  lxc file create c1/foo
+  lxc rebuild testimage c1
+  lxc delete c1
 
   # Test assigning an empty profile (with no root disk device) to an instance.
-  lxc init testimage c1
+  lxc init --empty c1
   lxc profile create foo
   ! lxc profile assign c1 foo || false
   lxc profile delete foo
-  lxc delete -f c1
+  lxc delete c1
 
   # Test assigning a profile through a YAML file to an instance.
-  poolName=$(lxc profile device get default root pool)
-  lxc profile create foo < <(cat <<EOF
+  local poolName
+  poolName="lxdtest-$(basename "${LXD_DIR}")"
+  lxc profile create foo << EOF
 config:
   limits.cpu: 2
   limits.memory: 1024MiB
@@ -694,33 +862,202 @@ devices:
     pool: ${poolName}
     type: disk
 EOF
-)
-  lxc init testimage c1 --profile foo
+  lxc init --empty c1 --profile foo
   [ "$(lxc config get c1 limits.cpu --expanded)" = "2" ]
   [ "$(lxc config get c1 limits.memory --expanded)" = "1024MiB" ]
-  lxc delete -f c1
+  lxc delete c1
   lxc profile delete foo
 
   # Multiple ephemeral instances delete
-  lxc launch testimage c1
-  lxc launch testimage c2
-  lxc launch testimage c3
+  lxc launch testimage c1 --ephemeral
+  lxc launch testimage c2 --ephemeral
+  lxc launch testimage c3 --ephemeral
 
+  # Check deletion via force delete and force stop code paths
+  lxc delete -f c1
+  lxc stop -f c2 c3
+  [ "$(lxc list -f csv -c n || echo fail)" = "" ]
+
+  # Cleanup
   fingerprint="$(lxc config trust ls --format csv | cut -d, -f4)"
   lxc config trust remove "${fingerprint}"
-  lxc delete -f c1 c2 c3
-  remaining_instances="$(lxc list --format csv)"
-  [ -z "${remaining_instances}" ]
+  lxc remote remove localhost
+}
+
+test_snap_basic_usage_vm() {
+  ensure_import_ubuntu_vm_image
+
+  echo "==> Create a VM suitable for stateful stop/start"
+  lxc launch ubuntu-vm v1 --vm -c migration.stateful=true -c limits.memory=384MiB -d root,size.state=384MiB -d "${SMALL_VM_ROOT_DISK}"
+  waitInstanceReady v1
+
+  echo "==> Stateful stop"
+  INITIAL_BOOT_ID="$(lxc exec v1 -- cat /proc/sys/kernel/random/boot_id)"
+  lxc stop --stateful v1
+  [ "$(lxc list -f csv -c s)" = "STOPPED" ]
+
+  echo "==> Stateful start"
+  lxc start v1
+  # the lxd-agent needs a bit of time to dial back in even when statefully restored
+  waitInstanceReady v1
+  [ "$(lxc exec v1 -- cat /proc/sys/kernel/random/boot_id)" = "${INITIAL_BOOT_ID}" ]
+
+  # Cleanup
+  lxc delete -f v1
+}
+
+test_basic_version() {
+  for bin in lxc lxd lxd-agent lxd-benchmark lxd-convert lxd-user fuidshift; do
+    "${bin}" --version
+    "${bin}" --help
+  done
+
+  # lxd subcommands
+  for sub in activateifneeded callhook import init manpage migratedump netcat recover shutdown sql version waitready cluster; do
+      lxd "${sub}" --help
+  done
+
+  # lxd fork subcommands, except for: forkcoresched forkexec forkproxy forksyscall forkuevent
+  for sub in forkconsole forkdns forkfile forklimits forkmigrate forksyscallgo forkmount forknet forkstart forkzfs; do
+      lxd "${sub}" --help
+  done
 }
 
 test_server_info() {
   # Ensure server always reports support for containers.
-  lxc query /1.0 | jq -e '.environment.instance_types | contains(["container"])'
+  lxc query /1.0 | jq --exit-status '.environment.instance_types | contains(["container"])'
+
+  # Ensure server reports support for VMs if it should test them.
+  if [ "${LXD_VM_TESTS}" = "1" ]; then
+    lxc query /1.0 | jq --exit-status '.environment.instance_types | contains(["virtual-machine"])'
+  fi
 
   # Ensure the version number has the format (X.Y.Z for LTSes and X.Y otherwise)
-  if lxc query /1.0 | jq -e '.environment.server_lts == true'; then
-    lxc query /1.0 | jq -re '.environment.server_version' | grep -E '[0-9]+\.[0-9]+\.[0-9]+'
+  if lxc query /1.0 | jq --exit-status '.environment.server_lts == true'; then
+    lxc query /1.0 | jq --exit-status --raw-output '.environment.server_version' | grep -xE '[0-9]+\.[0-9]+\.[0-9]+'
   else
-    lxc query /1.0 | jq -re '.environment.server_version' | grep -xE '[0-9]+\.[0-9]+'
+    lxc query /1.0 | jq --exit-status --raw-output '.environment.server_version' | grep -xE '[0-9]+\.[0-9]+'
   fi
+}
+
+test_duplicate_detection() {
+  ensure_import_testimage
+  test_image_fingerprint="$(lxc query /1.0/images/aliases/testimage | jq --exit-status --raw-output '.target')"
+
+  lxc auth group create foo
+  [ "$(! "${_LXC}" auth group create foo 2>&1 1>/dev/null)" = 'Error: Authorization group already exists' ]
+  lxc auth group create bar
+  [ "$(! "${_LXC}" auth group rename bar foo 2>&1 1>/dev/null)" = 'Error: Authorization group already exists' ]
+  lxc auth group delete foo
+  lxc auth group delete bar
+
+  lxc auth identity-provider-group create foo
+  [ "$(! "${_LXC}" auth identity-provider-group create foo 2>&1 1>/dev/null)" = 'Error: Identity provider group "foo" already exists' ]
+  lxc auth identity-provider-group create bar
+  [ "$(! "${_LXC}" auth identity-provider-group rename bar foo 2>&1 1>/dev/null)" = 'Error: Identity provider group "foo" already exists' ]
+  lxc auth identity-provider-group delete foo
+  lxc auth identity-provider-group delete bar
+
+  # Do not use tls/foo as it may clash with an existing cert injected by ensure_has_localhost_remote
+  lxc auth identity create tls/bar
+  [ "$(! "${_LXC}" auth identity create tls/bar 2>&1 1>/dev/null)" = 'Error: An identity with name "bar" already exists' ]
+  lxc auth identity delete tls/bar
+
+  lxc project create foo
+  [ "$(! "${_LXC}" project create foo 2>&1 1>/dev/null)" = 'Error: Project "foo" already exists' ]
+  lxc project create bar
+  [ "$(! "${_LXC}" project rename bar foo 2>&1 1>/dev/null)" = 'Error: A project named "foo" already exists' ]
+  lxc project delete foo
+  lxc project delete bar
+
+  [ "$(! "${_LXC}" image alias create testimage "${test_image_fingerprint}" 2>&1 1>/dev/null)" = 'Error: Alias "testimage" already exists' ]
+
+  lxc init foo --empty
+  [ "$(! "${_LXC}" init foo --empty 2>&1 1>/dev/null)" = 'Error: Instance "foo" already exists' ]
+  lxc init bar --empty
+  [ "$(! "${_LXC}" rename bar foo 2>&1 1>/dev/null)" = 'Error: Name "foo" already in use' ]
+  lxc delete bar
+
+  lxc snapshot foo snap0
+  [ "$(! "${_LXC}" snapshot foo snap0 2>&1 1>/dev/null)" = 'Error: Failed creating instance snapshot record "snap0": Snapshot "foo/snap0" already exists' ]
+  lxc snapshot foo snap1
+  [ "$(! "${_LXC}" rename foo/snap1 foo/snap0 2>&1 1>/dev/null)" = 'Error: Name "foo/snap0" already in use' ]
+  lxc delete foo
+
+  lxc network create foo
+  [ "$(! "${_LXC}" network create foo 2>&1 1>/dev/null)" = 'Error: The network already exists' ]
+  lxc network create bar ipv4.address=none ipv6.address=none
+  [ "$(! "${_LXC}" network rename bar foo 2>&1 1>/dev/null)" = 'Error: Network "foo" already exists' ]
+  lxc network delete bar
+
+  lxc network acl create foo
+  [ "$(! "${_LXC}" network acl create foo 2>&1 1>/dev/null)" = 'Error: The network ACL already exists' ]
+  lxc network acl create bar
+  [ "$(! "${_LXC}" network acl rename bar foo 2>&1 1>/dev/null)" = 'Error: An ACL by that name exists already' ]
+  lxc network acl delete foo
+  lxc network acl delete bar
+
+  lxc network zone create foo
+  [ "$(! "${_LXC}" network zone create foo 2>&1 1>/dev/null)" = 'Error: The network zone already exists' ]
+  lxc network zone delete foo
+
+  lxc network forward create foo 10.1.1.1
+  [ "$(! "${_LXC}" network forward create foo 10.1.1.1 2>&1 1>/dev/null)" = 'Error: Failed creating forward: A forward for that listen address already exists' ]
+  lxc network forward delete foo 10.1.1.1
+
+  lxc network forward create foo 2001:db8::1
+  [ "$(! "${_LXC}" network forward create foo 2001:db8::1 2>&1 1>/dev/null)" = 'Error: Failed creating forward: A forward for that listen address already exists' ]
+  lxc network forward delete foo 2001:db8::1
+
+  lxc network delete foo
+
+  if ovn_enabled; then
+    setup_ovn
+    uplink_network="uplink$$"
+    ip link add dummy0 type dummy
+    lxc network create "${uplink_network}" --type=physical parent=dummy0
+    lxc network set "${uplink_network}" ipv4.ovn.ranges=192.0.2.100-192.0.2.254
+    lxc network set "${uplink_network}" ipv6.ovn.ranges=2001:db8:1:2::100-2001:db8:1:2::254
+    lxc network set "${uplink_network}" ipv4.routes=192.0.2.0/24
+    lxc network set "${uplink_network}" ipv6.routes=2001:db8:1:2::/64
+    lxc network create foo-ovn --type ovn network="${uplink_network}"
+
+    lxc network load-balancer create foo-ovn 192.0.2.10
+    [ "$(! "${_LXC}" network load-balancer create foo-ovn 192.0.2.10 2>&1 1>/dev/null)" = 'Error: Failed creating load balancer: Listen address "192.0.2.10" overlaps with another network or NIC' ]
+    lxc network load-balancer delete foo-ovn 192.0.2.10
+
+    lxc network create foo-ovn2 --type ovn network="${uplink_network}"
+    lxc network peer create foo-ovn foo foo-ovn2
+    [ "$(! "${_LXC}" network peer create foo-ovn foo foo-ovn2 2>&1 1>/dev/null)" = 'Error: Failed creating peer: A peer for that name already exists' ]
+    lxc network peer delete foo-ovn foo
+
+    lxc network delete foo-ovn
+    lxc network delete foo-ovn2
+    lxc network delete "${uplink_network}"
+    ip link delete dummy0
+    unset_ovn_configuration
+  fi
+
+  lxc profile create foo
+  [ "$(! "${_LXC}" profile create foo 2>&1 1>/dev/null)" = 'Error: Error inserting "foo" into database: The profile already exists' ]
+  lxc profile create bar
+  [ "$(! "${_LXC}" profile rename bar foo 2>&1 1>/dev/null)" = 'Error: Name "foo" already in use' ]
+  lxc profile delete foo
+  lxc profile delete bar
+
+  lxc storage create foo dir
+  [ "$(! "${_LXC}" storage create foo dir 2>&1 1>/dev/null)" = 'Error: Storage pool "foo" already exists' ]
+
+  lxc storage volume create foo foo
+  [ "$(! "${_LXC}" storage volume create foo foo 2>&1 1>/dev/null)" = 'Error: Volume by that name already exists' ]
+  lxc storage volume create foo bar
+  [ "$(! "${_LXC}" storage volume rename foo bar foo 2>&1 1>/dev/null)" = 'Error: Volume by that name already exists' ]
+  lxc storage volume delete foo bar
+
+  lxc storage volume snapshot foo foo snap0
+  [ "$(! "${_LXC}" storage volume snapshot foo foo snap0 2>&1 1>/dev/null)" = 'Error: Snapshot "snap0" already in use' ]
+  lxc storage volume snapshot foo foo snap1
+  [ "$(! "${_LXC}" storage volume rename foo foo/snap1 foo/snap0 2>&1 1>/dev/null)" = 'Error: Storage volume snapshot "snap0" already exists for volume "foo"' ]
+  lxc storage volume delete foo foo
+  lxc storage delete foo
 }

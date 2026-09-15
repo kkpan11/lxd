@@ -1,23 +1,29 @@
 ---
-relatedlinks: https://linuxcontainers.org/lxc/security/
+relatedlinks: "[Linux&#32;containers&#32;security](https://linuxcontainers.org/lxc/security/)"
+myst:
+  html_meta:
+    description: Understand LXD security architecture, access controls, daemon access, container security, and security event audit logging for compliance and incident investigation.
 ---
 
 (exp-security)=
 (security)=
-# About security
+# Security
 
 ```{youtube} https://www.youtube.com/watch?v=cOOzKdYHkus
+:title: LXD security
 ```
 
-% Include content from [../../README.md](../../README.md)
-```{include} ../../README.md
-    :start-after: <!-- Include start security -->
-    :end-before: <!-- Include end security -->
-```
+Security considerations are critical when you install and deploy LXD.
+This page provides a high-level overview of information and concepts related to LXD security.
+To further increase your security posture, see {ref}`howto-security-harden`.
 
-See the following sections for detailed information.
+## Reporting vulnerabilities
 
-If you discover a security issue, see the [LXD security policy](https://github.com/canonical/lxd/blob/main/SECURITY.md) for information on how to report the issue.
+LXD adheres to the [Ubuntu disclosure policy](https://ubuntu.com/security/disclosure-policy).
+If you discover a security issue, see the [LXD security policy](https://github.com/canonical/lxd/blob/main/SECURITY.md) for information about how to report the issue.
+
+[LXD security advisories](https://github.com/canonical/lxd/security/advisories) are published on GitHub.
+For additional information about LXD releases and development, refer to our {ref}`ref-release-notes` and [LXD news on Discourse](https://discourse.ubuntu.com/c/project/lxd/news/143).
 
 ## Supported versions
 
@@ -28,6 +34,8 @@ Never use unsupported LXD versions in a production environment.
     :start-after: <!-- Include start supported versions -->
     :end-before: <!-- Include end supported versions -->
 ```
+
+See {ref}`ref-releases-snap` for the currently supported releases as well as information about updates and upgrades to the LXD snap.
 
 (security-daemon-access)=
 ## Access to the LXD daemon
@@ -54,16 +62,13 @@ The root user and all members of the `lxd` group can interact with the local dae
 (security_remote_access)=
 ### Access to the remote API
 
-By default, access to the daemon is only possible locally.
-By setting the {config:option}`server-core:core.https_address` configuration option, you can expose the same API over the network on a {abbr}`TLS (Transport Layer Security)` socket.
-See {ref}`server-expose` for instructions.
+By default, access to the daemon is only possible locally, but you can also {ref}`expose LXD to the network <server-expose>` on a {abbr}`TLS` (Transport Layer Security) socket. 
 Remote clients can then connect to LXD and access any image that is marked for public use.
 
 There are several ways to authenticate remote clients as trusted clients to allow them to access the API.
 See {ref}`authentication` for details.
+To increase your security posture in a production setup, you can also {ref}`harden remote API access <howto-security-harden-remote>` and {ref}`configure your firewall <network-bridge-firewall>`.
 
-In a production setup, you should set {config:option}`server-core:core.https_address` to the single address where the server should be available (rather than any address on the host).
-In addition, you should set firewall rules to allow access to the LXD port only from authorized hosts/subnets.
 
 (container-security)=
 ## Container security
@@ -99,21 +104,12 @@ These measures are valuable when running trusted workloads, but they do not make
 Therefore, you should not use privileged containers unless required.
 If you use them, make sure to put appropriate security measures in place.
 
-### Container name leakage
-
-The default server configuration makes it easy to list all cgroups on a system and, by extension, all running containers.
-
-You can prevent this name leakage by blocking access to `/sys/kernel/slab` and `/proc/sched_debug` before you start any containers.
-To do so, run the following commands:
-
-    chmod 400 /proc/sched_debug
-    chmod 700 /sys/kernel/slab/
-
 ## Network security
 
 Make sure to configure your network interfaces to be secure.
 Which aspects you should consider depends on the networking mode you decide to use.
 
+(exp-security-bridged)=
 ### Bridged NIC security
 
 The default networking mode in LXD is to provide a "managed" private network bridge that each instance connects to.
@@ -174,10 +170,36 @@ In this networking mode, the LXD host functions as a router, and static routes a
 By default, the `veth` interface created on the host has its `accept_ra` setting disabled to prevent router advertisements from the container modifying the IPv6 routing table on the LXD host.
 In addition to that, the `rp_filter` on the host is set to `1` to prevent source address spoofing for IPs that the host does not know the container has.
 
+(security-audit-events)=
+## Security events and audit logging
+
+LXD emits {ref}`security events <events-security>` that track important security-related actions in your system. These events provide a comprehensive audit trail of authentication attempts, authorization decisions, and administrative changes. This is essential for compliance, intrusion detection, and security incident investigation.
+
+Security events include:
+
+- **Authentication events**: Track login attempts, token lifecycle changes, and certificate modifications
+- **Authorization events**: Track permission denials and any changes to identities, groups, and their privileges.
+- **Daemon lifecycle events**: Track daemon startup/shutdown and changes to monitoring configuration
+- **User lifecycle events**: Track identity creation, modification, and deletion
+
+In a production environment, you can {ref}`monitor security events with Loki <howto-security-events-loki>` or another centralized logging system to maintain a persistent audit trail. To access security events with the CLI or REST API, consult {ref}`howto-security-events`.
+
+For additional logging methods, consult the {ref}`Logging <howto-security-harden-logging>` section in {ref}`howto-security-harden`. For details on metrics, including how to gather metrics with Prometheus, consult {ref}`metrics`. You can also {ref}`set up Grafana <grafana>` to visualize metrics and logging data.
+
+(security-cryptography)=
+## Cryptography
+
+LXD uses cryptographic technologies to authenticate, encrypt, and decrypt communication between servers, and to verify images copied from remote servers. For details, see {ref}`authentication` and {ref}`about-images`, as well as the guides to common operations related to {ref}`lxd-server` and {ref}`images`.
+
 ## Related topics
 
-{{security_how}}
+How-to guides:
+
+- {ref}`howto-security-harden`
+- {ref}`server-expose`
+- {ref}`howto-security-events`
 
 Explanation:
 
 - {ref}`authentication`
+- {ref}`about-images`

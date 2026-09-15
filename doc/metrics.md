@@ -1,11 +1,12 @@
 ---
-discourse: 12281,11735
+discourse: lxc:[Retrieve&#32;LXD&#32;metrics&#32;with&#32;Telegraf&#32;and&#32;InfluxDB&#32;2.x](12281),lxc:[Metric&#32;exporter&#32;for&#32;instances](11735)
 ---
 
 (metrics)=
 # How to monitor metrics
 
 ```{youtube} https://www.youtube.com/watch?v=EthK-8hm_fY
+:title: LXD metrics with Prometheus and Grafana
 ```
 
 <!-- Include start metrics intro -->
@@ -27,7 +28,7 @@ Fetching metrics is a relatively expensive operation for LXD to perform, so if t
 To view the raw data that LXD collects, use the [`lxc query`](lxc_query.md) command to query the `/1.0/metrics` endpoint:
 
 ```{terminal}
-:input: lxc query /1.0/metrics
+lxc query /1.0/metrics
 
 # HELP lxd_api_requests_completed_total The total number of completed API requests.
 # TYPE lxd_api_requests_completed_total counter
@@ -210,7 +211,7 @@ scrape_configs:
   For example, assume that `server.crt` has the following content:
 
   ```{terminal}
-  :input: openssl x509 -noout -text -in /var/snap/prometheus/common/tls/server.crt
+  openssl x509 -noout -text -in /var/snap/prometheus/common/tls/server.crt
 
   ...
               X509v3 Subject Alternative Name:
@@ -235,14 +236,18 @@ scrape_configs:
   # to the `/var/snap/lxd/common/lxd/cluster.crt` file found on every member of
   # the LXD cluster.
   #
-  # Note: the `project` param is are provided when not using the `default` project
-  #       or when multiple projects are used.
+  # Note: When using a certificate restricted to multiple projects,
+  #       use the `project` param to only scrape a specific project or projects.
+  #       Otherwise, omit it to return the metrics for all the accessible
+  #       projects in one scrape.
   #
-  # Note: each member of the cluster only provide metrics for instances it runs locally
-  #       this is why the `lxd-hdc` cluster lists 3 targets
+  # Note: Each member of the cluster only provides metrics for instances it runs
+  #       locally. This is why the `lxd-hdc` cluster lists 3 targets.
   - job_name: "lxd-hdc"
     metrics_path: '/1.0/metrics'
     params:
+      # If no project parameter is defined, by default, metrics for all
+      # accessible projects are returned.
       project: ['jdoe']
     scheme: 'https'
     static_configs:

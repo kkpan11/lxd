@@ -2,14 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"sync"
-
-	"github.com/gorilla/mux"
 
 	"github.com/canonical/lxd/lxd/cluster"
 	"github.com/canonical/lxd/lxd/instance"
@@ -47,13 +45,9 @@ func instanceSFTPHandler(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	instName, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	instName := r.PathValue("name")
 	if shared.IsSnapshot(instName) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+		return response.BadRequest(errors.New("Invalid instance name"))
 	}
 
 	if r.Header.Get("Upgrade") != "sftp" {
@@ -72,7 +66,7 @@ func instanceSFTPHandler(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Forward the request if the instance is remote.
-	client, err := cluster.ConnectIfInstanceIsRemote(s, projectName, instName, r, instanceType)
+	client, err := cluster.ConnectIfInstanceIsRemote(r.Context(), s, projectName, instName, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -113,18 +107,18 @@ func (r *sftpServeResponse) Render(w http.ResponseWriter, req *http.Request) err
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		return api.StatusErrorf(http.StatusInternalServerError, "Webserver doesn't support hijacking")
+		return api.StatusErrorf(http.StatusInternalServerError, "Webserver does not support hijacking")
 	}
 
 	remoteConn, _, err := hijacker.Hijack()
 	if err != nil {
-		return api.StatusErrorf(http.StatusInternalServerError, "Failed to hijack connection: %w", err)
+		return api.StatusErrorf(http.StatusInternalServerError, "Failed hijacking connection: %w", err)
 	}
 
 	defer func() { _ = remoteConn.Close() }()
 
-	remoteTCP, _ := tcp.ExtractConn(remoteConn)
-	if remoteTCP != nil {
+	remoteTCP, err := tcp.ExtractConn(remoteConn)
+	if err == nil && remoteTCP != nil {
 		// Apply TCP timeouts if remote connection is TCP (rather than Unix).
 		err = tcp.SetTimeouts(remoteTCP, 0)
 		if err != nil {
@@ -134,7 +128,7 @@ func (r *sftpServeResponse) Render(w http.ResponseWriter, req *http.Request) err
 
 	err = response.Upgrade(remoteConn, "sftp")
 	if err != nil {
-		return api.StatusErrorf(http.StatusInternalServerError, "Failed to upgrade SFTP connection: %w", err)
+		return api.StatusErrorf(http.StatusInternalServerError, "Failed upgrading SFTP connection: %w", err)
 	}
 
 	ctx, cancel := context.WithCancel(req.Context())
@@ -147,9 +141,7 @@ func (r *sftpServeResponse) Render(w http.ResponseWriter, req *http.Request) err
 	})
 
 	wg := sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		_, err := io.Copy(remoteConn, r.instConn)
 		if err != nil {
 			if ctx.Err() == nil {
@@ -158,7 +150,7 @@ func (r *sftpServeResponse) Render(w http.ResponseWriter, req *http.Request) err
 		}
 		cancel()               // Cancel context first so when remoteConn is closed it doesn't cause a warning.
 		_ = remoteConn.Close() // Trigger the cancellation of the io.Copy reading from remoteConn.
-	}()
+	})
 
 	_, err = io.Copy(r.instConn, remoteConn)
 	if err != nil {

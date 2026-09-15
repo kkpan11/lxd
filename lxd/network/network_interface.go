@@ -4,8 +4,8 @@ import (
 	"net"
 
 	"github.com/canonical/lxd/lxd/cluster"
-	"github.com/canonical/lxd/lxd/cluster/request"
 	"github.com/canonical/lxd/lxd/db"
+	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
@@ -48,6 +48,8 @@ type Network interface {
 	Create(clientType request.ClientType) error
 	Start() error
 	Stop() error
+	Evacuate() error
+	Restore() error
 	Rename(name string) error
 	Update(newNetwork api.NetworkPut, targetNode string, clientType request.ClientType) error
 	HandleHeartbeat(heartbeatData *cluster.APIHeartbeat) error
@@ -67,6 +69,10 @@ type Network interface {
 	LoadBalancerCreate(loadBalancer api.NetworkLoadBalancersPost, clientType request.ClientType) (net.IP, error)
 	LoadBalancerUpdate(listenAddress string, newLoadBalancer api.NetworkLoadBalancerPut, clientType request.ClientType) error
 	LoadBalancerDelete(listenAddress string, clientType request.ClientType) error
+	LoadBalancerPoolCreate(loadBalancerPool api.NetworkLoadBalancerPoolsPost) error
+	LoadBalancerPoolUpdate(poolName string, loadBalancerPool api.NetworkLoadBalancerPoolPut) error
+	LoadBalancerPoolDelete(poolName string) error
+	LoadBalancerPoolState(poolName string) (*api.NetworkLoadBalancerPoolState, error)
 
 	// Peerings.
 	PeerCreate(forward api.NetworkPeersPost) error

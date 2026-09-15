@@ -2,10 +2,14 @@ package cluster
 
 import (
 	"fmt"
+
+	"github.com/canonical/lxd/lxd/db/query"
 )
 
 // entityTypeStorageVolumeBackup implements entityTypeDBInfo for a StorageVolumeBackup.
-type entityTypeStorageVolumeBackup struct{}
+type entityTypeStorageVolumeBackup struct {
+	entityTypeCommon
+}
 
 func (e entityTypeStorageVolumeBackup) code() int64 {
 	return entityTypeCodeStorageVolumeBackup
@@ -44,11 +48,11 @@ FROM storage_volumes_backups
 }
 
 func (e entityTypeStorageVolumeBackup) urlsByProjectQuery() string {
-	return fmt.Sprintf(`%s WHERE projects.name = ?`, e.allURLsQuery())
+	return e.allURLsQuery() + " WHERE projects.name = ?"
 }
 
-func (e entityTypeStorageVolumeBackup) urlByIDQuery() string {
-	return fmt.Sprintf(`%s WHERE storage_volumes_backups.id = ?`, e.allURLsQuery())
+func (e entityTypeStorageVolumeBackup) urlsByIDsQuery(ids ...int64) string {
+	return e.allURLsQuery() + " WHERE storage_volumes_backups.id IN " + query.IntParams(ids...)
 }
 
 func (e entityTypeStorageVolumeBackup) idFromURLQuery() string {
@@ -69,7 +73,7 @@ WHERE projects.name = ?
 		WHEN %d THEN '%s' 
 	END = ? 
 	AND storage_volumes.name = ? 
-	AND storage_volumes_backups.name = ?
+	AND storage_volumes_backups.name = concat(storage_volumes.name, '/', ?)
 `, StoragePoolVolumeTypeContainer, StoragePoolVolumeTypeNameContainer,
 		StoragePoolVolumeTypeImage, StoragePoolVolumeTypeNameImage,
 		StoragePoolVolumeTypeCustom, StoragePoolVolumeTypeNameCustom,
@@ -77,17 +81,5 @@ WHERE projects.name = ?
 }
 
 func (e entityTypeStorageVolumeBackup) onDeleteTriggerSQL() (name string, sql string) {
-	name = "on_storage_volume_backup_delete"
-	return name, fmt.Sprintf(`
-CREATE TRIGGER %s
-	AFTER DELETE ON storage_volumes_backups
-	BEGIN
-	DELETE FROM auth_groups_permissions 
-		WHERE entity_type = %d 
-		AND entity_id = OLD.id;
-	DELETE FROM warnings
-		WHERE entity_type_code = %d
-		AND entity_id = OLD.id;
-	END
-`, name, e.code(), e.code())
+	return standardOnDeleteTriggerSQL("on_storage_volume_backup_delete", "storage_volumes_backups", e.code())
 }

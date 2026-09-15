@@ -66,7 +66,7 @@ const (
 	vdpaVhostDevDir = "/dev"
 )
 
-// VhostVdpa is the vhost-vdpa device information.
+// VhostVDPA is the vhost-vdpa device information.
 type VhostVDPA struct {
 	Name string
 	Path string
@@ -194,7 +194,7 @@ func runVDPANetlinkCmd(command uint8, flags int, data []*nl.RtAttr) ([][]byte, e
 }
 
 // newNetlinkAttribute creates a new netlink attribute based on the attribute type and data.
-func newNetlinkAttribute(attrType int, data interface{}) (*nl.RtAttr, error) {
+func newNetlinkAttribute(attrType int, data any) (*nl.RtAttr, error) {
 	switch attrType {
 	case vDPAAttrMgmtDevBusName, vDPAAttrMgmtDevDevName, vDPAAttrDevName:
 		strData, ok := data.(string)
@@ -394,13 +394,12 @@ func AddVDPADevice(pciDevSlotName string, volatile map[string]string) (*VDPADev,
 
 // DeleteVDPADevice deletes a vDPA management device.
 func DeleteVDPADevice(vDPADevName string) error {
-	header := []*nl.RtAttr{}
 	devName, err := newNetlinkAttribute(vDPAAttrDevName, vDPADevName)
 	if err != nil {
 		return fmt.Errorf("Failed creating vDPA `vDPADevName` netlink attr : %v", err)
 	}
 
-	header = append(header, devName)
+	header := []*nl.RtAttr{devName}
 
 	_, err = runVDPANetlinkCmd(vDPACmdDevDel, 0, header)
 	if err != nil {

@@ -8,22 +8,21 @@
 # echo "options mlx4_core num_vfs=4 probe_vf=4" | sudo tee /etc/modprobe.d/mellanox.conf
 # reboot
 test_container_devices_infiniband_physical() {
-  ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
-
-  parent=${LXD_IB_PHYSICAL_PARENT:-""}
+  local parent=${LXD_IB_PHYSICAL_PARENT:-""}
 
   if [ "$parent" = "" ]; then
-    echo "==> SKIP: No physical IB parent specified"
-    return
+    export TEST_UNMET_REQUIREMENT="No physical IB parent specified"
+    return 0
   fi
+
+  ensure_import_testimage
 
   ctName="nt$$"
   macRand=$(shuf -i 0-9 -n 1)
   ctMAC="96:29:52:03:73:4b:81:e${macRand}"
 
   # Get host dev MAC to check MAC restore.
-  parentHostMAC=$(cat /sys/class/net/"${parent}"/address)
+  parentHostMAC=$(< /sys/class/net/"${parent}"/address)
 
   # Record how many nics we started with.
   startNicCount=$(find /sys/class/net | wc -l)
@@ -80,7 +79,7 @@ test_container_devices_infiniband_physical() {
   fi
 
   # Check volatile cleanup on stop.
-  if lxc config show "${ctName}" | grep volatile.eth0 | grep -v volatile.eth0.name ; then
+  if [ "$(lxc config show "${ctName}" | grep -F volatile.eth0 | grep -vF volatile.eth0.name)" != "" ]; then
     echo "unexpected volatile key remains"
     false
   fi

@@ -7,6 +7,7 @@ package cluster
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -24,12 +25,6 @@ const configCreate = `INSERT INTO %s_config (%s_id, key, value)
   VALUES (?, ?, ?)`
 
 const configDelete = `DELETE FROM %s_config WHERE %s_id = ?`
-
-// configColumns returns a string of column names to be used with a SELECT statement for the entity.
-// Use this function when building statements to retrieve database entries matching the Config entity.
-func configColumns() string {
-	return "%s_config.id, %s_config.%s_id, %s_config.key, %s_config.value"
-}
 
 // getConfig can be used to run handwritten sql.Stmts to return a slice of objects.
 func getConfig(ctx context.Context, stmt *sql.Stmt, parent string, args ...any) ([]Config, error) {
@@ -49,7 +44,7 @@ func getConfig(ctx context.Context, stmt *sql.Stmt, parent string, args ...any) 
 
 	err := query.SelectObjects(ctx, stmt, dest, args...)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch from \"%s_config\" table: %w", parent, err)
+		return nil, fmt.Errorf("Failed fetching from \"%s_config\" table: %w", parent, err)
 	}
 
 	return objects, nil
@@ -73,7 +68,7 @@ func getConfigRaw(ctx context.Context, tx *sql.Tx, sql string, parent string, ar
 
 	err := query.Scan(ctx, tx, sql, dest, args...)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch from \"%s_config\" table: %w", parent, err)
+		return nil, fmt.Errorf("Failed fetching from \"%s_config\" table: %w", parent, err)
 	}
 
 	return objects, nil
@@ -85,12 +80,13 @@ func GetConfig(ctx context.Context, tx *sql.Tx, parent string, filters ...Config
 	var err error
 
 	// Result slice.
-	objects := make([]Config, 0)
+	var objects []Config
 
-	configObjectsLocal := strings.Replace(configObjects, "%s_id", fmt.Sprintf("%s_id", parent), -1)
+	configObjectsLocal := strings.ReplaceAll(configObjects, "%s_id", parent+"_id")
 	fillParent := make([]any, strings.Count(configObjectsLocal, "%s"))
+	mangledParent := strings.ReplaceAll(parent, "_", "s_") + "s"
 	for i := range fillParent {
-		fillParent[i] = strings.Replace(parent, "_", "s_", -1) + "s"
+		fillParent[i] = mangledParent
 	}
 
 	queryStr := fmt.Sprintf(configObjectsLocal, fillParent...)
@@ -117,7 +113,7 @@ func GetConfig(ctx context.Context, tx *sql.Tx, parent string, filters ...Config
 		}
 
 		if len(entries) == 0 {
-			return nil, fmt.Errorf("Cannot filter on empty ConfigFilter")
+			return nil, errors.New("Cannot filter on empty ConfigFilter")
 		}
 
 		queryParts[0] += fmt.Sprintf(cond, strings.Join(entries, " AND "))
@@ -127,7 +123,7 @@ func GetConfig(ctx context.Context, tx *sql.Tx, parent string, filters ...Config
 	// Select.
 	objects, err = getConfigRaw(ctx, tx, queryStr, parent, args...)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch from \"%s_config\" table: %w", parent, err)
+		return nil, fmt.Errorf("Failed fetching from \"%s_config\" table: %w", parent, err)
 	}
 
 	resultMap := map[int]map[string]string{}
@@ -151,10 +147,10 @@ func CreateConfig(ctx context.Context, tx *sql.Tx, parent string, object Config)
 		return nil
 	}
 
-	configCreateLocal := strings.Replace(configCreate, "%s_id", fmt.Sprintf("%s_id", parent), -1)
+	configCreateLocal := strings.ReplaceAll(configCreate, "%s_id", parent+"_id")
 	fillParent := make([]any, strings.Count(configCreateLocal, "%s"))
 	for i := range fillParent {
-		fillParent[i] = strings.Replace(parent, "_", "s_", -1) + "s"
+		fillParent[i] = strings.ReplaceAll(parent, "_", "s_") + "s"
 	}
 
 	queryStr := fmt.Sprintf(configCreateLocal, fillParent...)
@@ -195,10 +191,10 @@ func UpdateConfig(ctx context.Context, tx *sql.Tx, parent string, referenceID in
 // DeleteConfig deletes the config matching the given key parameters.
 // generator: config DeleteMany
 func DeleteConfig(ctx context.Context, tx *sql.Tx, parent string, referenceID int) error {
-	configDeleteLocal := strings.Replace(configDelete, "%s_id", fmt.Sprintf("%s_id", parent), -1)
+	configDeleteLocal := strings.ReplaceAll(configDelete, "%s_id", parent+"_id")
 	fillParent := make([]any, strings.Count(configDeleteLocal, "%s"))
 	for i := range fillParent {
-		fillParent[i] = strings.Replace(parent, "_", "s_", -1) + "s"
+		fillParent[i] = strings.ReplaceAll(parent, "_", "s_") + "s"
 	}
 
 	queryStr := fmt.Sprintf(configDeleteLocal, fillParent...)

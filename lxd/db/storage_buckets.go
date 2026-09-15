@@ -10,8 +10,6 @@ import (
 	"net/http"
 	"strings"
 
-	dqliteDriver "github.com/canonical/go-dqlite/driver"
-
 	"github.com/canonical/lxd/lxd/db/query"
 	"github.com/canonical/lxd/shared/api"
 )
@@ -29,7 +27,6 @@ type StorageBucket struct {
 	api.StorageBucket
 
 	ID       int64
-	Project  string
 	PoolID   int64
 	PoolName string
 }
@@ -78,7 +75,7 @@ func (c *ClusterTx) GetStoragePoolBuckets(ctx context.Context, memberSpecific bo
 		for i, filter := range filters {
 			// Validate filter.
 			if !memberSpecific && filter.Name != nil && ((filter.PoolID == nil && filter.PoolName == nil) || filter.Project == nil) {
-				return nil, fmt.Errorf("Cannot filter by bucket name without specifying pool and project when doing member inspecific search")
+				return nil, errors.New("Cannot filter by bucket name without specifying pool and project when doing member inspecific search")
 			}
 
 			var qFilters []string
@@ -90,7 +87,7 @@ func (c *ClusterTx) GetStoragePoolBuckets(ctx context.Context, memberSpecific bo
 
 			if filter.PoolName != nil {
 				qFilters = append(qFilters, "storage_pools.name= ?")
-				args = append(args, *filter.PoolID)
+				args = append(args, *filter.PoolName)
 			}
 
 			if filter.Project != nil {
@@ -104,14 +101,14 @@ func (c *ClusterTx) GetStoragePoolBuckets(ctx context.Context, memberSpecific bo
 			}
 
 			if qFilters == nil {
-				return nil, fmt.Errorf("Invalid storage bucket filter")
+				return nil, errors.New("Invalid storage bucket filter")
 			}
 
 			if i > 0 {
 				q.WriteString(" OR ")
 			}
 
-			q.WriteString(fmt.Sprintf("(%s)", strings.Join(qFilters, " AND ")))
+			fmt.Fprintf(q, "(%s)", strings.Join(qFilters, " AND "))
 		}
 
 		q.WriteString(")")
@@ -283,27 +280,18 @@ func (c *ClusterTx) GetStoragePoolLocalBucketByAccessKey(ctx context.Context, ac
 }
 
 // CreateStoragePoolBucket creates a new Storage Bucket.
-// If memberSpecific is true, then the storage bucket is associated to the current member, rather than being
-// associated to all members.
-func (c *ClusterTx) CreateStoragePoolBucket(ctx context.Context, poolID int64, projectName string, memberSpecific bool, info api.StorageBucketsPost) (int64, error) {
+func (c *ClusterTx) CreateStoragePoolBucket(ctx context.Context, poolID int64, projectName string, info api.StorageBucketsPost) (int64, error) {
 	var err error
 	var bucketID int64
-	var nodeID any
-
-	if memberSpecific {
-		nodeID = c.nodeID
-	}
 
 	// Insert a new Storage Bucket record.
 	result, err := c.tx.ExecContext(ctx, `
 		INSERT INTO storage_buckets
 		(storage_pool_id, node_id, name, description, project_id)
 		VALUES (?, ?, ?, ?, (SELECT id FROM projects WHERE name = ?))
-		`, poolID, nodeID, info.Name, info.Description, projectName)
+		`, poolID, nil, info.Name, info.Description, projectName)
 	if err != nil {
-		var dqliteErr dqliteDriver.Error
-		// Detect SQLITE_CONSTRAINT_UNIQUE (2067) errors.
-		if errors.As(err, &dqliteErr) && dqliteErr.Code == 2067 {
+		if query.IsConflictErr(err) {
 			return -1, api.StatusErrorf(http.StatusConflict, "A bucket for that name already exists")
 		}
 
@@ -452,14 +440,14 @@ func (c *ClusterTx) GetStoragePoolBucketKeys(ctx context.Context, bucketID int64
 			}
 
 			if qFilters == nil {
-				return nil, fmt.Errorf("Invalid storage bucket key filter")
+				return nil, errors.New("Invalid storage bucket key filter")
 			}
 
 			if i > 0 {
 				q.WriteString(" OR ")
 			}
 
-			q.WriteString(fmt.Sprintf("(%s)", strings.Join(qFilters, " AND ")))
+			fmt.Fprintf(q, "(%s)", strings.Join(qFilters, " AND "))
 		}
 
 		q.WriteString(")")
@@ -526,9 +514,7 @@ func (c *ClusterTx) CreateStoragePoolBucketKey(ctx context.Context, bucketID int
 		VALUES (?, ?, ?, ?, ?, ?)
 		`, bucketID, info.Name, info.Description, info.Role, info.AccessKey, info.SecretKey)
 	if err != nil {
-		var dqliteErr dqliteDriver.Error
-		// Detect SQLITE_CONSTRAINT_UNIQUE (2067) errors.
-		if errors.As(err, &dqliteErr) && dqliteErr.Code == 2067 {
+		if query.IsConflictErr(err) {
 			return -1, api.StatusErrorf(http.StatusConflict, "A bucket key for that name already exists")
 		}
 

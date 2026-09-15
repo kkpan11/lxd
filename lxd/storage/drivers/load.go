@@ -13,12 +13,21 @@ var drivers = map[string]func() driver{
 	"dir":        func() driver { return &dir{} },
 	"lvm":        func() driver { return &lvm{} },
 	"powerflex":  func() driver { return &powerflex{} },
+	"powerstore": func() driver { return &powerstore{} },
+	"pure":       func() driver { return &pure{} },
+	"alletra":    func() driver { return &alletra{} },
 	"zfs":        func() driver { return &zfs{} },
 }
 
-// Validators contains functions used for validating a drivers's config.
+// Validators contains functions used for validating a driver's config.
 type Validators struct {
-	PoolRules   func() map[string]func(string) error
+	// Regular list of rules valid for all pools.
+	PoolRules func() map[string]func(string) error
+
+	// List of rules valid for local pools.
+	LocalPoolRules func() map[string]func(string) error
+
+	// List of rules valid for pool volumes.
 	VolumeRules func(vol Volume) map[string]func(string) error
 }
 
@@ -68,6 +77,7 @@ func SupportedDrivers(s *state.State) []Info {
 	for driverName := range drivers {
 		driver, err := Load(s, driverName, "", nil, nil, nil, nil)
 		if err != nil {
+			logger.Debug("Storage driver not available", logger.Ctx{"driver": driverName, "err": err})
 			continue
 		}
 

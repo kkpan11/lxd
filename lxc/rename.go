@@ -2,13 +2,11 @@ package main
 
 import (
 	"errors"
-	"fmt"
 	"strings"
 
 	"github.com/spf13/cobra"
 
 	cli "github.com/canonical/lxd/shared/cmd"
-	"github.com/canonical/lxd/shared/i18n"
 )
 
 type cmdRename struct {
@@ -17,15 +15,14 @@ type cmdRename struct {
 
 func (c *cmdRename) command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("rename", i18n.G("[<remote>:]<instance>[/<snapshot>] <instance>[/<snapshot>]"))
-	cmd.Short = i18n.G("Rename instances and snapshots")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Rename instances and snapshots`))
+	cmd.Use = usage("rename", "[<remote>:]<instance>[/<snapshot>] <instance>[/<snapshot>]")
+	cmd.Short = "Rename instances and snapshots"
+	cmd.Long = cli.FormatSection("Description", `Rename instances and snapshots`)
 	cmd.RunE = c.run
 
 	cmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		if len(args) == 0 {
-			return c.global.cmpInstances(toComplete)
+			return c.global.cmpInstancesAndSnapshots(toComplete)
 		}
 
 		return nil, cobra.ShellCompDirectiveNoFileComp
@@ -57,11 +54,11 @@ func (c *cmdRename) run(cmd *cobra.Command, args []string) error {
 	if sourceRemote != destRemote {
 		// We just do renames
 		if strings.Contains(args[1], ":") {
-			return errors.New(i18n.G("Can't specify a different remote for rename"))
+			return errors.New("Cannot specify a different remote for rename")
 		}
 
 		// Don't require the remote to be passed as both source and target
-		args[1] = fmt.Sprintf("%s:%s", sourceRemote, args[1])
+		args[1] = sourceRemote + ":" + args[1]
 	}
 
 	// Call move

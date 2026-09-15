@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 
@@ -172,7 +173,7 @@ func (c *ClusterTx) GetNetworkForward(ctx context.Context, networkID int64, memb
 		return forwardID, forward, nil // Only single forward in map.
 	}
 
-	return -1, nil, fmt.Errorf("Unexpected forward list size")
+	return -1, nil, errors.New("Unexpected forward list size")
 }
 
 // networkForwardConfig populates the config map of the Network Forward with the given ID.
@@ -249,7 +250,7 @@ func (c *ClusterTx) GetNetworkForwardListenAddresses(ctx context.Context, networ
 }
 
 // GetProjectNetworkForwardListenAddressesByUplink returns map of Network Forward Listen Addresses that belong to
-// networks connected to the specified uplinkNetworkName.
+// networks connected to the specified uplinkNetworkName. Listen addresses that are internal OVN IPs are omitted.
 // Returns a map keyed on project name and network name containing a slice of listen addresses.
 func (c *ClusterTx) GetProjectNetworkForwardListenAddressesByUplink(ctx context.Context, uplinkNetworkName string, memberSpecific bool) (map[string]map[string][]string, error) {
 	q := strings.Builder{}
@@ -262,13 +263,18 @@ func (c *ClusterTx) GetProjectNetworkForwardListenAddressesByUplink(ctx context.
 	SELECT
 		projects.name,
 		networks.name,
-		networks_forwards.listen_address
+		networks.type,
+		networks_forwards.listen_address,
+		COALESCE(nc_ipv4.value, '') AS ipv4_address,
+		COALESCE(nc_ipv6.value, '') AS ipv6_address
 	FROM networks_forwards
-	JOIN networks on networks.id = networks_forwards.network_id
-	JOIN networks_config on networks.id = networks_config.network_id
+	JOIN networks ON networks.id = networks_forwards.network_id
 	JOIN projects ON projects.id = networks.project_id
+	JOIN networks_config AS nc_filter ON networks.id = nc_filter.network_id
+ 	LEFT JOIN networks_config AS nc_ipv4 ON networks.id = nc_ipv4.network_id AND nc_ipv4.key = 'ipv4.address'
+	LEFT JOIN networks_config AS nc_ipv6 ON networks.id = nc_ipv6.network_id AND nc_ipv6.key = 'ipv6.address'  
 	WHERE (
-		(networks_config.key = "network" AND networks_config.value = ?1)
+		(nc_filter.key = "network" AND nc_filter.value = ?1)
 		OR (projects.name = "default" AND networks.name = ?1)
 	)
 	`)
@@ -285,11 +291,37 @@ func (c *ClusterTx) GetProjectNetworkForwardListenAddressesByUplink(ctx context.
 	err := query.Scan(ctx, c.Tx(), q.String(), func(scan func(dest ...any) error) error {
 		var projectName string
 		var networkName string
+		var networkType NetworkType
 		var listenAddress string
+		var networkIP4Address string
+		var networkIP6Address string
 
-		err := scan(&projectName, &networkName, &listenAddress)
+		err := scan(&projectName, &networkName, &networkType, &listenAddress, &networkIP4Address, &networkIP6Address)
 		if err != nil {
 			return err
+		}
+
+		// Skip listen addresses that are internal OVN IPs.
+		if networkType == NetworkTypeOVN {
+			listenAddrIP := net.ParseIP(listenAddress)
+			listenAddrIsIP4 := listenAddrIP.To4() != nil
+
+			var netSubnet *net.IPNet
+			var err error
+
+			if listenAddrIsIP4 && networkIP4Address != "" {
+				_, netSubnet, err = net.ParseCIDR(networkIP4Address)
+			} else if !listenAddrIsIP4 && networkIP6Address != "" {
+				_, netSubnet, err = net.ParseCIDR(networkIP6Address)
+			}
+
+			if err != nil {
+				return err
+			}
+
+			if netSubnet != nil && netSubnet.Contains(listenAddrIP) {
+				return nil
+			}
 		}
 
 		if forwards[projectName] == nil {
@@ -381,7 +413,7 @@ func (c *ClusterTx) GetNetworkForwards(ctx context.Context, networkID int64, mem
 	}
 
 	if len(listenAddresses) > 0 {
-		q.WriteString(fmt.Sprintf("AND networks_forwards.listen_address IN %s ", query.Params(len(listenAddresses))))
+		fmt.Fprintf(q, "AND networks_forwards.listen_address IN %s ", query.Params(len(listenAddresses)))
 		for _, listenAddress := range listenAddresses {
 			args = append(args, listenAddress)
 		}

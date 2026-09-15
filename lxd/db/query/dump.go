@@ -24,7 +24,8 @@ func Dump(ctx context.Context, tx *sql.Tx, schemaOnly bool) (string, error) {
 
 	// For each table, write the schema and optionally write the data.
 	for _, tableName := range entityNames {
-		builder.WriteString(entitiesSchemas[tableName][1] + "\n")
+		builder.WriteString(entitiesSchemas[tableName][1])
+		builder.WriteString("\n")
 
 		if !schemaOnly && entitiesSchemas[tableName][0] == "table" {
 			tableData, err := getTableData(ctx, tx, tableName)
@@ -33,7 +34,8 @@ func Dump(ctx context.Context, tx *sql.Tx, schemaOnly bool) (string, error) {
 			}
 
 			for _, stmt := range tableData {
-				builder.WriteString(stmt + "\n")
+				builder.WriteString(stmt)
+				builder.WriteString("\n")
 			}
 		}
 	}
@@ -44,11 +46,12 @@ func Dump(ctx context.Context, tx *sql.Tx, schemaOnly bool) (string, error) {
 
 		tableData, err := getTableData(ctx, tx, "sqlite_sequence")
 		if err != nil {
-			return "", fmt.Errorf("Failed to dump table sqlite_sequence: %w", err)
+			return "", fmt.Errorf("Failed dumping table sqlite_sequence: %w", err)
 		}
 
 		for _, stmt := range tableData {
-			builder.WriteString(stmt + "\n")
+			builder.WriteString(stmt)
+			builder.WriteString("\n")
 		}
 	}
 
@@ -81,8 +84,9 @@ func getEntitiesSchemas(ctx context.Context, tx *sql.Tx) (map[string][2]string, 
 		}
 
 		// This is based on logic from dump_callback in sqlite source for sqlite3_db_dump function.
-		if strings.HasPrefix(schema, `CREATE TABLE "`) {
-			schema = strings.Replace(schema, "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1)
+		suffix, found := strings.CutPrefix(schema, `CREATE TABLE "`)
+		if found {
+			schema = `CREATE TABLE IF NOT EXISTS "` + suffix
 		}
 
 		names = append(names, name)
@@ -98,9 +102,9 @@ func getTableData(ctx context.Context, tx *sql.Tx, table string) ([]string, erro
 	var statements []string
 
 	// Query all rows.
-	rows, err := tx.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s ORDER BY rowid", table))
+	rows, err := tx.QueryContext(ctx, "SELECT * FROM "+table)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch rows for table %q: %w", table, err)
+		return nil, fmt.Errorf("Failed fetching rows for table %q: %w", table, err)
 	}
 
 	defer func() { _ = rows.Close() }()
@@ -108,7 +112,7 @@ func getTableData(ctx context.Context, tx *sql.Tx, table string) ([]string, erro
 	// Get the column names.
 	columns, err := rows.Columns()
 	if err != nil {
-		return nil, fmt.Errorf("Failed to get columns for table %q: %w", table, err)
+		return nil, fmt.Errorf("Failed getting columns for table %q: %w", table, err)
 	}
 
 	// Generate an INSERT statement for each row.
@@ -121,7 +125,7 @@ func getTableData(ctx context.Context, tx *sql.Tx, table string) ([]string, erro
 
 		err := rows.Scan(row...)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to scan row %d in table %q: %w", i, table, err)
+			return nil, fmt.Errorf("Failed scanning row %d in table %q: %w", i, table, err)
 		}
 
 		values := make([]string, len(columns))
@@ -131,7 +135,7 @@ func getTableData(ctx context.Context, tx *sql.Tx, table string) ([]string, erro
 				values[j] = strconv.FormatInt(v, 10)
 			case string:
 				// This is based on logic from dump_callback in sqlite source for sqlite3_db_dump function.
-				v = fmt.Sprintf("'%s'", strings.ReplaceAll(v, "'", "''"))
+				v = "'" + strings.ReplaceAll(v, "'", "''") + "'"
 
 				if strings.Contains(v, "\r") {
 					v = "replace(" + strings.ReplaceAll(v, "\r", "\\r") + ",'\\r',char(13))"
@@ -144,7 +148,7 @@ func getTableData(ctx context.Context, tx *sql.Tx, table string) ([]string, erro
 				values[j] = v
 
 			case []byte:
-				values[j] = fmt.Sprintf("'%s'", string(v))
+				values[j] = "'" + string(v) + "'"
 			case time.Time:
 				// Try and match the sqlite3 .dump output format.
 				format := "2006-01-02 15:04:05"
@@ -165,7 +169,7 @@ func getTableData(ctx context.Context, tx *sql.Tx, table string) ([]string, erro
 			}
 		}
 
-		statement := fmt.Sprintf("INSERT INTO %s VALUES(%s);", table, strings.Join(values, ","))
+		statement := "INSERT INTO " + table + " VALUES(" + strings.Join(values, ",") + ");"
 		statements = append(statements, statement)
 	}
 

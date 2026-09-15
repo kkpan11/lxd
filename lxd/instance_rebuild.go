@@ -3,17 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
-
-	"github.com/gorilla/mux"
 
 	"github.com/canonical/lxd/lxd/db"
 	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/db/operationtype"
 	"github.com/canonical/lxd/lxd/instance"
-	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/response"
@@ -62,13 +59,9 @@ func instanceRebuildPost(d *Daemon, r *http.Request) response.Response {
 
 	targetProjectName := request.ProjectParam(r)
 
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	name := r.PathValue("name")
 	if shared.IsSnapshot(name) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+		return response.BadRequest(errors.New("Invalid instance name"))
 	}
 
 	instanceType, err := urlInstanceTypeDetect(r)
@@ -77,7 +70,7 @@ func instanceRebuildPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(s, r, targetProjectName, name, instanceType)
+	resp, err := forwardedResponseIfInstanceIsRemote(r.Context(), s, targetProjectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -97,10 +90,11 @@ func instanceRebuildPost(d *Daemon, r *http.Request) response.Response {
 	var sourceImage *api.Image
 	var inst instance.Instance
 	var sourceImageRef string
+	var imageAuthorizationChecker func(ctx context.Context) error
 	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
 		dbProject, err := dbCluster.GetProject(ctx, tx.Tx(), targetProjectName)
 		if err != nil {
-			return fmt.Errorf("Failed loading project: %w", err)
+			return fmt.Errorf("Failed loading project %q: %w", targetProjectName, err)
 		}
 
 		targetProject, err = dbProject.ToAPI(ctx, tx.Tx())
@@ -113,9 +107,10 @@ func instanceRebuildPost(d *Daemon, r *http.Request) response.Response {
 			return fmt.Errorf("Failed loading instance: %w", err)
 		}
 
-		if req.Source.Type != "none" {
-			sourceImage, err = getSourceImageFromInstanceSource(ctx, s, tx, targetProject.Name, req.Source, &sourceImageRef, dbInst.Type.String())
-			if err != nil && !api.StatusErrorCheck(err, http.StatusNotFound) {
+		if req.Source.Type != api.SourceTypeNone {
+			// Try to resolve the source image from cache.
+			sourceImage, imageAuthorizationChecker, err = resolveSourceImageFromCache(r, s, tx, targetProject.Name, req.Source, &sourceImageRef, dbInst.Type.String())
+			if err != nil {
 				return err
 			}
 		}
@@ -126,45 +121,54 @@ func instanceRebuildPost(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
+	// Verify the caller has access to the image if it's from a different project, and to retrieve the image's metadata.
+	if imageAuthorizationChecker != nil {
+		err = imageAuthorizationChecker(r.Context())
+		if err != nil {
+			return response.SmartError(err)
+		}
+	}
+
 	inst, err = instance.LoadByProjectAndName(s, targetProject.Name, name)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	if inst.IsRunning() {
-		return response.BadRequest(fmt.Errorf("Instance must be stopped to be rebuilt"))
+		return response.BadRequest(errors.New("Instance must be stopped to be rebuilt"))
 	}
 
-	run := func(op *operations.Operation) error {
-		if req.Source.Type == "none" {
-			return instanceRebuildFromEmpty(inst, op)
+	run := func(ctx context.Context, op *operations.Operation) error {
+		if req.Source.Type == api.SourceTypeNone {
+			return instanceRebuildFromEmpty(ctx, inst, op)
 		}
 
 		if req.Source.Server != "" {
-			sourceImage, err = ensureDownloadedImageFitWithinBudget(s, r, op, *targetProject, sourceImageRef, req.Source, inst.Type().String())
+			sourceImage, err = ensureDownloadedImageFitWithinBudget(ctx, s, op, *targetProject, sourceImageRef, req.Source, inst.Type().String())
 			if err != nil {
 				return err
 			}
 		}
 
 		if sourceImage == nil {
-			return fmt.Errorf("Image not provided for instance rebuild")
+			return errors.New("Image not provided for instance rebuild")
 		}
 
-		return instanceRebuildFromImage(s, r, inst, sourceImage, op)
+		return instanceRebuildFromImage(ctx, s, inst, sourceImage, op)
 	}
 
-	resources := map[string][]api.URL{}
-	resources["instances"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", name)}
-
-	if inst.Type() == instancetype.Container {
-		resources["containers"] = resources["instances"]
+	args := operations.OperationArgs{
+		ProjectName: targetProject.Name,
+		EntityURL:   api.NewURL().Path(version.APIVersion, "instances", name).Project(inst.Project().Name),
+		Type:        operationtype.InstanceRebuild,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     run,
 	}
 
-	op, err := operations.OperationCreate(s, targetProject.Name, operations.OperationClassTask, operationtype.InstanceRebuild, resources, nil, run, nil, nil, r)
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }

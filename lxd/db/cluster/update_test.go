@@ -1,4 +1,4 @@
-package cluster_test
+package cluster
 
 import (
 	"context"
@@ -12,15 +12,15 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/db/query"
+	"github.com/canonical/lxd/lxd/identity"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/osarch"
 )
 
 func TestUpdateFromV0(t *testing.T) {
-	schema := cluster.Schema()
+	schema := Schema()
 	db, err := schema.ExerciseUpdate(1, nil)
 	require.NoError(t, err)
 
@@ -34,13 +34,16 @@ func TestUpdateFromV0(t *testing.T) {
 	require.Error(t, err)
 
 	// Unique constraint on address
-	stmt = "INSERT INTO nodes VALUES (3, 'bar', 'gasp', '1.2.3.4:666', 9, 11), ?, 0)"
+	stmt = "INSERT INTO nodes VALUES (3, 'bar', 'gasp', '1.2.3.4:666', 9, 11, ?, 0)"
 	_, err = db.Exec(stmt, time.Now())
 	require.Error(t, err)
+	var sqliteErr sqlite3.Error
+	require.ErrorAs(t, err, &sqliteErr)
+	require.Equal(t, sqlite3.ErrConstraintUnique, sqliteErr.ExtendedCode)
 }
 
 func TestUpdateFromV1_Certificates(t *testing.T) {
-	schema := cluster.Schema()
+	schema := Schema()
 	db, err := schema.ExerciseUpdate(2, nil)
 	require.NoError(t, err)
 
@@ -53,7 +56,7 @@ func TestUpdateFromV1_Certificates(t *testing.T) {
 }
 
 func TestUpdateFromV1_Config(t *testing.T) {
-	schema := cluster.Schema()
+	schema := Schema()
 	db, err := schema.ExerciseUpdate(2, nil)
 	require.NoError(t, err)
 
@@ -66,7 +69,7 @@ func TestUpdateFromV1_Config(t *testing.T) {
 }
 
 func TestUpdateFromV1_Containers(t *testing.T) {
-	schema := cluster.Schema()
+	schema := Schema()
 	db, err := schema.ExerciseUpdate(2, nil)
 	require.NoError(t, err)
 
@@ -100,7 +103,7 @@ INSERT INTO containers VALUES (2, 2, 'jammy', 2, 2, 1, ?, 1, ?, 'Ubuntu LTS')
 }
 
 func TestUpdateFromV1_Network(t *testing.T) {
-	schema := cluster.Schema()
+	schema := Schema()
 	db, err := schema.ExerciseUpdate(2, nil)
 	require.NoError(t, err)
 
@@ -124,7 +127,7 @@ func TestUpdateFromV1_ConfigTables(t *testing.T) {
 }
 
 func testConfigTable(t *testing.T, table string, setup func(db *sql.DB)) {
-	schema := cluster.Schema()
+	schema := Schema()
 	db, err := schema.ExerciseUpdate(2, nil)
 	require.NoError(t, err)
 
@@ -183,7 +186,7 @@ func testConfigTable(t *testing.T, table string, setup func(db *sql.DB)) {
 }
 
 func TestUpdateFromV2(t *testing.T) {
-	schema := cluster.Schema()
+	schema := Schema()
 	db, err := schema.ExerciseUpdate(3, nil)
 	require.NoError(t, err)
 
@@ -208,7 +211,7 @@ func TestUpdateFromV2(t *testing.T) {
 }
 
 func TestUpdateFromV3(t *testing.T) {
-	schema := cluster.Schema()
+	schema := Schema()
 	db, err := schema.ExerciseUpdate(4, nil)
 	require.NoError(t, err)
 
@@ -227,7 +230,7 @@ func TestUpdateFromV3(t *testing.T) {
 }
 
 func TestUpdateFromV5(t *testing.T) {
-	schema := cluster.Schema()
+	schema := Schema()
 	db, err := schema.ExerciseUpdate(6, func(db *sql.DB) {
 		// Create two nodes.
 		_, err := db.Exec(
@@ -298,7 +301,7 @@ SELECT id FROM storage_volumes WHERE storage_pool_id=2 AND name='v1' ORDER BY id
 }
 
 func TestUpdateFromV6(t *testing.T) {
-	schema := cluster.Schema()
+	schema := Schema()
 	db, err := schema.ExerciseUpdate(7, func(db *sql.DB) {
 		// Create two nodes.
 		_, err := db.Exec(
@@ -354,7 +357,7 @@ INSERT INTO storage_pools_config(storage_pool_id, node_id, key, value)
 }
 
 func TestUpdateFromV9(t *testing.T) {
-	schema := cluster.Schema()
+	schema := Schema()
 	db, err := schema.ExerciseUpdate(10, func(db *sql.DB) {
 		// Create a node.
 		_, err := db.Exec(
@@ -380,7 +383,7 @@ func TestUpdateFromV9(t *testing.T) {
 }
 
 func TestUpdateFromV11(t *testing.T) {
-	schema := cluster.Schema()
+	schema := Schema()
 	db, err := schema.ExerciseUpdate(12, func(db *sql.DB) {
 		// Insert a node.
 		_, err := db.Exec(
@@ -435,7 +438,7 @@ INSERT INTO profiles_devices_config VALUES(4, 2, 'pool', 'default');
 		require.NoError(t, err)
 		assert.Equal(t, 1, count)
 
-		stmt := fmt.Sprintf("SELECT project_id FROM %s", table)
+		stmt := "SELECT project_id FROM " + table
 		ids, err := query.SelectIntegers(context.Background(), tx, stmt)
 		require.NoError(t, err)
 		assert.Equal(t, []int{1}, ids)
@@ -443,7 +446,7 @@ INSERT INTO profiles_devices_config VALUES(4, 2, 'pool', 'default');
 
 	// Create a new project.
 	_, err = tx.Exec(`
-INSERT INTO projects VALUES (2, 'staging', 'Staging environment')`)
+INSERT INTO projects (id, name, description) VALUES (2, 'staging', 'Staging environment')`)
 	require.NoError(t, err)
 
 	// Check that it's possible to have two containers with the same name
@@ -468,7 +471,7 @@ INSERT INTO containers VALUES (4, 1, 'xenial', 1, 1, 0, ?, 0, ?, 'Xenial Xerus',
 }
 
 func TestUpdateFromV14(t *testing.T) {
-	schema := cluster.Schema()
+	schema := Schema()
 	db, err := schema.ExerciseUpdate(15, func(db *sql.DB) {
 		// Insert a node.
 		_, err := db.Exec(
@@ -497,7 +500,7 @@ INSERT INTO containers VALUES (1, 1, 'eoan', 1, 1, 0, ?, 0, ?, 'Eoan Ermine', 1,
 }
 
 func TestUpdateFromV15(t *testing.T) {
-	schema := cluster.Schema()
+	schema := Schema()
 	db, err := schema.ExerciseUpdate(16, func(db *sql.DB) {
 		// Insert a node.
 		_, err := db.Exec(
@@ -573,23 +576,23 @@ INSERT INTO instances VALUES (2, 1, 'eoan/snap', 2, 1, 0, ?, 0, ?, 'Eoan Ermine 
 
 	config, err := query.SelectConfig(context.Background(), tx, "instances_config", "id = 1")
 	require.NoError(t, err)
-	assert.Equal(t, config, map[string]string{"key": "value2"})
+	assert.Equal(t, map[string]string{"key": "value2"}, config)
 
 	config, err = query.SelectConfig(context.Background(), tx, "instances_snapshots_config", "id = 1")
 	require.NoError(t, err)
-	assert.Equal(t, config, map[string]string{"key": "value1"})
+	assert.Equal(t, map[string]string{"key": "value1"}, config)
 
 	config, err = query.SelectConfig(context.Background(), tx, "instances_devices_config", "id = 1")
 	require.NoError(t, err)
-	assert.Equal(t, config, map[string]string{"k": "v"})
+	assert.Equal(t, map[string]string{"k": "v"}, config)
 
 	config, err = query.SelectConfig(context.Background(), tx, "instances_snapshots_devices_config", "id = 1")
 	require.NoError(t, err)
-	assert.Equal(t, config, map[string]string{"k": "v"})
+	assert.Equal(t, map[string]string{"k": "v"}, config)
 }
 
 func TestUpdateFromV19(t *testing.T) {
-	schema := cluster.Schema()
+	schema := Schema()
 	db, err := schema.ExerciseUpdate(20, func(db *sql.DB) {
 		// Insert a node.
 		_, err := db.Exec(
@@ -625,7 +628,7 @@ VALUES (2, 'n2', '', '2.2.3.4:666', 1, 32, ?, 0)`, time.Now())
 }
 
 func TestUpdateFromV25(t *testing.T) {
-	schema := cluster.Schema()
+	schema := Schema()
 	db, err := schema.ExerciseUpdate(26, func(db *sql.DB) {
 		// Insert a node.
 		_, err := db.Exec(
@@ -673,18 +676,18 @@ func TestUpdateFromV25(t *testing.T) {
 	config, err := query.SelectConfig(context.Background(), tx, "storage_volumes_snapshots_config", "")
 	require.NoError(t, err)
 	assert.Len(t, config, 1)
-	assert.Equal(t, config["k"], "v-old")
+	assert.Equal(t, "v-old", config["k"])
 }
 
 func TestUpdateFromV26_WithoutVolumes(t *testing.T) {
-	schema := cluster.Schema()
-	db, err := schema.ExerciseUpdate(27, func(db *sql.DB) {})
+	schema := Schema()
+	db, err := schema.ExerciseUpdate(27, func(_ *sql.DB) {})
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 }
 
 func TestUpdateFromV26_WithVolumes(t *testing.T) {
-	schema := cluster.Schema()
+	schema := Schema()
 	db, err := schema.ExerciseUpdate(27, func(db *sql.DB) {
 		// Insert a node.
 		_, err := db.Exec(
@@ -718,11 +721,11 @@ func TestUpdateFromV26_WithVolumes(t *testing.T) {
 	ids, err := query.SelectIntegers(context.Background(), tx, "SELECT seq FROM sqlite_sequence WHERE name = 'storage_volumes'")
 	require.NoError(t, err)
 
-	assert.Equal(t, ids[0], 2)
+	assert.Equal(t, 2, ids[0])
 }
 
 func TestUpdateFromV34(t *testing.T) {
-	schema := cluster.Schema()
+	schema := Schema()
 	db, err := schema.ExerciseUpdate(35, func(db *sql.DB) {
 		// Insert two nodes.
 		_, err := db.Exec(
@@ -757,21 +760,21 @@ func TestUpdateFromV34(t *testing.T) {
 	count, err := query.Count(context.Background(), tx, "storage_volumes", "")
 	require.NoError(t, err)
 
-	assert.Equal(t, count, 1)
+	assert.Equal(t, 1, count)
 
 	row := tx.QueryRow("SELECT id, node_id FROM storage_volumes")
 	var id int
 	var nodeID any
 	require.NoError(t, row.Scan(&id, &nodeID))
-	assert.Equal(t, id, 2)
-	assert.Equal(t, nodeID, nil)
+	assert.Equal(t, 2, id)
+	assert.Nil(t, nodeID)
 }
 
 func TestUpdateFromV69(t *testing.T) {
 	c1 := string(shared.TestingKeyPair().PublicKey())
 	c2 := string(shared.TestingAltKeyPair().PublicKey())
 
-	schema := cluster.Schema()
+	schema := Schema()
 	db, err := schema.ExerciseUpdate(70, func(db *sql.DB) {
 		_, err := db.Exec(`
 INSERT INTO certificates (fingerprint, type, name, certificate, restricted) VALUES ('eeef45f0570ce713864c86ec60c8d88f60b4844d3a8849b262c77cb18e88394d', 1, 'restricted-client', ?, 1);
@@ -790,9 +793,9 @@ INSERT INTO certificates_projects (certificate_id, project_id) VALUES (1, 4);
 	})
 	require.NoError(t, err)
 
-	getTLSIdentityByFingerprint := func(fingerprint string) cluster.Identity {
-		identity := cluster.Identity{}
-		row := db.QueryRow(`SELECT id, auth_method, type, identifier, name, metadata FROM identities WHERE auth_method = ? AND identifier = ?`, cluster.AuthMethod(api.AuthenticationMethodTLS), fingerprint)
+	getTLSIdentityByFingerprint := func(fingerprint string) IdentitiesRow {
+		identity := IdentitiesRow{}
+		row := db.QueryRow(`SELECT id, auth_method, type, identifier, name, metadata FROM identities WHERE auth_method = ? AND identifier = ?`, AuthMethod(api.AuthenticationMethodTLS), fingerprint)
 		require.NoError(t, row.Err())
 		err = row.Scan(&identity.ID, &identity.AuthMethod, &identity.Type, &identity.Identifier, &identity.Name, &identity.Metadata)
 		require.NoError(t, row.Err())
@@ -802,10 +805,10 @@ INSERT INTO certificates_projects (certificate_id, project_id) VALUES (1, 4);
 	identity := getTLSIdentityByFingerprint("eeef45f0570ce713864c86ec60c8d88f60b4844d3a8849b262c77cb18e88394d")
 	assert.Equal(t, api.IdentityTypeCertificateClientRestricted, string(identity.Type))
 	assert.Equal(t, "restricted-client", identity.Name)
-	var metadata cluster.CertificateMetadata
+	var metadata map[string]string
 	err = json.Unmarshal([]byte(identity.Metadata), &metadata)
 	require.NoError(t, err)
-	assert.Equal(t, c1, metadata.Certificate)
+	assert.Equal(t, c1, metadata["cert"])
 
 	rows, err := db.Query(`SELECT projects.name FROM identities_projects JOIN projects ON identities_projects.project_id = projects.id WHERE identity_id = ?`, identity.ID)
 	require.NoError(t, err)
@@ -824,26 +827,207 @@ INSERT INTO certificates_projects (certificate_id, project_id) VALUES (1, 4);
 	assert.Equal(t, "unrestricted-client", identity.Name)
 	err = json.Unmarshal([]byte(identity.Metadata), &metadata)
 	require.NoError(t, err)
-	assert.Equal(t, c2, metadata.Certificate)
+	assert.Equal(t, c2, metadata["cert"])
 
 	identity = getTLSIdentityByFingerprint("49b262c77cb18e88394d8e6ec60c8d8eef45f0570ce713864c8f60b4844d3a88")
 	assert.Equal(t, api.IdentityTypeCertificateServer, string(identity.Type))
 	assert.Equal(t, "server", identity.Name)
 	err = json.Unmarshal([]byte(identity.Metadata), &metadata)
 	require.NoError(t, err)
-	assert.Equal(t, c1, metadata.Certificate)
+	assert.Equal(t, c1, metadata["cert"])
 
 	identity = getTLSIdentityByFingerprint("60c8d8eef45f0570ce713864c8f60b4844d3a8849b262c77cb18e88394d8e6ec")
 	assert.Equal(t, api.IdentityTypeCertificateMetricsRestricted, string(identity.Type))
 	assert.Equal(t, "metrics", identity.Name)
 	err = json.Unmarshal([]byte(identity.Metadata), &metadata)
 	require.NoError(t, err)
-	assert.Equal(t, c2, metadata.Certificate)
+	assert.Equal(t, c2, metadata["cert"])
 
 	identity = getTLSIdentityByFingerprint("47c88da8fd0cb9a8d44768a445e6c27aee44e078ce74cbaec0726de427bac056")
 	assert.Equal(t, api.IdentityTypeCertificateMetricsUnrestricted, string(identity.Type))
 	assert.Equal(t, "metrics", identity.Name)
 	err = json.Unmarshal([]byte(identity.Metadata), &metadata)
 	require.NoError(t, err)
-	assert.Equal(t, c2, metadata.Certificate)
+	assert.Equal(t, c2, metadata["cert"])
+}
+
+func TestUpdateFromV81(t *testing.T) {
+	cert1 := shared.TestingKeyPair()
+	cert1PEM := string(cert1.PublicKey())
+	cert1Fingerprint := cert1.Fingerprint()
+	cert1Metadata, err := json.Marshal(map[string]string{
+		"cert": cert1PEM,
+	})
+	require.NoError(t, err)
+
+	cert2 := shared.TestingAltKeyPair()
+	cert2PEM := string(cert2.PublicKey())
+	cert2Fingerprint := cert2.Fingerprint()
+	cert2Metadata, err := json.Marshal(map[string]string{
+		"cert": cert2PEM,
+	})
+	require.NoError(t, err)
+
+	pendingTLSClientSecret, err := shared.RandomCryptoString()
+	require.NoError(t, err)
+	pendingTLSMetadata := PendingTLSMetadata{
+		Secret: pendingTLSClientSecret,
+	}
+
+	pendingTLSClientMetadataBytes, err := json.Marshal(pendingTLSMetadata)
+	require.NoError(t, err)
+
+	schema := Schema()
+	db, err := schema.ExerciseUpdate(82, func(db *sql.DB) {
+		_, err := db.Exec(`
+INSERT INTO identities (identifier, auth_method, type, name, metadata) VALUES (?, ?, ?, ?, ?);
+INSERT INTO identities (identifier, auth_method, type, name, metadata) VALUES (?, ?, ?, ?, ?);
+-- Initial UI identity with no metadata
+INSERT INTO identities (identifier, auth_method, type, name, metadata) VALUES ('019d6c49-4909-7e85-bac0-ae9b5b230cc0', 3, 11, 'initial-ui-access', '');
+-- Bearer identity with no metadata
+INSERT INTO identities (identifier, auth_method, type, name, metadata) VALUES ('019d6c4f-bf62-7bb8-a1d2-a07808b64143', 3, 10, 'api-token-bearer', '');
+-- OIDC identity with metadata
+INSERT INTO identities (identifier, auth_method, type, name, metadata) VALUES ('jane.doe@example.com', 2, 5, 'Jane Doe', '{"subject": "019d6c52-5b4e-70e3-8758-cb71d6c829ec", "identity_provider_groups":["admins"]}');
+-- Pending TLS identity with metadata
+INSERT INTO identities (identifier, auth_method, type, name, metadata) VALUES ('019d6c92-f1a2-77bf-98d9-ca867f80ad28', 1, 8, 'pending-tls-client', ?);
+`,
+			cert1Fingerprint, authMethodTLS, identity.CertificateClientUnrestricted{}.Code(), "unrestricted", string(cert1Metadata),
+			cert2Fingerprint, authMethodTLS, identity.CertificateClient{}.Code(), "fine-grained", string(cert2Metadata),
+			string(pendingTLSClientMetadataBytes),
+		)
+		require.NoError(t, err)
+	})
+	require.NoError(t, err)
+
+	baseQ := `SELECT certificates.fingerprint, certificates.certificate, identities.identifier, identities.metadata
+FROM identities
+    JOIN identities_certificates ON identities.id = identities_certificates.identity_id
+	JOIN certificates ON identities_certificates.certificate_id = certificates.id `
+	row := db.QueryRowContext(t.Context(), baseQ+"WHERE identities.name = ?", "unrestricted")
+	var fingerprint, certificate, identifier, metadata string
+	require.NoError(t, row.Scan(&fingerprint, &certificate, &identifier, &metadata))
+	require.Equal(t, fingerprint, identifier)
+	require.Equal(t, cert1Fingerprint, fingerprint)
+	require.Equal(t, cert1PEM, certificate)
+	require.Empty(t, metadata)
+
+	row = db.QueryRowContext(t.Context(), baseQ+"WHERE identities.name = ?", "fine-grained")
+	require.NoError(t, row.Scan(&fingerprint, &certificate, &identifier, &metadata))
+	require.Equal(t, fingerprint, identifier)
+	require.Equal(t, cert2Fingerprint, fingerprint)
+	require.Equal(t, cert2PEM, certificate)
+	require.Empty(t, metadata)
+
+	q := `SELECT identifier, auth_method, type, name, metadata FROM identities WHERE identifier = ?`
+	row = db.QueryRowContext(t.Context(), q, "019d6c49-4909-7e85-bac0-ae9b5b230cc0")
+	var authMethod AuthMethod
+	var identityType IdentityType
+	var name string
+	require.NoError(t, row.Scan(&identifier, &authMethod, &identityType, &name, &metadata))
+	require.Equal(t, AuthMethod(api.AuthenticationMethodBearer), authMethod)
+	require.Equal(t, IdentityType(api.IdentityTypeBearerTokenInitialUI), identityType)
+	require.Equal(t, "initial-ui-access", name)
+	require.Empty(t, metadata)
+
+	row = db.QueryRowContext(t.Context(), q, "jane.doe@example.com")
+	require.NoError(t, row.Scan(&identifier, &authMethod, &identityType, &name, &metadata))
+	require.Equal(t, AuthMethod(api.AuthenticationMethodOIDC), authMethod)
+	require.Equal(t, IdentityType(api.IdentityTypeOIDCClient), identityType)
+	require.Equal(t, "Jane Doe", name)
+	var oidcMetadata OIDCMetadata
+	err = json.Unmarshal([]byte(metadata), &oidcMetadata)
+	require.NoError(t, err)
+	require.Equal(t, "019d6c52-5b4e-70e3-8758-cb71d6c829ec", oidcMetadata.Subject)
+	require.Len(t, oidcMetadata.IdentityProviderGroups, 1)
+	require.Equal(t, "admins", oidcMetadata.IdentityProviderGroups[0])
+
+	row = db.QueryRowContext(t.Context(), q, "019d6c92-f1a2-77bf-98d9-ca867f80ad28")
+	require.NoError(t, row.Scan(&identifier, &authMethod, &identityType, &name, &metadata))
+	require.Equal(t, AuthMethod(api.AuthenticationMethodTLS), authMethod)
+	require.Equal(t, IdentityType(api.IdentityTypeCertificateClientPending), identityType)
+	require.Equal(t, "pending-tls-client", name)
+	var gotPendingTLSMetadata PendingTLSMetadata
+	err = json.Unmarshal([]byte(metadata), &gotPendingTLSMetadata)
+	require.NoError(t, err)
+	require.Equal(t, pendingTLSMetadata, gotPendingTLSMetadata)
+}
+
+func TestUpdateFromV89(t *testing.T) {
+	// Identity type codes:
+	// 9:  DevLXD token bearer
+	// 10: Client token bearer
+	// 11: Initial UI token bearer
+	//
+	// Entity type codes:
+	// 24: Identity entities
+	//
+	// Secret type codes:
+	// 2:  Bearer signing keys
+	schema := Schema()
+	db, err := schema.ExerciseUpdate(90, func(db *sql.DB) {
+		_, err := db.Exec(`
+-- Client bearer identity without a signing key (should become pending).
+INSERT INTO identities (identifier, auth_method, type, name, metadata) VALUES ('019d6c4f-bf62-7bb8-a1d2-000000000001', 3, 10, 'client-no-token', '');
+ -- Client bearer identity with a signing key and an expired token (should stay active).
+ INSERT INTO identities (identifier, auth_method, type, name, metadata) VALUES ('019d6c4f-bf62-7bb8-a1d2-000000000002', 3, 10, 'client-with-token', '{"token_expiry":"2020-01-01T00:00:00Z"}');
+-- DevLXD bearer identity without a signing key (should become pending).
+INSERT INTO identities (identifier, auth_method, type, name, metadata) VALUES ('019d6c4f-bf62-7bb8-a1d2-000000000003', 3, 9, 'devlxd-no-token', '');
+-- DevLXD bearer identity with a signing key (should stay active).
+INSERT INTO identities (identifier, auth_method, type, name, metadata) VALUES ('019d6c4f-bf62-7bb8-a1d2-000000000004', 3, 9, 'devlxd-with-token', '{"token_expiry":"2035-01-01T00:00:00Z"}');
+-- Initial UI identity without a signing key (should become pending).
+INSERT INTO identities (identifier, auth_method, type, name, metadata) VALUES ('019d6c4f-bf62-7bb8-a1d2-000000000005', 3, 11, 'initial-ui', '');
+
+-- Add signing keys for the two identities that have an issued token.
+INSERT INTO secrets (entity_type, entity_id, type, value) SELECT 24, id, 2, 'client-signing-key' FROM identities WHERE identifier = '019d6c4f-bf62-7bb8-a1d2-000000000002';
+INSERT INTO secrets (entity_type, entity_id, type, value) SELECT 24, id, 2, 'devlxd-signing-key' FROM identities WHERE identifier = '019d6c4f-bf62-7bb8-a1d2-000000000004';
+`)
+		require.NoError(t, err)
+	})
+	require.NoError(t, err)
+
+	assertType := func(identifier string, expected string) {
+		t.Helper()
+		var identityType IdentityType
+		err := db.QueryRowContext(t.Context(), `SELECT type FROM identities WHERE identifier = ?`, identifier).Scan(&identityType)
+		require.NoError(t, err)
+		require.Equal(t, IdentityType(expected), identityType)
+	}
+
+	// Tokenless client and DevLXD identities are demoted to their pending type.
+	assertType("019d6c4f-bf62-7bb8-a1d2-000000000001", api.IdentityTypeBearerTokenClientPending)
+	assertType("019d6c4f-bf62-7bb8-a1d2-000000000003", api.IdentityTypeBearerTokenDevLXDPending)
+
+	// Identities that still hold a signing key keep their active type.
+	assertType("019d6c4f-bf62-7bb8-a1d2-000000000002", api.IdentityTypeBearerTokenClient)
+	assertType("019d6c4f-bf62-7bb8-a1d2-000000000004", api.IdentityTypeBearerTokenDevLXD)
+
+	assertType("019d6c4f-bf62-7bb8-a1d2-000000000005", api.IdentityTypeBearerTokenInitialUIPending)
+
+	// There is only ever one initial UI identity, whether it is active or pending, so a second one of either type
+	// must collide with the pending one that is already present.
+	_, err = db.ExecContext(t.Context(), `INSERT INTO identities (identifier, auth_method, type, name, metadata) VALUES ('019d6c4f-bf62-7bb8-a1d2-000000000006', 3, 11, 'initial-ui-active', '')`)
+	require.ErrorContains(t, err, "UNIQUE constraint failed")
+
+	_, err = db.ExecContext(t.Context(), `INSERT INTO identities (identifier, auth_method, type, name, metadata) VALUES ('019d6c4f-bf62-7bb8-a1d2-000000000007', 3, 16, 'initial-ui-pending', '')`)
+	require.ErrorContains(t, err, "UNIQUE constraint failed")
+}
+
+func TestUpdateFromV89InitialUIWithSigningKey(t *testing.T) {
+	// The initial UI identity is subject to the same rule as the other bearer identities, it keeps its active type
+	// while it holds a signing key. It gets its own test because the index that predates this update permits only
+	// one initial UI identity in the fixture.
+	schema := Schema()
+	db, err := schema.ExerciseUpdate(90, func(db *sql.DB) {
+		_, err := db.Exec(`
+INSERT INTO identities (identifier, auth_method, type, name, metadata) VALUES ('019d6c4f-bf62-7bb8-a1d2-000000000008', 3, 11, 'initial-ui', '{"token_expiry":"2035-01-01T00:00:00Z"}');
+INSERT INTO secrets (entity_type, entity_id, type, value) SELECT 24, id, 2, 'initial-ui-signing-key' FROM identities WHERE identifier = '019d6c4f-bf62-7bb8-a1d2-000000000008';
+`)
+		require.NoError(t, err)
+	})
+	require.NoError(t, err)
+
+	var identityType IdentityType
+	err = db.QueryRowContext(t.Context(), `SELECT type FROM identities WHERE identifier = ?`, "019d6c4f-bf62-7bb8-a1d2-000000000008").Scan(&identityType)
+	require.NoError(t, err)
+	require.Equal(t, IdentityType(api.IdentityTypeBearerTokenInitialUI), identityType)
 }

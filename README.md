@@ -14,11 +14,11 @@ You should consider using LXD if you want to containerize different environments
 
 ## Get started
 
-See [Getting started](https://documentation.ubuntu.com/lxd/en/latest/getting_started/) in the LXD documentation for installation instructions and first steps.
+See [Getting started](https://canonical.com/lxd/docs/latest/getting_started/) in the LXD documentation for installation instructions and first steps.
 
-- Release announcements: [`https://discourse.ubuntu.com/c/lxd/news/`](https://discourse.ubuntu.com/c/lxd/news/143)
+- Release announcements: [`https://discourse.ubuntu.com/tags/c/project/lxd/news/143/release`](https://discourse.ubuntu.com/tags/c/project/lxd/news/143/release)
 - Release tarballs: [`https://github.com/canonical/lxd/releases/`](https://github.com/canonical/lxd/releases/)
-- Documentation: [`https://documentation.ubuntu.com/lxd/en/latest/`](https://documentation.ubuntu.com/lxd/en/latest/)
+- Documentation: [`https://canonical.com/lxd/docs/latest/`](https://canonical.com/lxd/docs/latest/)
 
 ## Status
 
@@ -27,7 +27,6 @@ Type                | Service               | Status
 Tests               | GitHub                | [![Build Status](https://github.com/canonical/lxd/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/canonical/lxd/actions?query=event%3Apush+branch%3Amain)
 Go documentation    | Godoc                 | [![GoDoc](https://godoc.org/github.com/canonical/lxd/client?status.svg)](https://godoc.org/github.com/canonical/lxd/client)
 Static analysis     | GoReport              | [![Go Report Card](https://goreportcard.com/badge/github.com/canonical/lxd)](https://goreportcard.com/report/github.com/canonical/lxd)
-Translations        | Weblate               | [![Translation status](https://hosted.weblate.org/widget/lxd/lxd/svg-badge.svg)](https://hosted.weblate.org/projects/lxd/lxd/)
 
 ## Installing LXD from packages
 
@@ -39,9 +38,9 @@ Linux               | [Snap](https://snapcraft.io/lxd)                  | `snap 
 Windows             | [Chocolatey](https://chocolatey.org/packages/lxc) | `choco install lxc`
 macOS               | [Homebrew](https://formulae.brew.sh/formula/lxc)  | `brew install lxc`
 
-The LXD snap packaging repository is available [here](https://github.com/canonical/lxd-pkg-snap).
+The LXD snap packaging files are available in the [snap](snap) directory.
 
-For more instructions on installing LXD for a wide variety of Linux distributions and operating systems, and to install LXD from source, see [How to install LXD](https://documentation.ubuntu.com/lxd/en/latest/installing/) in the documentation.
+For more instructions on installing LXD for a wide variety of Linux distributions and operating systems, and to install LXD from source, see [How to install LXD](https://canonical.com/lxd/docs/latest/installing/) in the documentation.
 
 ## Client SDK packages
 
@@ -54,7 +53,7 @@ Language  | URL
 Go        | https://pkg.go.dev/github.com/canonical/lxd/client
 Python    | https://github.com/canonical/pylxd
 
-For more information on using the LXD API, see [REST API](https://documentation.ubuntu.com/lxd/en/latest/restapi_landing/) in the documentation.
+For more information on using the LXD API, see [REST API](https://canonical.com/lxd/docs/latest/restapi_landing/) in the documentation.
 
 ## Tools for managing LXD
 
@@ -76,14 +75,14 @@ Terraform provider          | https://registry.terraform.io/providers/terraform-
 Consider the following aspects to ensure that your LXD installation is secure:
 
 - Keep your operating system up-to-date and install all available security patches.
-- Use only supported LXD versions (LTS releases or monthly feature releases).
+- Use only supported LXD versions (LTS releases or the latest feature release).
 - Restrict access to the LXD daemon and the remote API.
 - Configure your network interfaces to be secure.
 - Do not use privileged containers unless required. If you use privileged containers, put appropriate security measures in place.
   <!-- Include end security -->
-  See [Container security](https://documentation.ubuntu.com/lxd/en/latest/explanation/security/#container-security) for more information.
+  See [Container security](https://canonical.com/lxd/docs/latest/explanation/security/#container-security) for more information.
 
-See [Security](https://documentation.ubuntu.com/lxd/en/latest/explanation/security/) for detailed information.
+See [Security](https://canonical.com/lxd/docs/latest/explanation/security/) for detailed information.
 
 **IMPORTANT:**
 <!-- Include start security note -->
@@ -94,34 +93,31 @@ Therefore, you should only give such access to users who you'd trust with root a
 <!-- Include end security note -->
 <!-- Include start support -->
 
-## Support and community
+## Community support
 
-The following channels are available for you to interact with the LXD community.
-
-### Bug reports
-
-You can file bug reports and feature requests at: [`https://github.com/canonical/lxd/issues/new`](https://github.com/canonical/lxd/issues/new)
+You can seek support from the LXD developers as well as the wider community through the following channels.
 
 ### Forum
 
-A discussion forum is available at: [`https://discourse.ubuntu.com/c/lxd/`](https://discourse.ubuntu.com/c/lxd/126)
+Ask questions or engage in discussions: [`https://discourse.ubuntu.com/c/project/lxd/`](https://discourse.ubuntu.com/c/project/lxd/126)
 
-### IRC
+### Documentation
 
-If you prefer live discussions, you can find us in [`#lxd`](https://web.libera.chat/#lxd) on `irc.libera.chat`. See [Getting started with IRC](https://discourse.ubuntu.com/t/getting-started-with-irc/37907) if needed.
+Access the official documentation: [`https://canonical.com/lxd/docs/latest/`](https://canonical.com/lxd/docs/latest/)
 
-### Commercial support
+### Bug reports and feature requests
 
-Commercial support for LXD is available through [Ubuntu Pro](https://ubuntu.com/support) (Ubuntu Pro (Infra-only) or full Ubuntu Pro).
-The support covers all LTS versions for five years starting from the day of the release.
+To file a new bug or feature request, [submit an issue on GitHub](https://github.com/canonical/lxd/issues/new).
 
-See the [full service description](https://ubuntu.com/legal/ubuntu-pro-description) for detailed information about what support Ubuntu Pro provides.
+### Other community resources
 
-## Documentation
+You can find additional resources on the [LXD website](https://canonical.com/lxd), on [YouTube](https://www.youtube.com/channel/UCuP6xPt0WTeZu32CkQPpbvA), and the [community-created tutorials](https://discourse.ubuntu.com/c/project/lxd/tutorials/146).
 
-The official documentation is available at: [`https://documentation.ubuntu.com/lxd/en/latest/`](https://documentation.ubuntu.com/lxd/en/latest/)
+## Commercial support
 
-You can find additional resources on the [website](https://canonical.com/lxd), on [YouTube](https://www.youtube.com/channel/UCuP6xPt0WTeZu32CkQPpbvA) and in the [Tutorials section](https://discourse.ubuntu.com/c/lxd/tutorials/146) in the forum.
+LTS releases of LXD receive standard support for five years, which means they receive continuous updates. Commercial support for LXD is provided as part of [Ubuntu Pro](https://ubuntu.com/pro) (both Infra-only and full Ubuntu Pro), including for [attached LXD instances running Ubuntu](https://canonical.com/lxd/docs/latest/howto/instances_ubuntu_pro_attach/). See the [full service description](https://ubuntu.com/legal/ubuntu-pro-description) for details.
+
+Managed solutions and firefighting support are also available for LXD deployments. See: [Managed services](https://ubuntu.com/managed).
 
 <!-- Include end support -->
 

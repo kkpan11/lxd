@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"text/template"
@@ -27,11 +29,15 @@ const nftablesContentTemplate = "nftablesContent"
 // to contain underscores (where as instance name is not).
 const nftablesChainSeparator = "."
 
-// nftablesMinVersion We need at least 0.9.1 as this was when the arp ether saddr filters were added.
-const nftablesMinVersion = "0.9.1"
+// Nftables is an implementation of LXD firewall using nftables.
+type Nftables struct {
+	kernelVersion version.DottedVersion
+}
 
-// Nftables is an implmentation of LXD firewall using nftables.
-type Nftables struct{}
+// NewNftables returns a new nftables firewall driver.
+func NewNftables(kernelVersion version.DottedVersion) Nftables {
+	return Nftables{kernelVersion: kernelVersion}
+}
 
 // String returns the driver name.
 func (d Nftables) String() string {
@@ -40,73 +46,33 @@ func (d Nftables) String() string {
 
 // Compat returns whether the driver backend is in use, and any host compatibility errors.
 func (d Nftables) Compat() (bool, error) {
-	// Get the kernel version.
-	uname, err := shared.Uname()
-	if err != nil {
-		return false, err
+	// We require a >= 5.2 kernel to avoid weird conflicts with xtables and support for inet table NAT rules.
+	minVer, _ := version.NewDottedVersion("5.2")
+	if d.kernelVersion == (version.DottedVersion{}) {
+		return false, errors.New("Kernel version is unknown")
 	}
 
-	// We require a >= 5.2 kernel to avoid weird conflicts with xtables and support for inet table NAT rules.
-	releaseLen := len(uname.Release)
-	if releaseLen > 1 {
-		verErr := fmt.Errorf("Kernel version does not meet minimum requirement of 5.2")
-		releaseParts := strings.SplitN(uname.Release, ".", 3)
-		if len(releaseParts) < 2 {
-			return false, fmt.Errorf("Failed parsing kernel version number into parts: %w", err)
-		}
-
-		majorVer := releaseParts[0]
-		majorVerInt, err := strconv.Atoi(majorVer)
-		if err != nil {
-			return false, fmt.Errorf("Failed parsing kernel major version number %q: %w", majorVer, err)
-		}
-
-		if majorVerInt < 5 {
-			return false, verErr
-		}
-
-		if majorVerInt == 5 {
-			minorVer := releaseParts[1]
-			minorVerInt, err := strconv.Atoi(minorVer)
-			if err != nil {
-				return false, fmt.Errorf("Failed parsing kernel minor version number %q: %w", minorVer, err)
-			}
-
-			if minorVerInt < 2 {
-				return false, verErr
-			}
-		}
+	if d.kernelVersion.Compare(minVer) < 0 {
+		return false, fmt.Errorf("Kernel version does not meet minimum requirement of %s", minVer)
 	}
 
 	// Check if nftables nft command exists, if not use xtables.
-	_, err = exec.LookPath("nft")
+	_, err := exec.LookPath("nft")
 	if err != nil {
 		return false, fmt.Errorf("Backend command %q missing", "nft")
 	}
 
-	// Get nftables version.
-	nftVersion, err := d.hostVersion()
-	if err != nil {
-		return false, fmt.Errorf("Failed detecting nft version: %w", err)
-	}
-
-	// Check nft version meets minimum required.
-	minVer, _ := version.NewDottedVersion(nftablesMinVersion)
-	if nftVersion.Compare(minVer) < 0 {
-		return false, fmt.Errorf("nft version %q is too low, need %q or above", nftVersion, nftablesMinVersion)
-	}
-
 	// Check that nftables works at all (some kernels let you list ruleset despite missing support).
-	testTable := fmt.Sprintf("lxd_test_%s", uuid.New().String())
+	testTable := "lxd_test_" + uuid.New().String()
 
 	_, err = shared.RunCommandCLocale("nft", "create", "table", testTable)
 	if err != nil {
-		return false, fmt.Errorf("Failed to create a test table: %w", err)
+		return false, fmt.Errorf("Failed creating a test table: %w", err)
 	}
 
 	_, err = shared.RunCommandCLocale("nft", "delete", "table", testTable)
 	if err != nil {
-		return false, fmt.Errorf("Failed to delete a test table: %w", err)
+		return false, fmt.Errorf("Failed deleting a test table: %w", err)
 	}
 
 	// Check whether in use by parsing ruleset and looking for existing rules.
@@ -116,7 +82,7 @@ func (d Nftables) Compat() (bool, error) {
 	}
 
 	for _, item := range ruleset {
-		if item.ItemType == "rule" {
+		if item.itemType == "rule" {
 			return true, nil // At least one rule found indicates in use.
 		}
 	}
@@ -126,7 +92,7 @@ func (d Nftables) Compat() (bool, error) {
 
 // nftGenericItem represents some common fields amongst the different nftables types.
 type nftGenericItem struct {
-	ItemType string `json:"-"`      // Type of item (table, chain or rule). Populated by LXD.
+	itemType string // Type of item (table, chain or rule). Populated by LXD.
 	Family   string `json:"family"` // Family of item (ip, ip6, bridge etc).
 	Table    string `json:"table"`  // Table the item belongs to (for chains and rules).
 	Chain    string `json:"chain"`  // Chain the item belongs to (for rules).
@@ -165,13 +131,13 @@ func (d Nftables) nftParseRuleset() ([]nftGenericItem, error) {
 		chain, foundChain := item["chain"]
 		table, foundTable := item["table"]
 		if foundRule {
-			rule.ItemType = "rule"
+			rule.itemType = "rule"
 			items = append(items, rule)
 		} else if foundChain {
-			chain.ItemType = "chain"
+			chain.itemType = "chain"
 			items = append(items, chain)
 		} else if foundTable {
-			table.ItemType = "table"
+			table.itemType = "table"
 			items = append(items, table)
 		}
 	}
@@ -182,17 +148,6 @@ func (d Nftables) nftParseRuleset() ([]nftGenericItem, error) {
 	}
 
 	return items, nil
-}
-
-// GetVersion returns the version of nftables.
-func (d Nftables) hostVersion() (*version.DottedVersion, error) {
-	output, err := shared.RunCommandCLocale("nft", "--version")
-	if err != nil {
-		return nil, fmt.Errorf("Failed to check nftables version: %w", err)
-	}
-
-	lines := strings.Split(string(output), " ")
-	return version.Parse(strings.TrimPrefix(lines[1], "v"))
 }
 
 // networkSetupForwardingPolicy allows forwarding dependent on boolean argument.
@@ -378,7 +333,7 @@ func (d Nftables) NetworkClear(networkName string, _ bool, _ []uint) error {
 
 // instanceDeviceLabel returns the unique label used for instance device chains.
 func (d Nftables) instanceDeviceLabel(projectName, instanceName, deviceName string) string {
-	return fmt.Sprintf("%s%s%s", project.Instance(projectName, instanceName), nftablesChainSeparator, deviceName)
+	return project.Instance(projectName, instanceName) + nftablesChainSeparator + deviceName
 }
 
 // InstanceSetupBridgeFilter sets up the filter rules to apply bridged device IP filtering.
@@ -398,7 +353,7 @@ func (d Nftables) InstanceSetupBridgeFilter(projectName string, instanceName str
 		"parentName":     parentName,
 		"hostName":       hostName,
 		"hwAddr":         hwAddr,
-		"hwAddrHex":      fmt.Sprintf("0x%s", hex.EncodeToString(mac)),
+		"hwAddrHex":      "0x" + hex.EncodeToString(mac),
 	}
 
 	// Filter unwanted ethernet frames when using IP filtering.
@@ -430,7 +385,7 @@ func (d Nftables) InstanceSetupBridgeFilter(projectName string, instanceName str
 		ipv6Nets = append(ipv6Nets, map[string]string{
 			"net":       ipv6Net.String(),
 			"nBits":     strconv.Itoa(ones),
-			"hexPrefix": fmt.Sprintf("0x%s", prefix),
+			"hexPrefix": "0x" + prefix,
 		})
 	}
 
@@ -461,22 +416,22 @@ func (d Nftables) InstanceClearBridgeFilter(projectName string, instanceName str
 // InstanceSetupProxyNAT creates DNAT rules for proxy devices.
 func (d Nftables) InstanceSetupProxyNAT(projectName string, instanceName string, deviceName string, forward *AddressForward) error {
 	if forward.ListenAddress == nil {
-		return fmt.Errorf("Listen address is required")
+		return errors.New("Listen address is required")
 	}
 
 	if forward.TargetAddress == nil {
-		return fmt.Errorf("Target address is required")
+		return errors.New("Target address is required")
 	}
 
 	listenPortsLen := len(forward.ListenPorts)
 	if listenPortsLen <= 0 {
-		return fmt.Errorf("At least 1 listen port must be supplied")
+		return errors.New("At least 1 listen port must be supplied")
 	}
 
 	// If multiple target ports supplied, check they match the listen port(s) count.
 	targetPortsLen := len(forward.TargetPorts)
 	if targetPortsLen != 1 && targetPortsLen != listenPortsLen {
-		return fmt.Errorf("Mismatch between listen port(s) and target port(s) count")
+		return errors.New("Mismatch between listen port(s) and target port(s) count")
 	}
 
 	ipFamily := "ip"
@@ -488,8 +443,8 @@ func (d Nftables) InstanceSetupProxyNAT(projectName string, instanceName string,
 	targetAddressStr := forward.TargetAddress.String()
 
 	// Generate slices of rules to add.
-	var dnatRules []map[string]any
-	var snatRules []map[string]any
+	dnatRules := make([]map[string]any, 0, listenPortsLen)
+	snatRules := make([]map[string]any, 0, listenPortsLen)
 
 	targetPortRanges := portRangesFromSlice(forward.TargetPorts)
 	for _, targetPortRange := range targetPortRanges {
@@ -508,9 +463,9 @@ func (d Nftables) InstanceSetupProxyNAT(projectName string, instanceName string,
 		targetDest := targetAddressStr
 		if targetPortRange[1] == 1 {
 			targetPortStr := portRangeStr(targetPortRange, ":")
-			targetDest = fmt.Sprintf("%s:%s", targetAddressStr, targetPortStr)
+			targetDest = targetAddressStr + ":" + targetPortStr
 			if ipFamily == "ip6" {
-				targetDest = fmt.Sprintf("[%s]:%s", targetAddressStr, targetPortStr)
+				targetDest = "[" + targetAddressStr + "]:" + targetPortStr
 			}
 		}
 
@@ -597,7 +552,7 @@ func (d Nftables) removeChains(families []string, chainSuffix string, chains ...
 	if chainSuffix != "" {
 		fullChains = make([]string, 0, len(chains))
 		for _, chain := range chains {
-			fullChains = append(fullChains, fmt.Sprintf("%s%s%s", chain, nftablesChainSeparator, chainSuffix))
+			fullChains = append(fullChains, chain+nftablesChainSeparator+chainSuffix)
 		}
 	}
 
@@ -605,7 +560,7 @@ func (d Nftables) removeChains(families []string, chainSuffix string, chains ...
 	foundChains := make(map[string]nftGenericItem)
 	for _, family := range families {
 		for _, item := range ruleset {
-			if item.ItemType == "chain" && item.Family == family && item.Table == nftablesNamespace && shared.ValueInSlice(item.Name, fullChains) {
+			if item.itemType == "chain" && item.Family == family && item.Table == nftablesNamespace && slices.Contains(fullChains, item.Name) {
 				foundChains[item.Name] = item
 			}
 		}
@@ -618,7 +573,7 @@ func (d Nftables) removeChains(families []string, chainSuffix string, chains ...
 			continue
 		}
 
-		_, err = shared.RunCommand("nft", "flush", "chain", item.Family, nftablesNamespace, item.Name, ";", "delete", "chain", item.Family, nftablesNamespace, item.Name)
+		_, err = shared.RunCommand(context.TODO(), "nft", "flush", "chain", item.Family, nftablesNamespace, item.Name, ";", "delete", "chain", item.Family, nftablesNamespace, item.Name)
 		if err != nil {
 			return fmt.Errorf("Failed deleting nftables chain %q (%s): %w", item.Name, item.Family, err)
 		}
@@ -686,7 +641,7 @@ func (d Nftables) InstanceClearNetPrio(projectName string, instanceName string, 
 	}
 
 	deviceLabel := d.instanceDeviceLabel(projectName, instanceName, deviceName)
-	chainLabel := fmt.Sprintf("netprio%s%s", nftablesChainSeparator, deviceLabel)
+	chainLabel := "netprio" + nftablesChainSeparator + deviceLabel
 
 	err := d.removeChains([]string{"netdev"}, chainLabel, "egress")
 	if err != nil {
@@ -719,12 +674,12 @@ func (d Nftables) NetworkApplyACLRules(networkName string, rules []ACLRule) erro
 			}
 
 			if nftRule == "" {
-				return fmt.Errorf("Invalid empty rule generated")
+				return errors.New("Invalid empty rule generated")
 			}
 
 			nftRules = append(nftRules, nftRule)
 		} else if nftRule == "" {
-			return fmt.Errorf("Invalid empty rule generated")
+			return errors.New("Invalid empty rule generated")
 		}
 	}
 
@@ -798,7 +753,7 @@ func (d Nftables) aclRuleCriteriaToRules(networkName string, ipVersion uint, rul
 	}
 
 	// Add protocol filters.
-	if shared.ValueInSlice(rule.Protocol, []string{"tcp", "udp"}) {
+	if slices.Contains([]string{"tcp", "udp"}, rule.Protocol) {
 		args = append(args, "meta", "l4proto", rule.Protocol)
 
 		if rule.SourcePort != "" {
@@ -808,7 +763,7 @@ func (d Nftables) aclRuleCriteriaToRules(networkName string, ipVersion uint, rul
 		if rule.DestinationPort != "" {
 			args = append(args, d.aclRulePortToACLMatch("dport", shared.SplitNTrimSpace(rule.DestinationPort, ",", -1, false)...)...)
 		}
-	} else if shared.ValueInSlice(rule.Protocol, []string{"icmp4", "icmp6"}) {
+	} else if slices.Contains([]string{"icmp4", "icmp6"}, rule.Protocol) {
 		var icmpIPVersion uint
 		var protoName string
 
@@ -852,7 +807,7 @@ func (d Nftables) aclRuleCriteriaToRules(networkName string, ipVersion uint, rul
 
 		if rule.LogName != "" {
 			// Add a trailing space to prefix for readability in logs.
-			args = append(args, "prefix", fmt.Sprintf(`"%s "`, rule.LogName))
+			args = append(args, "prefix", `"`+rule.LogName+` "`)
 		}
 	}
 
@@ -895,7 +850,7 @@ func (d Nftables) aclRuleSubjectToACLMatch(direction string, ipVersion uint, sub
 					continue // Skip subjects that are not for the ipVersion we are looking for.
 				}
 
-				fieldParts = append(fieldParts, fmt.Sprintf("%s-%s", criterionParts[0], criterionParts[1]))
+				fieldParts = append(fieldParts, criterionParts[0]+"-"+criterionParts[1])
 			}
 		} else {
 			ip := net.ParseIP(subjectCriterion)
@@ -927,7 +882,7 @@ func (d Nftables) aclRuleSubjectToACLMatch(direction string, ipVersion uint, sub
 			ipFamily = "ip6"
 		}
 
-		return []string{ipFamily, direction, fmt.Sprintf("{%s}", strings.Join(fieldParts, ","))}, partial, nil
+		return []string{ipFamily, direction, "{" + strings.Join(fieldParts, ",") + "}"}, partial, nil
 	}
 
 	return nil, partial, nil // No subjects suitable for ipVersion.
@@ -941,13 +896,13 @@ func (d Nftables) aclRulePortToACLMatch(direction string, portCriteria ...string
 	for _, portCriterion := range portCriteria {
 		criterionParts := strings.SplitN(portCriterion, "-", 2)
 		if len(criterionParts) > 1 {
-			fieldParts = append(fieldParts, fmt.Sprintf("%s-%s", criterionParts[0], criterionParts[1]))
+			fieldParts = append(fieldParts, criterionParts[0]+"-"+criterionParts[1])
 		} else {
 			fieldParts = append(fieldParts, criterionParts[0])
 		}
 	}
 
-	return []string{"th", direction, fmt.Sprintf("{%s}", strings.Join(fieldParts, ","))}
+	return []string{"th", direction, "{" + strings.Join(fieldParts, ",") + "}"}
 }
 
 // NetworkApplyForwards apply network address forward rules to firewall.
@@ -1016,9 +971,9 @@ func (d Nftables) NetworkApplyForwards(networkName string, rules []AddressForwar
 					targetDest := targetAddressStr
 					if targetPortRange[1] == 1 {
 						targetPortStr := portRangeStr(targetPortRange, ":")
-						targetDest = fmt.Sprintf("%s:%s", targetAddressStr, targetPortStr)
+						targetDest = targetAddressStr + ":" + targetPortStr
 						if ipFamily == "ip6" {
-							targetDest = fmt.Sprintf("[%s]:%s", targetAddressStr, targetPortStr)
+							targetDest = "[" + targetAddressStr + "]:" + targetPortStr
 						}
 					}
 
@@ -1034,7 +989,7 @@ func (d Nftables) NetworkApplyForwards(networkName string, rules []AddressForwar
 				// Format the destination host/port as appropriate.
 				targetDest := targetAddressStr
 				if ipFamily == "ip6" {
-					targetDest = fmt.Sprintf("[%s]", targetAddressStr)
+					targetDest = "[" + targetAddressStr + "]"
 				}
 
 				dnatRules = append(dnatRules, map[string]any{

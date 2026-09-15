@@ -2,9 +2,12 @@ package dnsmasq
 
 import (
 	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -13,10 +16,10 @@ import (
 	"github.com/canonical/lxd/lxd/storage/filesystem"
 	"github.com/canonical/lxd/lxd/subprocess"
 	"github.com/canonical/lxd/shared"
-	"github.com/canonical/lxd/shared/version"
 )
 
 const staticAllocationDeviceSeparator = "."
+const staticAllocationRemovingSuffix = ".removing"
 
 // DHCPAllocation represents an IP allocation from dnsmasq.
 type DHCPAllocation struct {
@@ -29,21 +32,23 @@ type DHCPAllocation struct {
 var ConfigMutex sync.Mutex
 
 // UpdateStaticEntry writes a single dhcp-host line for a network/instance combination.
+// With --dhcp-hostsdir, dnsmasq uses inotify to automatically detect new and changed files,
+// so no SIGHUP is required after calling this function.
 func UpdateStaticEntry(network string, projectName string, instanceName string, deviceName string, netConfig map[string]string, hwaddr string, ipv4Address string, ipv6Address string) error {
 	hwaddr = strings.ToLower(hwaddr)
 	line := hwaddr
 
 	// Generate the dhcp-host line
 	if ipv4Address != "" {
-		line += fmt.Sprintf(",%s", ipv4Address)
+		line += "," + ipv4Address
 	}
 
 	if ipv6Address != "" {
-		line += fmt.Sprintf(",[%s]", ipv6Address)
+		line += ",[" + ipv6Address + "]"
 	}
 
 	if netConfig["dns.mode"] == "" || netConfig["dns.mode"] == "managed" {
-		line += fmt.Sprintf(",%s", project.DNS(projectName, instanceName))
+		line += "," + project.DNS(projectName, instanceName)
 	}
 
 	if line == hwaddr {
@@ -51,7 +56,16 @@ func UpdateStaticEntry(network string, projectName string, instanceName string, 
 	}
 
 	deviceStaticFileName := StaticAllocationFileName(projectName, instanceName, deviceName)
-	err := os.WriteFile(shared.VarPath("networks", network, "dnsmasq.hosts", deviceStaticFileName), []byte(line+"\n"), 0644)
+	filePath := shared.VarPath("networks", network, "dnsmasq.hosts", deviceStaticFileName)
+
+	// Check if file already has the same content, skip write to avoid unnecessary inotify events.
+	existingContent, readErr := os.ReadFile(filePath)
+	content := []byte(line + "\n")
+	if readErr == nil && bytes.Equal(existingContent, content) {
+		return nil
+	}
+
+	err := os.WriteFile(filePath, content, 0644)
 	if err != nil {
 		return err
 	}
@@ -60,10 +74,27 @@ func UpdateStaticEntry(network string, projectName string, instanceName string, 
 }
 
 // RemoveStaticEntry removes a single dhcp-host line for a network/instance combination.
-func RemoveStaticEntry(network string, projectName string, instanceName string, deviceName string) error {
+// The file is moved out of the dnsmasq.hosts directory before deletion to avoid triggering
+// inotify events. The caller should send SIGHUP via Kill(network, true) to reload dnsmasq.
+func RemoveStaticEntry(network, projectName, instanceName, deviceName string) error {
 	deviceStaticFileName := StaticAllocationFileName(projectName, instanceName, deviceName)
-	err := os.Remove(shared.VarPath("networks", network, "dnsmasq.hosts", deviceStaticFileName))
-	if err != nil && !os.IsNotExist(err) {
+	netPath := shared.VarPath("networks", network, "dnsmasq.hosts")
+	filePath := filepath.Join(netPath, deviceStaticFileName)
+
+	// Sibling path avoids IN_MOVED_TO in dnsmasq's inotify watch on dnsmasq.hosts/.
+	tmpPath := netPath + "." + deviceStaticFileName + staticAllocationRemovingSuffix
+
+	err := os.Rename(filePath, tmpPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+
+		return err
+	}
+
+	err = os.Remove(tmpPath)
+	if err != nil {
 		return err
 	}
 
@@ -74,14 +105,14 @@ func RemoveStaticEntry(network string, projectName string, instanceName string, 
 func Kill(name string, reload bool) error {
 	pidPath := shared.VarPath("networks", name, "dnsmasq.pid")
 
-	// If the pid file doesn't exist, there is no process to kill.
-	if !shared.PathExists(pidPath) {
-		return nil
-	}
-
 	// Import saved subprocess details
 	p, err := subprocess.ImportProcess(pidPath)
 	if err != nil {
+		// If the pid file doesn't exist, there is no process to kill.
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+
 		return fmt.Errorf("Could not read pid file: %s", err)
 	}
 
@@ -96,23 +127,12 @@ func Kill(name string, reload bool) error {
 
 	err = p.Stop()
 	if err != nil && err != subprocess.ErrNotRunning {
-		return fmt.Errorf("Unable to kill dnsmasq: %s", err)
+		return fmt.Errorf("Cannot kill dnsmasq: %s", err)
 	}
 
 	time.Sleep(100 * time.Millisecond) // Give OS time to release sockets.
 
 	return nil
-}
-
-// GetVersion returns the version of dnsmasq.
-func GetVersion() (*version.DottedVersion, error) {
-	output, err := shared.RunCommandCLocale("dnsmasq", "--version")
-	if err != nil {
-		return nil, fmt.Errorf("Failed to check dnsmasq version: %w", err)
-	}
-
-	lines := strings.Split(string(output), " ")
-	return version.Parse(lines[2])
 }
 
 // DHCPStaticAllocationPath returns the path to the DHCP static allocation file.
@@ -122,10 +142,7 @@ func DHCPStaticAllocationPath(network string, deviceStaticFileName string) strin
 
 // DHCPStaticAllocation retrieves the dnsmasq statically allocated MAC and IPs for an instance device static file.
 // Returns MAC, IPv4 and IPv6 DHCPAllocation structs respectively.
-func DHCPStaticAllocation(network string, deviceStaticFileName string) (net.HardwareAddr, DHCPAllocation, DHCPAllocation, error) {
-	var IPv4, IPv6 DHCPAllocation
-	var mac net.HardwareAddr
-
+func DHCPStaticAllocation(network string, deviceStaticFileName string) (mac net.HardwareAddr, IPv4 DHCPAllocation, IPv6 DHCPAllocation, err error) {
 	file, err := os.Open(DHCPStaticAllocationPath(network, deviceStaticFileName))
 	if err != nil {
 		return nil, IPv4, IPv6, err
@@ -135,16 +152,17 @@ func DHCPStaticAllocation(network string, deviceStaticFileName string) (net.Hard
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		fields := strings.SplitN(scanner.Text(), ",", -1)
-		for _, field := range fields {
+		fields := strings.SplitSeq(scanner.Text(), ",")
+		for field := range fields {
 			// Check if field is IPv4 or IPv6 address.
 			if strings.Count(field, ".") == 3 {
 				IP := net.ParseIP(field)
-				if IP.To4() == nil {
+				ip4 := IP.To4()
+				if ip4 == nil {
 					return nil, IPv4, IPv6, fmt.Errorf("Error parsing IP address %q", field)
 				}
 
-				IPv4 = DHCPAllocation{StaticFileName: deviceStaticFileName, IP: IP.To4(), MAC: mac}
+				IPv4 = DHCPAllocation{StaticFileName: deviceStaticFileName, IP: ip4, MAC: mac}
 			} else if strings.HasPrefix(field, "[") && strings.HasSuffix(field, "]") {
 				IP := net.ParseIP(field[1 : len(field)-1])
 				if IP == nil {
@@ -183,14 +201,16 @@ func DHCPStaticAllocation(network string, deviceStaticFileName string) (net.Hard
 // for the network is set to "dynamic" and so cannot be trusted, so in this case we do not return
 // any identifying info.
 func DHCPAllAllocations(network string) (map[[4]byte]DHCPAllocation, map[[16]byte]DHCPAllocation, error) {
-	IPv4s := make(map[[4]byte]DHCPAllocation)
-	IPv6s := make(map[[16]byte]DHCPAllocation)
+	networkPath := shared.VarPath("networks", network)
 
 	// First read all statically allocated IPs.
-	files, err := os.ReadDir(shared.VarPath("networks", network, "dnsmasq.hosts"))
-	if err != nil && os.IsNotExist(err) {
+	files, err := os.ReadDir(filepath.Join(networkPath, "dnsmasq.hosts"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, nil, err
 	}
+
+	IPv4s := make(map[[4]byte]DHCPAllocation)
+	IPv6s := make(map[[16]byte]DHCPAllocation)
 
 	for _, entry := range files {
 		_, IPv4, IPv6, err := DHCPStaticAllocation(network, entry.Name())
@@ -200,19 +220,19 @@ func DHCPAllAllocations(network string) (map[[4]byte]DHCPAllocation, map[[16]byt
 
 		if IPv4.IP != nil {
 			var IPKey [4]byte
-			copy(IPKey[:], IPv4.IP.To4())
+			copy(IPKey[:], IPv4.IP)
 			IPv4s[IPKey] = IPv4
 		}
 
 		if IPv6.IP != nil {
 			var IPKey [16]byte
-			copy(IPKey[:], IPv6.IP.To16())
+			copy(IPKey[:], IPv6.IP)
 			IPv6s[IPKey] = IPv6
 		}
 	}
 
 	// Next read all dynamic allocated IPs.
-	file, err := os.Open(shared.VarPath("networks", network, "dnsmasq.leases"))
+	file, err := os.Open(filepath.Join(networkPath, "dnsmasq.leases"))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -228,10 +248,14 @@ func DHCPAllAllocations(network string) (map[[4]byte]DHCPAllocation, map[[16]byt
 				return nil, nil, fmt.Errorf("Error parsing IP address: %v", fields[2])
 			}
 
+			ip4 := IP.To4()
+
 			// Handle IPv6 addresses.
-			if IP.To4() == nil {
+			if ip4 == nil {
+				ip16 := IP.To16()
+
 				var IPKey [16]byte
-				copy(IPKey[:], IP.To16())
+				copy(IPKey[:], ip16)
 
 				// Don't replace IPs from static config as more reliable.
 				if IPv6s[IPKey].StaticFileName != "" {
@@ -239,7 +263,7 @@ func DHCPAllAllocations(network string) (map[[4]byte]DHCPAllocation, map[[16]byt
 				}
 
 				IPv6s[IPKey] = DHCPAllocation{
-					IP: IP.To16(),
+					IP: ip16,
 				}
 			} else {
 				// MAC only available in IPv4 leases.
@@ -249,7 +273,7 @@ func DHCPAllAllocations(network string) (map[[4]byte]DHCPAllocation, map[[16]byt
 				}
 
 				var IPKey [4]byte
-				copy(IPKey[:], IP.To4())
+				copy(IPKey[:], ip4)
 
 				// Don't replace IPs from static config as more reliable.
 				if IPv4s[IPKey].StaticFileName != "" {
@@ -258,7 +282,7 @@ func DHCPAllAllocations(network string) (map[[4]byte]DHCPAllocation, map[[16]byt
 
 				IPv4s[IPKey] = DHCPAllocation{
 					MAC: MAC,
-					IP:  IP.To4(),
+					IP:  ip4,
 				}
 			}
 		}
@@ -277,4 +301,34 @@ func StaticAllocationFileName(projectName string, instanceName string, deviceNam
 	escapedDeviceName := filesystem.PathNameEncode(deviceName)
 
 	return strings.Join([]string{project.Instance(projectName, instanceName), escapedDeviceName}, staticAllocationDeviceSeparator)
+}
+
+// CleanupLeftoverRemovingFiles removes any leftover .removing files in the network directory.
+// These files can be left behind if LXD is stopped after renaming a file in RemoveStaticEntry
+// but before the file is actually deleted.
+func CleanupLeftoverRemovingFiles(network string) error {
+	netPath := shared.VarPath("networks", network, "dnsmasq.hosts")
+	dirPath := filepath.Dir(netPath)
+	basePrefix := filepath.Base(netPath) + "."
+
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return fmt.Errorf("Failed reading network directory: %w", err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		if strings.HasPrefix(name, basePrefix) && strings.HasSuffix(name, staticAllocationRemovingSuffix) {
+			err = os.Remove(filepath.Join(dirPath, name))
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("Failed removing leftover file %q: %w", name, err)
+			}
+		}
+	}
+
+	return nil
 }

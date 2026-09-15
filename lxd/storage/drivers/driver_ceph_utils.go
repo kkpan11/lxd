@@ -1,13 +1,16 @@
 package drivers
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -48,8 +51,9 @@ var cephVolTypePrefixes = map[VolumeType]string{
 // osdPoolExists checks whether a given OSD pool exists.
 func (d *ceph) osdPoolExists() (bool, error) {
 	_, err := shared.RunCommand(
+		context.TODO(),
 		"ceph",
-		"--name", fmt.Sprintf("client.%s", d.config["ceph.user.name"]),
+		"--name", "client."+d.config["ceph.user.name"],
 		"--cluster", d.config["ceph.cluster_name"],
 		"osd",
 		"pool",
@@ -82,8 +86,9 @@ func (d *ceph) osdPoolExists() (bool, error) {
 //     existence of the pool first.
 func (d *ceph) osdDeletePool() error {
 	_, err := shared.RunCommand(
+		context.TODO(),
 		"ceph",
-		"--name", fmt.Sprintf("client.%s", d.config["ceph.user.name"]),
+		"--name", "client."+d.config["ceph.user.name"],
 		"--cluster", d.config["ceph.cluster_name"],
 		"osd",
 		"pool",
@@ -98,12 +103,17 @@ func (d *ceph) osdDeletePool() error {
 	return nil
 }
 
+func (d *ceph) roundUpTo512(a int64) int64 {
+	result := (a / 512) * 512
+	if a%512 != 0 {
+		result += 512
+	}
+
+	return result
+}
+
 // rbdCreateVolume creates an RBD storage volume.
-// Note that the default set of features is intentionally limited
-// by passing --image-feature explicitly. This is done to ensure that
-// the chances of a conflict between the features supported by the userspace
-// library and the kernel module are minimized. Otherwise random panics might
-// occur.
+// Note that the default set of features can be limited by setting the ceph.rbd.features config key.
 func (d *ceph) rbdCreateVolume(vol Volume, size string) error {
 	sizeBytes, err := units.ParseByteSizeString(size)
 	if err != nil {
@@ -120,20 +130,21 @@ func (d *ceph) rbdCreateVolume(vol Volume, size string) error {
 		for _, feature := range shared.SplitNTrimSpace(d.config["ceph.rbd.features"], ",", -1, true) {
 			cmd = append(cmd, "--image-feature", feature)
 		}
-	} else {
-		cmd = append(cmd, "--image-feature", "layering")
 	}
 
 	if d.config["ceph.osd.data_pool_name"] != "" {
 		cmd = append(cmd, "--data-pool", d.config["ceph.osd.data_pool_name"])
 	}
 
+	// Ceph allows writing only to images of size in multiples of 512B
+	sizeBytes = d.roundUpTo512(sizeBytes)
+
 	cmd = append(cmd,
 		"--size", fmt.Sprintf("%dB", sizeBytes),
 		"create",
 		d.getRBDVolumeName(vol, "", false, false))
 
-	_, err = shared.RunCommand("rbd", cmd...)
+	_, err = shared.RunCommand(context.TODO(), "rbd", cmd...)
 	return err
 }
 
@@ -144,6 +155,7 @@ func (d *ceph) rbdCreateVolume(vol Volume, size string) error {
 //     to check for the existence of the pool first.
 func (d *ceph) rbdDeleteVolume(vol Volume) error {
 	_, err := shared.RunCommand(
+		context.TODO(),
 		"rbd",
 		"--id", d.config["ceph.user.name"],
 		"--cluster", d.config["ceph.cluster_name"],
@@ -163,6 +175,7 @@ func (d *ceph) rbdDeleteVolume(vol Volume) error {
 func (d *ceph) rbdMapVolume(vol Volume) (string, error) {
 	rbdName := d.getRBDVolumeName(vol, "", false, false)
 	devPath, err := shared.RunCommand(
+		context.TODO(),
 		"rbd",
 		"--id", d.config["ceph.user.name"],
 		"--cluster", d.config["ceph.cluster_name"],
@@ -175,7 +188,7 @@ func (d *ceph) rbdMapVolume(vol Volume) (string, error) {
 
 	idx := strings.Index(devPath, "/dev/rbd")
 	if idx < 0 {
-		return "", fmt.Errorf("Failed to detect mapped device path")
+		return "", errors.New("Failed detecting mapped device path")
 	}
 
 	devPath = strings.TrimSpace(devPath[idx:])
@@ -194,6 +207,7 @@ func (d *ceph) rbdUnmapVolume(vol Volume, unmapUntilEINVAL bool) error {
 
 again:
 	_, err := shared.RunCommand(
+		context.TODO(),
 		"rbd",
 		"--id", d.config["ceph.user.name"],
 		"--cluster", d.config["ceph.cluster_name"],
@@ -218,7 +232,7 @@ again:
 					// EBUSY (currently in use).
 					busyCount++
 					if busyCount == 10 {
-						return err
+						return api.StatusErrorf(http.StatusLocked, "%w", err)
 					}
 
 					// Wait a second an try again.
@@ -246,6 +260,7 @@ again:
 func (d *ceph) rbdUnmapVolumeSnapshot(vol Volume, snapshotName string, unmapUntilEINVAL bool) error {
 again:
 	_, err := shared.RunCommand(
+		context.TODO(),
 		"rbd",
 		"--id", d.config["ceph.user.name"],
 		"--cluster", d.config["ceph.cluster_name"],
@@ -277,6 +292,7 @@ again:
 // rbdCreateVolumeSnapshot creates a read-write snapshot of a given RBD storage volume.
 func (d *ceph) rbdCreateVolumeSnapshot(vol Volume, snapshotName string) error {
 	_, err := shared.RunCommand(
+		context.TODO(),
 		"rbd",
 		"--id", d.config["ceph.user.name"],
 		"--cluster", d.config["ceph.cluster_name"],
@@ -296,6 +312,7 @@ func (d *ceph) rbdCreateVolumeSnapshot(vol Volume, snapshotName string) error {
 // This is a precondition to be able to create RBD clones from a given snapshot.
 func (d *ceph) rbdProtectVolumeSnapshot(vol Volume, snapshotName string) error {
 	_, err := shared.RunCommand(
+		context.TODO(),
 		"rbd",
 		"--id", d.config["ceph.user.name"],
 		"--cluster", d.config["ceph.cluster_name"],
@@ -327,6 +344,7 @@ func (d *ceph) rbdProtectVolumeSnapshot(vol Volume, snapshotName string) error {
 // - This command will only succeed if the snapshot does not have any clones.
 func (d *ceph) rbdUnprotectVolumeSnapshot(vol Volume, snapshotName string) error {
 	_, err := shared.RunCommand(
+		context.TODO(),
 		"rbd",
 		"--id", d.config["ceph.user.name"],
 		"--cluster", d.config["ceph.cluster_name"],
@@ -364,8 +382,6 @@ func (d *ceph) rbdCreateClone(sourceVol Volume, sourceSnapshotName string, targe
 		for _, feature := range shared.SplitNTrimSpace(d.config["ceph.rbd.features"], ",", -1, true) {
 			cmd = append(cmd, "--image-feature", feature)
 		}
-	} else {
-		cmd = append(cmd, "--image-feature", "layering")
 	}
 
 	if d.config["ceph.osd.data_pool_name"] != "" {
@@ -377,7 +393,7 @@ func (d *ceph) rbdCreateClone(sourceVol Volume, sourceSnapshotName string, targe
 		d.getRBDVolumeName(sourceVol, sourceSnapshotName, false, true),
 		d.getRBDVolumeName(targetVol, "", false, true))
 
-	_, err := shared.RunCommand("rbd", cmd...)
+	_, err := shared.RunCommand(context.TODO(), "rbd", cmd...)
 	if err != nil {
 		return err
 	}
@@ -388,6 +404,7 @@ func (d *ceph) rbdCreateClone(sourceVol Volume, sourceSnapshotName string, targe
 // rbdListSnapshotClones list all clones of an RBD snapshot.
 func (d *ceph) rbdListSnapshotClones(vol Volume, snapshotName string) ([]string, error) {
 	msg, err := shared.RunCommand(
+		context.TODO(),
 		"rbd",
 		"--id", d.config["ceph.user.name"],
 		"--cluster", d.config["ceph.cluster_name"],
@@ -422,6 +439,7 @@ func (d *ceph) rbdMarkVolumeDeleted(vol Volume, newVolumeName string) error {
 	deletedName := d.getRBDVolumeName(newVol, "", true, true)
 
 	_, err := shared.RunCommand(
+		context.TODO(),
 		"rbd",
 		"--id", d.config["ceph.user.name"],
 		"--cluster", d.config["ceph.cluster_name"],
@@ -447,6 +465,7 @@ func (d *ceph) rbdRenameVolume(vol Volume, newVolumeName string) error {
 	newVol := NewVolume(d, d.name, vol.volType, vol.contentType, newVolumeName, vol.config, vol.poolConfig)
 
 	_, err := shared.RunCommand(
+		context.TODO(),
 		"rbd",
 		"--id", d.config["ceph.user.name"],
 		"--cluster", d.config["ceph.cluster_name"],
@@ -469,6 +488,7 @@ func (d *ceph) rbdRenameVolume(vol Volume, newVolumeName string) error {
 // mapped twice. This will prevent it from being deleted.
 func (d *ceph) rbdRenameVolumeSnapshot(vol Volume, oldSnapshotName string, newSnapshotName string) error {
 	_, err := shared.RunCommand(
+		context.TODO(),
 		"rbd",
 		"--id", d.config["ceph.user.name"],
 		"--cluster", d.config["ceph.cluster_name"],
@@ -492,6 +512,7 @@ func (d *ceph) rbdRenameVolumeSnapshot(vol Volume, oldSnapshotName string, newSn
 //     helper library provides two small functions to do this but see below.
 func (d *ceph) rbdGetVolumeParent(vol Volume) (string, error) {
 	msg, err := shared.RunCommand(
+		context.TODO(),
 		"rbd",
 		"--id", d.config["ceph.user.name"],
 		"--cluster", d.config["ceph.cluster_name"],
@@ -512,7 +533,7 @@ func (d *ceph) rbdGetVolumeParent(vol Volume) (string, error) {
 
 	idx = strings.Index(msg, "\n")
 	if idx == -1 {
-		return "", fmt.Errorf("Unexpected parsing error")
+		return "", errors.New("Unexpected parsing error")
 	}
 
 	msg = msg[:idx]
@@ -526,6 +547,7 @@ func (d *ceph) rbdGetVolumeParent(vol Volume) (string, error) {
 // unprotected.
 func (d *ceph) rbdDeleteVolumeSnapshot(vol Volume, snapshotName string) error {
 	_, err := shared.RunCommand(
+		context.TODO(),
 		"rbd",
 		"--id", d.config["ceph.user.name"],
 		"--cluster", d.config["ceph.cluster_name"],
@@ -548,6 +570,7 @@ func (d *ceph) rbdDeleteVolumeSnapshot(vol Volume, snapshotName string) error {
 // <rbd-snapshot-name>.
 func (d *ceph) rbdListVolumeSnapshots(vol Volume) ([]string, error) {
 	msg, err := shared.RunCommand(
+		context.TODO(),
 		"rbd",
 		"--id", d.config["ceph.user.name"],
 		"--cluster", d.config["ceph.cluster_name"],
@@ -570,12 +593,12 @@ func (d *ceph) rbdListVolumeSnapshots(vol Volume) ([]string, error) {
 	for _, v := range data {
 		_, ok := v["name"]
 		if !ok {
-			return []string{}, fmt.Errorf("No \"name\" property found")
+			return []string{}, errors.New("No \"name\" property found")
 		}
 
 		name, ok := v["name"].(string)
 		if !ok {
-			return []string{}, fmt.Errorf("\"name\" property did not have string type")
+			return []string{}, errors.New("\"name\" property did not have string type")
 		}
 
 		name = strings.TrimSpace(name)
@@ -587,6 +610,31 @@ func (d *ceph) rbdListVolumeSnapshots(vol Volume) ([]string, error) {
 	}
 
 	return snapshots, nil
+}
+
+// getOSDPoolDefaultSize gets the global OSD default pool size that is used for
+// all pools created without an explicit OSD pool size.
+func (d *ceph) getOSDPoolDefaultSize() (int, error) {
+	defaultSize, err := shared.RunCommandRetry(context.TODO(), noKillRetryOpts, "ceph",
+		"--name", "client."+d.config["ceph.user.name"],
+		"--cluster", d.config["ceph.cluster_name"],
+		"config",
+		"get",
+		"mon",
+		"osd_pool_default_size",
+		"--format",
+		"json")
+	if err != nil {
+		return -1, err
+	}
+
+	var defaultSizeInt int
+	err = json.Unmarshal([]byte(defaultSize), &defaultSizeInt)
+	if err != nil {
+		return -1, err
+	}
+
+	return defaultSizeInt, nil
 }
 
 // copyVolumeDiff creates a sparse copy of a volume by exporting and importing the diff
@@ -865,7 +913,7 @@ func (d *ceph) deleteVolumeSnapshot(vol Volume, snapshotName string) (int, error
 			return -1, err
 		}
 
-		newSnapshotName := fmt.Sprintf("zombie_snapshot_%s", uuid.New().String())
+		newSnapshotName := "zombie_snapshot_" + uuid.New().String()
 		err = d.rbdRenameVolumeSnapshot(vol, snapshotName, newSnapshotName)
 		if err != nil {
 			return -1, err
@@ -883,7 +931,7 @@ func (d *ceph) parseParent(parent string) (Volume, string, error) {
 
 	idx := strings.Index(parent, "/")
 	if idx == -1 {
-		return vol, "", fmt.Errorf("Pool delimiter not found")
+		return vol, "", errors.New("Pool delimiter not found")
 	}
 
 	slider := parent[(idx + 1):]
@@ -950,16 +998,16 @@ func (d *ceph) parseParent(parent string) (Volume, string, error) {
 // <osd-pool-name>/<lxd-specific-prefix>_<rbd-storage-volume>
 // will be split into
 // <osd-pool-name>, <lxd-specific-prefix>, <rbd-storage-volume>.
-func (d *ceph) parseClone(clone string) (string, string, string, error) {
+func (d *ceph) parseClone(clone string) (poolName string, volumeType string, volumeName string, err error) {
 	idx := strings.Index(clone, "/")
 	if idx == -1 {
-		return "", "", "", fmt.Errorf("Unexpected parsing error")
+		return "", "", "", errors.New("Unexpected parsing error")
 	}
 
 	slider := clone[(idx + 1):]
-	poolName := clone[:idx]
+	poolName = clone[:idx]
 
-	volumeType := slider
+	volumeType = slider
 	idx = strings.Index(slider, "zombie_")
 	if idx == 0 {
 		idx += len("zombie_")
@@ -969,7 +1017,7 @@ func (d *ceph) parseClone(clone string) (string, string, string, error) {
 
 	idxType := strings.Index(slider, "_")
 	if idxType == -1 {
-		return "", "", "", fmt.Errorf("Unexpected parsing error")
+		return "", "", "", errors.New("Unexpected parsing error")
 	}
 
 	if idx == len("zombie_") {
@@ -980,13 +1028,13 @@ func (d *ceph) parseClone(clone string) (string, string, string, error) {
 
 	idx = strings.Index(slider, "_")
 	if idx == -1 {
-		return "", "", "", fmt.Errorf("Unexpected parsing error")
+		return "", "", "", errors.New("Unexpected parsing error")
 	}
 
-	volumeName := slider
+	volumeName = slider
 	idx = strings.Index(volumeName, "_")
 	if idx == -1 {
-		return "", "", "", fmt.Errorf("Unexpected parsing error")
+		return "", "", "", errors.New("Unexpected parsing error")
 	}
 
 	volumeName = volumeName[(idx + 1):]
@@ -1068,7 +1116,7 @@ func (d *ceph) getRBDMappedDevPath(vol Volume, mapIfMissing bool) (bool, string,
 			if len(rbdNameParts) == 2 && rbdNameParts[1] == devSnapName {
 				return false, fmt.Sprintf("/dev/rbd%d", idx), nil // We found a match.
 			}
-		} else if shared.ValueInSlice(devSnapName, []string{"-", ""}) {
+		} else if slices.Contains([]string{"-", ""}, devSnapName) {
 			// Volume is not a snapshot and neither is this device.
 			return false, fmt.Sprintf("/dev/rbd%d", idx), nil // We found a match.
 		}
@@ -1091,7 +1139,7 @@ func (d *ceph) getRBDMappedDevPath(vol Volume, mapIfMissing bool) (bool, string,
 
 // generateUUID regenerates the XFS/btrfs UUID as needed.
 func (d *ceph) generateUUID(fsType string, devPath string) error {
-	if !renegerateFilesystemUUIDNeeded(fsType) {
+	if !regenerateFilesystemUUIDNeeded(fsType) {
 		return nil
 	}
 
@@ -1106,15 +1154,22 @@ func (d *ceph) generateUUID(fsType string, devPath string) error {
 }
 
 func (d *ceph) getRBDVolumeName(vol Volume, snapName string, zombie bool, withPoolName bool) string {
-	out := CephGetRBDImageName(vol, snapName, zombie)
+	imageName, volSnapName := CephGetRBDImageName(vol, zombie)
+
+	// see `man 8 rbd` for "snap-spec"
+	if snapName != "" {
+		imageName += "@" + snapName
+	} else if volSnapName != "" {
+		imageName += "@" + volSnapName
+	}
 
 	// If needed, the output will be prefixed with the pool name, e.g.
 	// <pool>/<type>_<volname>@<snapname>.
 	if withPoolName {
-		out = fmt.Sprintf("%s/%s", d.config["ceph.osd.pool_name"], out)
+		imageName = d.config["ceph.osd.pool_name"] + "/" + imageName
 	}
 
-	return out
+	return imageName
 }
 
 // Let's say we want to send the a container "a" including snapshots "snap0" and
@@ -1136,7 +1191,7 @@ func (d *ceph) getRBDVolumeName(vol Volume, snapName string, zombie bool, withPo
 //
 //	rbd export-diff pool1/container_a@snapshot_snap1 --from-snap snapshot_snap0 - | rbd import-diff - pool2/container_a
 //	rbd export-diff pool1/container_a --from-snap snapshot_snap1 - | rbd import-diff - pool2/container_a
-func (d *ceph) sendVolume(conn io.ReadWriteCloser, volumeName string, volumeParentName string, tracker *ioprogress.ProgressTracker) error {
+func (d *ceph) sendVolume(conn io.ReadWriteCloser, volumeName string, volumeParentName string, writerWrapper ioprogress.WriterWrapper) error {
 	defer func() { _ = conn.Close() }()
 
 	args := []string{
@@ -1162,11 +1217,8 @@ func (d *ceph) sendVolume(conn io.ReadWriteCloser, volumeName string, volumePare
 
 	// Setup progress tracker.
 	var stdout io.WriteCloser = conn
-	if tracker != nil {
-		stdout = &ioprogress.ProgressWriter{
-			WriteCloser: conn,
-			Tracker:     tracker,
-		}
+	if writerWrapper != nil {
+		stdout = writerWrapper(conn)
 	}
 
 	cmd.Stdout = stdout
@@ -1268,7 +1320,7 @@ func (d *ceph) resizeVolume(vol Volume, sizeBytes int64, allowShrink bool) error
 	)
 
 	// Resize the block device.
-	_, err := shared.TryRunCommand("rbd", args...)
+	_, err := shared.RunCommandRetry(context.TODO(), noKillRetryOpts, "rbd", args...)
 
 	return err
 }

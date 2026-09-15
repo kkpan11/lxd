@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -19,22 +20,24 @@ import (
 
 // This task function expires logs when executed. It's started by the Daemon
 // and will run once every 24h.
-func expireLogsTask(state *state.State) (task.Func, task.Schedule) {
+func expireLogsTask(stateFunc func() *state.State) (task.Func, task.Schedule) {
 	f := func(ctx context.Context) {
-		opRun := func(op *operations.Operation) error {
+		state := stateFunc()
+
+		opRun := func(ctx context.Context, op *operations.Operation) error {
 			return expireLogs(ctx, state)
 		}
 
-		op, err := operations.OperationCreate(state, "", operations.OperationClassTask, operationtype.LogsExpire, nil, nil, opRun, nil, nil, nil)
-		if err != nil {
-			logger.Error("Failed creating log files expiry operation", logger.Ctx{"err": err})
-			return
+		args := operations.OperationArgs{
+			Type:    operationtype.LogsExpire,
+			Class:   operationtype.OperationClassTask,
+			RunHook: opRun,
 		}
 
 		logger.Info("Expiring log files")
-		err = op.Start()
+		op, err := operations.ScheduleServerOperation(state, args)
 		if err != nil {
-			logger.Error("Failed starting log files expiry operation", logger.Ctx{"err": err})
+			logger.Error("Failed creating log files expiry operation", logger.Ctx{"err": err})
 			return
 		}
 
@@ -112,7 +115,7 @@ func expireLogs(ctx context.Context, state *state.State) error {
 		}
 
 		// Check if the instance still exists.
-		if shared.ValueInSlice(fi.Name(), names) {
+		if slices.Contains(names, fi.Name()) {
 			instDirEntries, err := os.ReadDir(shared.LogPath(fi.Name()))
 			if err != nil {
 				return err

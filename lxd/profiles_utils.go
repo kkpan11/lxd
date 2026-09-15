@@ -4,21 +4,95 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/db/cluster"
 	deviceConfig "github.com/canonical/lxd/lxd/device/config"
 	"github.com/canonical/lxd/lxd/instance"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
+	"github.com/canonical/lxd/lxd/network"
 	"github.com/canonical/lxd/lxd/project/limits"
 	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/shared/api"
 )
 
-func doProfileUpdate(s *state.State, p api.Project, profileName string, id int64, profile *api.Profile, req api.ProfilePut) error {
+// checkProfileNICDeviceUsage checks if there are any instances of this profile attached to network load balancer pools.
+// The profile update cannot remove the mandatory nic device referenced by the load balancer pool.
+func checkProfileNICDeviceUsage(ctx context.Context, tx *db.ClusterTx, insts map[int]db.InstanceArgs, profileName string, req api.ProfilePut) error {
+	// Check if there are any instances of this profile attached to network load balancer pools.
+	// The profile update cannot remove the mandatory nic device.
+	for _, inst := range insts {
+		var networkNames []string
+
+		// Check if this instance is a member of any load balancer pool.
+		poolInstRows, err := cluster.GetNetworksLoadBalancerPoolInstanceRowsByID(ctx, tx.Tx(), int64(inst.ID))
+		if err != nil {
+			return err
+		}
+
+		// Exit early if instance is not a member of any pool.
+		if len(poolInstRows) == 0 {
+			continue
+		}
+
+		for _, poolInstRow := range poolInstRows {
+			// Get the pool to find its network.
+			pool, err := cluster.GetNetworksLoadBalancerPoolRowByID(ctx, tx.Tx(), poolInstRow.PoolID)
+			if err != nil {
+				return err
+			}
+
+			// Get the network name from the pool's network ID.
+			networkName, _, err := tx.GetNetworkNameAndProjectWithID(ctx, int(pool.NetworkID))
+			if err != nil {
+				return err
+			}
+
+			networkNames = append(networkNames, networkName)
+		}
+
+		// Build the new expanded devices with the updated profile.
+		newProfiles := make([]api.Profile, len(inst.Profiles))
+		copy(newProfiles, inst.Profiles)
+		for i, prof := range newProfiles {
+			// Find the profile being updated and update its devices.
+			if prof.Name == profileName {
+				newProfiles[i].Devices = req.Devices
+				break
+			}
+		}
+
+		newExpandedDevices := instancetype.ExpandInstanceDevices(inst.Devices.Clone(), newProfiles)
+
+		for _, networkName := range networkNames {
+			// Check if the new expanded devices still have a NIC connected to this network.
+			hasNIC := false
+			for _, devConfig := range newExpandedDevices {
+				if devConfig["type"] != "nic" {
+					continue
+				}
+
+				if network.NICUsesNetwork(devConfig, &api.Network{Name: networkName}) {
+					hasNIC = true
+					break
+				}
+			}
+
+			if !hasNIC {
+				return errors.New("At least one instance relies on this profile's nic device for network load balancer pool membership")
+			}
+		}
+	}
+
+	return nil
+}
+
+func doProfileUpdate(ctx context.Context, s *state.State, p api.Project, profileName string, profile *api.Profile, req api.ProfilePut) error {
 	// Check project limits.
-	err := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
-		return limits.AllowProfileUpdate(s.GlobalConfig, tx, p.Name, profileName, req)
+	err := s.DB.Cluster.Transaction(s.ShutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+		return limits.AllowProfileUpdate(ctx, s.GlobalConfig, tx, p.Name, profileName, req)
 	})
 	if err != nil {
 		return err
@@ -37,28 +111,28 @@ func doProfileUpdate(s *state.State, p api.Project, profileName string, id int64
 		return err
 	}
 
-	insts, projects, err := getProfileInstancesInfo(s.DB.Cluster, p.Name, profileName)
+	insts, projects, err := getProfileInstancesInfo(ctx, s.DB.Cluster, p.Name, profileName)
 	if err != nil {
-		return fmt.Errorf("Failed to query instances associated with profile %q: %w", profileName, err)
+		return fmt.Errorf("Failed querying instances associated with profile %q: %w", profileName, err)
 	}
 
 	// Check if the root disk device's pool would be changed or removed and prevent that if there are instances
 	// using that root disk device.
-	oldProfileRootDiskDeviceKey, oldProfileRootDiskDevice, _ := instancetype.GetRootDiskDevice(profile.Devices)
-	_, newProfileRootDiskDevice, _ := instancetype.GetRootDiskDevice(req.Devices)
-	if len(insts) > 0 && oldProfileRootDiskDevice["pool"] != "" && newProfileRootDiskDevice["pool"] == "" || (oldProfileRootDiskDevice["pool"] != newProfileRootDiskDevice["pool"]) {
+	oldProfileRootDiskDeviceKey, oldProfileRootDiskDevice, _ := api.GetRootDiskDevice(profile.Devices)
+	_, newProfileRootDiskDevice, _ := api.GetRootDiskDevice(req.Devices)
+	if oldProfileRootDiskDevice["pool"] != newProfileRootDiskDevice["pool"] {
 		// Check for instances using the device.
 		for _, inst := range insts {
 			// Check if the device is locally overridden.
-			k, v, _ := instancetype.GetRootDiskDevice(inst.Devices.CloneNative())
+			k, v, _ := api.GetRootDiskDevice(inst.Devices.CloneNative())
 			if k != "" && v["pool"] != "" {
 				continue
 			}
 
-			err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+			err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 				// Check what profile the device comes from by working backwards along the profiles list.
-				for i := len(inst.Profiles) - 1; i >= 0; i-- {
-					_, profile, err := tx.GetProfile(ctx, p.Name, inst.Profiles[i].Name)
+				for _, v := range slices.Backward(inst.Profiles) {
+					_, profile, err := tx.GetProfile(ctx, p.Name, v.Name)
 					if err != nil {
 						return err
 					}
@@ -67,9 +141,9 @@ func doProfileUpdate(s *state.State, p api.Project, profileName string, id int64
 					_, ok := profile.Devices[oldProfileRootDiskDeviceKey]
 					if ok {
 						// Found the profile.
-						if inst.Profiles[i].Name == profileName {
+						if v.Name == profileName {
 							// If it's the current profile, then we can't modify that root device.
-							return fmt.Errorf("At least one instance relies on this profile's root disk device")
+							return errors.New("At least one instance relies on this profile's root disk device")
 						}
 
 						// If it's not, then move on to the next instance.
@@ -85,8 +159,14 @@ func doProfileUpdate(s *state.State, p api.Project, profileName string, id int64
 		}
 	}
 
-	// Update the database.
-	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		// Check for instances which are referenced by load balancer pools through a nic device in this profile.
+		err := checkProfileNICDeviceUsage(ctx, tx, insts, profileName, req)
+		if err != nil {
+			return err
+		}
+
+		// Update the database.
 		devices, err := cluster.APIToDevices(req.Devices)
 		if err != nil {
 			return err
@@ -122,7 +202,7 @@ func doProfileUpdate(s *state.State, p api.Project, profileName string, id int64
 		}
 
 		if len(newProfiles) != 1 {
-			return fmt.Errorf("Failed to find profile %q in project %q", profileName, p.Name)
+			return fmt.Errorf("Failed finding profile %q in project %q", profileName, p.Name)
 		}
 
 		return nil
@@ -140,19 +220,20 @@ func doProfileUpdate(s *state.State, p api.Project, profileName string, id int64
 			continue // This instance does not belong to this member, skip.
 		}
 
-		err := doProfileUpdateInstance(s, inst, *projects[inst.Project])
+		err := doProfileUpdateInstance(ctx, s, inst, *projects[inst.Project])
 		if err != nil {
 			failures[&inst] = err
 		}
 	}
 
 	if len(failures) != 0 {
-		msg := "The following instances failed to update (profile change still saved):\n"
+		var msg strings.Builder
+		msg.WriteString("The following instances failed updating (profile change still saved):\n")
 		for inst, err := range failures {
-			msg += fmt.Sprintf(" - Project: %s, Instance: %s: %v\n", inst.Project, inst.Name, err)
+			fmt.Fprintf(&msg, " - Project: %s, Instance: %s: %v\n", inst.Project, inst.Name, err)
 		}
 
-		return errors.New(msg)
+		return errors.New(msg.String())
 	}
 
 	return nil
@@ -160,10 +241,10 @@ func doProfileUpdate(s *state.State, p api.Project, profileName string, id int64
 
 // Like doProfileUpdate but does not update the database, since it was already
 // updated by doProfileUpdate itself, called on the notifying node.
-func doProfileUpdateCluster(s *state.State, projectName string, profileName string, old api.ProfilePut) error {
-	insts, projects, err := getProfileInstancesInfo(s.DB.Cluster, projectName, profileName)
+func doProfileUpdateCluster(ctx context.Context, s *state.State, projectName string, profileName string, old api.ProfilePut) error {
+	insts, projects, err := getProfileInstancesInfo(ctx, s.DB.Cluster, projectName, profileName)
 	if err != nil {
-		return fmt.Errorf("Failed to query instances associated with profile %q: %w", profileName, err)
+		return fmt.Errorf("Failed querying instances associated with profile %q: %w", profileName, err)
 	}
 
 	failures := map[*db.InstanceArgs]error{}
@@ -185,26 +266,27 @@ func doProfileUpdateCluster(s *state.State, projectName string, profileName stri
 			}
 		}
 
-		err := doProfileUpdateInstance(s, inst, *projects[inst.Project])
+		err := doProfileUpdateInstance(ctx, s, inst, *projects[inst.Project])
 		if err != nil {
 			failures[&inst] = err
 		}
 	}
 
 	if len(failures) != 0 {
-		msg := "The following instances failed to update (profile change still saved):\n"
+		var msg strings.Builder
+		msg.WriteString("The following instances failed updating (profile change still saved):\n")
 		for inst, err := range failures {
-			msg += fmt.Sprintf(" - Project: %s, Instance: %s: %v\n", inst.Project, inst.Name, err)
+			fmt.Fprintf(&msg, " - Project: %s, Instance: %s: %v\n", inst.Project, inst.Name, err)
 		}
 
-		return errors.New(msg)
+		return errors.New(msg.String())
 	}
 
 	return nil
 }
 
 // Profile update of a single instance.
-func doProfileUpdateInstance(s *state.State, args db.InstanceArgs, p api.Project) error {
+func doProfileUpdateInstance(ctx context.Context, s *state.State, args db.InstanceArgs, p api.Project) error {
 	profileNames := make([]string, 0, len(args.Profiles))
 
 	for _, profile := range args.Profiles {
@@ -213,7 +295,7 @@ func doProfileUpdateInstance(s *state.State, args db.InstanceArgs, p api.Project
 
 	var profiles []api.Profile
 
-	err := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err := s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 		var err error
 
 		profiles, err = tx.GetProfiles(ctx, args.Project, profileNames)
@@ -231,7 +313,7 @@ func doProfileUpdateInstance(s *state.State, args db.InstanceArgs, p api.Project
 	}
 
 	// Update will internally load the new profile configs and detect the changes to apply.
-	return inst.Update(db.InstanceArgs{
+	return inst.Update(ctx, db.InstanceArgs{
 		Architecture: inst.Architecture(),
 		Config:       inst.LocalConfig(),
 		Description:  inst.Description(),
@@ -241,15 +323,15 @@ func doProfileUpdateInstance(s *state.State, args db.InstanceArgs, p api.Project
 		Project:      inst.Project().Name,
 		Type:         inst.Type(),
 		Snapshot:     inst.IsSnapshot(),
-	}, true)
+	}, instance.UpdateActionUser)
 }
 
 // Query the db for information about instances associated with the given profile.
-func getProfileInstancesInfo(dbCluster *db.Cluster, projectName string, profileName string) (map[int]db.InstanceArgs, map[string]*api.Project, error) {
+func getProfileInstancesInfo(ctx context.Context, dbCluster *db.Cluster, projectName string, profileName string) (map[int]db.InstanceArgs, map[string]*api.Project, error) {
 	var projectInstNames map[string][]string
 
 	// Query the db for information about instances associated with the given profile.
-	err := dbCluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err := dbCluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 		var err error
 
 		projectInstNames, err = tx.GetInstancesWithProfile(ctx, projectName, profileName)
@@ -257,13 +339,13 @@ func getProfileInstancesInfo(dbCluster *db.Cluster, projectName string, profileN
 		return err
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("Failed to query instances with profile %q: %w", profileName, err)
+		return nil, nil, fmt.Errorf("Failed querying instances with profile %q: %w", profileName, err)
 	}
 
 	var instances map[int]db.InstanceArgs
 	projects := make(map[string]*api.Project)
 
-	err = dbCluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err = dbCluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 		var dbInstances []cluster.Instance
 
 		for instProject, instNames := range projectInstNames {
@@ -299,7 +381,7 @@ func getProfileInstancesInfo(dbCluster *db.Cluster, projectName string, profileN
 		return nil
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("Failed to fetch instances: %w", err)
+		return nil, nil, fmt.Errorf("Failed fetching instances: %w", err)
 	}
 
 	return instances, projects, nil

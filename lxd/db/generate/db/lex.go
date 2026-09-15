@@ -29,18 +29,17 @@ func entityTable(entity string, override string) string {
 
 // Return the name of the Filter struct for the given database entity.
 func entityFilter(entity string) string {
-	return fmt.Sprintf("%sFilter", lex.Camel(entity))
+	return lex.Camel(entity) + "Filter"
 }
 
 // Return the name of the global variable holding the registration code for
 // the given kind of statement aganst the given entity.
 func stmtCodeVar(entity string, kind string, filters ...string) string {
 	prefix := lex.Minuscule(lex.Camel(entity))
-	name := fmt.Sprintf("%s%s", prefix, lex.Camel(kind))
+	name := prefix + lex.Camel(kind)
 
 	if len(filters) > 0 {
-		name += "By"
-		name += strings.Join(filters, "And")
+		name += "By" + strings.Join(filters, "And")
 	}
 
 	return name
@@ -48,43 +47,51 @@ func stmtCodeVar(entity string, kind string, filters ...string) string {
 
 // operation returns the kind of operation being performed, without filter fields.
 func operation(kind string) string {
-	return strings.Split(kind, "-by-")[0]
+	op, _, _ := strings.Cut(kind, "-by-")
+	return op
 }
 
 // activeFilters returns the filters mentioned in the command name.
 func activeFilters(kind string) []string {
-	startIndex := strings.Index(kind, "-by-") + len("-by-")
-	return strings.Split(kind[startIndex:], "-and-")
+	_, after, _ := strings.Cut(kind, "-by-")
+	return strings.Split(after, "-and-")
 }
 
 // Return an expression evaluating if a filter should be used (based on active
 // criteria).
 func activeCriteria(filter []string, ignoredFilter []string) string {
-	expr := ""
+	var expr strings.Builder
 	for i, name := range filter {
 		if i > 0 {
-			expr += " && "
+			expr.WriteString(" && ")
 		}
 
-		expr += fmt.Sprintf("filter.%s != nil", name)
+		expr.WriteString("filter.")
+		expr.WriteString(name)
+		expr.WriteString(" != nil")
 	}
 
 	for _, name := range ignoredFilter {
-		if len(expr) > 0 {
-			expr += " && "
+		if expr.Len() > 0 {
+			expr.WriteString(" && ")
 		}
 
-		expr += fmt.Sprintf("filter.%s == nil", name)
+		expr.WriteString("filter.")
+		expr.WriteString(name)
+		expr.WriteString(" == nil")
 	}
 
-	return expr
+	return expr.String()
 }
 
 // Return the code for a "dest" function, to be passed as parameter to
 // query.SelectObjects in order to scan a single row.
 func destFunc(slice string, typ string, fields []*Field) string {
 	var builder strings.Builder
-	writeLine := func(line string) { builder.WriteString(fmt.Sprintf("%s\n", line)) }
+	writeLine := func(line string) {
+		builder.WriteString(line)
+		builder.WriteString("\n")
+	}
 
 	writeLine(`func(scan func(dest ...any) error) error {`)
 
@@ -107,10 +114,10 @@ func destFunc(slice string, typ string, fields []*Field) string {
 	for i, field := range fields {
 		var arg string
 		if shared.IsTrue(field.Config.Get("marshal")) {
-			declVarName := fmt.Sprintf("%sStr", lex.Minuscule(field.Name))
+			declVarName := lex.Minuscule(field.Name) + "Str"
 			declVarNames = append(declVarNames, declVarName)
 			declVars[declVarName] = field
-			arg = fmt.Sprintf("&%s", declVarName)
+			arg = "&" + declVarName
 		} else {
 			arg = fmt.Sprintf("&%s.%s", varName, field.Name)
 		}

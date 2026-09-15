@@ -7,7 +7,7 @@ The LXD web UI is available as part of the LXD snap.
 See the [LXD-UI GitHub repository](https://github.com/canonical/lxd-ui) for the source code.
 ```
 
-```{figure} /images/ui_console.png
+```{figure} /images/UI/console.png
 :width: 100%
 :alt: Graphical console of an instance in the LXD web UI
 
@@ -15,6 +15,7 @@ Graphical console of an instance in the LXD web UI
 ```
 
 ```{youtube} https://www.youtube.com/watch?v=wqEH_d8LC1k
+:title: Early look at the LXD web UI
 ```
 
 The LXD web UI provides you with a graphical interface to manage your LXD server and instances.
@@ -22,56 +23,87 @@ It does not provide full functionality yet, but it is constantly evolving, alrea
 
 Complete the following steps to access the LXD web UI:
 
-1. Make sure that your LXD server is {ref}`exposed to the network <server-expose>`.
+(access-ui-expose)=
+## Expose the server to the network
+
+Make sure that your LXD server is {ref}`exposed to the network <server-expose>`.
    You can expose the server during {ref}`initialization <initialize>`, or afterwards by setting the {config:option}`server-core:core.https_address` server configuration option.
+
+(access-ui-browser)=
+## Access the UI in your browser
+
+Access the UI in your browser by entering the server address (for example, [`https://127.0.0.1:8443`](https://127.0.0.1:8443) for a local server, or an address like `https://192.0.2.10:8443` for a server running on `192.0.2.10`).
+
+If you have already set up access to the UI, you will see the {guilabel}`Instances` page. For setup instructions, continue below.
+
+(access-ui-setup)=
+## Set up access
+
+Access to the UI can be obtained in two ways:
+
+- Initial access via a UI access link (bearer token, valid for 1 day).
+- Permanent access using a browser certificate and trust token.
+
+(access-ui-setup-initial-access-link)=
+### UI access using initial link
+
+The `lxd init` command guides you through the LXD initialization process.
+When the server address is configured during the initialization process, LXD offers an option to generate an initial UI access link. If you agree with that option, an initial LXD UI access URL that is valid for 24 hours is printed at the end of the process, as shown below.
+
+```bash
+...
+Would you like the LXD server to be available over the network? (yes/no) [default=no]: yes
+Address to bind LXD to (not including port) [default=all]:
+Port to bind LXD to [default=8443]:
+Would you like to create an initial LXD UI access link? (yes/no) [default=yes]
+...
+UI initial identity (type: Initial UI token bearer): ui-admin-initial
+UI initial access link (expires: 2026-01-17 16:36): https://127.0.0.1:8443/?token=<bearer_token>
+```
+
+Open this URL in your browser to immediately access the UI as an admin.
+This method is intended for initial access and setup only. After logging in, configure the permanent authentication (mTLS or OIDC) for continued access.
+
+To obtain a new initial UI access link, run `lxd init` again.
+For convenience, the `--ui-initial-access-link` flag can be used to non-interactively generate a new one.
+
+```bash
+lxd init --ui-initial-access-link
+```
+
+The `ui-admin-initial` identity has the type `Initial UI token bearer` while a token is issued for it.
+Revoking the token changes its type to `Initial UI token bearer (pending)`, and issuing a new token changes it back.
+
+(access-ui-setup-certificate)=
+### Permanent UI access using browser certificate
+
+Permanent access to the UI requires both a browser certificate and a trust token.
 
 <!-- Include start access UI -->
 
-2. Access the UI in your browser by entering the server address (for example, [`https://127.0.0.1:8443`](https://127.0.0.1:8443) for a local server, or an address like `https://192.0.2.10:8443` for a server running on `192.0.2.10`).
+If you have not set up a secure {ref}`authentication-server-certificate`, LXD uses a self-signed certificate, which will cause a security warning in your browser. Use your browser's mechanism to continue this time despite the security warning.
 
-   If you have not set up a secure {ref}`authentication-server-certificate`, LXD uses a self-signed certificate, which will cause a security warning in your browser.
-   Use your browser's mechanism to continue despite the security warning.
+For example, in Chrome, click **Advanced**, then follow the link to **Proceed** at the bottom as shown below:
 
-   ```{figure} /images/ui_security_warning.png
-   :width: 80%
-   :alt: Example for a security warning in Chrome
-   ```
+```{figure} /images/ui_security_warning.png
+:width: 80%
+:alt: Example for a security warning in Chrome
+```
 
-1. Set up the certificates that are required for the UI client to authenticate with the LXD server by following the steps presented in the UI.
+In Firefox, click **Advanced**, then follow the link to **Accept the risk and continue**.
 
-   You have two options, depending on whether you already have a client certificate selected in your browser:
+#### Set up the browser certificate
 
-   - If you don't have a certificate yet, click {guilabel}`Create a new certificate` to get instructions for creating a set of certificates, adding the public key to the server's trust store, and adding the private key to your browser.
+Follow the instructions in the LXD UI browser page to install and select the browser certificate, also called a client certificate.
 
-     ```{figure} /images/ui_set_up_certificates.png
-     :width: 100%
-     :alt: Instructions for setting up certificates for the UI
-     ```
+If you have previously installed a certificate for the LXD UI, your browser will offer you the option to use it. Confirm that the installed certificate's issuer is listed in the LXD UI, then select it.
 
-   - If you already have a client certificate in your browser, select "use an existing certificate" to authorize the certificate with the server and re-use it.
+After you have selected your certificate, follow the LXD UI's on-page instructions to set up the trust token.
 
-     ```{figure} /images/ui_set_up_existing_cert.png
-     :width: 100%
-     :alt: Instructions for re-using an existing certificate for the UI
-     ```
-
-   See {ref}`authentication` for more information.
+Finally, click {guilabel}`Connect` in the UI to complete gaining access. You should then see the {guilabel}`Instances` page.
 
 <!-- Include end access UI -->
 
-After setting up the certificates, you can start creating instances, editing profiles, or configuring your server.
+Now you can start creating instances, editing profiles, or configuring your server.
 
-## Enable or disable the UI
-
-The {ref}`snap configuration option <howto-snap-configure>` `lxd ui.enable` controls whether the UI is enabled for LXD.
-
-Starting with LXD 5.21, the UI is enabled by default.
-If you want to disable it, set the option to `false`:
-
-    sudo snap set lxd ui.enable=false
-    sudo systemctl reload snap.lxd.daemon
-
-To enable it again, or to enable it for older LXD versions (that include the UI), set the option to `true`:
-
-    sudo snap set lxd ui.enable=true
-    sudo systemctl reload snap.lxd.daemon
+For detailed information about the authentication process, see: {ref}`authentication`.

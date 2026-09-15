@@ -82,8 +82,8 @@ func (a ByNameAndType) Swap(i, j int) {
 
 func (a ByNameAndType) Less(i, j int) bool {
 	// Sort snapshot and parent together.
-	iType := strings.Split(a[i][0], " ")[0]
-	jType := strings.Split(a[j][0], " ")[0]
+	iType, _, _ := strings.Cut(a[i][0], " ")
+	jType, _, _ := strings.Cut(a[j][0], " ")
 
 	if iType != jType {
 		return sortorder.NaturalLess(a[i][0], a[j][0])
@@ -137,18 +137,10 @@ type byPrecedence struct {
 }
 
 func (a byPrecedence) Len() int {
-	if a.data == nil {
-		return 0
-	}
-
 	return len(a.data)
 }
 
 func (a byPrecedence) Swap(i, j int) {
-	if a.data == nil {
-		return
-	}
-
 	a.data[i], a.data[j] = a.data[j], a.data[i]
 }
 

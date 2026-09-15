@@ -1,9 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
-
-	"github.com/spf13/cobra"
+	"slices"
 
 	"github.com/canonical/lxd/client"
 	storageDrivers "github.com/canonical/lxd/lxd/storage/drivers"
@@ -13,39 +13,39 @@ import (
 )
 
 // RunAuto initializes LXD in automatic (non-interactive) mode.
-func (c *cmdInit) RunAuto(cmd *cobra.Command, args []string, d lxd.InstanceServer, server *api.Server) (*api.InitPreseed, error) {
+func (c *cmdInit) RunAuto(args []string, d lxd.InstanceServer, server *api.Server) (*api.InitPreseed, error) {
 	// Quick checks.
-	if c.flagStorageBackend != "" && !shared.ValueInSlice(c.flagStorageBackend, storageDrivers.AllDriverNames()) {
-		return nil, fmt.Errorf("The requested backend '%s' isn't supported by lxd init", c.flagStorageBackend)
+	if c.flagStorageBackend != "" && !slices.Contains(storageDrivers.AllDriverNames(), c.flagStorageBackend) {
+		return nil, fmt.Errorf("The requested backend %q is not supported by lxd init", c.flagStorageBackend)
 	}
 
-	if c.flagStorageBackend != "" && !shared.ValueInSlice(c.flagStorageBackend, util.AvailableStorageDrivers(server.Environment.StorageSupportedDrivers, util.PoolTypeAny)) {
-		return nil, fmt.Errorf("The requested backend '%s' isn't available on your system (missing tools)", c.flagStorageBackend)
+	if c.flagStorageBackend != "" && !slices.Contains(util.AvailableStorageDrivers(server.Environment.StorageSupportedDrivers, util.PoolTypeAny), c.flagStorageBackend) {
+		return nil, fmt.Errorf("The requested backend %q is not available on your system (missing tools or incompatible kernel module)", c.flagStorageBackend)
 	}
 
 	if c.flagStorageBackend == "dir" || c.flagStorageBackend == "" {
 		if c.flagStorageLoopSize != -1 || c.flagStorageDevice != "" || c.flagStoragePool != "" {
-			return nil, fmt.Errorf("None of --storage-pool, --storage-create-device or --storage-create-loop may be used with the 'dir' backend")
+			return nil, errors.New("None of --storage-pool, --storage-create-device or --storage-create-loop may be used with the 'dir' backend")
 		}
 	} else {
 		if c.flagStorageLoopSize != -1 && c.flagStorageDevice != "" {
-			return nil, fmt.Errorf("Only one of --storage-create-device or --storage-create-loop can be specified")
+			return nil, errors.New("Only one of --storage-create-device or --storage-create-loop can be specified")
 		}
 	}
 
 	if c.flagNetworkAddress == "" {
 		if c.flagNetworkPort != -1 {
-			return nil, fmt.Errorf("--network-port can't be used without --network-address")
+			return nil, errors.New("--network-port cannot be used without --network-address")
 		}
 	}
 
 	storagePools, err := d.GetStoragePoolNames()
 	if err != nil {
-		return nil, fmt.Errorf("Failed to retrieve list of storage pools: %w", err)
+		return nil, fmt.Errorf("Failed retrieving list of storage pools: %w", err)
 	}
 
 	if len(storagePools) > 0 && (c.flagStorageBackend != "" || c.flagStorageDevice != "" || c.flagStorageLoopSize != -1 || c.flagStoragePool != "") {
-		return nil, fmt.Errorf("Storage has already been configured")
+		return nil, errors.New("Storage has already been configured")
 	}
 
 	// Defaults
@@ -109,7 +109,7 @@ func (c *cmdInit) RunAuto(cmd *cobra.Command, args []string, d lxd.InstanceServe
 	// Network configuration
 	networks, err := d.GetNetworks()
 	if err != nil {
-		return nil, fmt.Errorf("Failed to retrieve list of networks: %w", err)
+		return nil, fmt.Errorf("Failed retrieving list of networks: %w", err)
 	}
 
 	// Extract managed networks

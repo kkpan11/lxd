@@ -5,11 +5,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,6 +23,7 @@ import (
 
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
+	"github.com/canonical/lxd/shared/cancel"
 )
 
 // This is a modified version of https://github.com/grafana/loki/blob/v1.6.1/pkg/promtail/client/.
@@ -42,6 +46,12 @@ type config struct {
 	types    []string
 	location string
 
+	// Server-static OWASP fields populated for security event lines.
+	hostname          string
+	hostIP            string
+	port              string
+	clusterIdentifier string
+
 	timeout time.Duration
 	url     *url.URL
 }
@@ -55,79 +65,85 @@ type entry struct {
 type Client struct {
 	cfg     config
 	client  *http.Client
-	ctx     context.Context
-	quit    chan struct{}
-	once    sync.Once
+	cancel  cancel.Canceller
 	entries chan entry
 	wg      sync.WaitGroup
 }
 
 // NewClient returns a Client.
-func NewClient(ctx context.Context, u *url.URL, username string, password string, caCert string, instance string, location string, logLevel string, labels []string, types []string) *Client {
+func NewClient(ctx context.Context, u *url.URL, username string, password string, caCert string, instance string, location string, hostname string, hostIP string, port string, clusterIdentifier string, logLevel string, labels []string, types []string) (*Client, error) {
 	client := Client{
 		cfg: config{
-			batchSize: 10 * 1024,
-			batchWait: 1 * time.Second,
-			caCert:    caCert,
-			username:  username,
-			password:  password,
-			instance:  instance,
-			location:  location,
-			labels:    labels,
-			logLevel:  logLevel,
-			timeout:   10 * time.Second,
-			types:     types,
-			url:       u,
+			batchSize:         10 * 1024,
+			batchWait:         1 * time.Second,
+			caCert:            caCert,
+			username:          username,
+			password:          password,
+			instance:          instance,
+			location:          location,
+			hostname:          hostname,
+			hostIP:            hostIP,
+			port:              port,
+			clusterIdentifier: clusterIdentifier,
+			labels:            labels,
+			logLevel:          logLevel,
+			timeout:           10 * time.Second,
+			types:             types,
+			url:               u,
 		},
 		client:  &http.Client{},
-		ctx:     ctx,
 		entries: make(chan entry),
-		quit:    make(chan struct{}),
+		cancel:  cancel.New(),
 	}
 
 	if caCert != "" {
 		tlsConfig, err := shared.GetTLSConfigMem("", "", caCert, "", false)
 		if err != nil {
-			return nil
+			return nil, err
 		}
 
 		client.client.Transport = &http.Transport{
-			TLSClientConfig: tlsConfig,
+			TLSClientConfig:     tlsConfig,
+			TLSHandshakeTimeout: 10 * time.Second,
 		}
 	} else {
 		client.client = http.DefaultClient
 	}
 
+	_, ok := ctx.Deadline()
+	if !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, client.cfg.timeout)
+		defer cancel()
+	}
+
+	err := client.checkLoki(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	client.wg.Add(1)
 	go client.run()
 
-	return &client
+	return &client, nil
 }
 
 func (c *Client) run() {
 	batch := newBatch()
 
 	minWaitCheckFrequency := 10 * time.Millisecond
-	maxWaitCheckFrequency := c.cfg.batchWait / 10
-
-	if maxWaitCheckFrequency < minWaitCheckFrequency {
-		maxWaitCheckFrequency = minWaitCheckFrequency
-	}
+	maxWaitCheckFrequency := max(c.cfg.batchWait/10, minWaitCheckFrequency)
 
 	maxWaitCheck := time.NewTicker(maxWaitCheckFrequency)
 
 	defer func() {
-		// Send all pending batches
-		c.sendBatch(batch)
 		c.wg.Done()
 	}()
 
 	for {
 		select {
-		case <-c.ctx.Done():
-			return
-
-		case <-c.quit:
+		case <-c.cancel.Done():
+			c.sendBatch(batch)
 			return
 
 		case e := <-c.entries:
@@ -155,6 +171,36 @@ func (c *Client) run() {
 	}
 }
 
+func (c *Client) checkLoki(ctx context.Context) error {
+	req, err := http.NewRequest(http.MethodGet, c.cfg.url.String()+"/ready", nil)
+	if err != nil {
+		return err
+	}
+
+	req = req.WithContext(ctx)
+	req.Header.Set("Content-Type", contentType)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return errors.New("failed connecting to Loki")
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode/100 != 2 {
+		scanner := bufio.NewScanner(io.LimitReader(resp.Body, maxErrMsgLen))
+		line := ""
+
+		if scanner.Scan() {
+			line = scanner.Text()
+		}
+
+		return fmt.Errorf("Loki is not ready, server returned HTTP status %s (%d): %s", resp.Status, resp.StatusCode, line)
+	}
+
+	return nil
+}
+
 func (c *Client) sendBatch(batch *batch) {
 	if batch.empty() {
 		return
@@ -167,10 +213,12 @@ func (c *Client) sendBatch(batch *batch) {
 
 	var status int
 
-	for i := 0; i < 30; i++ {
-		// Try to send the message.
-		status, err = c.send(c.ctx, buf)
-		if err == nil {
+	for range 30 {
+		ctx, cancel := context.WithTimeout(context.Background(), c.cfg.timeout)
+		status, err = c.send(ctx, buf)
+		cancel()
+
+		if err != nil {
 			return
 		}
 
@@ -179,16 +227,17 @@ func (c *Client) sendBatch(batch *batch) {
 			return
 		}
 
-		// Retry every 10s.
-		time.Sleep(10 * time.Second)
+		// Retry every 10s, but exit if Stop() is called.
+		select {
+		case <-c.cancel.Done():
+			return
+		case <-time.After(c.cfg.timeout):
+		}
 	}
 }
 
 func (c *Client) send(ctx context.Context, buf []byte) (int, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.cfg.timeout)
-	defer cancel()
-
-	req, err := http.NewRequest("POST", fmt.Sprintf("%s/loki/api/v1/push", c.cfg.url.String()), bytes.NewReader(buf))
+	req, err := http.NewRequest(http.MethodPost, c.cfg.url.String()+"/loki/api/v1/push", bytes.NewReader(buf))
 	if err != nil {
 		return -1, err
 	}
@@ -221,13 +270,13 @@ func (c *Client) send(ctx context.Context, buf []byte) (int, error) {
 
 // Stop the client.
 func (c *Client) Stop() {
-	c.once.Do(func() { close(c.quit) })
+	c.cancel.Cancel()
 	c.wg.Wait()
 }
 
 // HandleEvent handles the event received from the internal event listener.
 func (c *Client) HandleEvent(event api.Event) {
-	if !shared.ValueInSlice(event.Type, c.cfg.types) {
+	if !slices.Contains(c.cfg.types, event.Type) {
 		return
 	}
 
@@ -251,7 +300,8 @@ func (c *Client) HandleEvent(event api.Event) {
 
 	context := make(map[string]string)
 
-	if event.Type == api.EventTypeLifecycle {
+	switch event.Type {
+	case api.EventTypeLifecycle:
 		lifecycleEvent := api.EventLifecycle{}
 
 		err := json.Unmarshal(event.Metadata, &lifecycleEvent)
@@ -272,9 +322,7 @@ func (c *Client) HandleEvent(event api.Event) {
 		context["action"] = lifecycleEvent.Action
 		context["source"] = lifecycleEvent.Source
 
-		for k, v := range buildNestedContext("context", lifecycleEvent.Context) {
-			context[k] = v
-		}
+		maps.Copy(context, buildNestedContext("context", lifecycleEvent.Context))
 
 		if lifecycleEvent.Requestor != nil {
 			context["requester-address"] = lifecycleEvent.Requestor.Address
@@ -284,25 +332,37 @@ func (c *Client) HandleEvent(event api.Event) {
 
 		// Add key-value pairs as labels but don't override any labels.
 		for k, v := range context {
-			if shared.ValueInSlice(k, c.cfg.labels) {
-				_, ok := entry.labels[k]
+			if slices.Contains(c.cfg.labels, k) {
+				// Label names may not contain any hyphens.
+				normalizedKey := strings.ReplaceAll(k, "-", "_")
+				_, ok := entry.labels[normalizedKey]
 				if !ok {
-					// Label names may not contain any hyphens.
-					entry.labels[strings.ReplaceAll(k, "-", "_")] = v
+					entry.labels[normalizedKey] = v
 					delete(context, k)
 				}
 			}
 		}
 
-		messagePrefix := ""
+		lineSize := len(lifecycleEvent.Action)
+		for k, v := range context {
+			lineSize += len(k) + 3 + len(v) + 1 // k="v" + space
+		}
+
+		var line strings.Builder
+		line.Grow(lineSize)
 
 		// Add the remaining context as the message prefix.
 		for k, v := range context {
-			messagePrefix += fmt.Sprintf("%s=\"%s\" ", k, v)
+			line.WriteString(k)
+			line.WriteString(`="`)
+			line.WriteString(v)
+			line.WriteString(`" `)
 		}
 
-		entry.Line = fmt.Sprintf("%s%s", messagePrefix, lifecycleEvent.Action)
-	} else if event.Type == api.EventTypeLogging || event.Type == api.EventTypeOVN {
+		line.WriteString(lifecycleEvent.Action)
+
+		entry.Line = line.String()
+	case api.EventTypeLogging, api.EventTypeOVN:
 		logEvent := api.EventLogging{}
 
 		err := json.Unmarshal(event.Metadata, &logEvent)
@@ -330,13 +390,11 @@ func (c *Client) HandleEvent(event api.Event) {
 		// log message itself.
 		context["level"] = logEvent.Level
 
-		for k, v := range buildNestedContext("context", tmpContext) {
-			context[k] = v
-		}
+		maps.Copy(context, buildNestedContext("context", tmpContext))
 
 		// Add key-value pairs as labels but don't override any labels.
 		for k, v := range context {
-			if shared.ValueInSlice(k, c.cfg.labels) {
+			if slices.Contains(c.cfg.labels, k) {
 				_, ok := entry.labels[k]
 				if !ok {
 					entry.labels[k] = v
@@ -353,19 +411,97 @@ func (c *Client) HandleEvent(event api.Event) {
 
 		sort.Strings(keys)
 
+		messageSize := len(logEvent.Message)
+		for _, k := range keys {
+			messageSize += len(k) + 3 + len(context[k]) + 1 // k="v" + space
+		}
+
 		var message strings.Builder
+		message.Grow(messageSize)
 
 		// Add the remaining context as the message prefix. The keys are sorted alphabetically.
 		for _, k := range keys {
-			message.WriteString(fmt.Sprintf("%s=%q ", k, context[k]))
+			message.WriteString(k)
+			message.WriteString(`="`)
+			message.WriteString(context[k])
+			message.WriteString(`" `)
 		}
 
 		message.WriteString(logEvent.Message)
 
 		entry.Line = message.String()
+	case api.EventTypeSecurity:
+		secEvent := api.EventSecurity{}
+
+		err := json.Unmarshal(event.Metadata, &secEvent)
+		if err != nil {
+			return
+		}
+
+		entry.Timestamp = event.Timestamp
+
+		// Loki receives the OWASP-shaped audit payload. The events API
+		// metadata uses Go-style names; the OWASP transformation lives
+		// here so consumers of /1.0/events do not see OWASP fields.
+		owasp := c.securityEventToOWASP(event, secEvent, location)
+
+		for k, v := range owasp {
+			if !slices.Contains(c.cfg.labels, k) {
+				continue
+			}
+
+			_, ok := entry.labels[k]
+			if ok {
+				continue
+			}
+
+			entry.labels[k] = v
+		}
+
+		lineBytes, err := json.Marshal(owasp)
+		if err != nil {
+			return
+		}
+
+		entry.Line = string(lineBytes)
 	}
 
 	c.entries <- entry
+}
+
+// securityEventToOWASP renders an api.EventSecurity into the OWASP-named
+// audit log entry used as the Loki line. The Go-shaped payload from the
+// events API is combined with the envelope timestamp/location and the
+// server-static fields plumbed through the Loki client config so that the
+// resulting line conforms to the OWASP audit log schema.
+func (c *Client) securityEventToOWASP(event api.Event, sec api.EventSecurity, location string) map[string]string {
+	owasp := map[string]string{
+		"appid":               "lxd",
+		"type":                api.EventTypeSecurity,
+		"datetime":            event.Timestamp.Format(time.RFC3339Nano),
+		"event":               sec.Name,
+		"level":               sec.Level,
+		"description":         sec.Description,
+		"hostname":            c.cfg.hostname,
+		"host_ip":             c.cfg.hostIP,
+		"port":                c.cfg.port,
+		"protocol":            "https",
+		"request_uri":         sec.RequestPath,
+		"request_method":      sec.RequestMethod,
+		"event_source":        location,
+		"cluster_member_name": location,
+		"cluster_identifier":  c.cfg.clusterIdentifier,
+	}
+
+	if sec.Requestor != nil {
+		owasp["useragent"] = sec.Requestor.UserAgent
+		owasp["source_ip"] = sec.Requestor.Address
+		if sec.Requestor.Protocol != "" && sec.Requestor.Username != "" {
+			owasp["user_id"] = sec.Requestor.Protocol + "/" + sec.Requestor.Username
+		}
+	}
+
+	return owasp
 }
 
 func buildNestedContext(prefix string, m map[string]any) map[string]string {
@@ -379,14 +515,14 @@ func buildNestedContext(prefix string, m map[string]any) map[string]string {
 				if prefix == "" {
 					labels[k] = v
 				} else {
-					labels[fmt.Sprintf("%s-%s", prefix, k)] = v
+					labels[prefix+"-"+k] = v
 				}
 			}
 		} else {
 			if prefix == "" {
-				labels[k] = fmt.Sprintf("%v", v)
+				labels[k] = fmt.Sprint(v)
 			} else {
-				labels[fmt.Sprintf("%s-%s", prefix, k)] = fmt.Sprintf("%v", v)
+				labels[prefix+"-"+k] = fmt.Sprint(v)
 			}
 		}
 	}
@@ -396,7 +532,7 @@ func buildNestedContext(prefix string, m map[string]any) map[string]string {
 
 // MarshalJSON returns the JSON encoding of Entry.
 func (e Entry) MarshalJSON() ([]byte, error) {
-	return []byte(fmt.Sprintf("[\"%d\", %s]", e.Timestamp.UnixNano(), strconv.Quote(e.Line))), nil
+	return []byte(`["` + strconv.FormatInt(e.Timestamp.UnixNano(), 10) + `", ` + strconv.Quote(e.Line) + "]"), nil
 }
 
 // String implements the Stringer interface. It returns a formatted/sorted set of label key/value pairs.

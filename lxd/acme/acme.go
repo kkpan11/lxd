@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/go-acme/lego/v4/acme"
@@ -35,7 +36,7 @@ const ClusterCertFilename = "cluster.crt.new"
 // certificateNeedsUpdate returns true if the domain doesn't match the certificate's DNS names
 // or it's valid for less than 30 days.
 func certificateNeedsUpdate(domain string, cert *x509.Certificate) bool {
-	return !shared.ValueInSlice(domain, cert.DNSNames) || time.Now().After(cert.NotAfter.Add(-30*24*time.Hour))
+	return !slices.Contains(cert.DNSNames, domain) || time.Now().After(cert.NotAfter.Add(-30*24*time.Hour))
 }
 
 // UpdateCertificate updates the certificate.
@@ -47,50 +48,53 @@ func UpdateCertificate(s *state.State, provider HTTP01Provider, clustered bool, 
 	// If clusterCertFilename exists, it means that a previously issued certificate couldn't be
 	// distributed to all cluster members and was therefore kept back. In this case, don't issue
 	// a new certificate but return the previously issued one.
-	if !force && clustered && shared.PathExists(clusterCertFilename) {
-		keyFilename := shared.VarPath("cluster.key")
-
+	if !force && clustered {
 		clusterCert, err := os.ReadFile(clusterCertFilename)
-		if err != nil {
+		if err != nil && !os.IsNotExist(err) {
 			return nil, fmt.Errorf("Failed reading cluster certificate file: %w", err)
 		}
 
-		key, err := os.ReadFile(keyFilename)
-		if err != nil {
-			return nil, fmt.Errorf("Failed reading cluster key file: %w", err)
-		}
+		if err == nil {
+			keyFilename := shared.VarPath("cluster.key")
 
-		keyPair, err := tls.X509KeyPair(clusterCert, key)
-		if err != nil {
-			return nil, fmt.Errorf("Failed to get keypair: %w", err)
-		}
+			key, err := os.ReadFile(keyFilename)
+			if err != nil {
+				return nil, fmt.Errorf("Failed reading cluster key file: %w", err)
+			}
 
-		cert, err := x509.ParseCertificate(keyPair.Certificate[0])
-		if err != nil {
-			return nil, fmt.Errorf("Failed to parse certificate: %w", err)
-		}
+			keyPair, err := tls.X509KeyPair(clusterCert, key)
+			if err != nil {
+				return nil, fmt.Errorf("Failed getting keypair: %w", err)
+			}
 
-		if !certificateNeedsUpdate(domain, cert) {
-			return &certificate.Resource{
-				Certificate: clusterCert,
-				PrivateKey:  key,
-			}, nil
+			cert, err := x509.ParseCertificate(keyPair.Certificate[0])
+			if err != nil {
+				return nil, fmt.Errorf("Failed parsing certificate: %w", err)
+			}
+
+			if !certificateNeedsUpdate(domain, cert) {
+				return &certificate.Resource{
+					Certificate: clusterCert,
+					PrivateKey:  key,
+				}, nil
+			}
 		}
 	}
 
-	if shared.PathExists(clusterCertFilename) {
-		_ = os.Remove(clusterCertFilename)
+	err := os.Remove(clusterCertFilename)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("Failed removing old cluster certificate file: %w", err)
 	}
 
 	// Load the certificate.
 	certInfo, err := util.LoadCert(s.OS.VarDir)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to load certificate and key file: %w", err)
+		return nil, fmt.Errorf("Failed loading certificate and key file: %w", err)
 	}
 
 	cert, err := x509.ParseCertificate(certInfo.KeyPair().Certificate[0])
 	if err != nil {
-		return nil, fmt.Errorf("Failed to parse certificate: %w", err)
+		return nil, fmt.Errorf("Failed parsing certificate: %w", err)
 	}
 
 	if !force && !certificateNeedsUpdate(domain, cert) {
@@ -122,7 +126,7 @@ func UpdateCertificate(s *state.State, provider HTTP01Provider, clustered bool, 
 
 	client, err := lego.NewClient(config)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to create new client: %w", err)
+		return nil, fmt.Errorf("Failed creating new client: %w", err)
 	}
 
 	err = client.Challenge.SetHTTP01Provider(provider)
@@ -133,7 +137,7 @@ func UpdateCertificate(s *state.State, provider HTTP01Provider, clustered bool, 
 	var reg *registration.Resource
 
 	// Registration might fail randomly (as seen in manual tests), so retry in that case.
-	for i := 0; i < retries; i++ {
+	for range retries {
 		reg, err = client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
 		if err == nil {
 			break
@@ -145,12 +149,12 @@ func UpdateCertificate(s *state.State, provider HTTP01Provider, clustered bool, 
 			break
 		}
 
-		l.Warn("Failed to register user, retrying in 10 seconds", logger.Ctx{"err": err})
+		l.Warn("Failed registering user, retrying in 10 seconds", logger.Ctx{"err": err})
 		time.Sleep(10 * time.Second)
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("Failed to register user: %w", err)
+		return nil, fmt.Errorf("Failed registering user: %w", err)
 	}
 
 	user.Registration = reg
@@ -167,7 +171,7 @@ func UpdateCertificate(s *state.State, provider HTTP01Provider, clustered bool, 
 
 	// Get new certificate.
 	// This might fail randomly (as seen in manual tests), so retry in that case.
-	for i := 0; i < retries; i++ {
+	for range retries {
 		certificates, err = client.Certificate.Obtain(request)
 		if err == nil {
 			break
@@ -179,12 +183,12 @@ func UpdateCertificate(s *state.State, provider HTTP01Provider, clustered bool, 
 			break
 		}
 
-		l.Warn("Failed to obtain certificate, retrying in 10 seconds", logger.Ctx{"err": err})
+		l.Warn("Failed obtaining certificate, retrying in 10 seconds", logger.Ctx{"err": err})
 		time.Sleep(10 * time.Second)
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("Failed to obtain certificate: %w", err)
+		return nil, fmt.Errorf("Failed obtaining certificate: %w", err)
 	}
 
 	l.Info("Finished issuing certificate")

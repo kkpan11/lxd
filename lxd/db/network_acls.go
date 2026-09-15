@@ -42,6 +42,39 @@ func (c *ClusterTx) GetNetworkACLs(ctx context.Context, project string) ([]strin
 	return aclNames, nil
 }
 
+// GetNetworkACLsAllProjects returns the names of existing Network ACLs.
+func (c *ClusterTx) GetNetworkACLsAllProjects(ctx context.Context) (map[string][]string, error) {
+	q := `SELECT projects.name, networks_acls.name FROM networks_acls
+		JOIN projects ON projects.id=networks_acls.project_id
+		ORDER BY networks_acls.id
+	`
+
+	aclNames := map[string][]string{}
+	err := query.Scan(ctx, c.tx, q, func(scan func(dest ...any) error) error {
+		var projectName string
+		var aclName string
+
+		err := scan(&projectName, &aclName)
+		if err != nil {
+			return err
+		}
+
+		_, ok := aclNames[projectName]
+		if !ok {
+			aclNames[projectName] = []string{}
+		}
+
+		aclNames[projectName] = append(aclNames[projectName], aclName)
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return aclNames, nil
+}
+
 // GetNetworkACLIDsByNames returns a map of names to IDs of existing Network ACLs.
 func (c *ClusterTx) GetNetworkACLIDsByNames(ctx context.Context, project string) (map[string]int64, error) {
 	q := `SELECT id, name FROM networks_acls
@@ -295,7 +328,7 @@ func (c *ClusterTx) GetNetworkACLURIs(ctx context.Context, projectID int, projec
 
 	names, err := query.SelectStrings(ctx, c.tx, sql, projectID)
 	if err != nil {
-		return nil, fmt.Errorf("Unable to get URIs for network acl: %w", err)
+		return nil, fmt.Errorf("Cannot get URIs for network acl: %w", err)
 	}
 
 	uris := make([]string, len(names))

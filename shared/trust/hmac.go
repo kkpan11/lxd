@@ -77,20 +77,20 @@ func NewHMAC(key []byte, conf HMACConf) HMACFormatter {
 // splitVersionFromHMAC is a helper to separate the HMAC version from the actual HMAC.
 // Depending on the used format the HMAC value has to be splitted further (see argon2).
 func (h *HMAC) splitVersionFromHMAC(header string) (HMACVersion, string, error) {
-	authHeaderSplit := strings.Split(header, " ")
-	if len(authHeaderSplit) != 2 {
+	version, hmac, found := strings.Cut(header, " ")
+	if !found {
 		return "", "", errors.New("Version or HMAC is missing")
 	}
 
-	if authHeaderSplit[0] == "" {
+	if version == "" {
 		return "", "", errors.New("Version cannot be empty")
 	}
 
-	if authHeaderSplit[1] == "" {
+	if hmac == "" {
 		return "", "", errors.New("HMAC cannot be empty")
 	}
 
-	return HMACVersion(authHeaderSplit[0]), authHeaderSplit[1], nil
+	return HMACVersion(version), hmac, nil
 }
 
 // Version returns the used HMAC version.
@@ -100,7 +100,7 @@ func (h *HMAC) Version() HMACVersion {
 
 // HTTPHeader returns the actual HMAC together with the used version.
 func (h *HMAC) HTTPHeader(hmac []byte) string {
-	return fmt.Sprintf("%s %s", h.conf.Version, hex.EncodeToString(hmac))
+	return string(h.conf.Version) + " " + hex.EncodeToString(hmac)
 }
 
 // ParseHTTPHeader parses the given header and returns a new instance of the default formatter
@@ -114,7 +114,7 @@ func (h *HMAC) ParseHTTPHeader(header string) (HMACFormatter, []byte, error) {
 
 	hmacFromHeader, err := hex.DecodeString(hmacStr)
 	if err != nil {
-		return nil, nil, fmt.Errorf("Failed to decode the HMAC: %w", err)
+		return nil, nil, fmt.Errorf("Failed decoding the HMAC: %w", err)
 	}
 
 	hNew := NewHMAC(h.key, NewDefaultHMACConf(version))
@@ -126,7 +126,7 @@ func (h *HMAC) WriteBytes(b []byte) ([]byte, error) {
 	mac := hmac.New(h.conf.HashFunc, h.key)
 	_, err := mac.Write(b)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to create HMAC: %w", err)
+		return nil, fmt.Errorf("Failed creating HMAC: %w", err)
 	}
 
 	return mac.Sum(nil), nil
@@ -136,7 +136,7 @@ func (h *HMAC) WriteBytes(b []byte) ([]byte, error) {
 func (h *HMAC) WriteJSON(v any) ([]byte, error) {
 	payload, err := json.Marshal(v)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to marshal payload: %w", err)
+		return nil, fmt.Errorf("Failed marshaling payload: %w", err)
 	}
 
 	return h.WriteBytes(payload)
@@ -147,7 +147,7 @@ func (h *HMAC) WriteJSON(v any) ([]byte, error) {
 func (h *HMAC) WriteRequest(r *http.Request) ([]byte, error) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to read request body: %w", err)
+		return nil, fmt.Errorf("Failed reading request body: %w", err)
 	}
 
 	defer func() {
@@ -157,7 +157,7 @@ func (h *HMAC) WriteRequest(r *http.Request) ([]byte, error) {
 
 	err = r.Body.Close()
 	if err != nil {
-		return nil, fmt.Errorf("Failed to close the request body: %w", err)
+		return nil, fmt.Errorf("Failed closing the request body: %w", err)
 	}
 
 	return h.WriteBytes(body)
@@ -167,7 +167,7 @@ func (h *HMAC) WriteRequest(r *http.Request) ([]byte, error) {
 func HMACAuthorizationHeader(h HMACFormatter, v any) (string, error) {
 	hmacBytes, err := h.WriteJSON(v)
 	if err != nil {
-		return "", api.StatusErrorf(http.StatusInternalServerError, "Failed to calculate HMAC from struct: %w", err)
+		return "", api.StatusErrorf(http.StatusInternalServerError, "Failed calculating HMAC from struct: %w", err)
 	}
 
 	return h.HTTPHeader(hmacBytes), nil
@@ -184,7 +184,7 @@ func HMACEqual(h HMACFormatter, r *http.Request) error {
 
 	hFromHeader, hmacFromHeader, err := h.ParseHTTPHeader(authHeader)
 	if err != nil {
-		return api.StatusErrorf(http.StatusInternalServerError, "Failed to parse Authorization header: %w", err)
+		return api.StatusErrorf(http.StatusInternalServerError, "Failed parsing Authorization header: %w", err)
 	}
 
 	// Check if the HMAC version from the formatter matches the one found in the request header.
@@ -197,7 +197,7 @@ func HMACEqual(h HMACFormatter, r *http.Request) error {
 	// Use the formatter derived from the header to re-create the HMAC from the request's body.
 	hmacFromBody, err := hFromHeader.WriteRequest(r)
 	if err != nil {
-		return api.StatusErrorf(http.StatusInternalServerError, "Failed to calculate HMAC from request body: %w", err)
+		return api.StatusErrorf(http.StatusInternalServerError, "Failed calculating HMAC from request body: %w", err)
 	}
 
 	// Compare if the HMAC from the header matches the one computed over the body.

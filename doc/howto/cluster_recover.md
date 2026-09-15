@@ -24,6 +24,7 @@ Run `lxd cluster --help` for an overview of all available commands.
 ## Database members
 
 Every LXD cluster has a specific number of members (configured through {config:option}`server-cluster:cluster.max_voters`) that serve as voting members of the distributed database.
+If the cluster uses {ref}`control plane mode <clustering-control-plane>`, only cluster members with the `control-plane` role act as voters.
 If you lose a majority of these cluster members (for example, you have a three-member cluster and you lose two members), the cluster loses quorum and becomes unavailable.
 
 To determine which members have (or had) database roles, log on to any surviving member of your cluster and run the following command:
@@ -69,7 +70,7 @@ LXD automatically takes a backup of the database before making changes (see {ref
 
 If some members of your cluster are no longer reachable, or if the cluster itself is unreachable due to a change in IP address or listening port number, you can reconfigure the cluster.
 
-To do so, choose one database member to edit the cluster configuration.
+To do so, choose the {ref}`most up-to-date database member <up-to-date_cluster_member>` to edit the cluster configuration.
 Once the cluster edit is complete you will need to manually copy the reconfigured global database to every other surviving member.
 
 You can change the IP addresses or listening port numbers for each member as required.
@@ -78,7 +79,7 @@ The cluster configuration must contain the description of the full cluster.
 
 You can edit the {ref}`clustering-member-roles` of the members, but with the following limitations:
 
-- A cluster member that does not have a `database*` role cannot become a voter, because it might lack a global database.
+- A cluster member that does not have a `database-voter`, `database-standby`, or `database-leader` role cannot become a voter, because it might lack a global database.
 - At least two members must remain voters (except in the case of a two-member cluster, where one voter suffices), or there will be no quorum.
 
 Before performing the recovery, stop the LXD daemon on all surviving cluster members.
@@ -146,6 +147,18 @@ unpack the tarball in its place:
     cd /var/snap/lxd/common/lxd
     sudo rm -r database
     sudo tar -xf db_backup.TIMESTAMP.tar.gz
+
+(up-to-date_cluster_member)=
+## Find the most up-to-date cluster member
+On every shutdown, LXD's {ref}`database members <clustering-member-roles>` log
+the Raft term and index:
+
+    Dqlite last entry    index=1039 term=672
+
+To determine which database member is most up to date:
+
+- If two members have different terms, the member with the higher term is more up to date.
+- If two members have the same term, the member with the higher index is more up to date.
 
 ## Manually alter Raft membership
 

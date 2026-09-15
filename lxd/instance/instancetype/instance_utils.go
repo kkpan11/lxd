@@ -1,6 +1,7 @@
 package instancetype
 
 import (
+	"maps"
 	"strconv"
 
 	deviceConfig "github.com/canonical/lxd/lxd/device/config"
@@ -8,12 +9,12 @@ import (
 )
 
 // ExpandInstanceConfig expands the given instance config with the config values of the given profiles.
-func ExpandInstanceConfig(globalConfig map[string]any, config map[string]string, profiles []api.Profile) map[string]string {
+func ExpandInstanceConfig(globalConfig map[string]string, config map[string]string, profiles []api.Profile) map[string]string {
 	expandedConfig := map[string]string{}
 
 	// Apply global config overriding
 	if globalConfig != nil {
-		globalInstancesMigrationStatefulStr, ok := globalConfig["instances.migration.stateful"].(string)
+		globalInstancesMigrationStatefulStr, ok := globalConfig["instances.migration.stateful"]
 		if ok {
 			globalInstancesMigrationStateful, _ := strconv.ParseBool(globalInstancesMigrationStatefulStr)
 			if globalInstancesMigrationStateful {
@@ -29,15 +30,11 @@ func ExpandInstanceConfig(globalConfig map[string]any, config map[string]string,
 	}
 
 	for i := range profileConfigs {
-		for k, v := range profileConfigs[i] {
-			expandedConfig[k] = v
-		}
+		maps.Copy(expandedConfig, profileConfigs[i])
 	}
 
 	// Stick the given config on top.
-	for k, v := range config {
-		expandedConfig[k] = v
-	}
+	maps.Copy(expandedConfig, config)
 
 	return expandedConfig
 }
@@ -53,15 +50,11 @@ func ExpandInstanceDevices(devices deviceConfig.Devices, profiles []api.Profile)
 	}
 
 	for i := range profileDevices {
-		for k, v := range profileDevices[i] {
-			expandedDevices[k] = v
-		}
+		maps.Copy(expandedDevices, profileDevices[i])
 	}
 
 	// Stick the given devices on top.
-	for k, v := range devices {
-		expandedDevices[k] = v
-	}
+	maps.Copy(expandedDevices, devices)
 
 	return expandedDevices
 }

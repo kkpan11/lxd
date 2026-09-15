@@ -5,8 +5,11 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -15,7 +18,6 @@ import (
 	"github.com/canonical/lxd/lxd/db/operationtype"
 	"github.com/canonical/lxd/lxd/db/query"
 	"github.com/canonical/lxd/lxd/util"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/osarch"
 	"github.com/canonical/lxd/shared/version"
@@ -24,29 +26,50 @@ import (
 // ClusterRole represents the role of a member in a cluster.
 type ClusterRole string
 
-// ClusterRoleDatabase represents the database role in a cluster.
-const ClusterRoleDatabase = ClusterRole("database")
+// ClusterRoleClass represents the class of a cluster role.
+type ClusterRoleClass int
+
+const (
+	// ClusterRoleClassAutomatic represents roles that are automatically assigned by LXD.
+	ClusterRoleClassAutomatic ClusterRoleClass = iota
+
+	// ClusterRoleClassCustom represents roles that can be custom assigned.
+	ClusterRoleClassCustom
+)
+
+// ClusterRoleDatabaseVoter represents the database voter role in a cluster.
+// Assigned to cluster members with the [RaftVoter] role.
+const ClusterRoleDatabaseVoter = ClusterRole("database-voter")
 
 // ClusterRoleDatabaseStandBy represents the database stand-by role in a cluster.
+// Assigned to cluster members with the [RaftStandBy] role.
 const ClusterRoleDatabaseStandBy = ClusterRole("database-standby")
 
 // ClusterRoleDatabaseLeader represents the database leader role in a cluster.
+// Assigned to the current Raft leader.
 const ClusterRoleDatabaseLeader = ClusterRole("database-leader")
 
-// ClusterRoleEventHub represents a cluster member who operates as an event hub.
-const ClusterRoleEventHub = ClusterRole("event-hub")
+// ClusterRoleControlPlane represents a control plane cluster member.
+const ClusterRoleControlPlane = ClusterRole("control-plane")
 
-// ClusterRoleOVNChassis represents a cluster member who operates as an OVN chassis.
+// ClusterRoleOVNChassis represents a cluster member that operates as an OVN chassis.
 const ClusterRoleOVNChassis = ClusterRole("ovn-chassis")
 
-// ClusterRoles maps role ids into human-readable names.
-//
-// Note: the database role is currently stored directly in the raft
-// configuration which acts as single source of truth for it. This map should
-// only contain LXD-specific cluster roles.
-var ClusterRoles = map[int]ClusterRole{
-	1: ClusterRoleEventHub,
-	2: ClusterRoleOVNChassis,
+// ClusterRoles maps role classes to their respective role definitions.
+// Automatic roles are managed by LXD and cannot be manually modified.
+// Custom roles can be assigned and removed by users via the API.
+var ClusterRoles = map[ClusterRoleClass]map[int]ClusterRole{
+	// Automatic roles are not stored in the database, so the keys are not IDs.
+	ClusterRoleClassAutomatic: {
+		1: ClusterRoleDatabaseVoter,
+		2: ClusterRoleDatabaseStandBy,
+		3: ClusterRoleDatabaseLeader,
+	},
+	// Custom cluster roles are stored in the database and are therefore keyed by their respective IDs.
+	ClusterRoleClassCustom: {
+		2: ClusterRoleOVNChassis,
+		3: ClusterRoleControlPlane,
+	},
 }
 
 // Numeric type codes identifying different cluster member states.
@@ -84,14 +107,13 @@ type NodeInfoArgs struct {
 	FailureDomains       map[uint64]string
 	MemberFailureDomains map[string]uint64
 	OfflineThreshold     time.Duration
-	MaxMemberVersion     [2]int
+	Members              []NodeInfo
 	RaftNodes            []RaftNode
 }
 
 // ToAPI returns a LXD API entry.
 func (n NodeInfo) ToAPI(ctx context.Context, tx *ClusterTx, args NodeInfoArgs) (*api.ClusterMember, error) {
 	var err error
-	var maxVersion [2]int
 	var failureDomain string
 
 	domainID := args.MemberFailureDomains[n.Address]
@@ -99,9 +121,9 @@ func (n NodeInfo) ToAPI(ctx context.Context, tx *ClusterTx, args NodeInfoArgs) (
 
 	// From local database.
 	var raftNode *RaftNode
-	for _, node := range args.RaftNodes {
+	for i, node := range args.RaftNodes {
 		if node.Address == n.Address {
-			raftNode = &node
+			raftNode = &args.RaftNodes[i]
 			break
 		}
 	}
@@ -110,7 +132,7 @@ func (n NodeInfo) ToAPI(ctx context.Context, tx *ClusterTx, args NodeInfoArgs) (
 	result := api.ClusterMember{}
 	result.Description = n.Description
 	result.ServerName = n.Name
-	result.URL = fmt.Sprintf("https://%s", n.Address)
+	result.URL = "https://" + n.Address
 	result.Database = false
 	result.Config = n.Config
 
@@ -122,13 +144,16 @@ func (n NodeInfo) ToAPI(ctx context.Context, tx *ClusterTx, args NodeInfoArgs) (
 	result.Groups = n.Groups
 
 	// Check if member is the leader.
-	if args.LeaderAddress == n.Address {
+	isLeader := args.LeaderAddress == n.Address
+	if isLeader {
 		result.Roles = append(result.Roles, string(ClusterRoleDatabaseLeader))
 		result.Database = true
 	}
 
-	if raftNode != nil && raftNode.Role == RaftVoter {
-		result.Roles = append(result.Roles, string(ClusterRoleDatabase))
+	// Add database-voter role only for non-leader voters.
+	// Leaders are implicitly voters, so we don't show database-voter for them.
+	if raftNode != nil && raftNode.Role == RaftVoter && !isLeader {
+		result.Roles = append(result.Roles, string(ClusterRoleDatabaseVoter))
 		result.Database = true
 	}
 
@@ -155,15 +180,26 @@ func (n NodeInfo) ToAPI(ctx context.Context, tx *ClusterTx, args NodeInfoArgs) (
 		result.Status = "Offline"
 		result.Message = fmt.Sprintf("No heartbeat for %s (%s)", time.Since(n.Heartbeat), n.Heartbeat)
 	} else {
-		// Check if up to date.
-		n, err := util.CompareVersions(maxVersion, n.Version())
-		if err != nil {
-			return nil, err
-		}
+		for _, member := range args.Members {
+			if member.ID == n.ID {
+				continue // Skip ourselves.
+			}
 
-		if n == 1 {
-			result.Status = "Blocked"
-			result.Message = "Needs updating to newer version"
+			// Check if up to date.
+			cmp, err := util.CompareVersions(member.Version(), n.Version())
+			if err != nil {
+				return nil, fmt.Errorf("Failed comparing with version of member %q: %w", member.Name, err)
+			}
+
+			if cmp == 1 {
+				result.Status = "Blocked"
+				result.Message = "LXD version is older than other members"
+				break
+			} else if cmp == 2 {
+				result.Status = "Blocked"
+				result.Message = "LXD version is newer than other members"
+				break
+			}
 		}
 	}
 
@@ -190,38 +226,12 @@ func (c *ClusterTx) GetNodeByAddress(ctx context.Context, address string) (NodeI
 	case 1:
 		return nodes[0], nil
 	default:
-		return null, fmt.Errorf("more than one node matches")
+		return null, errors.New("more than one node matches")
 	}
 }
 
-// GetNodeMaxVersion returns the highest schema and API versions possible on the cluster.
-func (c *ClusterTx) GetNodeMaxVersion(ctx context.Context) ([2]int, error) {
-	version := [2]int{}
-
-	// Get the maximum DB schema.
-	var maxSchema int
-	row := c.tx.QueryRowContext(ctx, "SELECT MAX(schema) FROM nodes")
-	err := row.Scan(&maxSchema)
-	if err != nil {
-		return version, err
-	}
-
-	// Get the maximum API extension.
-	var maxAPI int
-	row = c.tx.QueryRowContext(ctx, "SELECT MAX(api_extensions) FROM nodes")
-	err = row.Scan(&maxAPI)
-	if err != nil {
-		return version, err
-	}
-
-	// Compute the combined version.
-	version = [2]int{maxSchema, maxAPI}
-
-	return version, nil
-}
-
-// GetNodeWithID returns the node with the given ID.
-func (c *ClusterTx) GetNodeWithID(ctx context.Context, nodeID int) (NodeInfo, error) {
+// GetNodeByID returns the node with the given ID.
+func (c *ClusterTx) GetNodeByID(ctx context.Context, nodeID int64) (NodeInfo, error) {
 	null := NodeInfo{}
 	nodes, err := c.nodes(ctx, false /* not pending */, "id=?", nodeID)
 	if err != nil {
@@ -234,14 +244,14 @@ func (c *ClusterTx) GetNodeWithID(ctx context.Context, nodeID int) (NodeInfo, er
 	case 1:
 		return nodes[0], nil
 	default:
-		return null, fmt.Errorf("More than one cluster member matches")
+		return null, errors.New("More than one cluster member matches")
 	}
 }
 
 // GetPendingNodeByAddress returns the pending node with the given network address.
 func (c *ClusterTx) GetPendingNodeByAddress(ctx context.Context, address string) (NodeInfo, error) {
 	null := NodeInfo{}
-	nodes, err := c.nodes(ctx, true /*pending */, "address=?", address)
+	nodes, err := c.nodes(ctx, true /* pending */, "address=?", address)
 	if err != nil {
 		return null, err
 	}
@@ -252,7 +262,7 @@ func (c *ClusterTx) GetPendingNodeByAddress(ctx context.Context, address string)
 	case 1:
 		return nodes[0], nil
 	default:
-		return null, fmt.Errorf("More than one cluster member matches")
+		return null, errors.New("More than one cluster member matches")
 	}
 }
 
@@ -270,7 +280,7 @@ func (c *ClusterTx) GetNodeByName(ctx context.Context, name string) (NodeInfo, e
 	case 1:
 		return nodes[0], nil
 	default:
-		return null, fmt.Errorf("More than one cluster member matches")
+		return null, errors.New("More than one cluster member matches")
 	}
 }
 
@@ -289,7 +299,7 @@ func (c *ClusterTx) GetLocalNodeName(ctx context.Context) (string, error) {
 	case 1:
 		return names[0], nil
 	default:
-		return "", fmt.Errorf("inconsistency: non-unique node ID")
+		return "", errors.New("inconsistency: non-unique node ID")
 	}
 }
 
@@ -307,7 +317,7 @@ func (c *ClusterTx) GetLocalNodeAddress(ctx context.Context) (string, error) {
 	case 1:
 		return addresses[0], nil
 	default:
-		return "", fmt.Errorf("inconsistency: non-unique node ID")
+		return "", errors.New("inconsistency: non-unique node ID")
 	}
 }
 
@@ -316,7 +326,7 @@ func (c *ClusterTx) GetLocalNodeAddress(ctx context.Context) (string, error) {
 func (c *ClusterTx) NodeIsOutdated(ctx context.Context) (bool, error) {
 	nodes, err := c.nodes(ctx, false /* not pending */, "")
 	if err != nil {
-		return false, fmt.Errorf("Failed to fetch nodes: %w", err)
+		return false, fmt.Errorf("Failed fetching nodes: %w", err)
 	}
 
 	// Figure our own version.
@@ -327,7 +337,7 @@ func (c *ClusterTx) NodeIsOutdated(ctx context.Context) (bool, error) {
 		}
 	}
 	if version[0] == 0 || version[1] == 0 {
-		return false, fmt.Errorf("Inconsistency: local member not found")
+		return false, errors.New("Inconsistency: local member not found")
 	}
 
 	// Check if any of the other nodes is greater than us.
@@ -338,7 +348,7 @@ func (c *ClusterTx) NodeIsOutdated(ctx context.Context) (bool, error) {
 
 		n, err := util.CompareVersions(node.Version(), version)
 		if err != nil {
-			return false, fmt.Errorf("Failed to compare with version of member %s: %w", node.Name, err)
+			return false, fmt.Errorf("Failed comparing with version of member %q: %w", node.Name, err)
 		}
 
 		if n == 1 {
@@ -365,7 +375,7 @@ func (c *ClusterTx) GetNodes(ctx context.Context) ([]NodeInfo, error) {
 func (c *ClusterTx) GetNodesCount(ctx context.Context) (int, error) {
 	count, err := query.Count(ctx, c.tx, "nodes", "")
 	if err != nil {
-		return 0, fmt.Errorf("failed to count existing nodes: %w", err)
+		return 0, fmt.Errorf("failed counting existing nodes: %w", err)
 	}
 
 	return count, nil
@@ -374,25 +384,25 @@ func (c *ClusterTx) GetNodesCount(ctx context.Context) (int, error) {
 // RenameNode changes the name of an existing node.
 //
 // Return an error if a node with the same name already exists.
-func (c *ClusterTx) RenameNode(ctx context.Context, old string, new string) error {
-	count, err := query.Count(ctx, c.tx, "nodes", "name=?", new)
+func (c *ClusterTx) RenameNode(ctx context.Context, oldName string, newName string) error {
+	count, err := query.Count(ctx, c.tx, "nodes", "name=?", newName)
 	if err != nil {
-		return fmt.Errorf("failed to check existing nodes: %w", err)
+		return fmt.Errorf("failed checking existing nodes: %w", err)
 	}
 
 	if count != 0 {
-		return api.StatusErrorf(http.StatusConflict, "A cluster member already exists with name %q", new)
+		return api.StatusErrorf(http.StatusConflict, "A cluster member already exists with name %q", newName)
 	}
 
 	stmt := `UPDATE nodes SET name=? WHERE name=?`
-	result, err := c.tx.Exec(stmt, new, old)
+	result, err := c.tx.Exec(stmt, newName, oldName)
 	if err != nil {
-		return fmt.Errorf("failed to update node name: %w", err)
+		return fmt.Errorf("failed updating node name: %w", err)
 	}
 
 	n, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("failed to get rows count: %w", err)
+		return fmt.Errorf("failed getting rows count: %w", err)
 	}
 
 	if n != 1 {
@@ -407,12 +417,12 @@ func (c *ClusterTx) SetDescription(id int64, description string) error {
 	stmt := `UPDATE nodes SET description=? WHERE id=?`
 	result, err := c.tx.Exec(stmt, description, id)
 	if err != nil {
-		return fmt.Errorf("Failed to update node name: %w", err)
+		return fmt.Errorf("Failed updating node name: %w", err)
 	}
 
 	n, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("Failed to get rows count: %w", err)
+		return fmt.Errorf("Failed getting rows count: %w", err)
 	}
 
 	if n != 1 {
@@ -422,7 +432,7 @@ func (c *ClusterTx) SetDescription(id int64, description string) error {
 	return nil
 }
 
-// Nodes returns all LXD nodes part of the cluster.
+// nodes returns all LXD nodes part of the cluster.
 func (c *ClusterTx) nodes(ctx context.Context, pending bool, where string, args ...any) ([]NodeInfo, error) {
 	// Get node roles
 	sql := "SELECT node_id, role FROM nodes_roles"
@@ -441,8 +451,12 @@ func (c *ClusterTx) nodes(ctx context.Context, pending bool, where string, args 
 			nodeRoles[nodeID] = []ClusterRole{}
 		}
 
-		roleName := string(ClusterRoles[role])
-		nodeRoles[nodeID] = append(nodeRoles[nodeID], ClusterRole(roleName))
+		roleName, ok := ClusterRoles[ClusterRoleClassCustom][role]
+		if !ok {
+			return fmt.Errorf("Unknown manual cluster role ID %d in nodes_roles table", role)
+		}
+
+		nodeRoles[nodeID] = append(nodeRoles[nodeID], roleName)
 
 		return nil
 	})
@@ -492,7 +506,7 @@ JOIN cluster_groups ON cluster_groups.id = nodes_cluster_groups.group_id`
 	args = append([]any{ClusterMemberStatePending}, args...)
 
 	if where != "" {
-		sql += fmt.Sprintf("AND %s ", where)
+		sql += "AND " + where + " "
 	}
 
 	sql += "ORDER BY id"
@@ -511,7 +525,7 @@ JOIN cluster_groups ON cluster_groups.id = nodes_cluster_groups.group_id`
 		return nil
 	}, args...)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch nodes: %w", err)
+		return nil, fmt.Errorf("Failed fetching nodes: %w", err)
 	}
 
 	// Add the roles
@@ -530,9 +544,9 @@ JOIN cluster_groups ON cluster_groups.id = nodes_cluster_groups.group_id`
 		}
 	}
 
-	config, err := cluster.GetConfig(context.TODO(), c.Tx(), "node")
+	config, err := cluster.GetConfig(ctx, c.Tx(), "node")
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch nodes config: %w", err)
+		return nil, fmt.Errorf("Failed fetching nodes config: %w", err)
 	}
 
 	for i := range nodes {
@@ -615,38 +629,27 @@ func (c *ClusterTx) BootstrapNode(name string, address string) error {
 func (c *ClusterTx) UpdateNodeConfig(ctx context.Context, id int64, config map[string]string) error {
 	err := cluster.UpdateConfig(ctx, c.Tx(), "node", int(id), config)
 	if err != nil {
-		return fmt.Errorf("Unable to update node config: %w", err)
+		return fmt.Errorf("Cannot update local config: %w", err)
 	}
 
 	return nil
 }
 
 // UpdateNodeRoles changes the list of roles on a member.
+// Only custom (user-assignable) roles are stored in the database.
+// Automatic roles are managed by Raft and filtered out.
+// Callers are expected to validate roles before calling this function.
 func (c *ClusterTx) UpdateNodeRoles(id int64, roles []ClusterRole) error {
-	getRoleID := func(role ClusterRole) (int, error) {
-		for k, v := range ClusterRoles {
-			if v == role {
-				return k, nil
-			}
-		}
-
-		return -1, fmt.Errorf("Invalid cluster role %q", role)
-	}
-
-	// Translate role names to ids
+	// Translate role names to IDs
 	roleIDs := []int{}
 	for _, role := range roles {
-		// Skip internal-only roles.
-		if role == ClusterRoleDatabase || role == ClusterRoleDatabaseStandBy || role == ClusterRoleDatabaseLeader {
-			continue
+		// Find the role ID for the given custom role.
+		for id, customRole := range ClusterRoles[ClusterRoleClassCustom] {
+			if role == customRole {
+				roleIDs = append(roleIDs, id)
+				break
+			}
 		}
-
-		roleID, err := getRoleID(role)
-		if err != nil {
-			return err
-		}
-
-		roleIDs = append(roleIDs, roleID)
 	}
 
 	// Update the database record
@@ -667,7 +670,7 @@ func (c *ClusterTx) UpdateNodeRoles(id int64, roles []ClusterRole) error {
 
 // UpdateNodeClusterGroups changes the list of cluster groups the member belongs to.
 func (c *ClusterTx) UpdateNodeClusterGroups(ctx context.Context, id int64, groups []string) error {
-	nodeInfo, err := c.GetNodeWithID(ctx, int(id))
+	nodeInfo, err := c.GetNodeByID(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -681,7 +684,7 @@ func (c *ClusterTx) UpdateNodeClusterGroups(ctx context.Context, id int64, group
 
 	// Check if node already belongs to the given groups.
 	for _, newGroup := range groups {
-		if shared.ValueInSlice(newGroup, oldGroups) {
+		if slices.Contains(oldGroups, newGroup) {
 			// Node already belongs to this group.
 			skipGroups = append(skipGroups, newGroup)
 			continue
@@ -690,19 +693,19 @@ func (c *ClusterTx) UpdateNodeClusterGroups(ctx context.Context, id int64, group
 		// Add node to new group.
 		err = c.AddNodeToClusterGroup(ctx, newGroup, nodeInfo.Name)
 		if err != nil {
-			return fmt.Errorf("Failed to add member to cluster group: %w", err)
+			return fmt.Errorf("Failed adding member to cluster group: %w", err)
 		}
 	}
 
 	for _, oldGroup := range oldGroups {
-		if shared.ValueInSlice(oldGroup, skipGroups) {
+		if slices.Contains(skipGroups, oldGroup) {
 			continue
 		}
 
 		// Remove node from group.
 		err = c.RemoveNodeFromClusterGroup(ctx, oldGroup, nodeInfo.Name)
 		if err != nil {
-			return fmt.Errorf("Failed to remove member from cluster group: %w", err)
+			return fmt.Errorf("Failed removing member from cluster group: %w", err)
 		}
 	}
 
@@ -714,7 +717,7 @@ func (c *ClusterTx) UpdateNodeFailureDomain(ctx context.Context, id int64, domai
 	var domainID any
 
 	if domain == "" {
-		return fmt.Errorf("Failure domain name can't be empty")
+		return errors.New("Failure domain name cannot be empty")
 	}
 
 	if domain == "default" {
@@ -911,12 +914,11 @@ func (c *ClusterTx) NodeIsEmpty(ctx context.Context, id int64) (string, error) {
 	// Check if the node has any instances.
 	instances, err := query.SelectStrings(ctx, c.tx, "SELECT name FROM instances WHERE node_id=?", id)
 	if err != nil {
-		return "", fmt.Errorf("Failed to get instances for node %d: %w", id, err)
+		return "", fmt.Errorf("Failed getting instances for node %d: %w", id, err)
 	}
 
 	if len(instances) > 0 {
-		message := fmt.Sprintf(
-			"Node still has the following instances: %s", strings.Join(instances, ", "))
+		message := "Node still has the following instances: " + strings.Join(instances, ", ")
 		return message, nil
 	}
 
@@ -940,7 +942,7 @@ func (c *ClusterTx) NodeIsEmpty(ctx context.Context, id int64) (string, error) {
 		return nil
 	})
 	if err != nil {
-		return "", fmt.Errorf("Failed to get image list for node %d: %w", id, err)
+		return "", fmt.Errorf("Failed getting image list for node %d: %w", id, err)
 	}
 
 	index := map[string][]int64{} // Map fingerprints to IDs of nodes
@@ -960,8 +962,7 @@ func (c *ClusterTx) NodeIsEmpty(ctx context.Context, id int64) (string, error) {
 	}
 
 	if len(fingerprints) > 0 {
-		message := fmt.Sprintf(
-			"Node still has the following images: %s", strings.Join(fingerprints, ", "))
+		message := "Node still has the following images: " + strings.Join(fingerprints, ", ")
 		return message, nil
 	}
 
@@ -974,12 +975,11 @@ SELECT storage_volumes.name
 `
 	volumes, err := query.SelectStrings(ctx, c.tx, sql, id, cluster.StoragePoolVolumeTypeCustom)
 	if err != nil {
-		return "", fmt.Errorf("Failed to get custom volumes for node %d: %w", id, err)
+		return "", fmt.Errorf("Failed getting custom volumes for node %d: %w", id, err)
 	}
 
 	if len(volumes) > 0 {
-		message := fmt.Sprintf(
-			"Node still has the following custom volumes: %s", strings.Join(volumes, ", "))
+		message := "Node still has the following custom volumes: " + strings.Join(volumes, ", ")
 		return message, nil
 	}
 
@@ -988,7 +988,12 @@ SELECT storage_volumes.name
 
 // ClearNode removes any instance or image associated with this node.
 func (c *ClusterTx) ClearNode(ctx context.Context, id int64) error {
-	_, err := c.tx.Exec("DELETE FROM instances WHERE node_id=?", id)
+	_, err := c.tx.Exec("DELETE FROM storage_volumes WHERE (name, project_id) IN (SELECT name, project_id FROM instances WHERE node_id=?) AND type IN (?, ?)", id, cluster.StoragePoolVolumeTypeContainer, cluster.StoragePoolVolumeTypeVM)
+	if err != nil {
+		return err
+	}
+
+	_, err = c.tx.Exec("DELETE FROM instances WHERE node_id=?", id)
 	if err != nil {
 		return err
 	}
@@ -1065,12 +1070,12 @@ func (c *ClusterTx) GetCandidateMembers(ctx context.Context, allMembers []NodeIn
 		}
 
 		// Skip group-only members if targeted cluster group doesn't match.
-		if member.Config["scheduler.instance"] == "group" && !shared.ValueInSlice(targetClusterGroup, member.Groups) {
+		if member.Config["scheduler.instance"] == "group" && !slices.Contains(member.Groups, targetClusterGroup) {
 			continue
 		}
 
 		// Skip if a group is requested and member isn't part of it.
-		if targetClusterGroup != "" && !shared.ValueInSlice(targetClusterGroup, member.Groups) {
+		if targetClusterGroup != "" && !slices.Contains(member.Groups, targetClusterGroup) {
 			continue
 		}
 
@@ -1078,7 +1083,7 @@ func (c *ClusterTx) GetCandidateMembers(ctx context.Context, allMembers []NodeIn
 		if allowedClusterGroups != nil {
 			found := false
 			for _, allowedClusterGroup := range allowedClusterGroups {
-				if shared.ValueInSlice(allowedClusterGroup, member.Groups) {
+				if slices.Contains(member.Groups, allowedClusterGroup) {
 					found = true
 					break
 				}
@@ -1099,7 +1104,7 @@ func (c *ClusterTx) GetCandidateMembers(ctx context.Context, allMembers []NodeIn
 
 			supportedArchitectures := append([]int{member.Architecture}, personalities...)
 			for _, supportedArchitecture := range supportedArchitectures {
-				if shared.ValueInSlice(supportedArchitecture, targetArchitectures) {
+				if slices.Contains(targetArchitectures, supportedArchitecture) {
 					candidateMembers = append(candidateMembers, member)
 					break
 				}
@@ -1116,34 +1121,55 @@ func (c *ClusterTx) GetCandidateMembers(ctx context.Context, allMembers []NodeIn
 // GetNodeWithLeastInstances returns the name of the member with the least number of instances that are either
 // already created or being created with an operation.
 func (c *ClusterTx) GetNodeWithLeastInstances(ctx context.Context, members []NodeInfo) (*NodeInfo, error) {
-	var member *NodeInfo
-	var lowestInstanceCount = -1
-
-	for i := range members {
-		// Fetch the number of instances already created on this member.
-		created, err := query.Count(ctx, c.tx, "instances", "node_id=?", members[i].ID)
-		if err != nil {
-			return nil, fmt.Errorf("Failed to get instances count: %w", err)
-		}
-
-		// Fetch the number of instances currently being created on this member.
-		pending, err := query.Count(ctx, c.tx, "operations", "node_id=? AND type=?", members[i].ID, operationtype.InstanceCreate)
-		if err != nil {
-			return nil, fmt.Errorf("Failed to get pending instances count: %w", err)
-		}
-
-		memberInstanceCount := created + pending
-		if lowestInstanceCount == -1 || memberInstanceCount < lowestInstanceCount {
-			lowestInstanceCount = memberInstanceCount
-			member = &members[i]
-		}
-	}
-
-	if member == nil {
+	if len(members) == 0 {
 		return nil, api.StatusErrorf(http.StatusNotFound, "No suitable cluster member could be found")
 	}
 
-	return member, nil
+	// Initialize member instance counts and get a slice of member IDs for use in query.
+	memberIDs := make([]int64, 0, len(members))
+	counts := make(map[int64]int64)
+	for _, nodeInfo := range members {
+		memberIDs = append(memberIDs, nodeInfo.ID)
+		counts[nodeInfo.ID] = 0
+	}
+
+	// Create a union query for instances and running instance create operations.
+	var b strings.Builder
+	b.WriteString("SELECT instances.node_id, COUNT(*) FROM instances WHERE instances.node_id IN ")
+	b.WriteString(query.IntParams(memberIDs...))
+	b.WriteString(" GROUP BY instances.node_id ")
+	b.WriteString("UNION ALL ")
+	b.WriteString("SELECT operations.node_id, COUNT(*) FROM operations WHERE operations.node_id IN ")
+	b.WriteString(query.IntParams(memberIDs...))
+	b.WriteString(" AND operations.type = ? AND operations.status_code = ? GROUP BY operations.node_id")
+
+	// Query and populate instance counts.
+	err := query.Scan(ctx, c.tx, b.String(), func(scan func(dest ...any) error) error {
+		var nodeID, count int64
+		err := scan(&nodeID, &count)
+		if err != nil {
+			return err
+		}
+
+		counts[nodeID] += count
+		return nil
+	}, operationtype.InstanceCreate, api.Running)
+	if err != nil {
+		return nil, fmt.Errorf("Failed getting instance count: %w", err)
+	}
+
+	// Iterate over the given members to find the one with the lowest instance (or pending instance) count.
+	lowest := int64(math.MaxInt64)
+	var nodeWithFewestInstances *NodeInfo
+	for _, member := range members {
+		count := counts[member.ID]
+		if count < lowest {
+			lowest = count
+			nodeWithFewestInstances = &member
+		}
+	}
+
+	return nodeWithFewestInstances, nil
 }
 
 // SetNodeVersion updates the schema and API version of the node with the
@@ -1153,16 +1179,16 @@ func (c *ClusterTx) SetNodeVersion(id int64, version [2]int) error {
 
 	result, err := c.tx.Exec(stmt, version[0], version[1], id)
 	if err != nil {
-		return fmt.Errorf("Failed to update nodes table: %w", err)
+		return fmt.Errorf("Failed updating nodes table: %w", err)
 	}
 
 	n, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("Failed to get affected rows: %w", err)
+		return fmt.Errorf("Failed getting affected rows: %w", err)
 	}
 
 	if n != 1 {
-		return fmt.Errorf("Expected exactly one row to be updated")
+		return errors.New("Expected exactly one row to be updated")
 	}
 
 	return nil

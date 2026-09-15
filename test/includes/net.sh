@@ -2,34 +2,25 @@
 
 # Return an available random local port
 local_tcp_port() {
-    if command -v python3 >/dev/null 2>&1; then
-        cat << EOF | python3
+    exec python3 -c "
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.bind(('127.0.0.1', 0))
 print(s.getsockname()[1])
-s.close()
-EOF
-        return
-    fi
-
-    local port pid
-
-    while true; do
-        port=$(shuf -i 10000-32768 -n 1)
-        nc -l 127.0.0.1 "${port}" >/dev/null 2>&1 &
-        pid=$!
-        kill "${pid}" >/dev/null 2>&1 || continue
-        wait "${pid}" || true
-        echo "${port}"
-        return
-    done
+s.close()"
 }
 
 # Certificate-aware curl wrapper
 my_curl() {
-    CERTNAME="${CERTNAME:-"client"}"
+    local CERTNAME="${CERTNAME:-"client"}"
     curl --insecure --silent --cert "${LXD_CONF}/${CERTNAME}.crt" --key "${LXD_CONF}/${CERTNAME}.key" "$@"
+}
+
+# Certificate-aware curl wrapper with strict TLS verification.
+trusted_curl() {
+    local CERTNAME="${CERTNAME:-"client"}"
+    local CACERT="${CACERT:-"${LXD_CONF}/server.crt"}"
+    curl --silent --cert "${LXD_CONF}/${CERTNAME}.crt" --key "${LXD_CONF}/${CERTNAME}.key" --cacert "${CACERT}" "$@"
 }
 
 # Wait for duplicate address detection to complete.
@@ -47,13 +38,7 @@ wait_for_dad() {
     return
   fi
 
-  while true
-  do
-    ip -6 a show
-    if ! eval "$cmd" | grep "tentative" ; then
-      break
-    fi
-
-    sleep 0.5
+  while eval "$cmd" | grep -wFm1 "tentative" ; do
+    sleep 0.1
   done
 }

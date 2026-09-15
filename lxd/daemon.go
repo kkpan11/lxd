@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -15,29 +15,34 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	dqliteClient "github.com/canonical/go-dqlite/client"
-	"github.com/canonical/go-dqlite/driver"
-	"github.com/google/uuid"
-	"github.com/gorilla/mux"
-	liblxc "github.com/lxc/go-lxc"
+	"github.com/Rican7/retry"
+	"github.com/Rican7/retry/backoff"
+	"github.com/Rican7/retry/strategy"
+	dqliteClient "github.com/canonical/go-dqlite/v3/client"
+	"github.com/canonical/go-dqlite/v3/driver"
 	"golang.org/x/sys/unix"
 
-	"github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/lxd/acme"
 	"github.com/canonical/lxd/lxd/apparmor"
 	"github.com/canonical/lxd/lxd/auth"
+	"github.com/canonical/lxd/lxd/auth/bearer"
 	authDrivers "github.com/canonical/lxd/lxd/auth/drivers"
 	"github.com/canonical/lxd/lxd/auth/oidc"
 	"github.com/canonical/lxd/lxd/bgp"
 	"github.com/canonical/lxd/lxd/cluster"
 	clusterConfig "github.com/canonical/lxd/lxd/cluster/config"
+	"github.com/canonical/lxd/lxd/config"
 	"github.com/canonical/lxd/lxd/daemon"
 	"github.com/canonical/lxd/lxd/db"
 	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
+	dbOIDC "github.com/canonical/lxd/lxd/db/oidc"
 	"github.com/canonical/lxd/lxd/db/openfga"
 	"github.com/canonical/lxd/lxd/db/warningtype"
 	"github.com/canonical/lxd/lxd/dns"
@@ -51,22 +56,19 @@ import (
 	"github.com/canonical/lxd/lxd/instance"
 	instanceDrivers "github.com/canonical/lxd/lxd/instance/drivers"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
-	"github.com/canonical/lxd/lxd/lifecycle"
 	"github.com/canonical/lxd/lxd/loki"
-	"github.com/canonical/lxd/lxd/maas"
 	"github.com/canonical/lxd/lxd/metrics"
 	networkZone "github.com/canonical/lxd/lxd/network/zone"
 	"github.com/canonical/lxd/lxd/node"
+	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/request"
+	"github.com/canonical/lxd/lxd/request/security"
 	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/lxd/rsync"
-	scriptletLoad "github.com/canonical/lxd/lxd/scriptlet/load"
 	"github.com/canonical/lxd/lxd/seccomp"
 	"github.com/canonical/lxd/lxd/state"
-	storagePools "github.com/canonical/lxd/lxd/storage"
 	storageDrivers "github.com/canonical/lxd/lxd/storage/drivers"
 	"github.com/canonical/lxd/lxd/storage/filesystem"
-	"github.com/canonical/lxd/lxd/storage/s3/miniod"
 	"github.com/canonical/lxd/lxd/sys"
 	"github.com/canonical/lxd/lxd/task"
 	"github.com/canonical/lxd/lxd/ubuntupro"
@@ -87,12 +89,11 @@ type Daemon struct {
 	os            *sys.OS
 	db            *db.DB
 	firewall      firewall.Firewall
-	maas          *maas.Controller
 	bgp           *bgp.Server
 	dns           *dns.Server
 
 	// Event servers
-	devlxdEvents     *events.DevLXDServer
+	devLXDEvents     *events.DevLXDServer
 	events           *events.Server
 	internalListener *events.InternalListener
 
@@ -118,7 +119,7 @@ type Daemon struct {
 
 	proxy func(req *http.Request) (*url.URL, error)
 
-	oidcVerifier *oidc.Verifier
+	oidcVerifier atomic.Pointer[oidc.Verifier]
 
 	// Stores last heartbeat node information to detect node changes.
 	lastNodeList *cluster.APIHeartbeat
@@ -131,11 +132,13 @@ type Daemon struct {
 	serverCertInt *shared.CertInfo // Do not use this directly, use servertCert func.
 
 	// Status control.
-	setupChan      chan struct{}      // Closed when basic Daemon setup is completed
-	waitReady      *cancel.Canceller  // Cancelled when LXD is fully ready
-	shutdownCtx    context.Context    // Cancelled when shutdown starts.
-	shutdownCancel context.CancelFunc // Cancels the shutdownCtx to indicate shutdown starting.
-	shutdownDoneCh chan error         // Receives the result of the d.Stop() function and tells LXD to end.
+	startStopLock    sync.Mutex       // Prevent concurrent starts and stops.
+	setupChan        chan struct{}    // Closed when basic Daemon setup is completed
+	waitReady        cancel.Canceller // Cancelled when LXD is fully ready
+	waitNetworkReady cancel.Canceller // Closed when all networks are ready.
+	waitStorageReady cancel.Canceller // Closed when all storage pools are ready.
+	shutdownCtx      cancel.Canceller // Cancelled when shutdown starts.
+	shutdownDoneCh   chan error       // Receives the result of the d.Stop() function and tells LXD to end.
 
 	// Device monitor for watching filesystem events
 	devmonitor fsmonitor.FSMonitor
@@ -152,9 +155,6 @@ type Daemon struct {
 	serverName      string
 	serverClustered bool
 
-	// Server's UUID from file.
-	serverUUID string
-
 	lokiClient *loki.Client
 
 	// HTTP-01 challenge provider for ACME
@@ -168,6 +168,10 @@ type Daemon struct {
 
 	// Ubuntu Pro settings
 	ubuntuPro *ubuntupro.Client
+
+	// internalSecrets holds the current in-memory value of the secrets
+	internalSecrets   dbCluster.AuthSecrets
+	internalSecretsMu sync.Mutex
 }
 
 // DaemonConfig holds configuration values for Daemon.
@@ -180,25 +184,22 @@ type DaemonConfig struct {
 
 // newDaemon returns a new Daemon object with the given configuration.
 func newDaemon(config *DaemonConfig, os *sys.OS) *Daemon {
-	lxdEvents := events.NewServer(daemon.Debug, daemon.Verbose, cluster.EventHubPush)
-	devlxdEvents := events.NewDevLXDServer(daemon.Debug, daemon.Verbose)
-	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+	shutdownCtx := cancel.New()
 
 	d := &Daemon{
-		identityCache:  &identity.Cache{},
-		config:         config,
-		devlxdEvents:   devlxdEvents,
-		events:         lxdEvents,
-		tasks:          task.NewGroup(),
-		clusterTasks:   task.NewGroup(),
-		db:             &db.DB{},
-		http01Provider: acme.NewHTTP01Provider(),
-		os:             os,
-		setupChan:      make(chan struct{}),
-		waitReady:      cancel.New(context.Background()),
-		shutdownCtx:    shutdownCtx,
-		shutdownCancel: shutdownCancel,
-		shutdownDoneCh: make(chan error),
+		identityCache:    &identity.Cache{},
+		config:           config,
+		tasks:            task.NewGroup(),
+		clusterTasks:     task.NewGroup(),
+		db:               &db.DB{},
+		http01Provider:   acme.NewHTTP01Provider(),
+		os:               os,
+		setupChan:        make(chan struct{}),
+		waitReady:        cancel.New(),
+		waitNetworkReady: cancel.New(),
+		waitStorageReady: cancel.New(),
+		shutdownCtx:      shutdownCtx,
+		shutdownDoneCh:   make(chan error),
 	}
 
 	d.serverCert = func() *shared.CertInfo { return d.serverCertInt }
@@ -223,39 +224,59 @@ func defaultDaemon() *Daemon {
 
 // APIEndpoint represents a URL in our API.
 type APIEndpoint struct {
-	Name    string             // Name for this endpoint.
-	Path    string             // Path pattern for this endpoint.
-	Aliases []APIEndpointAlias // Any aliases for this endpoint.
-	Get     APIEndpointAction
-	Head    APIEndpointAction
-	Put     APIEndpointAction
-	Post    APIEndpointAction
-	Delete  APIEndpointAction
-	Patch   APIEndpointAction
-}
+	Path        string      // Path pattern for this endpoint.
+	MetricsType entity.Type // Main entity type related to this endpoint. Used by the API metrics.
+	Get         APIEndpointAction
+	Head        APIEndpointAction
+	Put         APIEndpointAction
+	Post        APIEndpointAction
+	Delete      APIEndpointAction
+	Patch       APIEndpointAction
 
-// APIEndpointAlias represents an alias URL of and APIEndpoint in our API.
-type APIEndpointAlias struct {
-	Name string // Name for this alias.
-	Path string // Path pattern for this alias.
+	// ProjectSpecific indicates that the endpoint manages project specific resources.
+	// This is used for global authorization checks.
+	ProjectSpecific bool
+
+	// EndpointResolver optionally resolves this endpoint to a more specific sub-endpoint based on the
+	// request path. This is used when multiple logical endpoints share a single ServeMux pattern to avoid
+	// pattern conflicts (e.g. images/aliases/{name...} vs images/{fingerprint}/export). When set, createCmd
+	// dispatches to the resolved endpoint's action handlers instead of this endpoint's own actions.
+	EndpointResolver func(r *http.Request) *APIEndpoint
 }
 
 // APIEndpointAction represents an action on an API endpoint.
 type APIEndpointAction struct {
-	Handler        func(d *Daemon, r *http.Request) response.Response
-	AccessHandler  func(d *Daemon, r *http.Request) response.Response
-	AllowUntrusted bool
+	Handler         func(d *Daemon, r *http.Request) response.Response
+	AccessHandler   func(d *Daemon, r *http.Request) response.Response
+	AllowUntrusted  bool
+	AllProjectsMode allProjectsMode
+	ContentTypes    []string // Client content types to allow.
 }
+
+// allProjectsMode dictates how the all-projects query parameter is handled if present.
+type allProjectsMode uint8
+
+const (
+	// allProjectsModeNotSupported is the default (zero) value.
+	allProjectsModeNotSupported allProjectsMode = iota
+
+	// allProjectsModeDisallowRestrictedTLSClients is used to prevent restricted TLS clients from querying resources
+	// across all projects. This is to maintain legacy behaviour and can be removed when restricted TLS clients are removed.
+	allProjectsModeDisallowRestrictedTLSClients
+
+	// allProjectsModeAllowAll allows all (authenticated) callers to use the all projects query parameter.
+	allProjectsModeAllowAll
+)
 
 // allowAuthenticated is an AccessHandler which allows only authenticated requests. This should be used in conjunction
 // with further access control within the handler (e.g. to filter resources the user is able to view/edit).
 func allowAuthenticated(_ *Daemon, r *http.Request) response.Response {
-	trusted, err := request.GetCtxValue[bool](r.Context(), request.CtxTrusted)
+	requestor, err := request.GetRequestor(r.Context())
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	if trusted {
+	if requestor.IsTrusted() {
 		return response.EmptySyncResponse
 	}
 
@@ -282,11 +303,10 @@ func allowPermission(entityType entity.Type, entitlement auth.Entitlement, muxVa
 			entityURL = entity.ProjectURL(request.ProjectParam(r))
 		} else {
 			muxValues := make([]string, 0, len(muxVars))
-			vars := mux.Vars(r)
 			for _, muxVar := range muxVars {
-				muxValue := vars[muxVar]
+				muxValue := r.PathValue(muxVar)
 				if muxValue == "" {
-					return response.InternalError(fmt.Errorf("Failed to perform permission check: Path argument label %q not found in request URL %q", muxVar, r.URL))
+					return response.InternalError(fmt.Errorf("Failed performing permission check: Path argument label %q not found in request URL %q", muxVar, r.URL))
 				}
 
 				muxValues = append(muxValues, muxValue)
@@ -294,7 +314,7 @@ func allowPermission(entityType entity.Type, entitlement auth.Entitlement, muxVa
 
 			entityURL, err = entityType.URL(request.QueryParam(r, "project"), request.QueryParam(r, "target"), muxValues...)
 			if err != nil {
-				return response.InternalError(fmt.Errorf("Failed to perform permission check: %w", err))
+				return response.InternalError(fmt.Errorf("Failed performing permission check: %w", err))
 			}
 		}
 
@@ -308,51 +328,110 @@ func allowPermission(entityType entity.Type, entitlement auth.Entitlement, muxVa
 	}
 }
 
-// allowProjectResourceList should be used instead of allowAuthenticated when listing resources within a project.
-// This prevents a restricted TLS client from listing resources in a project that they do not have access to.
-func allowProjectResourceList(d *Daemon, r *http.Request) response.Response {
-	// The caller must be authenticated.
-	if !auth.IsTrusted(r.Context()) {
-		return response.Forbidden(nil)
+// reportEntitlements takes a map of entity URLs to EntitlementReporters (in practice, API types that implement the ReportEntitlements method), and
+// reports the entitlements that the caller has on each entity URL to the corresponding EntitlementReporter.
+func reportEntitlements(ctx context.Context, authorizer auth.Authorizer, entityType entity.Type, requestedEntitlements []auth.Entitlement, entityURLToEntitlementReporter map[*api.URL]auth.EntitlementReporter) error {
+	// Nothing to do
+	if len(entityURLToEntitlementReporter) == 0 {
+		return nil
 	}
 
-	isServerAdmin, err := auth.IsServerAdmin(r.Context(), d.identityCache)
+	requestor, err := request.GetRequestor(ctx)
 	if err != nil {
-		return response.InternalError(fmt.Errorf("Failed to determine caller privilege: %w", err))
+		return err
 	}
 
-	// A root user can list resources in any project.
-	if isServerAdmin {
-		return response.EmptySyncResponse
+	// No fine-grained identities are global admins. Check this first in case the caller is using e.g. the unix socket.
+	if requestor.IsAdmin() {
+		return api.NewStatusError(http.StatusBadRequest, "Cannot report entitlements for identities that do not use fine-grained authorization")
 	}
 
-	id, err := auth.GetIdentityFromCtx(r.Context(), d.identityCache)
+	// Any other requestor should have an identity type present.
+	identityType, err := requestor.CallerIdentityType()
 	if err != nil {
-		return response.InternalError(fmt.Errorf("Failed to determine caller identity: %w", err))
+		return err
 	}
 
-	switch id.IdentityType {
-	case api.IdentityTypeOIDCClient:
-		// OIDC authenticated clients are governed by fine-grained auth. They can call the endpoint but may see an empty list.
-		return response.EmptySyncResponse
-	case api.IdentityTypeCertificateClientRestricted:
-		// A restricted client may be able to call the endpoint, continue.
-	default:
-		// No other identity types may list resources (e.g. metrics certificates).
-		return response.Forbidden(nil)
+	// Check the identity type is fine-grained (it could be a restricted client certificate).
+	if !identityType.IsFineGrained() {
+		return api.NewStatusError(http.StatusBadRequest, "Cannot report entitlements for identities that do not use fine-grained authorization")
 	}
 
-	// all-projects requests are not allowed
-	if shared.IsTrue(request.QueryParam(r, "all-projects")) {
-		return response.Forbidden(fmt.Errorf("Certificate is restricted"))
+	// In the case where we have only one entity URL, we'll use the authorizer's CheckPermission method
+	// whereas if we have multiple entity URLs, we'll use the authorizer's GetPermissionChecker method that
+	// is more efficient for returning entitlements for a batch of entities.
+	if len(entityURLToEntitlementReporter) == 1 {
+		for u, r := range entityURLToEntitlementReporter {
+			entitlements := make([]string, 0, len(requestedEntitlements))
+			for _, entitlement := range requestedEntitlements {
+				err = authorizer.CheckPermission(ctx, u, entitlement)
+				if err != nil {
+					if auth.IsDeniedError(err) {
+						continue
+					}
+
+					return fmt.Errorf("Failed checking entitlement %q for entity URL %q: %w", entitlement, u, err)
+				}
+
+				entitlements = append(entitlements, string(entitlement))
+			}
+
+			r.ReportEntitlements(entitlements)
+		}
+
+		return nil
 	}
 
-	// Disallow listing resources in projects the caller does not have access to.
-	if !shared.ValueInSlice(request.ProjectParam(r), id.Projects) {
-		return response.Forbidden(fmt.Errorf("Certificate is restricted"))
+	checkersByEntitlement := make(map[auth.Entitlement]auth.PermissionChecker)
+	for _, entitlement := range requestedEntitlements {
+		checker, err := authorizer.GetPermissionChecker(ctx, entitlement, entityType)
+		if err != nil {
+			return fmt.Errorf("Failed getting a permission checker for entitlement %q and for entity type %q: %w", entitlement, entityType, err)
+		}
+
+		checkersByEntitlement[entitlement] = checker
 	}
 
-	return response.EmptySyncResponse
+	for u, reporter := range entityURLToEntitlementReporter {
+		entitlements := make([]string, 0, len(requestedEntitlements))
+		for entitlement, checker := range checkersByEntitlement {
+			if checker(u) {
+				entitlements = append(entitlements, string(entitlement))
+			}
+		}
+
+		reporter.ReportEntitlements(entitlements)
+	}
+
+	return nil
+}
+
+// extractEntitlementsFromQuery extracts the entitlements from the query string of the request.
+func extractEntitlementsFromQuery(r *http.Request, entityType entity.Type, allowRecursion bool) ([]auth.Entitlement, error) {
+	rawEntitlements := request.QueryParam(r, "with-access-entitlements")
+	if rawEntitlements == "" {
+		return nil, nil
+	}
+
+	allowedEntitlements := auth.EntityTypeToEntitlements[entityType]
+	entitlements := strings.Split(rawEntitlements, ",")
+	validEntitlements := make([]auth.Entitlement, 0, len(entitlements))
+	for _, e := range entitlements {
+		if !slices.Contains(allowedEntitlements, auth.Entitlement(e)) {
+			return nil, api.StatusErrorf(http.StatusBadRequest, "Requested entitlement %q is not valid for entity type %q", e, entityType)
+		}
+
+		validEntitlements = append(validEntitlements, auth.Entitlement(e))
+	}
+
+	// Entitlements can only be requested when recursion is enabled for a request returning multiple entities (this function call uses `allowRecursion=true`).
+	// If the request is meant to return a single entity, the entitlements can be requested regardless of the recursion setting (in this case, the function is called with `allowRecursion=false`).
+	recursion, _ := util.IsRecursionRequest(r)
+	if len(validEntitlements) > 0 && (recursion == 0 && allowRecursion) {
+		return nil, errors.New("Entitlements can only be requested when recursion is enabled")
+	}
+
+	return validEntitlements, nil
 }
 
 // Authenticate validates an incoming http Request
@@ -362,204 +441,254 @@ func allowProjectResourceList(d *Daemon, r *http.Request) response.Response {
 // This does not perform authorization, only validates authentication.
 // Returns whether trusted or not, the username (or certificate fingerprint) of the trusted client, and the type of
 // client that has been authenticated (cluster, unix, oidc or tls).
-func (d *Daemon) Authenticate(w http.ResponseWriter, r *http.Request) (trusted bool, username string, method string, identityProviderGroups []string, err error) {
-	// Perform mTLS check against server certificates. If this passes, the request was made by another cluster member
-	// and the protocol is auth.AuthenticationMethodCluster.
-	if r.TLS != nil {
-		for _, i := range r.TLS.PeerCertificates {
-			trusted, fingerprint := util.CheckMutualTLS(*i, d.identityCache.X509Certificates(api.IdentityTypeCertificateServer))
-			if trusted {
-				return true, fingerprint, auth.AuthenticationMethodCluster, nil, nil
-			}
-		}
-	}
-
-	// Local unix socket queries.
-	if r.RemoteAddr == "@" && r.TLS == nil {
-		if w != nil {
-			cred, err := ucred.GetCredFromContext(r.Context())
-			if err != nil {
-				return false, "", "", nil, err
-			}
-
-			u, err := user.LookupId(fmt.Sprintf("%d", cred.Uid))
-			if err != nil {
-				return true, fmt.Sprintf("uid=%d", cred.Uid), auth.AuthenticationMethodUnix, nil, nil
-			}
-
-			return true, u.Username, auth.AuthenticationMethodUnix, nil, nil
-		}
-
-		return true, "", auth.AuthenticationMethodUnix, nil, nil
-	}
-
-	// Cluster notification with wrong certificate.
-	if isClusterNotification(r) {
-		return false, "", "", nil, fmt.Errorf("Cluster notification isn't using trusted server certificate")
-	}
-
-	// Bad query, no TLS found.
+//
+// allowUntrusted is the AllowUntrusted flag of the endpoint action being
+// dispatched. It gates emission of authn_login_fail: the event is raised
+// only when no auth method recognised the caller and the endpoint required
+// authentication. Errors returned from this function never trigger the
+// event because they may originate from a server-side fault (e.g. an
+// unreachable IdP).
+func (d *Daemon) Authenticate(w http.ResponseWriter, r *http.Request, oidcVerifier *oidc.Verifier, allowUntrusted bool) (*request.RequestorArgs, error) {
 	if r.TLS == nil {
-		return false, "", "", nil, fmt.Errorf("Bad/missing TLS on network query")
-	}
-
-	if d.oidcVerifier != nil && d.oidcVerifier.IsRequest(r) {
-		result, err := d.oidcVerifier.Auth(d.shutdownCtx, w, r)
-		if err != nil {
-			return false, "", "", nil, fmt.Errorf("Failed OIDC Authentication: %w", err)
+		// For a socket, the server is listening on a file, but the client does not have an address.
+		// Since there is no address, the kernel uses an unnamed unix socket address.
+		// An unnamed or abstract Unix socket address is rendered as '@'.
+		// Without TLS, we only accept unix socket access.
+		if r.RemoteAddr != "@" {
+			return nil, errors.New("Bad/missing TLS on network query")
 		}
 
-		err = d.handleOIDCAuthenticationResult(r, result)
+		// Get user credentials from the connection.
+		// This is only to populate the username.
+		// The caller already has permission by way of file permissions on the socket.
+		cred, err := ucred.GetCredFromContext(r.Context())
 		if err != nil {
-			return false, "", "", nil, fmt.Errorf("Failed to process OIDC authentication result: %w", err)
+			return nil, err
 		}
 
-		return true, result.Email, api.AuthenticationMethodOIDC, result.IdentityProviderGroups, nil
+		uid := strconv.FormatUint(uint64(cred.Uid), 10)
+		username := "uid=" + uid
+
+		u, err := user.LookupId(uid)
+		if err == nil {
+			username = u.Username
+		}
+
+		return &request.RequestorArgs{
+			Trusted:  true,
+			Username: username,
+			Protocol: request.ProtocolUnix,
+		}, nil
 	}
 
-	isMetricsRequest := func(u url.URL) bool {
-		return strings.HasPrefix(u.Path, "/1.0/metrics")
-	}
+	d.globalConfigMu.Lock()
+	trustCACertificates := d.globalConfig.TrustCACertificates()
+	clusterUUID := d.globalConfig.ClusterUUID()
+	d.globalConfigMu.Unlock()
 
-	// List of candidate identity types for this request. We have already checked server certificates at the beginning of this method
-	// so we only need to consider client and metrics certificates. (OIDC auth was completed above).
-	candidateIdentityTypes := []string{api.IdentityTypeCertificateClientUnrestricted, api.IdentityTypeCertificateClientRestricted}
-	if isMetricsRequest(*r.URL) {
-		// Metrics certificates can only authenticate when calling metrics related endpoints.
-		candidateIdentityTypes = append(candidateIdentityTypes, api.IdentityTypeCertificateMetricsUnrestricted, api.IdentityTypeCertificateMetricsRestricted)
-	}
+	// Request has TLS. If client sent a peer certificate, check mTLS and CA.
+	if len(r.TLS.PeerCertificates) > 0 {
+		// Convert list of peer certificates to map.
+		peerCertificateFingerprints := make([]string, 0, len(r.TLS.PeerCertificates))
+		peerCertificates := make(map[string]x509.Certificate, len(r.TLS.PeerCertificates))
+		for _, c := range r.TLS.PeerCertificates {
+			f := shared.CertFingerprint(c)
+			peerCertificates[f] = *c
+			peerCertificateFingerprints = append(peerCertificateFingerprints, f)
+		}
 
-	// Map of candidate certificates of mTLS check.
-	candidateCertificates := make(map[string]x509.Certificate)
-
-	// If the network cert has a CA, validate the peer certificates against it.
-	if d.endpoints.NetworkCert().CA() != nil {
-		trustCACertificates := d.globalConfig.TrustCACertificates()
-		for _, peerCertificate := range r.TLS.PeerCertificates {
-			trusted, _, fingerprint := util.CheckCASignature(*peerCertificate, d.endpoints.NetworkCert())
-			if !trusted {
-				return false, "", "", nil, nil
-			} else if trustCACertificates {
-				// If CA signed certificates are implicitly trusted via `core.trust_ca_certificates`, return now. Otherwise, continue to mTLS check.
-				// Returning the protocol as auth.AuthenticationMethodPKI will indicate to the auth.Authorizer that
-				// this certificate may not be present in the trust store. If it isn't in the trust store, the caller
-				// has full access to LXD. If it is in the trust store, standard TLS restrictions will apply.
-				return true, fingerprint, auth.AuthenticationMethodPKI, nil, nil
+		// Anonymous function to call for each certificate type and it's associated protocol.
+		authTLS := func(protocol string, certGetter func(...string) map[string]x509.Certificate) (*request.RequestorArgs, error) {
+			// Did the client send any certificates we recognise?
+			matchedCerts := certGetter(peerCertificateFingerprints...)
+			if len(matchedCerts) == 0 {
+				// If not, they are not authenticated, but there is no error.
+				return nil, nil
+			} else if len(matchedCerts) > 1 {
+				// If they matched more than one, we don't know who to authenticate the caller as, so return an error.
+				return nil, api.StatusErrorf(http.StatusBadRequest, "Client sent too many credentials")
 			}
 
-			// We are trusted by the CA. But because `core.trust_ca_certificates` is false, we also need to check that
-			// the client certificate is in the trust store.
-			id, err := d.identityCache.Get(api.AuthenticationMethodTLS, fingerprint)
+			// Get the recognised fingerprint (there is only one).
+			var matchedFingerprint string
+			for k := range matchedCerts {
+				matchedFingerprint = k
+			}
+
+			// We've recognised the fingerprint of the caller certificate, but now we need to perform a full mTLS check.
+			trusted, _ := util.CheckMutualTLS(peerCertificates[matchedFingerprint], matchedCerts)
+			if trusted {
+				// If there is a server.ca file, then all client certificates must be signed by it.
+				// This does not apply to server certificates.
+				if protocol != request.ProtocolCluster && d.endpoints.NetworkCert().CA() != nil {
+					trusted, _, _ = util.CheckCASignature(peerCertificates[matchedFingerprint], d.endpoints.NetworkCert())
+					if !trusted {
+						return nil, nil
+					}
+				}
+
+				// Get expiration date of the matched certificate.
+				certExpiresAt := peerCertificates[matchedFingerprint].NotAfter.UTC()
+
+				return &request.RequestorArgs{
+					Trusted:   trusted,
+					Protocol:  protocol,
+					Username:  matchedFingerprint,
+					ExpiresAt: &certExpiresAt,
+				}, nil
+			}
+
+			return nil, nil
+		}
+
+		// Check server certificates.
+		requestor, err := authTLS(request.ProtocolCluster, d.identityCache.GetServerCertificates)
+		if err != nil {
+			return nil, err
+		} else if requestor != nil {
+			return requestor, nil
+		}
+
+		// Check client certificates.
+		requestor, err = authTLS(api.AuthenticationMethodTLS, d.identityCache.GetClientCertificates)
+		if err != nil {
+			return nil, err
+		} else if requestor != nil {
+			return requestor, nil
+		}
+
+		// Only check metrics certificates if it is a metrics API route.
+		if strings.HasPrefix(r.URL.Path, "/1.0/metrics") {
+			requestor, err = authTLS(api.AuthenticationMethodTLS, d.identityCache.GetMetricsCertificates)
 			if err != nil {
-				return false, "", "", nil, nil
+				return nil, err
+			} else if requestor != nil {
+				return requestor, nil
 			}
-
-			// The identity type must be in our list of candidate types (e.g. if this certificate is a metrics certificate
-			// and we're on a non-metrics related route).
-			if !shared.ValueInSlice(id.IdentityType, candidateIdentityTypes) {
-				return false, "", "", nil, nil
-			}
-
-			// In CA mode we only consider if this exact certificate is valid via mTLS checks below.
-			candidateCertificates[id.Identifier] = *id.Certificate
 		}
-	} else {
-		// In non-CA mode we consider all certificates that would be valid for this API route.
-		candidateCertificates = d.identityCache.X509Certificates(candidateIdentityTypes...)
-	}
 
-	// Perform mTLS check on candidates.
-	for _, i := range r.TLS.PeerCertificates {
-		trusted, fingerprint := util.CheckMutualTLS(*i, candidateCertificates)
-		if trusted {
-			return true, fingerprint, api.AuthenticationMethodTLS, nil, nil
+		// Lastly, check if core.trust_ca_certificates is true. If so, allow all CA signed certificates without checking
+		// mTLS.
+		if d.endpoints.NetworkCert().CA() != nil && trustCACertificates {
+			for f, cert := range peerCertificates {
+				trusted, _, _ := util.CheckCASignature(cert, d.endpoints.NetworkCert())
+				if trusted {
+					return &request.RequestorArgs{
+						Trusted:  true,
+						Username: f,
+						Protocol: request.ProtocolPKI,
+					}, nil
+				}
+			}
 		}
 	}
 
-	// Reject unauthorized.
-	return false, "", "", nil, nil
+	// Check if the caller has a bearer token.
+	isBearerRequest, tokenLocation, token, subject := bearer.IsAPIRequest(r, clusterUUID)
+	if isBearerRequest {
+		if tokenLocation == auth.TokenLocationQuery {
+			// Query token parameters are only valid for browser requests to the root URL.
+			// The root URL handler validates the token and sets it as a session cookie.
+			if r.URL.Path == "/" && isBrowserClient(r) {
+				return &request.RequestorArgs{Trusted: false}, nil
+			}
+
+			return nil, api.StatusErrorf(http.StatusForbidden, "Token query parameter usage is not allowed for the /1.0 API")
+		}
+
+		bearerRequestor, err := bearer.Authenticate(r.Context(), subject, token, tokenLocation, d.identityCache, d.events.SendSecurity)
+		if err != nil {
+			return nil, fmt.Errorf("Failed verifying bearer token: %w", err)
+		}
+
+		// We successfully authenticated the user via bearer token.
+		// The bearerRequestor contains the identity info (username, protocol=bearer).
+		return bearerRequestor, nil
+	}
+
+	// Lastly, check OIDC authentication using the verifier.
+	if oidcVerifier != nil && oidcVerifier.IsRequest(r) {
+		result, err := oidcVerifier.Auth(w, r)
+		if err != nil {
+			return nil, fmt.Errorf("Failed OIDC Authentication: %w", err)
+		}
+
+		return &request.RequestorArgs{
+			Trusted:  true,
+			Username: result.Email,
+			Protocol: api.AuthenticationMethodOIDC,
+		}, nil
+	}
+
+	// Peer presented a client certificate but no auth method recognised the
+	// caller. Emit only when the endpoint requires authentication; anonymous
+	// requests (no peer cert, no bearer, no OIDC header) also reach this
+	// point and intentionally do not emit.
+	if !allowUntrusted && len(r.TLS.PeerCertificates) > 0 {
+		loginFail := security.AuthnLoginFail.WithSuffix(string(api.AuthenticationMethodTLS)).
+			UserEvent(r.Context(), security.LevelWarning, "TLS authentication failure")
+		d.events.SendSecurity(loginFail)
+	}
+
+	return &request.RequestorArgs{Trusted: false}, nil
 }
 
-// handleOIDCAuthenticationResult checks the identity cache for the OIDC identity by their email address. If no identity
-// is found, an identity is added with that email. If an identity is found but the OIDC subject is different to the
-// expected value, the identity is updated with the new subject.
-func (d *Daemon) handleOIDCAuthenticationResult(r *http.Request, result *oidc.AuthenticationResult) error {
-	var action lifecycle.IdentityAction
+// getCoreAuthSecrets gets a copy of the current, cluster-wide secrets. The approach can be summarized as follows:
+// 1. Check if the current in-memory value is valid. If valid, return a copy.
+// 2. Check if the current in-database value is valid. If valid, replace in-memory value and return a copy.
+// 3. Rotate the in-database value within the transaction, then replace in-memory value and return a copy.
+// Steps 2 and 3 must happen within the same transaction so that database locking enforces consistency across the
+// cluster. Everything is performed with a lock on the in-memory value. Note that this approach assumes that the UTC
+// time is synchronized across all cluster members, as this is used for validity checking.
+func (d *Daemon) getCoreAuthSecrets(ctx context.Context) (dbCluster.AuthSecrets, error) {
+	// Obtain a lock.
+	d.internalSecretsMu.Lock()
+	defer d.internalSecretsMu.Unlock()
 
-	id, err := d.identityCache.Get(api.AuthenticationMethodOIDC, result.Email)
-	if err != nil && !api.StatusErrorCheck(err, http.StatusNotFound) {
-		return fmt.Errorf("Failed getting OIDC identity from cache: %w", err)
-	} else if err != nil {
-		// Identity not found. Add it to the database and refresh the identity cache.
-		idMetadata := dbCluster.OIDCMetadata{Subject: result.Subject}
-		b, err := json.Marshal(idMetadata)
-		if err != nil {
-			return fmt.Errorf("Failed to marshal OIDC identity metadata: %w", err)
-		}
+	// Get the expiry.
+	d.globalConfigMu.Lock()
+	expiry := d.globalConfig.AuthSecretExpiry()
+	d.globalConfigMu.Unlock()
 
-		err = d.db.Cluster.Transaction(d.shutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
-			_, err := dbCluster.CreateIdentity(ctx, tx.Tx(), dbCluster.Identity{
-				AuthMethod: api.AuthenticationMethodOIDC,
-				Type:       api.IdentityTypeOIDCClient,
-				Identifier: result.Email,
-				Name:       result.Name,
-				Metadata:   string(b),
-			})
-			return err
-		})
-		if err != nil {
-			return fmt.Errorf("Failed to add new OIDC identity to database: %w", err)
-		}
-
-		action = lifecycle.IdentityCreated
-	} else if id.Subject != result.Subject || id.Name != result.Name {
-		// The OIDC subject of the user with this email address has changed (this should be rare). Replace the
-		// subject in the identity metadata and refresh the cache.
-		idMetadata := dbCluster.OIDCMetadata{Subject: result.Subject}
-		b, err := json.Marshal(idMetadata)
-		if err != nil {
-			return fmt.Errorf("Failed to marshal OIDC identity metadata: %w", err)
-		}
-
-		err = d.db.Cluster.Transaction(d.shutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
-			return dbCluster.UpdateIdentity(ctx, tx.Tx(), api.AuthenticationMethodOIDC, result.Email, dbCluster.Identity{
-				AuthMethod: api.AuthenticationMethodOIDC,
-				Type:       api.IdentityTypeOIDCClient,
-				Identifier: result.Email,
-				Name:       result.Name,
-				Metadata:   string(b),
-			})
-		})
-		if err != nil {
-			return fmt.Errorf("Failed to update OIDC identity information: %w", err)
-		}
-
-		action = lifecycle.IdentityUpdated
+	// Check if the current in-memory secrets are valid.
+	err := d.internalSecrets.Validate(expiry)
+	if err == nil {
+		// If valid, return a copy.
+		return slices.Clone(d.internalSecrets), nil
 	}
 
-	if action != "" {
-		// Notify other nodes about the new identity.
-		s := d.State()
-		notifier, err := cluster.NewNotifier(s, s.Endpoints.NetworkCert(), s.ServerCert(), cluster.NotifyAlive)
+	// Otherwise, start a transaction.
+	err = d.db.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		// Get the secrets.
+		secrets, err := dbCluster.GetCoreAuthSecrets(ctx, tx.Tx())
 		if err != nil {
-			return fmt.Errorf("Failed to notify cluster members of new or updated OIDC identity: %w", err)
-		}
-
-		err = notifier(func(client lxd.InstanceServer) error {
-			_, _, err := client.RawQuery(http.MethodPost, "/internal/identity-cache-refresh", nil, "")
 			return err
-		})
-		if err != nil {
-			return fmt.Errorf("Failed to notify cluster members of new or updated OIDC identity: %w", err)
 		}
 
-		lc := action.Event(api.AuthenticationMethodOIDC, result.Email, request.CreateRequestor(r), nil)
-		s.Events.SendLifecycle(api.ProjectDefaultName, lc)
+		// Check if the secrets are valid (if no secrets were found, then they are not valid).
+		err = secrets.Validate(expiry)
+		if err == nil {
+			// If valid, set internal secrets to the value defined in the database and exit transaction.
+			d.internalSecrets = secrets
+			return nil
+		}
 
-		s.UpdateIdentityCache()
+		// Rotate the secrets. If there were none, this will add the first value.
+		rotatedSecrets, err := secrets.Rotate(ctx, tx.Tx())
+		if err != nil {
+			return err
+		}
+
+		// Set internal secrets to the new value and exit transaction.
+		d.internalSecrets = rotatedSecrets
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	return nil
+	// Above transaction set the internal secrets to a new valid value. Return a copy.
+	return slices.Clone(d.internalSecrets), nil
 }
 
 // State creates a new State instance linked to our internal db and os.
@@ -580,42 +709,65 @@ func (d *Daemon) State() *state.State {
 	localConfig := d.localConfig
 	d.globalConfigMu.Unlock()
 
-	return &state.State{
+	s := &state.State{
 		ShutdownCtx:         d.shutdownCtx,
 		DB:                  d.db,
-		MAAS:                d.maas,
 		BGP:                 d.bgp,
 		DNS:                 d.dns,
 		OS:                  d.os,
 		Endpoints:           d.endpoints,
 		Events:              d.events,
-		DevlxdEvents:        d.devlxdEvents,
+		DevlxdEvents:        d.devLXDEvents,
 		Firewall:            d.firewall,
 		Proxy:               d.proxy,
 		ServerCert:          d.serverCert,
 		UpdateIdentityCache: func() { updateIdentityCache(d) },
+		IdentityCache:       d.identityCache,
 		InstanceTypes:       instanceTypes,
 		DevMonitor:          d.devmonitor,
 		GlobalConfig:        globalConfig,
 		LocalConfig:         localConfig,
 		ServerName:          d.serverName,
 		ServerClustered:     d.serverClustered,
-		ServerUUID:          d.serverUUID,
 		StartTime:           d.startTime,
 		Authorizer:          d.authorizer,
 		UbuntuPro:           d.ubuntuPro,
-	}
-}
-
-// UnixSocket returns the full path to the unix.socket file that this daemon is
-// listening on. Used by tests.
-func (d *Daemon) UnixSocket() string {
-	path := os.Getenv("LXD_SOCKET")
-	if path != "" {
-		return path
+		NetworkReady:        d.waitNetworkReady,
+		StorageReady:        d.waitStorageReady,
+		CoreAuthSecrets:     d.getCoreAuthSecrets,
 	}
 
-	return filepath.Join(d.os.VarDir, "unix.socket")
+	s.LeaderInfo = func() (*state.LeaderInfo, error) {
+		if !s.ServerClustered {
+			return &state.LeaderInfo{
+				Clustered: false,
+				Leader:    true,
+				Address:   "",
+			}, nil
+		}
+
+		localClusterAddress := s.LocalConfig.ClusterAddress()
+		leaderAddress, err := d.gateway.LeaderAddress()
+		if err != nil {
+			return nil, fmt.Errorf("Failed getting the address of the cluster leader: %w", err)
+		}
+
+		return &state.LeaderInfo{
+			Clustered: true,
+			Leader:    localClusterAddress == leaderAddress,
+			Address:   leaderAddress,
+		}, nil
+	}
+
+	s.ImagesStoragePath = func(projectName string) string {
+		return daemonStoragePath(s.LocalConfig.StorageImagesVolume(projectName), config.DaemonStorageTypeImages)
+	}
+
+	s.BackupsStoragePath = func(projectName string) string {
+		return daemonStoragePath(s.LocalConfig.StorageBackupsVolume(projectName), config.DaemonStorageTypeBackups)
+	}
+
+	return s
 }
 
 // createCmd creates API handlers for the provided endpoint including some useful behavior,
@@ -623,45 +775,102 @@ func (d *Daemon) UnixSocket() string {
 //
 // The created handler also keeps track of handled requests for the API metrics
 // for the main API endpoints.
-func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
+func (d *Daemon) createCmd(restAPI *http.ServeMux, version string, c APIEndpoint) {
 	var uri string
 	if c.Path == "" {
-		uri = fmt.Sprintf("/%s", version)
+		uri = "/" + version
 	} else if version != "" {
-		uri = fmt.Sprintf("/%s/%s", version, c.Path)
+		uri = "/" + version + "/" + c.Path
 	} else {
-		uri = fmt.Sprintf("/%s", c.Path)
+		uri = "/" + c.Path
 	}
 
-	route := restAPI.HandleFunc(uri, func(w http.ResponseWriter, r *http.Request) {
+	// Define a function to track the request for the API metrics if this is a main API endpoint (version 1.0).
+	// This is used in the handler below.
+	metricsTrackRequestIfNeeded := func(version string, r *http.Request, entityType entity.Type) {
+		if version == "1.0" {
+			metrics.TrackStartedRequest(r, entityType)
+		}
+	}
+
+	restAPI.HandleFunc(uri, func(w http.ResponseWriter, r *http.Request) {
+		// Resolve endpoint first if there is an EndpointResolver.
+		// This ensures that any 404 responses can be generated early in the request handling process.
+		endpoint := c
+		if c.EndpointResolver != nil {
+			resolved := c.EndpointResolver(r)
+			if resolved == nil {
+				metricsTrackRequestIfNeeded(version, r, c.MetricsType)
+
+				// Resolver returned nil, meaning no matching sub-endpoint was found.
+				// Return 404 Not Found rather than falling through to a 501.
+				_ = response.NotFound(nil).Render(w, r)
+				return
+			}
+
+			endpoint = *resolved
+		}
+
 		// Only endpoints from the main API (version 1.0) should be counted for the metrics.
 		// This prevents internal endpoints from being included as well.
-		if version == "1.0" {
-			metrics.TrackStartedRequest(r)
-		}
+		metricsTrackRequestIfNeeded(version, r, endpoint.MetricsType)
+
+		// Initialise the security audit context once per request so any
+		// downstream auth path can emit security events without each call
+		// site having to remember to populate the OWASP base fields.
+		security.InitRequestAuditInfo(r)
 
 		w.Header().Set("Content-Type", "application/json")
 
-		if !(r.RemoteAddr == "@" && version == "internal") {
+		if r.RemoteAddr != "@" || version != "internal" {
 			// Block public API requests until we're done with basic
 			// initialization tasks, such setting up the cluster database.
 			select {
 			case <-d.setupChan:
 			default:
-				response := response.Unavailable(fmt.Errorf("LXD daemon setup in progress"))
+				response := response.Unavailable(errors.New("LXD daemon setup in progress"))
 				_ = response.Render(w, r)
 				return
 			}
 		}
 
+		// Resolve the endpoint action up front so authentication knows
+		// whether the endpoint requires authentication. This drives whether
+		// authn_login_fail is emitted on a fallthrough (no auth method
+		// recognised the caller).
+		var endpointAction APIEndpointAction
+		switch r.Method {
+		case http.MethodGet:
+			endpointAction = endpoint.Get
+		case http.MethodHead:
+			endpointAction = endpoint.Head
+		case http.MethodPut:
+			endpointAction = endpoint.Put
+		case http.MethodPost:
+			endpointAction = endpoint.Post
+		case http.MethodDelete:
+			endpointAction = endpoint.Delete
+		case http.MethodPatch:
+			endpointAction = endpoint.Patch
+		default:
+			_ = response.NotFound(fmt.Errorf("Method %q not found", r.Method)).Render(w, r)
+			return
+		}
+
+		if endpointAction.Handler == nil {
+			_ = response.NotImplemented(nil).Render(w, r)
+			return
+		}
+
 		// Authentication
-		trusted, username, protocol, identityProviderGroups, err := d.Authenticate(w, r)
+		oidcVerifier := d.oidcVerifier.Load()
+		requestor, err := d.Authenticate(w, r, oidcVerifier, endpointAction.AllowUntrusted)
 		if err != nil {
-			var authError oidc.AuthError
-			if errors.As(err, &authError) {
+			_, ok := errors.AsType[oidc.AuthError](err)
+			if ok {
 				// Ensure the OIDC headers are set if needed.
-				if d.oidcVerifier != nil {
-					_ = d.oidcVerifier.WriteHeaders(w)
+				if oidcVerifier != nil {
+					_ = oidcVerifier.WriteHeaders(w)
 				}
 
 				// Return 401 Unauthorized error. This indicates to the client that it needs to use the
@@ -674,67 +883,47 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 			return
 		}
 
-		// Set the "trusted" value in the request context.
-		request.SetCtxValue(r, request.CtxTrusted, trusted)
+		// Initialise the request info.
+		err = request.SetRequestor(r, d.requestorHook, *requestor)
+		if err != nil {
+			_ = response.SmartError(err).Render(w, r)
+			return
+		}
 
 		// Reject internal queries to remote, non-cluster, clients
-		if version == "internal" && !shared.ValueInSlice(protocol, []string{auth.AuthenticationMethodUnix, auth.AuthenticationMethodCluster}) {
+		if version == "internal" && !slices.Contains([]string{request.ProtocolUnix, request.ProtocolCluster}, requestor.Protocol) {
 			// Except for the initial cluster accept request (done over trusted TLS)
-			if !trusted || c.Path != "cluster/accept" || protocol != api.AuthenticationMethodTLS {
+			if !requestor.Trusted || c.Path != "cluster/accept" || requestor.Protocol != api.AuthenticationMethodTLS {
 				logger.Warn("Rejecting remote internal API request", logger.Ctx{"ip": r.RemoteAddr})
 				_ = response.Forbidden(nil).Render(w, r)
 				return
 			}
 		}
 
-		logCtx := logger.Ctx{"method": r.Method, "url": r.URL.RequestURI(), "ip": r.RemoteAddr, "protocol": protocol}
-		if protocol == auth.AuthenticationMethodCluster {
-			logCtx["fingerprint"] = username
+		logCtx := logger.Ctx{"method": r.Method, "url": r.URL.RequestURI(), "ip": r.RemoteAddr, "protocol": requestor.Protocol}
+		if requestor.Protocol == request.ProtocolCluster {
+			logCtx["fingerprint"] = requestor.Username
 		} else {
-			logCtx["username"] = username
+			logCtx["username"] = requestor.Username
 		}
 
-		untrustedOk := (r.Method == "GET" && c.Get.AllowUntrusted) || (r.Method == "POST" && c.Post.AllowUntrusted)
-		if trusted {
+		untrustedOk := (r.Method == "GET" && endpoint.Get.AllowUntrusted) || (r.Method == "POST" && endpoint.Post.AllowUntrusted)
+		if requestor.Trusted {
 			logger.Debug("Handling API request", logCtx)
-
-			// Add authentication/authorization context data.
-			ctx := context.WithValue(r.Context(), request.CtxUsername, username)
-			ctx = context.WithValue(ctx, request.CtxProtocol, protocol)
-			if len(identityProviderGroups) > 0 {
-				ctx = context.WithValue(ctx, request.CtxIdentityProviderGroups, identityProviderGroups)
-			}
-
-			// Add forwarded requestor data.
-			if protocol == auth.AuthenticationMethodCluster {
-				// Add authentication/authorization context data.
-				ctx = context.WithValue(ctx, request.CtxForwardedAddress, r.Header.Get(request.HeaderForwardedAddress))
-				ctx = context.WithValue(ctx, request.CtxForwardedUsername, r.Header.Get(request.HeaderForwardedUsername))
-				ctx = context.WithValue(ctx, request.CtxForwardedProtocol, r.Header.Get(request.HeaderForwardedProtocol))
-				forwardedIdentityProviderGroupsJSON := r.Header.Get(request.HeaderForwardedIdentityProviderGroups)
-				if forwardedIdentityProviderGroupsJSON != "" {
-					var forwardedIdentityProviderGroups []string
-					err = json.Unmarshal([]byte(forwardedIdentityProviderGroupsJSON), &forwardedIdentityProviderGroups)
-					if err != nil {
-						logger.Error("Failed unmarshalling identity provider groups from forwarded request header", logger.Ctx{"err": err})
-					} else {
-						ctx = context.WithValue(ctx, request.CtxForwardedIdentityProviderGroups, forwardedIdentityProviderGroups)
-					}
-				}
-			}
-
-			r = r.WithContext(ctx)
 		} else if untrustedOk && r.Header.Get("X-LXD-authenticated") == "" {
-			logger.Debug(fmt.Sprintf("Allowing untrusted %s", r.Method), logger.Ctx{"url": r.URL.RequestURI(), "ip": r.RemoteAddr})
+			logger.Debug("Allowing untrusted "+r.Method, logger.Ctx{"url": r.URL.RequestURI(), "ip": r.RemoteAddr})
 		} else {
-			if d.oidcVerifier != nil {
-				_ = d.oidcVerifier.WriteHeaders(w)
+			if oidcVerifier != nil {
+				_ = oidcVerifier.WriteHeaders(w)
 			}
 
 			logger.Warn("Rejecting request from untrusted client", logger.Ctx{"ip": r.RemoteAddr})
 			_ = response.Forbidden(nil).Render(w, r)
 			return
 		}
+
+		// Set OpenFGA cache in request context.
+		request.SetContextValue(r, request.CtxOpenFGARequestCache, &openfga.RequestCache{})
 
 		// Dump full request JSON when in debug mode
 		if daemon.Debug && r.Method != "GET" && util.IsJSONRequest(r) {
@@ -778,52 +967,11 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 		}
 
 		if d.shutdownCtx.Err() == context.Canceled && !allowedDuringShutdown() {
-			_ = response.Unavailable(fmt.Errorf("LXD is shutting down")).Render(w, r)
+			_ = response.Unavailable(errors.New("LXD is shutting down")).Render(w, r)
 			return
 		}
 
-		handleRequest := func(action APIEndpointAction) response.Response {
-			if action.Handler == nil {
-				return response.NotImplemented(nil)
-			}
-
-			// All APIEndpointActions should have an access handler or should allow untrusted requests.
-			if action.AccessHandler == nil && !action.AllowUntrusted {
-				return response.InternalError(fmt.Errorf("Access handler not defined for %s %s", r.Method, r.URL.RequestURI()))
-			}
-
-			// If the request is not trusted, only call the handler if the action allows it.
-			if !trusted && !action.AllowUntrusted {
-				return response.Forbidden(errors.New("You must be authenticated"))
-			}
-
-			// Call the access handler if there is one.
-			if action.AccessHandler != nil {
-				resp := action.AccessHandler(d, r)
-				if resp != response.EmptySyncResponse {
-					return resp
-				}
-			}
-
-			return action.Handler(d, r)
-		}
-
-		switch r.Method {
-		case "GET":
-			resp = handleRequest(c.Get)
-		case "HEAD":
-			resp = handleRequest(c.Head)
-		case "PUT":
-			resp = handleRequest(c.Put)
-		case "POST":
-			resp = handleRequest(c.Post)
-		case "DELETE":
-			resp = handleRequest(c.Delete)
-		case "PATCH":
-			resp = handleRequest(c.Patch)
-		default:
-			resp = response.NotFound(fmt.Errorf("Method %q not found", r.Method))
-		}
+		resp = handleRequest(d, r, endpointAction, endpoint.ProjectSpecific)
 
 		// Handle errors
 		err = resp.Render(w, r)
@@ -834,12 +982,88 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 			}
 		}
 	})
+}
 
-	// If the endpoint has a canonical name then record it so it can be used to build URLS
-	// and accessed in the context of the request by the handler function.
-	if c.Name != "" {
-		route.Name(c.Name)
+// handleRequest is called from the HTTP handler func defined in (*Daemon).createCmd for all API endpoint actions.
+func handleRequest(d *Daemon, r *http.Request, action APIEndpointAction, projectSpecific bool) response.Response {
+	// Protect against CSRF when using LXD-UI with browser that supports Fetch metadata.
+	// Deny Sec-Fetch-Site when set to cross-site or same-site.
+	if http.NewCrossOriginProtection().Check(r) != nil {
+		return response.ErrorResponse(http.StatusForbidden, "Forbidden Sec-Fetch-Site header value")
 	}
+
+	contentTypes := action.ContentTypes
+	if len(contentTypes) == 0 {
+		// Require application/json if not specified by handler.
+		contentTypes = []string{"application/json"}
+	}
+
+	// Validate browser Content-Type if supplied, or if non-zero Content-Length supplied.
+	if isBrowserClient(r) {
+		contentTypeParts := shared.SplitNTrimSpace(r.Header.Get("Content-Type"), ";", 2, false) // Ignore multi-part boundary part.
+		contentLength := r.Header.Get("Content-Length")
+		hasContentLength := contentLength != "" && contentLength != "0"
+		if (hasContentLength || contentTypeParts[0] != "") && !slices.Contains(contentTypes, contentTypeParts[0]) {
+			return response.ErrorResponse(http.StatusUnsupportedMediaType, "Unsupported Content-Type for this request")
+		}
+	}
+
+	// All APIEndpointActions should have an access handler or should allow untrusted requests.
+	if action.AccessHandler == nil && !action.AllowUntrusted {
+		return response.InternalError(fmt.Errorf("Access handler not defined for %s %s", r.Method, r.URL.RequestURI()))
+	}
+
+	// Get the requestor.
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	// If the request is not trusted, only call the handler if the action allows it.
+	if !requestor.IsTrusted() && !action.AllowUntrusted {
+		return response.Forbidden(errors.New("You must be authenticated"))
+	}
+
+	// Global permission checks applied for project specific endpoints.
+	// This can only be globally applied for trusted endpoints.
+	// Endpoints that allow untrusted requests must enforce the project check themselves.
+	if projectSpecific && !action.AllowUntrusted {
+		projectName, allProjects, err := request.ProjectParams(r)
+		if err != nil {
+			return response.SmartError(err)
+		}
+
+		if allProjects {
+			// Handle all-projects query parameter according to endpoint action specified mode.
+			// The default value if unspecified is allProjectsModeNotSupported.
+			switch action.AllProjectsMode {
+			case allProjectsModeNotSupported:
+				return response.BadRequest(errors.New("All projects queries are not supported"))
+			case allProjectsModeDisallowRestrictedTLSClients:
+				if requestor.IsIdentityType(api.IdentityTypeCertificateClientRestricted) {
+					return response.Forbidden(errors.New("Certificate is restricted"))
+				}
+
+			case allProjectsModeAllowAll:
+			}
+		} else {
+			// Check that the caller can view the requested project.
+			err = d.authorizer.CheckPermission(r.Context(), entity.ProjectURL(projectName), auth.EntitlementCanView)
+			if err != nil {
+				return response.SmartError(err)
+			}
+		}
+	}
+
+	// Call the access handler if there is one.
+	if action.AccessHandler != nil {
+		resp := action.AccessHandler(d, r)
+		if resp != response.EmptySyncResponse {
+			return resp
+		}
+	}
+
+	return action.Handler(d, r)
 }
 
 // have we setup shared mounts?
@@ -848,7 +1072,7 @@ var sharedMountsLock sync.Mutex
 // setupSharedMounts will mount any shared mounts needed, and set daemon.SharedMountsSetup to true.
 func setupSharedMounts() error {
 	// Check if we already went through this
-	if daemon.SharedMountsSetup {
+	if daemon.SharedMountsSetup.Load() {
 		return nil
 	}
 
@@ -859,7 +1083,7 @@ func setupSharedMounts() error {
 	// Check if already setup
 	path := shared.VarPath("shmounts")
 	if filesystem.IsMountPoint(path) {
-		daemon.SharedMountsSetup = true
+		daemon.SharedMountsSetup.Store(true)
 		return nil
 	}
 
@@ -876,7 +1100,7 @@ func setupSharedMounts() error {
 		return err
 	}
 
-	daemon.SharedMountsSetup = true
+	daemon.SharedMountsSetup.Store(true)
 	return nil
 }
 
@@ -884,24 +1108,15 @@ func setupSharedMounts() error {
 func (d *Daemon) Init() error {
 	d.startTime = time.Now()
 
-	err := d.init()
-
-	// If an error occurred synchronously while starting up, let's try to
-	// cleanup any state we produced so far. Errors happening here will be
-	// ignored.
-	if err != nil {
-		logger.Error("Failed to start the daemon", logger.Ctx{"err": err})
-		_ = d.Stop(context.Background(), unix.SIGINT)
-		return err
-	}
-
-	return nil
+	return d.init()
 }
 
 func (d *Daemon) setupLoki(URL string, cert string, key string, caCert string, instanceName string, logLevel string, labels []string, types []string) error {
 	// Stop any existing loki client.
 	if d.lokiClient != nil {
+		d.internalListener.RemoveHandler("loki")
 		d.lokiClient.Stop()
+		d.lokiClient = nil
 	}
 
 	// Check basic requirements for starting a new client.
@@ -917,12 +1132,12 @@ func (d *Daemon) setupLoki(URL string, cert string, key string, caCert string, i
 
 	// Handle standalone systems.
 	var location string
-	if !d.serverClustered {
-		hostname, err := os.Hostname()
-		if err != nil {
-			return err
-		}
+	hostname, err := os.Hostname()
+	if err != nil {
+		return err
+	}
 
+	if !d.serverClustered {
 		location = hostname
 		if instanceName == "" {
 			instanceName = hostname
@@ -931,8 +1146,28 @@ func (d *Daemon) setupLoki(URL string, cert string, key string, caCert string, i
 		instanceName = d.serverName
 	}
 
+	// Server-static OWASP fields for security event lines: derived from the
+	// configured HTTPS listener so the Loki entry has a consistent host/port
+	// regardless of which listener the request hit.
+	var hostIP, port string
+	d.globalConfigMu.Lock()
+	clusterIdentifier := d.globalConfig.ClusterUUID()
+	d.globalConfigMu.Unlock()
+
+	httpsAddress := d.localConfig.HTTPSAddress()
+	if httpsAddress != "" {
+		host, p, splitErr := net.SplitHostPort(httpsAddress)
+		if splitErr == nil {
+			hostIP = host
+			port = p
+		}
+	}
+
 	// Start a new client.
-	d.lokiClient = loki.NewClient(d.shutdownCtx, u, cert, key, caCert, instanceName, location, logLevel, labels, types)
+	d.lokiClient, err = loki.NewClient(d.shutdownCtx, u, cert, key, caCert, instanceName, location, hostname, hostIP, port, clusterIdentifier, logLevel, labels, types)
+	if err != nil {
+		return err
+	}
 
 	// Attach the new client to the log handler.
 	d.internalListener.AddHandler("loki", d.lokiClient.HandleEvent)
@@ -940,31 +1175,41 @@ func (d *Daemon) setupLoki(URL string, cert string, key string, caCert string, i
 	return nil
 }
 
-func (d *Daemon) init() error {
-	var err error
+func (d *Daemon) init() (err error) {
+	d.startStopLock.Lock()
+	defer d.startStopLock.Unlock()
+
+	defer func() {
+		if err != nil {
+			// Use context.Background() rather than d.shutdownCtx because a shutdown
+			// may be the reason init() failed, in which case d.shutdownCtx is already cancelled.
+			shared.SnapSetHealth(context.Background(), shared.SnapHealthError, "LXD daemon failed to start")
+		}
+	}()
 
 	var dbWarnings []dbCluster.Warning
 
 	// Set default authorizer.
-	d.authorizer, err = authDrivers.LoadAuthorizer(d.shutdownCtx, authDrivers.DriverTLS, logger.Log, d.identityCache)
+	d.authorizer, err = authDrivers.LoadAuthorizer(d.shutdownCtx, authDrivers.DriverTLS, logger.Log, authDrivers.WithSendSecurity(d.events.SendSecurity))
 	if err != nil {
 		return err
 	}
 
-	// Setup logger
+	// Setup events
+	d.devLXDEvents = events.NewDevLXDServer(daemon.Debug, daemon.Verbose)
+	d.events, err = events.NewServer(daemon.Debug, daemon.Verbose, cluster.EventHubPush)
+	if err != nil {
+		return err
+	}
+
+	// Configure logging events.
 	events.LoggingServer = d.events
 
 	// Setup internal event listener
 	d.internalListener = events.NewInternalListener(d.shutdownCtx, d.events)
 
 	// Lets check if there's an existing LXD running
-	err = endpoints.CheckAlreadyRunning(d.UnixSocket())
-	if err != nil {
-		return err
-	}
-
-	/* Set the LVM environment */
-	err = os.Setenv("LVM_SUPPRESS_FD_WARNINGS", "1")
+	err = endpoints.CheckAlreadyRunning(d.os.GetUnixSocket())
 	if err != nil {
 		return err
 	}
@@ -1007,31 +1252,26 @@ func (d *Daemon) init() error {
 		}
 	}
 
-	// Detect LXC features
-	d.os.LXCFeatures = map[string]bool{}
-	lxcExtensions := []string{
-		"mount_injection_file",
-		"seccomp_notify",
-		"network_ipvlan",
-		"network_l2proxy",
-		"network_gateway_device_route",
-		"network_phys_macvlan_mtu",
-		"network_veth_router",
-		"cgroup2",
-		"pidfd",
-		"seccomp_allow_deny_syntax",
-		"devpts_fd",
-		"seccomp_proxy_send_notify_fd",
-		"idmapped_mounts_v2",
-		"core_scheduling",
-	}
-
-	for _, extension := range lxcExtensions {
-		d.os.LXCFeatures[extension] = liblxc.HasAPIExtension(extension)
+	// LXC features available in 5.0.0+
+	d.os.LXCFeatures = map[string]bool{
+		"mount_injection_file":         true,
+		"seccomp_notify":               true,
+		"network_ipvlan":               true,
+		"network_l2proxy":              true,
+		"network_gateway_device_route": true,
+		"network_phys_macvlan_mtu":     true,
+		"network_veth_router":          true,
+		"cgroup2":                      true,
+		"pidfd":                        true,
+		"seccomp_allow_deny_syntax":    true,
+		"devpts_fd":                    true,
+		"seccomp_proxy_send_notify_fd": true,
+		"idmapped_mounts_v2":           true,
+		"core_scheduling":              true,
 	}
 
 	// Look for kernel features
-	logger.Infof("Kernel features:")
+	logger.Info("Kernel features:")
 
 	d.os.CloseRange = canUseCloseRange()
 	if d.os.CloseRange {
@@ -1047,23 +1287,16 @@ func (d *Daemon) init() error {
 		logger.Info(" - netnsid-based network retrieval: no")
 	}
 
-	if canUsePidFds() && d.os.LXCFeatures["pidfd"] {
-		d.os.PidFds = true
-	}
-
-	if d.os.PidFds {
+	d.os.PidFds.Store(canUsePidFds())
+	if d.os.PidFds.Load() {
 		logger.Info(" - pidfds: yes")
 	} else {
 		logger.Info(" - pidfds: no")
 	}
 
-	if canUseCoreScheduling() {
-		d.os.CoreScheduling = true
+	d.os.CoreScheduling.Store(canUseCoreScheduling())
+	if d.os.CoreScheduling.Load() {
 		logger.Info(" - core scheduling: yes")
-
-		if d.os.LXCFeatures["core_scheduling"] {
-			d.os.ContainerCoreScheduling = true
-		}
 	} else {
 		logger.Info(" - core scheduling: no")
 	}
@@ -1089,8 +1322,8 @@ func (d *Daemon) init() error {
 		logger.Info(" - seccomp listener continue syscalls: no")
 	}
 
-	if canUseSeccompListenerAddfd() && d.os.LXCFeatures["seccomp_proxy_send_notify_fd"] {
-		d.os.SeccompListenerAddfd = true
+	d.os.SeccompListenerAddfd = canUseSeccompListenerAddfd()
+	if d.os.SeccompListenerAddfd {
 		logger.Info(" - seccomp listener add file descriptors: yes")
 	} else {
 		logger.Info(" - seccomp listener add file descriptors: no")
@@ -1103,8 +1336,8 @@ func (d *Daemon) init() error {
 		logger.Info(" - attach to namespaces via pidfds: no")
 	}
 
-	if d.os.LXCFeatures["devpts_fd"] && canUseNativeTerminals() {
-		d.os.NativeTerminals = true
+	d.os.NativeTerminals = canUseNativeTerminals()
+	if d.os.NativeTerminals {
 		logger.Info(" - safe native terminal allocation: yes")
 	} else {
 		logger.Info(" - safe native terminal allocation: no")
@@ -1117,6 +1350,13 @@ func (d *Daemon) init() error {
 		logger.Info(" - unprivileged binfmt_misc: no")
 	}
 
+	d.os.BPFToken = canUseBPFToken()
+	if d.os.BPFToken {
+		logger.Info(" - BPF Token: yes")
+	} else {
+		logger.Info(" - BPF Token: no")
+	}
+
 	/*
 	 * During daemon startup we're the only thread that touches VFS3Fscaps
 	 * so we don't need to bother with atomic.StoreInt32() when touching
@@ -1125,15 +1365,15 @@ func (d *Daemon) init() error {
 	d.os.VFS3Fscaps = idmap.SupportsVFS3Fscaps("")
 	if d.os.VFS3Fscaps {
 		idmap.VFS3Fscaps = idmap.VFS3FscapsSupported
-		logger.Infof(" - unprivileged file capabilities: yes")
+		logger.Info(" - unprivileged file capabilities: yes")
 	} else {
 		idmap.VFS3Fscaps = idmap.VFS3FscapsUnsupported
-		logger.Infof(" - unprivileged file capabilities: no")
+		logger.Info(" - unprivileged file capabilities: no")
 	}
 
 	dbWarnings = append(dbWarnings, d.os.CGInfo.Warnings()...)
 
-	logger.Infof(" - cgroup layout: %s", d.os.CGInfo.Mode())
+	logger.Infof(" - cgroup layout: %s", d.os.CGInfo.Layout)
 
 	for _, w := range dbWarnings {
 		logger.Warnf(" - %s, %s", warningtype.TypeNames[warningtype.Type(w.TypeCode)], w.LastMessage)
@@ -1165,8 +1405,8 @@ func (d *Daemon) init() error {
 	if err == nil {
 		fd, err := os.Open(testDev)
 		if err != nil && os.IsPermission(err) {
-			logger.Warn("Unable to access device nodes, LXD likely running on a nodev mount")
-			d.os.Nodev = true
+			logger.Warn("Cannot access device nodes, LXD likely running on a nodev mount")
+			d.os.Nodev.Store(true)
 		}
 
 		_ = fd.Close()
@@ -1203,7 +1443,7 @@ func (d *Daemon) init() error {
 	}
 
 	// Detect if clustered, but not yet upgraded to per-server client certificates.
-	if d.serverClustered && len(d.identityCache.GetByType(api.IdentityTypeCertificateServer)) < 1 {
+	if d.serverClustered && len(d.identityCache.GetServerCertificates()) < 1 {
 		// If the cluster has not yet upgraded to per-server client certificates (by running patch
 		// patchClusteringServerCertTrust) then temporarily use the network (cluster) certificate as client
 		// certificate, and cause us to trust it for use as client certificate from the other members.
@@ -1225,14 +1465,33 @@ func (d *Daemon) init() error {
 		if shared.PathExists(tarballPath) {
 			err = cluster.DatabaseReplaceFromTarball(tarballPath, d.db.Node)
 			if err != nil {
-				return fmt.Errorf("Failed to load recovery tarball: %w", err)
+				return fmt.Errorf("Failed loading recovery tarball: %w", err)
 			}
 		}
 	}
 
+	// Load local config (must come after processing incoming recovery tarball as it can update local config).
+	logger.Info("Loading daemon configuration")
+	err = d.db.Node.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
+		d.localConfig, err = node.ConfigLoad(ctx, tx)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+
+	localHTTPAddress := d.localConfig.HTTPSAddress()
+	localClusterAddress := d.localConfig.ClusterAddress()
+	debugAddress := d.localConfig.DebugAddress()
+
+	// Sense check for clustering mode.
+	if localClusterAddress == "" && d.serverClustered {
+		return errors.New("Server is clustered (has local raft addresses) but cluster.https_address is not set")
+	}
+
 	/* Setup dqlite */
 	clusterLogLevel := "ERROR"
-	if shared.ValueInSlice("dqlite", trace) {
+	if slices.Contains(trace, "dqlite") {
 		clusterLogLevel = "TRACE"
 	}
 
@@ -1257,46 +1516,32 @@ func (d *Daemon) init() error {
 			logger.Warn("Failed setting up shared mounts", logger.Ctx{"err": err})
 		}
 
-		// Attempt to Mount the devlxd tmpfs
-		devlxd := filepath.Join(d.os.VarDir, "devlxd")
-		if !filesystem.IsMountPoint(devlxd) {
-			err = unix.Mount("tmpfs", devlxd, "tmpfs", 0, "size=100k,mode=0755")
+		// Attempt to Mount the devLXD tmpfs
+		devLXD := filepath.Join(d.os.VarDir, "devlxd")
+		if !filesystem.IsMountPoint(devLXD) {
+			err = unix.Mount("tmpfs", devLXD, "tmpfs", 0, "size=100k,mode=0755")
 			if err != nil {
-				logger.Warn("Failed to mount devlxd", logger.Ctx{"err": err})
+				logger.Warn("Failed mounting devLXD", logger.Ctx{"err": err})
 			}
 		}
 	}
-
-	logger.Info("Loading daemon configuration")
-	err = d.db.Node.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
-		d.localConfig, err = node.ConfigLoad(ctx, tx)
-		return err
-	})
-	if err != nil {
-		return err
-	}
-
-	localHTTPAddress := d.localConfig.HTTPSAddress()
-	localClusterAddress := d.localConfig.ClusterAddress()
-	debugAddress := d.localConfig.DebugAddress()
 
 	if os.Getenv("LISTEN_PID") != "" {
 		d.systemdSocketActivated = true
 	}
 
 	/* Setup the web server */
-	config := &endpoints.Config{
+	endpointsConfig := &endpoints.Config{
 		Dir:                  d.os.VarDir,
-		UnixSocket:           d.UnixSocket(),
+		UnixSocket:           d.os.GetUnixSocket(),
 		Cert:                 networkCert,
 		RestServer:           restServer(d),
-		DevLxdServer:         devLxdServer(d),
+		DevLxdServer:         devLXDServer(d),
 		LocalUnixSocketGroup: d.config.Group,
 		NetworkAddress:       localHTTPAddress,
 		ClusterAddress:       localClusterAddress,
 		DebugAddress:         debugAddress,
 		MetricsServer:        metricsServer(d),
-		StorageBucketsServer: storageBucketsServer(d),
 		VsockServer:          vSockServer(d),
 		VsockSupport:         false,
 	}
@@ -1304,10 +1549,10 @@ func (d *Daemon) init() error {
 	// Enable vsock server support if VM instances supported.
 	err, found := d.State().InstanceTypes[instancetype.VM]
 	if found && err == nil {
-		config.VsockSupport = true
+		endpointsConfig.VsockSupport = true
 	}
 
-	d.endpoints, err = endpoints.Up(config)
+	d.endpoints, err = endpoints.Up(endpointsConfig)
 	if err != nil {
 		return err
 	}
@@ -1338,49 +1583,64 @@ func (d *Daemon) init() error {
 			driver.WithLogFunc(cluster.DqliteLog),
 		}
 
-		if shared.ValueInSlice("database", trace) {
+		if slices.Contains(trace, "database") {
 			options = append(options, driver.WithTracing(dqliteClient.LogDebug))
 		}
 
-		d.db.Cluster, err = db.OpenCluster(context.Background(), "db.bin", store, localClusterAddress, dir, d.config.DqliteSetupTimeout, nil, options...)
+		// Assign cluster DB handle to d.gateway.Cluster so its immediately usable by gateway even if DB
+		// returns StatusPreconditionFailed. This way its usable for heartbeats whilst it waits for the
+		// other members to become aligned.
+		d.gateway.Cluster, err = db.OpenCluster(d.shutdownCtx, "db.bin", store, localClusterAddress, dir, d.config.DqliteSetupTimeout, d.os.ServerUUID, options...)
 		if err == nil {
 			logger.Info("Initialized global database")
+
+			// If cluster DB handle is established without issue, make available to the rest of LXD.
+			d.db.Cluster = d.gateway.Cluster
 			break
-		} else if errors.Is(err, db.ErrSomeNodesAreBehind) {
+		} else if api.StatusErrorCheck(err, http.StatusPreconditionFailed) {
 			// If some other nodes have schema or API versions less recent
 			// than this node, we block until we receive a notification
 			// from the last node being upgraded that everything should be
 			// now fine, and then retry
-			logger.Warn("Wait for other cluster nodes to upgrade their versions, cluster not started yet")
+			logger.Warn("Wait for other cluster members to align their versions, cluster not started yet")
 
+			shared.SnapSetHealth(d.shutdownCtx, shared.SnapHealthWaiting, "Waiting for cluster members to align their versions after snap refresh")
 			// The only thing we want to still do on this node is
 			// to run the heartbeat task, in case we are the raft
 			// leader.
-			d.gateway.Cluster = d.db.Cluster
 			taskFunc, taskSchedule := cluster.HeartbeatTask(d.gateway)
 			hbGroup := task.NewGroup()
 			d.taskClusterHeartbeat = hbGroup.Add(taskFunc, taskSchedule)
 			hbGroup.Start(d.shutdownCtx)
-			d.gateway.WaitUpgradeNotification()
-			_ = hbGroup.Stop(time.Second)
-			d.gateway.Cluster = nil
 
-			_ = d.db.Cluster.Close()
+			{
+				// Wait for refresh notification from other members.
+				waitNotificationCtx, cancel := context.WithTimeout(d.shutdownCtx, time.Minute)
+				d.gateway.WaitUpgradeNotification(waitNotificationCtx)
+				cancel()
+			}
+
+			_ = hbGroup.Stop(time.Second)
+			_ = d.gateway.Cluster.Close()
+
+			d.gateway.HeartbeatLock.Lock()
+			d.gateway.Cluster = nil
+			d.gateway.HeartbeatLock.Unlock()
 
 			continue
 		}
 
-		return fmt.Errorf("Failed to initialize global database: %w", err)
+		return fmt.Errorf("Failed initializing global database: %w", err)
 	}
 
 	// Load the embedded OpenFGA authorizer. This cannot be loaded until after the cluster database is initialised,
 	// so the TLS authorizer must be loaded first to set up clustering.
-	d.authorizer, err = authDrivers.LoadAuthorizer(d.shutdownCtx, authDrivers.DriverEmbeddedOpenFGA, logger.Log, d.identityCache, authDrivers.WithOpenFGADatastore(openfga.NewOpenFGAStore(d.db.Cluster)))
+	d.authorizer, err = authDrivers.LoadAuthorizer(d.shutdownCtx, authDrivers.DriverEmbeddedOpenFGA, logger.Log, authDrivers.WithOpenFGADatastore(openfga.NewOpenFGAStore(d.db.Cluster)), authDrivers.WithSendSecurity(d.events.SendSecurity))
 	if err != nil {
 		return err
 	}
 
-	d.firewall = firewall.New()
+	d.firewall = firewall.New(d.os.KernelVersion)
 	logger.Info("Firewall loaded driver", logger.Ctx{"driver": d.firewall})
 
 	err = cluster.NotifyUpgradeCompleted(d.State(), networkCert, d.serverCert())
@@ -1391,33 +1651,6 @@ func (d *Daemon) init() error {
 		logger.Warn("Could not notify all nodes of database upgrade", logger.Ctx{"err": err})
 	}
 
-	d.gateway.Cluster = d.db.Cluster
-
-	// This logic used to belong to patchUpdateFromV10, but has been moved
-	// here because it needs database access.
-	if shared.PathExists(shared.VarPath("lxc")) {
-		err := os.Rename(shared.VarPath("lxc"), shared.VarPath("containers"))
-		if err != nil {
-			return err
-		}
-
-		logger.Debug("Restarting all the containers following directory rename")
-
-		s := d.State()
-		instances, err := instance.LoadNodeAll(s, instancetype.Container)
-		if err != nil {
-			return fmt.Errorf("Failed loading containers to restart: %w", err)
-		}
-
-		instancesShutdown(instances)
-		instancesStart(s, instances)
-	}
-
-	// Setup the user-agent.
-	if d.serverClustered {
-		version.UserAgentFeatures([]string{"cluster"})
-	}
-
 	// Apply all patches that need to be run before the cluster config gets loaded.
 	err = patchesApply(d, patchPreLoadClusterConfig)
 	if err != nil {
@@ -1426,7 +1659,7 @@ func (d *Daemon) init() error {
 
 	// Load server name and config before patches run (so they can access them from d.State()).
 	err = d.db.Cluster.Transaction(d.shutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
-		config, err := clusterConfig.Load(ctx, tx)
+		globalConfig, err := clusterConfig.Load(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -1439,8 +1672,22 @@ func (d *Daemon) init() error {
 
 		d.globalConfigMu.Lock()
 		d.serverName = serverName
-		d.globalConfig = config
+		d.globalConfig = globalConfig
 		d.globalConfigMu.Unlock()
+
+		// Add the per-project config options to the daemon config schema.
+		projects, err := dbCluster.GetProjectNames(ctx, tx.Tx())
+		if err != nil {
+			return fmt.Errorf("Failed getting project names: %w", err)
+		}
+
+		node.ConfigSchema.Lock()
+		for _, project := range projects {
+			node.ConfigSchema.Types["storage.project."+project+".images_volume"] = config.Key{}
+			node.ConfigSchema.Types["storage.project."+project+".backups_volume"] = config.Key{}
+		}
+
+		node.ConfigSchema.Unlock()
 
 		return nil
 	})
@@ -1448,33 +1695,38 @@ func (d *Daemon) init() error {
 		return err
 	}
 
+	// Setup the user-agent.
+	userAgentFeatures := []string{}
+	if d.serverClustered {
+		userAgentFeatures = append(userAgentFeatures, "cluster")
+
+		// A clustered LXD might be part of a MicroCloud.
+		d.globalConfigMu.Lock()
+		userMicrocloud := d.globalConfig.UserMicrocloud()
+		d.globalConfigMu.Unlock()
+
+		if userMicrocloud {
+			userAgentFeatures = append(userAgentFeatures, "microcloud")
+		}
+	}
+
+	if len(userAgentFeatures) > 0 {
+		err = version.UserAgentFeatures(userAgentFeatures)
+		if err != nil {
+			logger.Warn("Failed configuring LXD user agent", logger.Ctx{"err": err, "features": userAgentFeatures})
+		}
+	}
+
 	d.events.SetLocalLocation(d.serverName)
 
-	// Setup and load the server's UUID file.
-	// Use os.VarDir to allow setting up the uuid file also in the test suite.
-	var serverUUID string
-	uuidPath := filepath.Join(d.os.VarDir, "server.uuid")
-	if !shared.PathExists(uuidPath) {
-		serverUUID = uuid.New().String()
-		err := os.WriteFile(uuidPath, []byte(serverUUID), 0600)
-		if err != nil {
-			return fmt.Errorf("Failed to create server.uuid file: %w", err)
-		}
-	}
+	d.globalConfigMu.Lock()
+	clusterUUID := d.globalConfig.ClusterUUID()
+	d.globalConfigMu.Unlock()
 
-	if serverUUID == "" {
-		uuidBytes, err := os.ReadFile(uuidPath)
-		if err != nil {
-			return fmt.Errorf("Failed to read server.uuid file: %w", err)
-		}
-
-		serverUUID = string(uuidBytes)
-	}
-
-	d.serverUUID = serverUUID
+	d.events.SetClusterIdentifier(clusterUUID)
 
 	// Mount the storage pools.
-	logger.Infof("Initializing storage pools")
+	logger.Info("Initializing storage pools")
 	err = storageStartup(d.State())
 	if err != nil {
 		return err
@@ -1487,14 +1739,14 @@ func (d *Daemon) init() error {
 	}
 
 	// Mount any daemon storage volumes.
-	logger.Infof("Initializing daemon storage mounts")
+	logger.Info("Initializing daemon storage mounts")
 	err = daemonStorageMount(d.State())
 	if err != nil {
 		return err
 	}
 
 	// Create directories on daemon storage mounts.
-	err = d.os.InitStorage()
+	err = d.os.InitStorage(d.localConfig)
 	if err != nil {
 		return err
 	}
@@ -1531,27 +1783,25 @@ func (d *Daemon) init() error {
 
 	d.events.SetLocalLocation(d.serverName)
 
+	d.globalConfigMu.Lock()
+	clusterUUID = d.globalConfig.ClusterUUID()
+	d.globalConfigMu.Unlock()
+
+	d.events.SetClusterIdentifier(clusterUUID)
+
 	// Get daemon configuration.
 	bgpAddress := d.localConfig.BGPAddress()
 	bgpRouterID := d.localConfig.BGPRouterID()
-	bgpASN := int64(0)
-
-	maasAPIURL := ""
-	maasAPIKey := ""
-	maasMachine := d.localConfig.MAASMachine()
 
 	// Get specific config keys.
 	d.globalConfigMu.Lock()
-	bgpASN = d.globalConfig.BGPASN()
+	bgpASN := d.globalConfig.BGPASN()
 
 	d.proxy = shared.ProxyFromConfig(d.globalConfig.ProxyHTTPS(), d.globalConfig.ProxyHTTP(), d.globalConfig.ProxyIgnoreHosts())
 
-	maasAPIURL, maasAPIKey = d.globalConfig.MAASController()
 	d.gateway.HeartbeatOfflineThreshold = d.globalConfig.OfflineThreshold()
 	lokiURL, lokiUsername, lokiPassword, lokiCACert, lokiInstance, lokiLoglevel, lokiLabels, lokiTypes := d.globalConfig.LokiServer()
-	oidcIssuer, oidcClientID, oidcAudience, oidcGroupsClaim := d.globalConfig.OIDCServer()
 	syslogSocketEnabled := d.localConfig.SyslogSocket()
-	instancePlacementScriptlet := d.globalConfig.InstancesPlacementScriptlet()
 
 	d.endpoints.NetworkUpdateTrustedProxy(d.globalConfig.HTTPSTrustedProxy())
 	d.globalConfigMu.Unlock()
@@ -1560,7 +1810,7 @@ func (d *Daemon) init() error {
 	if lokiURL != "" {
 		err = d.setupLoki(lokiURL, lokiUsername, lokiPassword, lokiCACert, lokiInstance, lokiLoglevel, lokiLabels, lokiTypes)
 		if err != nil {
-			return err
+			logger.Warn("Failed setting up Loki", logger.Ctx{"err": err})
 		}
 	}
 
@@ -1571,33 +1821,16 @@ func (d *Daemon) init() error {
 		}
 	}
 
-	// Setup OIDC authentication.
-	if oidcIssuer != "" && oidcClientID != "" {
-		httpClientFunc := func() (*http.Client, error) {
-			return util.HTTPClient("", d.proxy)
-		}
-
-		d.oidcVerifier, err = oidc.NewVerifier(oidcIssuer, oidcClientID, oidcAudience, d.serverCert, d.identityCache, httpClientFunc, &oidc.Opts{GroupsClaim: oidcGroupsClaim})
-		if err != nil {
-			return err
-		}
-	}
+	// Setup OIDC verifier
+	initializeOIDCVerifier(d)
 
 	// Setup BGP listener.
 	d.bgp = bgp.NewServer()
-	if bgpAddress != "" && bgpASN != 0 && bgpRouterID != "" {
-		err := d.bgp.Start(bgpAddress, uint32(bgpASN), net.ParseIP(bgpRouterID))
-		if err != nil {
-			return err
-		}
-
-		logger.Info("Started BGP server")
-	}
 
 	// Setup DNS listener.
 	d.dns = dns.NewServer(d.db.Cluster, func(name string, full bool) (*dns.Zone, error) {
 		// Fetch the zone.
-		zone, err := networkZone.LoadByName(d.State(), name)
+		zone, err := networkZone.LoadByName(d.shutdownCtx, d.State(), name)
 		if err != nil {
 			return nil, err
 		}
@@ -1610,9 +1843,9 @@ func (d *Daemon) init() error {
 
 		if full {
 			// Full content was requested.
-			zoneBuilder, err := zone.Content()
+			zoneBuilder, err := zone.Content(d.shutdownCtx)
 			if err != nil {
-				logger.Errorf("Failed to render DNS zone %q: %v", name, err)
+				logger.Errorf("Failed rendering DNS zone %q: %v", name, err)
 				return nil, err
 			}
 
@@ -1621,7 +1854,7 @@ func (d *Daemon) init() error {
 			// SOA only.
 			zoneBuilder, err := zone.SOA()
 			if err != nil {
-				logger.Errorf("Failed to render DNS zone %q: %v", name, err)
+				logger.Errorf("Failed rendering DNS zone %q: %v", name, err)
 				return nil, err
 			}
 
@@ -1632,16 +1865,27 @@ func (d *Daemon) init() error {
 	})
 
 	// Setup the networks.
-	if !d.db.Cluster.LocalNodeIsEvacuated() {
-		logger.Infof("Initializing networks")
+	logger.Info("Initializing networks")
 
-		err = networkStartup(d.State())
-		if err != nil {
-			return err
-		}
+	err = networkStartup(d.State, false)
+	if err != nil {
+		return err
 	}
 
 	// Setup tertiary listeners that may use managed network addresses and must be started after networks.
+	if bgpAddress != "" && bgpASN != 0 && bgpRouterID != "" {
+		if bgpASN > math.MaxUint32 {
+			return errors.New("Cannot convert BGP ASN to uint32: Upper bound exceeded")
+		}
+
+		err := d.bgp.Configure(bgpAddress, uint32(bgpASN), net.ParseIP(bgpRouterID))
+		if err != nil {
+			return err
+		}
+
+		logger.Info("Started BGP server")
+	}
+
 	dnsAddress := d.localConfig.DNSAddress()
 	if dnsAddress != "" {
 		err = d.dns.Start(dnsAddress)
@@ -1660,34 +1904,18 @@ func (d *Daemon) init() error {
 		}
 	}
 
-	storageBucketsAddress := d.localConfig.StorageBucketsAddress()
-	if storageBucketsAddress != "" {
-		err = d.endpoints.UpStorageBuckets(storageBucketsAddress)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Load instance placement scriptlet.
-	if instancePlacementScriptlet != "" {
-		err = scriptletLoad.InstancePlacementSet(instancePlacementScriptlet)
-		if err != nil {
-			logger.Warn("Failed loading instance placement scriptlet", logger.Ctx{"err": err})
-		}
-	}
-
 	// Apply all patches that need to be run after networks are initialised.
 	err = patchesApply(d, patchPostNetworks)
 	if err != nil {
 		return err
 	}
 
-	// Cleanup leftover images.
-	pruneLeftoverImages(d.State())
-
 	var instances []instance.Instance
 
 	if !d.os.MockMode {
+		// Cleanup leftover images.
+		pruneLeftoverImages(d.State())
+
 		// Start the scheduler
 		go deviceEventListener(d.State)
 
@@ -1709,6 +1937,11 @@ func (d *Daemon) init() error {
 			return fmt.Errorf("Failed loading local instances: %w", err)
 		}
 
+		err = patchesApply(d, patchPostInstancesLoaded)
+		if err != nil {
+			return err
+		}
+
 		// Register devices on running instances to receive events and reconnect to VM monitor sockets.
 		// This should come after the event handler go routines have been started.
 		devicesRegister(instances)
@@ -1716,7 +1949,13 @@ func (d *Daemon) init() error {
 		// Setup seccomp handler
 		if d.os.SeccompListener {
 			seccompServer, err := seccomp.NewSeccompServer(d.State(), shared.VarPath("seccomp.socket"), func(pid int32, state *state.State) (seccomp.Instance, error) {
-				return findContainerForPid(pid, state)
+				c, _, err := getLXCMonitorContainer(state, pid)
+				if err != nil || c == nil {
+					logger.Warn("Could not match PID to container for seccomp", logger.Ctx{"pid": pid, "err": err})
+					return nil, errPIDNotInContainer // Don't return error to avoid leaking details about the process.
+				}
+
+				return c, nil
 			})
 			if err != nil {
 				return err
@@ -1728,43 +1967,6 @@ func (d *Daemon) init() error {
 
 		// Read the trusted identities
 		updateIdentityCache(d)
-
-		// Connect to MAAS
-		if maasAPIURL != "" {
-			go func() {
-				warningAdded := false
-
-				for {
-					err = d.setupMAASController(maasAPIURL, maasAPIKey, maasMachine)
-					if err == nil {
-						logger.Info("Connected to MAAS controller", logger.Ctx{"url": maasAPIURL})
-						break
-					}
-
-					logger.Warn("Unable to connect to MAAS, trying again in a minute", logger.Ctx{"url": maasAPIURL, "err": err})
-
-					if !warningAdded {
-						_ = d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
-							err := tx.UpsertWarningLocalNode(ctx, "", "", -1, warningtype.UnableToConnectToMAAS, err.Error())
-							if err != nil {
-								logger.Warn("Failed to create warning", logger.Ctx{"err": err})
-							}
-
-							return nil
-						})
-
-						warningAdded = true
-					}
-
-					time.Sleep(time.Minute)
-				}
-
-				// Resolve any previously created warning once connected
-				if warningAdded {
-					_ = warnings.ResolveWarningsByLocalNodeAndType(d.db.Cluster, warningtype.UnableToConnectToMAAS)
-				}
-			}()
-		}
 	}
 
 	err = d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
@@ -1782,7 +1984,7 @@ func (d *Daemon) init() error {
 		for _, w := range dbWarnings {
 			err := tx.UpsertWarningLocalNode(ctx, "", "", -1, warningtype.Type(w.TypeCode), w.LastMessage)
 			if err != nil {
-				logger.Warn("Failed to create warning", logger.Ctx{"err": err})
+				logger.Warn("Failed creating warning", logger.Ctx{"err": err})
 			}
 		}
 
@@ -1792,7 +1994,7 @@ func (d *Daemon) init() error {
 	// Resolve warnings older than the daemon start time
 	err = warnings.ResolveWarningsByLocalNodeOlderThan(d.db.Cluster, d.startTime)
 	if err != nil {
-		logger.Warn("Failed to resolve warnings", logger.Ctx{"err": err})
+		logger.Warn("Failed resolving warnings", logger.Ctx{"err": err})
 	}
 
 	// Start cluster tasks if needed.
@@ -1810,44 +2012,55 @@ func (d *Daemon) init() error {
 	//        but has not been fully completed.
 	if !d.os.MockMode {
 		// Log expiry (daily)
-		d.tasks.Add(expireLogsTask(d.State()))
+		d.tasks.Add(expireLogsTask(d.State))
 
 		// Remove expired images (daily)
-		d.taskPruneImages = d.tasks.Add(pruneExpiredImagesTask(d))
+		d.taskPruneImages = d.tasks.Add(pruneExpiredImagesTask(d.State))
 
 		// Auto-update images (every 6 hours, configurable)
-		d.tasks.Add(autoUpdateImagesTask(d))
+		d.tasks.Add(autoUpdateImagesTask(d.State))
 
 		// Auto-update instance types (daily)
-		d.tasks.Add(instanceRefreshTypesTask(d))
+		d.tasks.Add(instanceRefreshTypesTask(d.State))
 
 		// Remove expired backups (hourly)
-		d.tasks.Add(pruneExpiredBackupsTask(d))
+		d.tasks.Add(pruneExpiredBackupsTask(d.State))
 
 		// Prune expired instance snapshots and take snapshot of instances (minutely check of configurable cron expression)
-		d.tasks.Add(pruneExpiredAndAutoCreateInstanceSnapshotsTask(d))
+		d.tasks.Add(pruneExpiredAndAutoCreateInstanceSnapshotsTask(d.State))
 
 		// Prune expired custom volume snapshots and take snapshots of custom volumes (minutely check of configurable cron expression)
-		d.tasks.Add(pruneExpiredAndAutoCreateCustomVolumeSnapshotsTask(d))
+		d.tasks.Add(pruneExpiredAndAutoCreateCustomVolumeSnapshotsTask(d.State))
 
 		// Remove resolved warnings (daily)
-		d.tasks.Add(pruneResolvedWarningsTask(d))
+		d.tasks.Add(pruneResolvedWarningsTask(d.State))
 
 		// Auto-renew server certificate (daily)
 		d.tasks.Add(autoRenewCertificateTask(d))
 
 		// Remove expired tokens (hourly)
-		d.tasks.Add(autoRemoveExpiredTokensTask(d))
+		d.tasks.Add(autoRemoveExpiredTokensTask(d.State))
+
+		// Run scheduled replicators (minutely check of configurable cron expression)
+		d.tasks.Add(runScheduledReplicatorsTask(d.State))
+
+		// Synchronize operations with the database (minutely)
+		d.tasks.Add(synchronizeOperationsTask(d.State))
+
+		// Refresh cluster link volatile addresses (daily).
+		d.tasks.Add(autoRefreshClusterLinkVolatileAddressesTask(d.State))
 	}
 
-	// Start all background tasks
+	// Load Ubuntu Pro configuration before starting any instances.
+	// Also add the Ubuntu Pro attachment status to the user agent.
+	d.ubuntuPro = ubuntupro.New(d.shutdownCtx, d.os.ReleaseInfo["NAME"])
+
+	// Start all background tasks.
+	// Some background tasks might do HTTP requests which are best done once the user agent is fully configured.
 	d.tasks.Start(d.shutdownCtx)
 
-	// Load Ubuntu Pro configuration before starting any instances.
-	d.ubuntuPro = ubuntupro.New(d.os.ReleaseInfo["NAME"], d.shutdownCtx)
-
 	// Restore instances
-	instancesStart(d.State(), instances)
+	instancesStart(d.shutdownCtx, d.State(), instances)
 
 	// Re-balance in case things changed while LXD was down
 	deviceTaskBalance(d.State())
@@ -1855,9 +2068,82 @@ func (d *Daemon) init() error {
 	// Unblock incoming requests
 	d.waitReady.Cancel()
 
+	d.events.SendSecurity(security.SysStartup.ServerEvent(security.LevelInfo, "LXD daemon started"))
+
 	logger.Info("Daemon started")
 
+	shared.SnapSetHealth(d.shutdownCtx, shared.SnapHealthOkay, "")
 	return nil
+}
+
+// requestorHook runs for all authenticated (trusted) client requests to the remote API or to the DevLXD API (via bearer auth).
+// It gets the identity by the authentication method (protocol) and identifier (username) and returns authorization details.
+func (d *Daemon) requestorHook(ctx context.Context, authenticationMethod string, identifier string) (*request.RequestorHookResult, error) {
+	res := &request.RequestorHookResult{}
+	err := d.db.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		id, err := dbCluster.GetIdentityByAuthenticationMethodAndIdentifier(ctx, tx.Tx(), authenticationMethod, identifier)
+		if err != nil {
+			return fmt.Errorf("Failed getting identity: %w", err)
+		}
+
+		idType, err := identity.New(string(id.Type))
+		if err != nil {
+			return fmt.Errorf("Failed determining type of identity: %w", err)
+		}
+
+		res.IdentityID = id.ID
+		res.IdentityType = idType
+
+		// If client is an admin, there are no groups or projects to get.
+		if idType.IsAdmin() || idType.Name() == api.IdentityTypeCertificateMetricsUnrestricted {
+			return nil
+		}
+
+		// If not fine-grained, get the project list.
+		if !idType.IsFineGrained() {
+			dbProjects, err := dbCluster.GetCertificateLegacyProjectsWithFeatures(ctx, tx.Tx(), id.ID)
+			if err != nil {
+				return fmt.Errorf("Failed getting projects for identity: %w", err)
+			}
+
+			res.Projects = dbProjects
+			return nil
+		}
+
+		// Otherwise get the authorization groups.
+		dbGroups, err := dbCluster.GetAuthGroupsByIdentityID(ctx, tx.Tx(), id.ID)
+		if err != nil {
+			return fmt.Errorf("Failed getting groups for identity: %w", err)
+		}
+
+		res.AuthGroups = make([]string, 0, len(dbGroups))
+		for _, g := range dbGroups {
+			res.AuthGroups = append(res.AuthGroups, g.Name)
+		}
+
+		if idType.Name() == api.IdentityTypeOIDCClient {
+			metadata, err := id.OIDCMetadata()
+			if err != nil {
+				return fmt.Errorf("Failed reading OIDC identity metadata: %w", err)
+			}
+
+			if len(metadata.IdentityProviderGroups) > 0 {
+				// If IdP groups are set, map them to LXD auth groups.
+				res.IdentityProviderGroups = metadata.IdentityProviderGroups
+				res.EffectiveAuthGroups, err = dbCluster.GetDistinctAuthGroupNamesFromIDPGroupNames(ctx, tx.Tx(), metadata.IdentityProviderGroups)
+				if err != nil {
+					return fmt.Errorf("Failed mapping identity provider groups to authorization groups: %w", err)
+				}
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return res, nil
 }
 
 func (d *Daemon) startClusterTasks() {
@@ -1871,20 +2157,27 @@ func (d *Daemon) startClusterTasks() {
 	d.taskClusterHeartbeat = d.clusterTasks.Add(cluster.HeartbeatTask(d.gateway))
 
 	// Auto-sync images across the cluster (hourly)
-	d.clusterTasks.Add(autoSyncImagesTask(d))
+	d.clusterTasks.Add(autoSyncImagesTask(d.State))
 
 	// Remove orphaned operations
-	d.clusterTasks.Add(autoRemoveOrphanedOperationsTask(d))
+	d.clusterTasks.Add(autoRemoveOrphanedOperationsTask(d.State))
 
 	// Perform automatic evacuation for offline cluster members
-	d.clusterTasks.Add(autoHealClusterTask(d))
+	d.clusterTasks.Add(autoHealClusterTask(d.State, d.gateway))
+
+	// Remove expired OIDC sessions
+	d.clusterTasks.Add(pruneExpiredOIDCSessionsTask(d.State))
 
 	// Start all background tasks
 	d.clusterTasks.Start(d.shutdownCtx)
 }
 
 func (d *Daemon) stopClusterTasks() {
-	_ = d.clusterTasks.Stop(3 * time.Second)
+	err := d.clusterTasks.Stop(3 * time.Second)
+	if err != nil {
+		logger.Warn("Failed stopping cluster tasks", logger.Ctx{"err": err})
+	}
+
 	d.clusterTasks = task.NewGroup()
 }
 
@@ -1900,14 +2193,41 @@ func (d *Daemon) numRunningInstances(instances []instance.Instance) int {
 	return count
 }
 
+// cancelCancelableOps cancels all running cancelable operations.
+func cancelCancelableOps(ctx context.Context) error {
+	ops := operations.Clone()
+	for _, op := range ops {
+		_ = op.Cancel()
+		_ = op.Wait(ctx)
+	}
+
+	return nil
+}
+
 // Stop stops the shared daemon.
 func (d *Daemon) Stop(ctx context.Context, sig os.Signal) error {
-	logger.Info("Starting shutdown sequence", logger.Ctx{"signal": sig})
+	// Emit sys_shutdown before cancelling shutdownCtx so internal sinks (e.g. the Loki client)
+	// are still alive to forward the event.
+	if d.events != nil {
+		d.events.SendSecurity(security.SysShutdown.ServerEvent(security.LevelInfo, "LXD daemon stopping"))
+	}
 
 	// Cancelling the context will make everyone aware that we're shutting down.
-	d.shutdownCancel()
+	d.shutdownCtx.Cancel()
 
-	if d.gateway != nil {
+	d.startStopLock.Lock()
+	defer d.startStopLock.Unlock()
+
+	logger.Info("Starting shutdown sequence", logger.Ctx{"signal": sig})
+
+	s := d.State()
+
+	// Skip the member-role handover if the cluster DB never opened (e.g. init()
+	// failed between gateway creation and db.OpenCluster): there is no
+	// membership state to hand over, and handoverMemberRole would dereference
+	// the nil cluster DB. The gateway itself is still torn down below via
+	// Kill() and Shutdown().
+	if d.gateway != nil && d.db.Cluster != nil {
 		d.stopClusterTasks()
 
 		err := handoverMemberRole(d.State(), d.gateway)
@@ -1916,11 +2236,6 @@ func (d *Daemon) Stop(ctx context.Context, sig os.Signal) error {
 			d.gateway.Kill()
 		}
 	}
-
-	s := d.State()
-
-	// Stop any running minio processes cleanly before unmount storage pools.
-	miniod.StopAll()
 
 	var err error
 	var instances []instance.Instance
@@ -1948,67 +2263,67 @@ func (d *Daemon) Stop(ctx context.Context, sig os.Signal) error {
 
 	// Handle shutdown (unix.SIGPWR) and reload (unix.SIGTERM) signals.
 	if sig == unix.SIGPWR || sig == unix.SIGTERM {
-		if d.db.Cluster != nil {
-			// waitForOperations will block until all operations are done, or it's forced to shut down.
-			// For the latter case, we re-use the shutdown channel which is filled when a shutdown is
-			// initiated using `lxd shutdown`.
-			waitForOperations(ctx, d.db.Cluster, s.GlobalConfig.ShutdownTimeout())
-		}
-
-		// Unmount daemon image and backup volumes if set.
-		logger.Info("Stopping daemon storage volumes")
-		done := make(chan struct{})
-		go func() {
-			err := daemonStorageVolumesUnmount(s)
-			if err != nil {
-				logger.Error("Failed to unmount image and backup volumes", logger.Ctx{"err": err})
-			}
-
-			done <- struct{}{}
-		}()
-
-		// Only wait 60 seconds in case the storage backend is unreachable.
-		select {
-		case <-time.After(time.Minute):
-			logger.Error("Timed out waiting for image and backup volume")
-		case <-done:
-		}
-
 		// Full shutdown requested.
 		if sig == unix.SIGPWR {
-			instancesShutdown(instances)
+			{
+				logger.Debug("Shutting down instances")
+				var instOperationWaitCtx context.Context
+				var cancel context.CancelFunc
+				if s.GlobalConfig != nil {
+					instOperationWaitCtx, cancel = context.WithTimeout(ctx, s.GlobalConfig.ShutdownTimeout())
+					defer cancel()
+				} else {
+					instOperationWaitCtx, cancel = context.WithCancel(ctx)
+					cancel() // Don't wait for operations to finish.
+				}
 
-			logger.Info("Stopping networks")
-			networkShutdown(s)
-
-			// Unmount storage pools after instances stopped.
-			logger.Info("Stopping storage pools")
-
-			var pools []string
-
-			err := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
-				var err error
-
-				pools, err = tx.GetStoragePoolNames(ctx)
-
-				return err
-			})
-			if err != nil && !response.IsNotFoundError(err) {
-				logger.Error("Failed to get storage pools", logger.Ctx{"err": err})
+				instancesShutdown(instOperationWaitCtx, instances)
 			}
 
-			for _, poolName := range pools {
-				pool, err := storagePools.LoadByName(s, poolName)
+			if d.db.Cluster != nil {
+				// Try to cancel any cancelable operations.
+				ctx, cancel := context.WithTimeout(context.Background(), s.GlobalConfig.ShutdownTimeout())
+				defer cancel()
+
+				err = cancelCancelableOps(ctx)
 				if err != nil {
-					logger.Error("Failed to get storage pool", logger.Ctx{"pool": poolName, "err": err})
-					continue
+					logger.Error("Failed canceling cancelable operations", logger.Ctx{"err": err})
+				}
+			}
+
+			// Stop networks.
+			networkStop(s, false)
+
+			// Unmount daemon image and backup volumes if set.
+			logger.Info("Stopping daemon storage volumes")
+			logger.Debug("Unmounting daemon storage volumes")
+			volUnmountCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			err := daemonStorageVolumesUnmount(s, volUnmountCtx)
+			if err != nil {
+				logger.Error("Failed unmounting image and backup volumes", logger.Ctx{"err": err})
+			}
+
+			logger.Debug("Daemon storage volumes unmounted")
+
+			// Unmount storage pools after instances stopped and images/backup volumes unmounted.
+			storageStop(s)
+		}
+
+		if d.db.Cluster != nil {
+			// Remove remaining operations before closing the database.
+			err := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+				err := dbCluster.ClearStaleOperationsFromNodes(ctx, tx.Tx(), s.DB.Cluster.GetNodeID())
+				if err != nil {
+					logger.Warn("Failed clearing stale operations", logger.Ctx{"err": err, "node_id": s.DB.Cluster.GetNodeID()})
 				}
 
-				_, err = pool.Unmount()
-				if err != nil {
-					logger.Error("Unable to unmount storage pool", logger.Ctx{"pool": poolName, "err": err})
-					continue
-				}
+				return nil
+			})
+			if err != nil {
+				logger.Error("Failed cleaning up operations", logger.Ctx{"err": err})
+			} else {
+				logger.Debug("Operations deleted from the database")
 			}
 		}
 	}
@@ -2034,11 +2349,11 @@ func (d *Daemon) Stop(ctx context.Context, sig os.Signal) error {
 		logger.Info("Closing the database")
 		err := d.db.Cluster.Close()
 		if err != nil {
-			logger.Debug("Could not close global database cleanly", logger.Ctx{"err": err})
+			logger.Warn("Could not close global database cleanly", logger.Ctx{"err": err})
 		}
 	}
 
-	if d.db != nil && d.db.Node != nil {
+	if d.db.Node != nil {
 		trackError(d.db.Node.Close(), "Close local database")
 	}
 
@@ -2065,50 +2380,23 @@ func (d *Daemon) Stop(ctx context.Context, sig os.Signal) error {
 		trackError(d.seccomp.Stop(), "Stop seccomp")
 	}
 
+	trackError(filesystem.SyncFS(filepath.Join(d.os.VarDir, "database")), "Sync database directory")
+
 	n = len(errs)
 	if n > 0 {
 		format := "%v"
 		if n > 1 {
-			format += fmt.Sprintf(" (and %d more errors)", n)
+			format += fmt.Sprint(" (and ", n, " more errors)")
 		}
 
 		err = fmt.Errorf(format, errs[0])
 	}
 
 	if err != nil {
-		logger.Error("Failed to cleanly shutdown daemon", logger.Ctx{"err": err})
+		logger.Error("Failed cleanly shutting down daemon", logger.Ctx{"err": err})
 	}
 
 	return err
-}
-
-// Setup MAAS.
-func (d *Daemon) setupMAASController(server string, key string, machine string) error {
-	var err error
-	d.maas = nil
-
-	// Default the machine name to the hostname
-	if machine == "" {
-		machine, err = os.Hostname()
-		if err != nil {
-			return err
-		}
-	}
-
-	// We need both URL and key, otherwise disable MAAS
-	if server == "" || key == "" {
-		return nil
-	}
-
-	// Get a new controller struct
-	controller, err := maas.NewController(server, key, machine)
-	if err != nil {
-		d.maas = nil
-		return err
-	}
-
-	d.maas = controller
-	return nil
 }
 
 func (d *Daemon) setupSyslogSocket(enable bool) error {
@@ -2161,6 +2449,99 @@ func initializeDbObject(d *Daemon) error {
 	return nil
 }
 
+// initializeOIDCVerifier attempts to initialise the [oidc.Verifier] in the background and set it on the [Daemon].
+// OIDC initialization can fail because it calls out to the IdP to get endpoint information and JWKs (discovery).
+// This is prone to failure, especially if the IdP is deployed within LXD as a VM (e.g. on reboot we need to wait for
+// the VM to start).
+func initializeOIDCVerifier(d *Daemon) {
+	// If no issuer or client ID, then nothing to set up.
+	d.globalConfigMu.Lock()
+	issuer, clientID, _, _, _, _, _ := d.globalConfig.OIDCServer()
+	if issuer == "" || clientID == "" {
+		d.globalConfigMu.Unlock()
+		return
+	}
+
+	d.globalConfigMu.Unlock()
+
+	// Anonymous function to initialize the verifier.
+	setupOIDC := func() error {
+		// Don't attempt to configure the verifier if the daemon is shutting down.
+		if d.shutdownCtx.Err() != nil {
+			return nil
+		}
+
+		// If running in the background, an admin might update the config via /1.0 and the verifier might already be set.
+		// If so, nothing to do.
+		verifier := d.oidcVerifier.Load()
+		if verifier != nil {
+			return nil
+		}
+
+		// If no issuer or client ID, then nothing to set up. These values may have been unset via /1.0, if so, cancel retries by returning nil.
+		d.globalConfigMu.Lock()
+		issuer, clientID, clientSecret, scopes, audience, groupsClaim, deviceClientID := d.globalConfig.OIDCServer()
+		if issuer == "" || clientID == "" {
+			d.globalConfigMu.Unlock()
+			return nil
+		}
+
+		d.globalConfigMu.Unlock()
+
+		// Proxy set up (for LXD to reach the IdP).
+		httpClientFunc := func() (*http.Client, error) {
+			return util.HTTPClient("", d.proxy)
+		}
+
+		// Set up session handler and verifier. This will perform OIDC discovery and may fail.
+		expiryFunc := func() string {
+			d.globalConfigMu.Lock()
+			defer d.globalConfigMu.Unlock()
+			return d.globalConfig.OIDCSessionExpiry()
+		}
+
+		sessionHandler := dbOIDC.NewSessionHandler(d.db.Cluster, d.events, expiryFunc)
+
+		var err error
+		verifier, err = oidc.NewVerifier(d.shutdownCtx, issuer, clientID, clientSecret, scopes, audience, groupsClaim, deviceClientID, d.globalConfig.ClusterUUID(), d.endpoints.NetworkAddress(), d.getCoreAuthSecrets, httpClientFunc, sessionHandler)
+		if err != nil {
+			return err
+		}
+
+		d.oidcVerifier.Store(verifier)
+		return nil
+	}
+
+	// Start goroutine to handle set up.
+	go func() {
+		var attemptLimit uint = 14
+		algorithm := backoff.Fibonacci(time.Second)
+		err := retry.Retry(func(attempt uint) error {
+			err := setupOIDC()
+			if err != nil {
+				if attempt < attemptLimit {
+					logger.Warn("Failed applying OIDC configuration", logger.Ctx{"err": err, "attempt": attempt, "retrying_in": algorithm(attempt)})
+				} else {
+					logger.Error("Failed applying OIDC configuration", logger.Ctx{"err": err, "attempt": attempt})
+				}
+
+				return err
+			}
+
+			return nil
+		}, strategy.Backoff(algorithm), strategy.Limit(attemptLimit))
+
+		if err != nil {
+			err = d.db.Cluster.Transaction(d.shutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+				return tx.UpsertWarningLocalNode(ctx, "", "", -1, warningtype.OIDCAuthenticationUnavailable, "Failed applying OIDC configuration")
+			})
+			if err != nil {
+				logger.Error("Failed creating warning after failing to apply OIDC configuration", logger.Ctx{"err": err})
+			}
+		}
+	}()
+}
+
 // hasMemberStateChanged returns true if the number of members, their addresses or state has changed.
 func (d *Daemon) hasMemberStateChanged(heartbeatData *cluster.APIHeartbeat) bool {
 	// No previous heartbeat data.
@@ -2205,7 +2586,7 @@ func (d *Daemon) heartbeatHandler(w http.ResponseWriter, r *http.Request, isLead
 					return tx.UpsertWarningLocalNode(ctx, "", "", -1, warningtype.ClusterTimeSkew, fmt.Sprintf("leaderTime: %s, localTime: %s", hbData.Time, now))
 				})
 				if err != nil {
-					logger.Warn("Failed to create cluster time skew warning", logger.Ctx{"err": err})
+					logger.Warn("Failed creating cluster time skew warning", logger.Ctx{"err": err})
 				}
 			}
 		}
@@ -2218,7 +2599,7 @@ func (d *Daemon) heartbeatHandler(w http.ResponseWriter, r *http.Request, isLead
 			if d.db.Cluster != nil {
 				err := warnings.ResolveWarningsByLocalNodeAndType(d.db.Cluster, warningtype.ClusterTimeSkew)
 				if err != nil {
-					logger.Warn("Failed to resolve cluster time skew warning", logger.Ctx{"err": err})
+					logger.Warn("Failed resolving cluster time skew warning", logger.Ctx{"err": err})
 				}
 			}
 
@@ -2255,7 +2636,7 @@ func (d *Daemon) heartbeatHandler(w http.ResponseWriter, r *http.Request, isLead
 	})
 	if err != nil {
 		logger.Error("Error updating raft members", logger.Ctx{"err": err})
-		http.Error(w, "500 failed to update raft nodes", http.StatusInternalServerError)
+		http.Error(w, "500 failed updating raft nodes", http.StatusInternalServerError)
 		return
 	}
 
@@ -2271,7 +2652,8 @@ func (d *Daemon) heartbeatHandler(w http.ResponseWriter, r *http.Request, isLead
 		// at the end of the heartbeat so no need to do it here.
 		if !isLeader || !d.gateway.HeartbeatRestart() {
 			// Run heartbeat refresh task async so heartbeat response is sent to leader straight away.
-			go d.nodeRefreshTask(hbData, isLeader, nil)
+			// The heartbeat mode is only set by the leader running the operation, and not by other members receiving it.
+			go d.nodeRefreshTask(hbData, isLeader, nil, -1)
 		}
 	} else {
 		if isLeader {
@@ -2290,7 +2672,7 @@ func (d *Daemon) heartbeatHandler(w http.ResponseWriter, r *http.Request, isLead
 // When run on the leader, it accepts a list of unavailableMembers that have not responded to the current heartbeat
 // round (but may not be considered actually offline at this stage). These unavailable members will not be used for
 // role rebalancing.
-func (d *Daemon) nodeRefreshTask(heartbeatData *cluster.APIHeartbeat, isLeader bool, unavailableMembers []string) {
+func (d *Daemon) nodeRefreshTask(heartbeatData *cluster.APIHeartbeat, isLeader bool, unavailableMembers []string, mode cluster.HeartbeatMode) {
 	s := d.State()
 
 	// Don't process the heartbeat until we're fully online.
@@ -2341,11 +2723,9 @@ func (d *Daemon) nodeRefreshTask(heartbeatData *cluster.APIHeartbeat, isLeader b
 	// Run asynchronously so that connecting to remote members doesn't delay other heartbeat tasks.
 	wg := sync.WaitGroup{}
 
-	wg.Add(1)
-	go func() {
+	wg.Go(func() {
 		cluster.EventsUpdateListeners(d.endpoints, d.db.Cluster, d.serverCert, heartbeatData.Members, d.events.Inject)
-		wg.Done()
-	}()
+	})
 
 	// Only update the node list if there are no state change task failures.
 	// If there are failures, then we leave the old state so that we can re-try the tasks again next heartbeat.
@@ -2353,62 +2733,148 @@ func (d *Daemon) nodeRefreshTask(heartbeatData *cluster.APIHeartbeat, isLeader b
 		d.lastNodeList = heartbeatData
 	}
 
-	// If we are leader and called from the leader heartbeat send function (unavailbleMembers != nil) and there
+	// If we are leader and called from the leader heartbeat send function (unavailableMembers != nil) and there
 	// are other members in the cluster, then check if we need to update roles. We do not want to do this if
 	// we are called on the leader as part of a notification heartbeat being received from another member.
 	if isLeader && unavailableMembers != nil && len(heartbeatData.Members) > 1 {
-		isDegraded := false
-		hasNodesNotPartOfRaft := false
-		onlineVoters := 0
-		onlineStandbys := 0
+		offlineMemberIDs := d.handleHeartbeatClusterRoleChanges(heartbeatData, unavailableMembers, localClusterAddress)
 
-		for _, node := range heartbeatData.Members {
-			role := db.RaftRole(node.RaftRole)
-			if node.Online {
-				// Count online members that have voter or stand-by raft role.
-				switch role {
-				case db.RaftVoter:
-					onlineVoters++
-				case db.RaftStandBy:
-					onlineStandbys++
+		if len(offlineMemberIDs) > 0 {
+			// On initial heartbeat, if there are offline nodes (whether part of raft or not) delete any orphaned operations
+			// that may be present there. After the initial heartbeat, this is handled by the autoRemoveOrphanedOperationsTask.
+			// It can't be performed at startup in case of stale member state, which can lead to operations being erroneously removed.
+			if mode == cluster.HeartbeatInitial {
+				err = d.db.Cluster.Transaction(d.shutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+					return dbCluster.ClearStaleOperationsFromNodes(ctx, tx.Tx(), offlineMemberIDs...)
+				})
+				if err != nil {
+					logger.Warn("Could not remove orphaned operations from offline members after initial heartbeat round", logger.Ctx{"err": err, "local": localClusterAddress})
 				}
-
-				if node.RaftID == 0 {
-					hasNodesNotPartOfRaft = true
-				}
-			} else if role != db.RaftSpare {
-				isDegraded = true // Offline member that has voter or stand-by raft role.
-			}
-		}
-
-		maxVoters := s.GlobalConfig.MaxVoters()
-		maxStandBy := s.GlobalConfig.MaxStandBy()
-
-		// If there are offline members that have voter or stand-by database roles, let's see if we can
-		// replace them with spare ones. Also, if we don't have enough voters or standbys, let's see if we
-		// can upgrade some member.
-		if isDegraded || onlineVoters < int(maxVoters) || onlineStandbys < int(maxStandBy) {
-			d.clusterMembershipMutex.Lock()
-			logger.Debug("Rebalancing member roles in heartbeat", logger.Ctx{"local": localClusterAddress})
-			err := rebalanceMemberRoles(d.State(), d.gateway, nil, unavailableMembers)
-			if err != nil && !errors.Is(err, cluster.ErrNotLeader) {
-				logger.Warn("Could not rebalance cluster member roles", logger.Ctx{"err": err, "local": localClusterAddress})
 			}
 
-			d.clusterMembershipMutex.Unlock()
-		}
-
-		if hasNodesNotPartOfRaft {
-			d.clusterMembershipMutex.Lock()
-			logger.Debug("Upgrading members without raft role in heartbeat", logger.Ctx{"local": localClusterAddress})
-			err := upgradeNodesWithoutRaftRole(d.State(), d.gateway)
-			if err != nil && !errors.Is(err, cluster.ErrNotLeader) {
-				logger.Warn("Failed upgrading raft roles:", logger.Ctx{"err": err, "local": localClusterAddress})
+			// For any heartbeat, if there are offline cluster members running durable operations, we need to restart them here.
+			err = operations.RestartDurableOperationsFromNodes(s.ShutdownCtx, s, offlineMemberIDs...)
+			if err != nil {
+				logger.Warn("Could not restart durable operations from offline members", logger.Ctx{"err": err, "offlineMemberIDs": offlineMemberIDs})
 			}
-
-			d.clusterMembershipMutex.Unlock()
 		}
 	}
 
 	wg.Wait()
+}
+
+// handleHeartbeatClusterRoleChanges rebalances and upgrades raft roles during leader heartbeat processing and returns offline member IDs.
+func (d *Daemon) handleHeartbeatClusterRoleChanges(heartbeatData *cluster.APIHeartbeat, unavailableMembers []string, localClusterAddress string) (offlineMemberIDs []int64) {
+	s := d.State()
+	isDegraded := false
+	hasNodesNotPartOfRaft := false
+	hasNonControlPlaneMemberWithDatabaseRole := false
+	hasEvacuatedMemberWithDatabaseRole := false
+	onlineVoters := int64(0)
+	onlineStandbys := int64(0)
+	offlineMemberIDs = make([]int64, 0, len(heartbeatData.Members))
+
+	// Build member roles map from heartbeat data.
+	memberRoles := make(map[string][]db.ClusterRole, len(heartbeatData.Members))
+	var evacuatedMembers []string
+	for _, member := range heartbeatData.Members {
+		memberRoles[member.Address] = member.Roles
+		if member.State == db.ClusterMemberStateEvacuated {
+			evacuatedMembers = append(evacuatedMembers, member.Address)
+		}
+	}
+
+	controlPlaneActive := cluster.IsControlPlaneActive(memberRoles)
+	for id, node := range heartbeatData.Members {
+		role := db.RaftRole(node.RaftRole)
+		if node.Online {
+			// Count online members that have voter or stand-by raft role.
+			switch role {
+			case db.RaftVoter:
+				onlineVoters++
+			case db.RaftStandBy:
+				onlineStandbys++
+			}
+
+			if node.RaftID == 0 {
+				hasNodesNotPartOfRaft = true
+			}
+
+			// Check if an online non-control-plane node currently has a raft role other than spare.
+			if controlPlaneActive && !slices.Contains(node.Roles, db.ClusterRoleControlPlane) && role != db.RaftSpare {
+				hasNonControlPlaneMemberWithDatabaseRole = true
+				logger.Info("Detected non-control-plane member with database role", logger.Ctx{"address": node.Address, "role": role, "local": localClusterAddress})
+			}
+
+			if node.State == db.ClusterMemberStateEvacuated && role != db.RaftSpare {
+				hasEvacuatedMemberWithDatabaseRole = true
+				logger.Info("Detected evacuated member with database role", logger.Ctx{"address": node.Address, "role": role, "local": localClusterAddress})
+			}
+		} else {
+			offlineMemberIDs = append(offlineMemberIDs, id)
+			if role != db.RaftSpare {
+				isDegraded = true // Offline member that has voter or stand-by raft role.
+			}
+		}
+	}
+
+	maxVoters := s.GlobalConfig.MaxVoters()
+	maxStandBy := s.GlobalConfig.MaxStandBy()
+	needsRebalance := isDegraded || onlineVoters != maxVoters || onlineStandbys != maxStandBy || hasNonControlPlaneMemberWithDatabaseRole || hasEvacuatedMemberWithDatabaseRole
+
+	if !needsRebalance && !hasNodesNotPartOfRaft {
+		return offlineMemberIDs
+	}
+
+	d.clusterMembershipMutex.Lock()
+	defer d.clusterMembershipMutex.Unlock()
+
+	// If there are offline members that have voter or stand-by database roles, let's see if we can replace them with spare ones.
+	if needsRebalance {
+		logger.Debug("Rebalancing member roles in heartbeat", logger.Ctx{"local": localClusterAddress})
+		err := rebalanceMemberRoles(context.Background(), s, d.gateway, unavailableMembers, memberRoles, evacuatedMembers)
+		if err != nil && !errors.Is(err, cluster.ErrNotLeader) {
+			logger.Warn("Could not rebalance cluster member roles", logger.Ctx{"err": err, "local": localClusterAddress})
+		}
+	}
+
+	// If we don't have enough voters or standbys, let's see if we can upgrade some member.
+	if hasNodesNotPartOfRaft {
+		logger.Debug("Upgrading members without raft role in heartbeat", logger.Ctx{"local": localClusterAddress})
+		err := upgradeNodesWithoutRaftRole(s, d.gateway)
+		if err != nil && !errors.Is(err, cluster.ErrNotLeader) {
+			logger.Warn("Failed upgrading raft roles", logger.Ctx{"err": err, "local": localClusterAddress})
+		}
+	}
+
+	return offlineMemberIDs
+}
+
+// runWithBackoff calls fn after progressively increasing delays (starting at start,
+// incrementing by step each iteration, capped at maxDelay). It stops when fn returns true or
+// ctx is done.
+func runWithBackoff(ctx context.Context, start, step, maxDelay time.Duration, fn func() bool) {
+	delay := start
+
+	for {
+		t := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !t.Stop() {
+				<-t.C
+			}
+
+			return
+		case <-t.C:
+		}
+
+		if fn() {
+			return
+		}
+
+		delay += step
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+	}
 }

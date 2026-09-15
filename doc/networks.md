@@ -1,87 +1,72 @@
 ---
-discourse: 13021
+discourse: lxc:[How&#32;to&#32;use&#32;a&#32;second&#32;IP&#32;with&#32;a&#32;container&#32;and&#32;routed&#32;NIC](13021)
+myst:
+  html_meta:
+    description: An index of how-to guides for LXD networking, including creating and configuring networks and network features such as ACLs, forwards, and BGP.
 ---
 
 (networking)=
 # Networking
 
-```{only} diataxis
-The following how-to guides cover common operations related to networking.
+These how-to guides cover common operations related to LXD networking.
 
-How to create and configure a network:
-```
+## Create and configure networks
 
-```{filtered-toctree}
+```{toctree}
 :titlesonly:
 
-:diataxis:Create a network </howto/network_create>
-:diataxis:Configure a network </howto/network_configure>
+Create a network </howto/network_create>
+Configure a network </howto/network_configure>
 ```
 
-```{only} diataxis
-How to configure specific networking features:
-```
+## Configure networking features
 
-```{filtered-toctree}
+These features are available for multiple types of networks.
+
+```{toctree}
 :titlesonly:
 
-:diataxis:Configure as BGP server </howto/network_bgp>
-:diataxis:Configure network ACLs </howto/network_acls>
-:diataxis:Configure forwards </howto/network_forwards>
-:diataxis:Configure network zones </howto/network_zones>
+Configure as BGP server </howto/network_bgp>
+Configure network ACLs </howto/network_acls>
+Configure forwards </howto/network_forwards>
+Configure network zones </howto/network_zones>
 ```
 
-```{only} diataxis
-How to configure specific networking features (managed bridge networks only):
-```
+## Configure bridge network features
 
-```{filtered-toctree}
+These features are available for managed bridge networks only.
+
+```{toctree}
 :titlesonly:
 
-:diataxis:Configure your firewall </howto/network_bridge_firewalld>
-:diataxis:Integrate with resolved </howto/network_bridge_resolved>
+Configure your firewall </howto/network_bridge_firewalld>
+Integrate with resolved </howto/network_bridge_resolved>
 ```
 
-```{only} diataxis
-How to configure specific networking features (OVN networks only):
-```
+## Configure OVN network features
 
-```{filtered-toctree}
+These features are available for OVN networks only.
+
+```{toctree}
 :titlesonly:
 
-:diataxis:Set up OVN </howto/network_ovn_setup>
-:diataxis:Configure load balancers </howto/network_load_balancers>
-:diataxis:Configure peer routing </howto/network_ovn_peers>
+Set up OVN </howto/network_ovn_setup>
+Configure load balancers </howto/network_load_balancers>
+Configure peer routing </howto/network_ovn_peers>
 ```
 
-```{only} diataxis
-How to troubleshoot your networking setup:
-```
+## Troubleshoot networks
 
-```{filtered-toctree}
+IPAM information shows the IP addresses allocated across networks and instances, useful for diagnosing network issues.
+
+```{toctree}
 :titlesonly:
 
-:diataxis:Display IPAM information </howto/network_ipam>
+Display IPAM information </howto/network_ipam>
 ```
 
 ## Related topics
 
-```{only} diataxis
 {{networks_exp}}
 
 {{networks_ref}}
-```
-
-```{filtered-toctree}
-:maxdepth: 1
-
-:topical:/explanation/networks
-:topical:Create a network </howto/network_create>
-:topical:Configure a network </howto/network_configure>
-:topical:Configure network ACLs </howto/network_acls>
-:topical:Configure network forwards </howto/network_forwards>
-:topical:Configure network zones </howto/network_zones>
-:topical:Configure LXD as BGP server </howto/network_bgp>
-:topical:Display LXD IPAM information </howto/network_ipam>
-:topical:/reference/networks
-```

@@ -10,7 +10,7 @@ The `unix-hotplug` device type is supported for containers.
 It supports hotplugging.
 ```
 
-Unix hotplug devices make the requested Unix device appear as a device in the instance (under `/dev`).
+Unix hotplug devices make the requested Unix device appear as a device in the container (under `/dev`).
 If the device exists on the host system, you can read from it and write to it.
 
 The implementation depends on `systemd-udev` to be run on the host.
@@ -27,8 +27,8 @@ The implementation depends on `systemd-udev` to be run on the host.
 
 ## Configuration examples
 
-Add a `unix-hotplug` device to an instance by specifying its vendor ID and product ID:
+Add a `unix-hotplug` device to an instance by specifying its vendor ID, product ID, and/or subsystem:
 
-    lxc config device add <instance_name> <device_name> unix-hotplug vendorid=<vendor_ID> productid=<product_ID>
+    lxc config device add <instance_name> <device_name> unix-hotplug vendorid=<vendor_ID> productid=<product_ID> subsystem=<subsystem>
 
 See {ref}`instances-configure-devices` for more information.

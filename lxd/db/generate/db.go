@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/spf13/cobra"
@@ -18,11 +19,10 @@ func newDb() *cobra.Command {
 		Use:   "db [sub-command]",
 		Short: "Database-related code generation.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return fmt.Errorf("Not implemented")
+			return errors.New("Not implemented")
 		},
 	}
 
-	cmd.AddCommand(newDbSchema())
 	cmd.AddCommand(newDbMapper())
 
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
@@ -31,24 +31,12 @@ func newDb() *cobra.Command {
 	return cmd
 }
 
-func newDbSchema() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "schema",
-		Short: "Generate database schema by applying updates.",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return db.UpdateSchema()
-		},
-	}
-
-	return cmd
-}
-
 func newDbMapper() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "mapper [sub-command]",
 		Short: "Generate code mapping database rows to Go structs.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return fmt.Errorf("Not implemented")
+			return errors.New("Not implemented")
 		},
 	}
 
@@ -94,7 +82,7 @@ func newDbMapperStmt() *cobra.Command {
 			kind := args[0]
 
 			if entity == "" {
-				return fmt.Errorf("No database entity given")
+				return errors.New("No database entity given")
 			}
 
 			config, err := parseParams(args[1:])
@@ -135,7 +123,7 @@ func newDbMapperMethod() *cobra.Command {
 			kind := args[0]
 
 			if entity == "" {
-				return fmt.Errorf("No database entity given")
+				return errors.New("No database entity given")
 			}
 
 			config, err := parseParams(args[1:])

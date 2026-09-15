@@ -3,12 +3,12 @@ package qmp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/digitalocean/go-qemu/qmp"
 
 	"github.com/canonical/lxd/shared/logger"
 )
@@ -31,7 +31,7 @@ var EventVMShutdownReasonDisconnect = "disconnect"
 // Monitor represents a QMP monitor.
 type Monitor struct {
 	path string
-	qmp  *qmp.SocketMonitor
+	qmp  *qemuMachineProtocol
 
 	agentStarted      bool
 	agentStartedMu    sync.Mutex
@@ -69,13 +69,14 @@ func (m *Monitor) start() error {
 			status := entries[len(entries)-2]
 
 			m.agentStartedMu.Lock()
-			if status == "STARTED" {
+			switch status {
+			case "STARTED":
 				if !m.agentStarted && m.eventHandler != nil {
 					go m.eventHandler(EventAgentStarted, nil)
 				}
 
 				m.agentStarted = true
-			} else if status == "STOPPED" {
+			case "STOPPED":
 				m.agentStarted = false
 			}
 
@@ -84,7 +85,7 @@ func (m *Monitor) start() error {
 	}
 
 	// Start event monitoring go routine.
-	chEvents, err := m.qmp.Events(context.Background())
+	chEvents, err := m.qmp.getEvents(context.Background())
 	if err != nil {
 		return err
 	}
@@ -126,7 +127,7 @@ func (m *Monitor) start() error {
 				}
 
 				if e.Event == "" {
-					logger.Warnf("Unexpected empty event received from qmp event channel")
+					logger.Warn("Unexpected empty event received from qmp event channel")
 					time.Sleep(time.Second) // Don't spin if we receive a lot of these.
 					continue
 				}
@@ -148,12 +149,15 @@ func (m *Monitor) start() error {
 // ping is used to validate if the QMP socket is still active.
 func (m *Monitor) ping() error {
 	// Check if disconnected
-	if m.disconnected {
+	if m.disconnected || m.qmp == nil {
 		return ErrMonitorDisconnect
 	}
 
+	id := m.qmp.qmpIncreaseID()
+
 	// Query the capabilities to validate the monitor.
-	_, err := m.qmp.Run([]byte("{'execute': 'query-version'}"))
+	_, err := m.qmp.run(fmt.Appendf([]byte{},
+		`{"execute": "query-version", "id": %d}`, id), id)
 	if err != nil {
 		m.Disconnect()
 		return ErrMonitorDisconnect
@@ -162,28 +166,14 @@ func (m *Monitor) ping() error {
 	return nil
 }
 
-// run executes a command.
-func (m *Monitor) run(cmd string, args any, resp any) error {
+// runJSON executes a JSON-formatted command.
+func (m *Monitor) runJSON(request []byte, resp any, id uint32) error {
 	// Check if disconnected
-	if m.disconnected {
+	if m.disconnected || m.qmp == nil {
 		return ErrMonitorDisconnect
 	}
 
-	// Run the command.
-	requestArgs := struct {
-		Execute   string `json:"execute"`
-		Arguments any    `json:"arguments,omitempty"`
-	}{
-		Execute:   cmd,
-		Arguments: args,
-	}
-
-	request, err := json.Marshal(requestArgs)
-	if err != nil {
-		return err
-	}
-
-	out, err := m.qmp.Run(request)
+	out, err := m.qmp.run(request, id)
 	if err != nil {
 		// Confirm the daemon didn't die.
 		errPing := m.ping()
@@ -211,6 +201,25 @@ func (m *Monitor) run(cmd string, args any, resp any) error {
 	return nil
 }
 
+// run executes a command.
+func (m *Monitor) run(cmd string, args any, resp any) error {
+	id := m.qmp.qmpIncreaseID()
+
+	// Construct the command.
+	requestArgs := qmpCommand{
+		ID:        id,
+		Execute:   cmd,
+		Arguments: args,
+	}
+
+	request, err := json.Marshal(requestArgs)
+	if err != nil {
+		return err
+	}
+
+	return m.runJSON(request, resp, id)
+}
+
 // Connect creates or retrieves an existing QMP monitor for the path.
 func Connect(path string, serialCharDev string, eventHandler func(name string, data map[string]any)) (*Monitor, error) {
 	monitorsLock.Lock()
@@ -224,14 +233,21 @@ func Connect(path string, serialCharDev string, eventHandler func(name string, d
 	}
 
 	// Setup the connection.
-	qmpConn, err := qmp.NewSocketMonitor("unix", path, time.Second)
+	c, err := net.DialTimeout("unix", path, time.Second)
 	if err != nil {
 		return nil, err
 	}
 
+	var qmpConn qemuMachineProtocol
+
+	qmpConn.uc, ok = c.(*net.UnixConn)
+	if !ok {
+		return nil, errors.New("QMP connection must be unix socket")
+	}
+
 	chError := make(chan error, 1)
 	go func() {
-		err = qmpConn.Connect()
+		err = qmpConn.connect()
 		chError <- err
 	}()
 
@@ -242,14 +258,14 @@ func Connect(path string, serialCharDev string, eventHandler func(name string, d
 		}
 
 	case <-time.After(5 * time.Second):
-		_ = qmpConn.Disconnect()
-		return nil, fmt.Errorf("QMP connection timed out")
+		_ = qmpConn.disconnect()
+		return nil, errors.New("QMP connection timed out")
 	}
 
 	// Setup the monitor struct.
 	monitor = &Monitor{}
 	monitor.path = path
-	monitor.qmp = qmpConn
+	monitor.qmp = &qmpConn
 	monitor.chDisconnect = make(chan struct{}, 1)
 	monitor.eventHandler = eventHandler
 	monitor.serialCharDev = serialCharDev
@@ -271,8 +287,8 @@ func Connect(path string, serialCharDev string, eventHandler func(name string, d
 	return monitor, nil
 }
 
-// AgenStarted indicates whether an agent has been detected.
-func (m *Monitor) AgenStarted() bool {
+// AgentStarted indicates whether an agent has been detected.
+func (m *Monitor) AgentStarted() bool {
 	m.agentStartedMu.Lock()
 	defer m.agentStartedMu.Unlock()
 
@@ -288,7 +304,7 @@ func (m *Monitor) Disconnect() {
 	if !m.disconnected {
 		close(m.chDisconnect)
 		m.disconnected = true
-		_ = m.qmp.Disconnect()
+		_ = m.qmp.disconnect()
 	}
 
 	// Remove from the map.
@@ -298,7 +314,7 @@ func (m *Monitor) Disconnect() {
 // Wait returns a channel that will be closed on disconnection.
 func (m *Monitor) Wait() (chan struct{}, error) {
 	// Check if disconnected
-	if m.disconnected {
+	if m.disconnected || m.qmp == nil {
 		return nil, ErrMonitorDisconnect
 	}
 

@@ -86,19 +86,11 @@ func (h *dnsHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	if len(r.Question) != 1 {
 		msg.SetRcode(r, dns.RcodeNameError)
 	} else if r.Question[0].Qtype == dns.TypePTR {
-		msg, err = h.handlePTR(r)
-		if err != nil {
-			logger.Errorf("PTR record lookup failed for %s: %v", r.Question[0].Name, err)
-			msg.SetRcode(r, dns.RcodeNameError)
-		}
+		msg = h.handlePTR(r)
 	} else if r.Question[0].Qtype == dns.TypeA || r.Question[0].Qtype == dns.TypeAAAA {
-		msg, err = h.handleA(r)
-		if err != nil {
-			logger.Errorf("A record lookup failed for %s: %v", r.Question[0].Name, err)
-			msg.SetRcode(r, dns.RcodeNameError)
-		}
+		msg = h.handleA(r)
 
-		// Currently forkdns doesn't support IPv6, but to ensure compatbility and expected behavior with
+		// Currently forkdns doesn't support IPv6, but to ensure compatibility and expected behavior with
 		// DNS clients, we return an empty AAAA response if the A record was found (meaning the domain
 		// exists, but no AAAA records).
 		if r.Question[0].Qtype == dns.TypeAAAA && msg.Rcode == dns.RcodeSuccess {
@@ -119,7 +111,7 @@ func (h *dnsHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 // It is used with cluster networking to provide cluster wide DNS PTR resolution by consulting the
 // local DHCP leases file and if not found, then relaying the question to the other cluster member's
 // forkdns instance. Returns DNS message to be sent as response.
-func (h *dnsHandler) handlePTR(r *dns.Msg) (dns.Msg, error) {
+func (h *dnsHandler) handlePTR(r *dns.Msg) dns.Msg {
 	msg := dns.Msg{}
 	msg.SetReply(r)
 
@@ -148,12 +140,12 @@ func (h *dnsHandler) handlePTR(r *dns.Msg) (dns.Msg, error) {
 				Ptr: fmt.Sprintf("%s.%s.", hostname, h.domain),
 			})
 
-			return msg, nil
+			return msg
 		}
 
 		// Record not found locally, return NXDOMAIN.
 		msg.SetRcode(r, dns.RcodeNameError)
-		return msg, nil
+		return msg
 	}
 
 	// If we get here, then the recursion desired flag was set, meaning we cannot answer the
@@ -172,18 +164,18 @@ func (h *dnsHandler) handlePTR(r *dns.Msg) (dns.Msg, error) {
 		req.RecursionDesired = false
 		req.Id = r.Id
 
-		resp, err := dns.Exchange(&req, fmt.Sprintf("%s:1053", server))
+		resp, err := dns.Exchange(&req, server+":1053")
 		if err != nil || len(resp.Answer) == 0 {
 			// Error or empty response, try the next one
 			continue
 		}
 
-		return *resp, nil
+		return *resp
 	}
 
-	// Record not found in any of the remove servers.
+	// Record not found in any of the remote servers.
 	msg.SetRcode(r, dns.RcodeNameError)
-	return msg, nil
+	return msg
 }
 
 // getLeaseHostByReverseIPName finds the hostname used in the DHCP lease by supplying a reverse
@@ -191,7 +183,7 @@ func (h *dnsHandler) handlePTR(r *dns.Msg) (dns.Msg, error) {
 func (h *dnsHandler) getLeaseHostByReverseIPName(reverseName string) (string, error) {
 	ip := dnsutil.ExtractAddressFromReverse(reverseName)
 	if ip == "" {
-		return "", errors.New("Failed to convert reverse name to IP")
+		return "", errors.New("Failed converting reverse name to IP")
 	}
 
 	file, err := os.Open(h.leaseFile)
@@ -224,7 +216,7 @@ func (h *dnsHandler) getLeaseHostByReverseIPName(reverseName string) (string, er
 // It is used with cluster networking to provide cluster wide DNS A resolution by consulting the
 // local DHCP leases file and if not found, then relaying the question to the other cluster member's
 // forkdns instance. Returns DNS message to be sent as response.
-func (h *dnsHandler) handleA(r *dns.Msg) (dns.Msg, error) {
+func (h *dnsHandler) handleA(r *dns.Msg) dns.Msg {
 	msg := dns.Msg{}
 	msg.SetReply(r)
 
@@ -251,12 +243,12 @@ func (h *dnsHandler) handleA(r *dns.Msg) (dns.Msg, error) {
 				A: net.ParseIP(ip),
 			})
 
-			return msg, nil
+			return msg
 		}
 
 		// Record not found locally, return NXDOMAIN.
 		msg.SetRcode(r, dns.RcodeNameError)
-		return msg, nil
+		return msg
 	}
 
 	// If we get here, then the recursion desired flag was set, meaning we cannot answer the
@@ -275,18 +267,18 @@ func (h *dnsHandler) handleA(r *dns.Msg) (dns.Msg, error) {
 		req.RecursionDesired = false
 		req.Id = r.Id
 
-		resp, err := dns.Exchange(&req, fmt.Sprintf("%s:1053", server))
+		resp, err := dns.Exchange(&req, server+":1053")
 		if err != nil || resp.Rcode != dns.RcodeSuccess {
 			// Error sending request or error response, try next server.
 			continue
 		}
 
-		return *resp, nil
+		return *resp
 	}
 
 	// Record not found in any of the remote servers.
 	msg.SetRcode(r, dns.RcodeNameError)
-	return msg, nil
+	return msg
 }
 
 // getLeaseHostByDNSName finds the hostname used in the DHCP lease by supplying a DNS A name.
@@ -319,7 +311,7 @@ func (h *dnsHandler) getLeaseHostByDNSName(dnsName string) (string, error) {
 	return "", nil
 }
 
-func (c *cmdForkDNS) Command() *cobra.Command {
+func (c *cmdForkDNS) command() *cobra.Command {
 	// Main subcommand
 	cmd := &cobra.Command{}
 	cmd.Use = "forkdns <listen address> <domain> <network name>"
@@ -331,17 +323,17 @@ func (c *cmdForkDNS) Command() *cobra.Command {
   It uses the "recursion desired" flag in incoming DNS requests to modify its behaviour.
   When "recursion desired" is set to yes, the query is immediately relayed to the other cluster nodes
   (with the "recursion desired" flag set to no) as it indicates that the local dnsmasq process was
-  unable to answer it from the local lease file.
+  cannot answer it from the local lease file.
   When "recursion desired" flag is set to no, this indicates the request has been sent from another
   forkdns process, and the local dnsmasq lease file only is parsed to try and answer the query.
 `
-	cmd.RunE = c.Run
+	cmd.RunE = c.run
 	cmd.Hidden = true
 
 	return cmd
 }
 
-func (c *cmdForkDNS) Run(cmd *cobra.Command, args []string) error {
+func (c *cmdForkDNS) run(cmd *cobra.Command, args []string) error {
 	// Quick checks.
 	if len(args) < 3 {
 		_ = cmd.Help()
@@ -350,7 +342,7 @@ func (c *cmdForkDNS) Run(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 
-		return fmt.Errorf("Missing required arguments")
+		return errors.New("Missing required arguments")
 	}
 
 	err := logger.InitLogger("", "lxd-forkdns", c.global.flagLogVerbose, c.global.flagLogDebug, nil)
@@ -361,7 +353,7 @@ func (c *cmdForkDNS) Run(cmd *cobra.Command, args []string) error {
 	// Setup watcher on servers file.
 	watcher, err := inotify.NewWatcher()
 	if err != nil {
-		return fmt.Errorf("Unable to setup inotify: %s", err)
+		return fmt.Errorf("Cannot setup inotify: %s", err)
 	}
 
 	networkName := args[2]
@@ -371,7 +363,7 @@ func (c *cmdForkDNS) Run(cmd *cobra.Command, args []string) error {
 	// temporary file first and then renamed to the file actually used by forkdns.
 	err = watcher.AddWatch(path, inotify.InMovedTo)
 	if err != nil {
-		return fmt.Errorf("Unable to setup inotify watch on %s: %w", path, err)
+		return fmt.Errorf("Cannot setup inotify watch on %s: %w", path, err)
 	}
 
 	// Run the server list monitor concurrently waiting for file changes.
@@ -391,7 +383,7 @@ func (c *cmdForkDNS) Run(cmd *cobra.Command, args []string) error {
 
 	err = srv.ListenAndServe()
 	if err != nil {
-		return fmt.Errorf("Failed to set udp listener: %w", err)
+		return fmt.Errorf("Failed setting udp listener: %w", err)
 	}
 
 	return nil

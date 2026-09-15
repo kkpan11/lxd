@@ -1,238 +1,482 @@
-import sys
+import datetime
 import os
-import requests
-from urllib.parse import urlparse
-from git import Repo, InvalidGitRepositoryError
-import time
+import yaml
+import textwrap
+
+############################
+# LXD custom initializations #
+############################
+
+import sys
+import subprocess
+from git import Repo
+import filecmp
 import ast
+import re
+import shutil
 
-sys.path.append('./')
-from custom_conf import *
+sys.path.insert(0, os.path.abspath('.'))
+from redirects import redirects  # noqa: F401 (used by sphinx_reredirects via conf.py namespace)
+
 sys.path.append('.sphinx/')
-from build_requirements import *
 
-# Configuration file for the Sphinx documentation builder.
-# You should not do any modifications to this file. Put your custom
-# configuration into the custom_conf.py file.
-# If you need to change this file, contribute the changes upstream.
-#
-# For the full list of built-in configuration values, see the documentation:
-# https://www.sphinx-doc.org/en/master/usage/configuration.html
+# Set global version variable used in objects.inv to numeric version defined in flex.go
+with open("../shared/version/flex.go") as fd:
+    match = re.search(r'var Version = "([^"]+)"', fd.read())
+    version = match.group(1) if match else "unknown"
 
-############################################################
-### Extensions
-############################################################
 
-extensions = [
-    'sphinx_design',
-    'sphinx_copybutton',
-    'sphinxcontrib.jquery'
+#######################
+# Project information #
+#######################
+
+# Project name
+project = 'LXD'
+author = 'LXD contributors'
+
+# Sidebar documentation title; best kept reasonably short
+# To disable the title, set to an empty string.
+html_title = project + ' documentation ' + version
+
+# Copyright string; shown at the bottom of the page
+copyright = '2014-%s AGPL-3.0, %s' % (datetime.date.today().year, author)
+
+# Documentation website URL
+
+version_slug = f'{os.environ.get("READTHEDOCS_VERSION", "local")}'
+
+slug = 'lxd/docs'
+
+html_baseurl = f'https://canonical.com/lxd/docs/{version_slug}/'
+
+# NOTE: The Open Graph Protocol (OGP) enhances page display in a social graph
+#       and is used by social media platforms; see https://ogp.me/
+ogp_site_url = f'https://canonical.com/lxd/docs/{version_slug}/'
+
+# Preview name of the documentation website
+ogp_site_name = html_title
+
+# Preview image URL
+ogp_image = f'https://canonical.com/lxd/docs/{version_slug}/_static/lxd_tag.png'
+
+# Product favicon; shown in bookmarks, browser tabs, etc.
+html_favicon = '_static/favicon.ico'
+
+# Dictionary of values to pass into the Sphinx context for all pages:
+# https://www.sphinx-doc.org/en/master/usage/configuration.html#confval-html_context
+html_context = {
+    # Product page URL; can be different from product docs URL
+    'product_page': 'canonical.com/lxd',
+
+    # Product tag image; the orange part of your logo, shown in the page header
+    'product_tag': '_static/lxd_tag.png',
+
+    # Your Discourse instance URL
+    # NOTE: If set, adding ':discourse: 123' to an .rst file
+    #       will add a link to Discourse topic 123 at the bottom of the page.
+    'discourse': 'https://discourse.ubuntu.com/c/lxd/',
+
+    # LXD docs refer to two different Discourse instances
+    'discourse_prefix': {
+        'ubuntu': 'https://discourse.ubuntu.com/t/',
+        'lxc': 'https://discuss.linuxcontainers.org/t/'
+    },
+
+    # Your Mattermost channel URL
+    'mattermost': '',
+
+    # Your Matrix channel URL
+    'matrix': 'https://matrix.to/#/#documentation:ubuntu.com',
+
+    # Your documentation GitHub repository URL
+    # NOTE: If set, links for viewing the documentation source files
+    #       and creating GitHub issues are added at the bottom of each page.
+    'github_url': 'https://github.com/canonical/lxd',
+
+    # Docs branch in the repo; used in links for viewing the source files
+    'repo_default_branch': 'main',
+
+    # Docs location in the repo; used in links for viewing the source files
+    'repo_folder': '/doc/',
+
+    # Enables the Previous / Next buttons at the bottom of pages
+    # NOTE: Valid options are none, prev, next, both
+    'sequential_nav': 'both',
+
+    # Enables listing contributors on individual pages
+    # This feature is deprecated and will be removed in the future
+    'display_contributors': False,
+
+    # Required for feedback button
+    'github_issues': 'enabled',
+}
+
+html_extra_path = ['_extra']
+
+# Enables the pencil icon to edit pages on GitHub, shown at the top of each page
+html_theme_options = {
+    'source_edit_link': html_context['github_url']
+}
+
+#######################
+# Sitemap configuration: https://sphinx-sitemap.readthedocs.io/
+#######################
+
+# sphinx-sitemap uses html_baseurl (set earlier in this file) to generate the full URL for each page:
+
+sitemap_url_scheme = '{link}'
+
+# Include `lastmod` dates in the sitemap:
+sitemap_show_lastmod = True
+
+# Exclude generated pages from the sitemap:
+sitemap_excludes = [
+    '404/',
+    'genindex/',
+    'search/',
 ]
 
-# Only add redirects extension if any redirects are specified.
-if AreRedirectsDefined():
-    extensions.append('sphinx_reredirects')
+# TODO: Add more pages to sitemap_excludes if needed. Wildcards are supported.
+#       For example, to exclude module pages generated by autodoc, add '_modules/*'.
 
-# Only add myst extensions if any configuration is present.
-if IsMyStParserUsed():
-    extensions.append('myst_parser')
+#######################
+# Template and asset locations
+#######################
 
-    # Additional MyST syntax
-    myst_enable_extensions = [
-        'substitution',
-        'deflist',
-        'linkify'
-    ]
-    myst_enable_extensions.extend(custom_myst_extensions)
+html_static_path = ['_static']
+templates_path = ['_templates']
 
-# Only add Open Graph extension if any configuration is present.
-if IsOpenGraphConfigured():
-    extensions.append('sphinxext.opengraph')
 
-extensions.extend(custom_extensions)
-extensions = DeduplicateExtensions(extensions)
+#############
+# Redirects #
+#############
 
-### Configuration for extensions
+# To set up redirects in the Read the Docs project dashboard:
+# https://docs.readthedocs.io/en/stable/guides/redirects.html
 
-# Used for related links
-if not 'discourse_prefix' in html_context and 'discourse' in html_context:
-    html_context['discourse_prefix'] = html_context['discourse'] + '/t/'
+# redirects = {}
+# NOTE: The above line is commented out because LXD imports redirects from redirects.py
+# instead of setting it here
 
-# The URL prefix for the notfound extension depends on whether the documentation uses versions.
-# For documentation on documentation.ubuntu.com, we also must add the slug.
-url_version = ''
-url_lang = ''
+############################
+# sphinx-llm configuration #
+############################
 
-# Determine if the URL uses versions and language
-if 'READTHEDOCS_CANONICAL_URL' in os.environ and os.environ['READTHEDOCS_CANONICAL_URL']:
-    url_parts = os.environ['READTHEDOCS_CANONICAL_URL'].split('/')
+# This description is included in llms.txt to provide some initial context for your
+# product docs.
+llms_txt_description = textwrap.dedent(
+    """\
+    This is the documentation for LXD, a system container and virtual machine manager.
+    """
+)
 
-    if len(url_parts) >= 2 and 'READTHEDOCS_VERSION' in os.environ and os.environ['READTHEDOCS_VERSION'] == url_parts[-2]:
-        url_version = url_parts[-2] + '/'
+# The base URL for references built by sphinx-markdown-builder.
+if os.environ.get("READTHEDOCS"):
+    markdown_http_base = html_baseurl
 
-    if len(url_parts) >= 3 and 'READTHEDOCS_LANGUAGE' in os.environ and os.environ['READTHEDOCS_LANGUAGE'] == url_parts[-3]:
-        url_lang = url_parts[-3] + '/'
+###########################
+# Link checker exceptions #
+###########################
 
-# Set notfound_urls_prefix to the slug (if defined) and the version/language affix
-if slug:
-    notfound_urls_prefix = '/' + slug  + '/' + url_lang + url_version
-elif len(url_lang + url_version) > 0:
-    notfound_urls_prefix = '/' + url_lang + url_version
-else:
-    notfound_urls_prefix = ''
+# A regex list of URLs that are ignored by 'make linkcheck'
 
+# Always ignore these links
+linkcheck_ignore = [
+    r"https?://localhost.*",
+    r"https?://127\.0\.0\.1.*",
+    r"^/.*/api/",
+    # These links often/always fail both locally and in GitHub CI
+    r"https://ceph\.io.*",
+    r"https://.*\.sourceforge\.net.*",
+    r"https://www\.gnu\.org.*",
+    # These links often fail due to infra issues
+    r"https://.*\.canonical\.com.*",
+    r"https://snapcraft\.io.*",
+    r"https://ubuntu\.com.*",
+    r"https://.*\.launchpad\.net.*",
+    # Ignore so that we can refer to an unpublished release when preparing release notes
+    r"https://github\.com/canonical/lxd/compare.*",
+    r"https://github\.com/canonical/lxd/releases/tag/lxd-.*",
+    r'https://kubernetes\.io/.*',
+]
+
+# Ignore these links in GitHub CI due to site restrictions causing failures
+# In local checks, they are not ignored and should pass
+if os.environ.get('CI') == 'true':
+    linkcheck_ignore.extend([
+        r"https://www\.hpe\.com.*",
+        r"https://www\.schlachter\.tech.*",
+        r"https://www\.dell\.com.*",
+    ])
+
+# Pages on which to ignore anchors (check the link without the anchor)
+linkcheck_anchors_ignore_for_url = [
+    r'https://github\.com/.*',
+    r'https://snapcraft\.io/docs/.*',
+    'https://docs.docker.com/network/packet-filtering-firewalls/'
+]
+
+linkcheck_exclude_documents = [r'.*/manpages/.*']
+
+# Increase linkcheck rate limit timeout max; default when unset is 300
+# https://www.sphinx-doc.org/en/master/usage/configuration.html#confval-linkcheck_timeout
+linkcheck_rate_limit_timeout = 600
+
+# Increase linkcheck retries; default when unset is 1
+# https://www.sphinx-doc.org/en/master/usage/configuration.html#confval-linkcheck_retries
+linkcheck_retries = 3
+
+########################
+# Configuration extras #
+########################
+
+extensions = [
+    'canonical_sphinx',
+    'notfound.extension',
+    'sphinx_design',
+    'sphinx_reredirects',
+    'sphinx_tabs.tabs',
+    'sphinxcontrib.jquery',
+    'sphinxext.opengraph',
+    'sphinx_config_options',
+    'sphinx_llm.txt',
+    'sphinx_related_links',
+    'sphinx_roles',
+    'sphinx_terminal',
+    'sphinx_youtube_links',
+    'sphinxcontrib.cairosvgconverter',
+    'sphinx_last_updated_by_git',
+    'sphinx.ext.intersphinx',
+    'sphinx_sitemap',
+    'sphinx_remove_toctrees',
+    'myst_parser',
+]
+
+# Additional MyST extensions
+# substitution, deflist, and linkify are always enabled by default
+myst_enable_extensions = {
+    'attrs_block',
+}
+
+# Exclude from processing
+exclude_patterns = [
+    'html',
+    'README.md',
+    'config_options_cheat_sheet.md',
+    'reference/release-notes/release-notes-template.md',
+]
+
+# Adds custom CSS files, located under 'html_static_path' or from external link
+html_css_files = [
+    'lxd_custom.css',
+    'https://assets.ubuntu.com/v1/d86746ef-cookie_banner.css',
+]
+
+# Adds custom JavaScript files, located under 'html_static_path' or from external link
+html_js_files = [
+    'https://assets.ubuntu.com/v1/287a5e8f-bundle.js',
+    'js/rtd-versions-flyout.js',
+    'js/overwrite_links.js',
+]
+
+# Feedback button at the top; enabled by default
+# To disable the button, uncomment the line below:
+
+# disable_feedback_button = True
+
+# Specifies a reST snippet to be prepended to each .rst file
+# Defines a :center: role that centers table cell content.
+# Defines a :h2: role that styles content for use with PDF generation.
+# Defines woke-ignore and vale-ignore roles that can be used to mark content to be
+# ignored by vale and woke checks
+rst_prolog = """
+.. role:: center
+   :class: align-center
+.. role:: h2
+    :class: hclass2
+.. role:: woke-ignore
+    :class: woke-ignore
+.. role:: vale-ignore
+    :class: vale-ignore
+"""
+
+
+############################################################
+### Misc LXD custom configuration
+############################################################
+
+# Use custom 404 page text
 notfound_context = {
     'title': 'Page not found',
     'body': '<p><strong>Sorry, but the documentation page that you are looking for was not found.</strong></p>\n\n<p>Documentation changes over time, and pages are moved around. We try to redirect you to the updated content where possible, but unfortunately, that didn\'t work this time (maybe because the content you were looking for does not exist in this version of the documentation).</p>\n<p>You can try to use the navigation to locate the content you\'re looking for, or search for a similar page.</p>\n',
 }
 
-# Default image for OGP (to prevent font errors, see
-# https://github.com/canonical/sphinx-docs-starter-pack/pull/54 )
-if not 'ogp_image' in locals():
-    ogp_image = 'https://assets.ubuntu.com/v1/253da317-image-document-ubuntudocs.svg'
+# Prevents making links from URLs that do not start with a protocol
+myst_linkify_fuzzy_links = False
+# Auto-generate HTML anchors down to heading level 7
+# https://myst-parser.readthedocs.io/en/latest/syntax/optional.html#auto-generated-header-anchors
+myst_heading_anchors = 7
 
-############################################################
-### General configuration
-############################################################
+myst_substitutions = {}
+if os.path.exists('./substitutions.yaml'):
+    with open('./substitutions.yaml', 'r') as fd:
+        myst_substitutions.update(yaml.safe_load(fd.read()))
+if os.path.exists('./related_topics.yaml'):
+    with open('./related_topics.yaml', 'r') as fd:
+        myst_substitutions.update(yaml.safe_load(fd.read()))
 
-exclude_patterns = [
-    '_build',
-    'Thumbs.db',
-    '.DS_Store',
-    '.sphinx',
-]
-exclude_patterns.extend(custom_excludes)
+# Version label shown in the RTD flyout next to "default", in parentheses.
+# Set the FLYOUT_DEFAULT_VERSION_LABEL environment variable in the RTD project dashboard.
+html_context['flyout_default_version_label'] = os.environ.get('FLYOUT_DEFAULT_VERSION_LABEL', '')
 
-rst_epilog = '''
-.. include:: /reuse/links.txt
-'''
-if 'custom_rst_epilog' in locals():
-    rst_epilog = custom_rst_epilog
-
-source_suffix = {
-    '.rst': 'restructuredtext',
-    '.md': 'markdown',
+# Add configuration for intersphinx mapping
+# Local fallback inventories are used if the remote is temporarily unavailable.
+# To update them, run: make update-intersphinx-backups
+# When adding a new mapping here, also update the update-intersphinx-backups Makefile target to download a backup inventory file.
+intersphinx_mapping = {
+    'cloud-init': ('https://docs.cloud-init.io/en/latest/', (None, '.sphinx/intersphinx/cloud-init-objects.inv')),
+    'imagebuilder': ('https://canonical-lxd-imagebuilder.readthedocs-hosted.com/en/latest/', (None, '.sphinx/intersphinx/imagebuilder-objects.inv')),
+    'snap': ('https://snapcraft.io/docs/', (None, '.sphinx/intersphinx/snap-objects.inv')),
 }
 
-if not 'conf_py_path' in html_context and 'github_folder' in html_context:
-    html_context['conf_py_path'] = html_context['github_folder']
+if ('LOCAL_SPHINX_BUILD' in os.environ) and (os.environ['LOCAL_SPHINX_BUILD'] == 'True'):
+    swagger_url_scheme = '/api/#{{path}}'
+else:
+    swagger_url_scheme = '/lxd/latest/api/#{{path}}'
 
-# For ignoring specific links
-linkcheck_anchors_ignore_for_url = [
-    r'https://github\.com/.*'
-]
-linkcheck_anchors_ignore_for_url.extend(custom_linkcheck_anchors_ignore_for_url)
+myst_url_schemes = {
+    'http': None,
+    'https': None,
+    'swagger': swagger_url_scheme,
+}
 
-# Tags cannot be added directly in custom_conf.py, so add them here
-for tag in custom_tags:
-    tags.add(tag)
+remove_from_toctrees = ['reference/manpages/lxc/*.md']
 
-# html_context['get_contribs'] is a function and cannot be
-# cached (see https://github.com/sphinx-doc/sphinx/issues/12300)
-suppress_warnings = ["config.cache"]
+# Download and link swagger-ui files
+if not os.path.isdir('.sphinx/deps/swagger-ui'):
+    Repo.clone_from('https://github.com/swagger-api/swagger-ui', '.sphinx/deps/swagger-ui', depth=1)
+
+os.makedirs('_static/swagger-ui/', exist_ok=True)
+
+if not os.path.islink('_static/swagger-ui/swagger-ui-bundle.js'):
+    os.symlink('../../.sphinx/deps/swagger-ui/dist/swagger-ui-bundle.js', '_static/swagger-ui/swagger-ui-bundle.js')
+if not os.path.islink('_static/swagger-ui/swagger-ui-standalone-preset.js'):
+    os.symlink('../../.sphinx/deps/swagger-ui/dist/swagger-ui-standalone-preset.js', '_static/swagger-ui/swagger-ui-standalone-preset.js')
+if not os.path.islink('_static/swagger-ui/swagger-ui.css'):
+    os.symlink('../../.sphinx/deps/swagger-ui/dist/swagger-ui.css', '_static/swagger-ui/swagger-ui.css')
+
+### MAN PAGES ###
+
+# Find path to lxc client (different for local builds and on RTD)
+
+if os.environ.get('LOCAL_SPHINX_BUILD') == 'True':
+    path = str(subprocess.check_output(['go', 'env', 'GOPATH'], encoding='utf-8').strip())
+    lxc = os.path.join(path, 'bin', 'lxc')
+    if os.path.isfile(lxc):
+        print('Using ' + lxc + ' to generate man pages.')
+    else:
+        print('Cannot find lxc in ' + lxc)
+        sys.exit(2)
+else:
+    lxc = '../lxc.bin'
+
+# Generate man pages content
+
+os.makedirs('.sphinx/deps/manpages', exist_ok=True)
+if os.path.isfile(lxc):
+    subprocess.run([lxc, 'manpage', '.sphinx/deps/manpages/', '--format=md'],
+                   check=True)
+else:
+    print('No man page content generated.')
+
+# Preprocess man pages content
+
+for page in [x for x in os.listdir('.sphinx/deps/manpages')
+             if os.path.isfile(os.path.join('.sphinx/deps/manpages/', x))]:
+
+    # replace underscores with slashes to create a directory structure
+    pagepath = page.replace('_', '/')
+
+    # for each generated page, add an anchor, fix the title, and adjust the
+    # heading levels
+    with open(os.path.join('.sphinx/deps/manpages/', page), 'r') as mdfile:
+        content = mdfile.readlines()
+
+    os.makedirs(os.path.dirname(os.path.join('.sphinx/deps/manpages/', pagepath)),
+                exist_ok=True)
+
+    with open(os.path.join('.sphinx/deps/manpages/', pagepath), 'w') as mdfile:
+        mdfile.write('(' + page + ')=\n')
+        in_code_block = False
+        for line in content:
+            if line.startswith('###### Auto generated'):
+                continue
+            elif line.startswith('## '):
+                mdfile.write('# `' + line[3:].rstrip() + '`\n')
+            elif line.startswith('##'):
+                mdfile.write(line[1:])
+            elif line.startswith('```'):
+                if not in_code_block and line.rstrip() == '```':
+                    mdfile.write('```none\n')
+                else:
+                    mdfile.write(line)
+
+                in_code_block = not in_code_block
+            else:
+                mdfile.write(line)
+
+    # remove the input page (unless the file path doesn't change)
+    if '_' in page:
+        os.remove(os.path.join('.sphinx/deps/manpages/', page))
+
+# Complete and copy man pages content
+
+for folder, subfolders, files in os.walk('.sphinx/deps/manpages'):
+
+    # for each subfolder, add toctrees to the parent page that
+    # include the subpages
+    for subfolder in subfolders:
+        with open(os.path.join(folder, subfolder + '.md'), 'a') as parent:
+            parent.write('```{toctree}\n:titlesonly:\n:glob:\n:hidden:\n\n' +
+                         subfolder + '/*\n```\n')
+
+    # for each file, if the content is different to what has been generated
+    # before, copy the file to the reference/manpages folder
+    # (copying all would mess up the incremental build)
+    for f in files:
+        sourcefile = os.path.join(folder, f)
+        targetfile = os.path.join('reference/manpages/',
+                                  os.path.relpath(folder,
+                                                  '.sphinx/deps/manpages'),
+                                  f)
+
+        if (not os.path.isfile(targetfile) or
+            not filecmp.cmp(sourcefile, targetfile, shallow=False)):
+
+            os.makedirs(os.path.dirname(targetfile), exist_ok=True)
+            shutil.copy2(sourcefile, targetfile)
+
+### End MAN PAGES ###
 
 ############################################################
-### Styling
+### Custom PDF/LaTeX configuration
 ############################################################
 
-# Find the current builder
-builder = 'dirhtml'
-if '-b' in sys.argv:
-    builder = sys.argv[sys.argv.index('-b')+1]
-
-# Setting templates_path for epub makes the build fail
-if builder == 'dirhtml' or builder == 'html':
-    templates_path = ['.sphinx/_templates']
-    notfound_template = '404.html'
-
-# Theme configuration
-html_theme = 'furo'
-html_last_updated_fmt = ''
-html_permalinks_icon = '¶'
-
-if html_title == '':
-    html_theme_options = {
-        'sidebar_hide_name': True
-        }
-
-############################################################
-### Additional files
-############################################################
-
-html_static_path = ['.sphinx/_static']
-
-html_css_files = [
-    'custom.css',
-    'header.css',
-    'github_issue_links.css',
-    'furo_colors.css',
-    'footer.css'
-]
-html_css_files.extend(custom_html_css_files)
-
-html_js_files = ['header-nav.js', 'footer.js']
-if 'github_issues' in html_context and html_context['github_issues'] and not disable_feedback_button:
-    html_js_files.append('github_issue_links.js')
-html_js_files.extend(custom_html_js_files)
-
-#############################################################
-# Display the contributors
-
-def get_contributors_for_file(github_url, github_folder, pagename, page_source_suffix, display_contributors_since=None):
-    filename = f"{pagename}{page_source_suffix}"
-    paths=html_context['github_folder'][1:] + filename
-
-    try:
-        repo = Repo(".")
-    except InvalidGitRepositoryError:
-        cwd = os.getcwd()
-        ghfolder = html_context['github_folder'][:-1]
-        if ghfolder and cwd.endswith(ghfolder):
-            repo = Repo(cwd.rpartition(ghfolder)[0])
-        else:
-            print("The local Git repository could not be found.")
-            return
-
-    since = display_contributors_since if display_contributors_since and display_contributors_since.strip() else None
-
-    commits = repo.iter_commits(paths=paths, since=since)
-
-    contributors_dict = {}
-    for commit in commits:
-        contributor = commit.author.name
-        if contributor not in contributors_dict or commit.committed_date > contributors_dict[contributor]['date']:
-            contributors_dict[contributor] = {
-                'date': commit.committed_date,
-                'sha': commit.hexsha
-            }
-    # The github_page contains the link to the contributor's latest commit.
-    contributors_list = [{'name': name, 'github_page': f"{github_url}/commit/{data['sha']}"} for name, data in contributors_dict.items()]
-    sorted_contributors_list = sorted(contributors_list, key=lambda x: x['name'])
-    return sorted_contributors_list
-
-html_context['get_contribs'] = get_contributors_for_file
-
-############################################################
-### PDF configuration
-############################################################
-
-latex_additional_files = [
-    "./.sphinx/fonts/Ubuntu-B.ttf",
-    "./.sphinx/fonts/Ubuntu-R.ttf",
-    "./.sphinx/fonts/Ubuntu-RI.ttf",
-    "./.sphinx/fonts/UbuntuMono-R.ttf",
-    "./.sphinx/fonts/UbuntuMono-RI.ttf",
-    "./.sphinx/fonts/UbuntuMono-B.ttf",
-    "./.sphinx/images/Canonical-logo-4x.png",
-    "./.sphinx/images/front-page-light.pdf",
-    "./.sphinx/images/normal-page-footer.pdf",
-]
-
-latex_engine = 'xelatex'
-latex_show_pagerefs = True
-latex_show_urls = 'footnote'
+# Use LXD's custom LaTeX template because the one from canonical-sphinx introduces
+# a bug with white-on-white text on most pages
 
 with open(".sphinx/latex_elements_template.txt", "rt") as file:
     latex_config = file.read()
 
 latex_elements = ast.literal_eval(latex_config.replace("$PROJECT", project))
+
+
+###########################################
+### Prevent indexing of older docs versions
+###########################################
+
+# Add RTD docs version slugs for versions that should not be indexed by search engines
+noindex_versions = {"stable-5.0", "stable-4.0"}
+
+rtd_version = os.environ.get("READTHEDOCS_VERSION", "")
+html_context["seo_noindex"] = rtd_version in noindex_versions

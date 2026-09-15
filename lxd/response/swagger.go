@@ -1,10 +1,23 @@
 // Package response contains helpers for rendering LXD HTTP responses.
-//
-//nolint:deadcode,unused
 package response
 
 import (
 	"github.com/canonical/lxd/shared/api"
+)
+
+// Silence `unused` linter noise not realizing that these are used in the
+// swagger docs (doc/rest-api.yaml).
+var (
+	_ = swaggerOperation{}
+	_ = swaggerEmptySyncResponse{}
+	_ = swaggerBadRequest{}
+	_ = swaggerForbidden{}
+	_ = swaggerPreconditionFailed{}
+	_ = swaggerStatusLocked{}
+	_ = swaggerInternalServerError{}
+	_ = swaggerNotFound{}
+	_ = swaggerNotImplemented{}
+	_ = swaggerEmptySyncResponse{}
 )
 
 // Operation
@@ -102,6 +115,24 @@ type swaggerPreconditionFailed struct {
 	}
 }
 
+// Status Locked
+//
+// swagger:response StatusLocked
+type swaggerStatusLocked struct {
+	// Internal server Error
+	// in: body
+	Body struct {
+		// Example: error
+		Type string `json:"type"`
+
+		// Example: status locked
+		Error string `json:"error"`
+
+		// Example: 423
+		ErrorCode int `json:"error_code"`
+	}
+}
+
 // Internal Server Error
 //
 // swagger:response InternalServerError
@@ -134,6 +165,24 @@ type swaggerNotFound struct {
 		Error string `json:"error"`
 
 		// Example: 404
+		ErrorCode int `json:"error_code"`
+	}
+}
+
+// Not implemented
+//
+// swagger:response NotImplemented
+type swaggerNotImplemented struct {
+	// Not implemented
+	// in: body
+	Body struct {
+		// Example: error
+		Type string `json:"type"`
+
+		// Example: not implemented
+		Error string `json:"error"`
+
+		// Example: 501
 		ErrorCode int `json:"error_code"`
 	}
 }

@@ -16,7 +16,7 @@ type cmdGlobal struct {
 func main() {
 	// daemon command (main)
 	daemonCmd := cmdDaemon{}
-	app := daemonCmd.Command()
+	app := daemonCmd.command()
 	app.Use = "lxd-user"
 	app.Short = "LXD user project daemon"
 	app.Long = `Description:
@@ -33,6 +33,10 @@ func main() {
 	globalCmd := cmdGlobal{}
 	app.PersistentFlags().BoolVar(&globalCmd.flagVersion, "version", false, "Print version number")
 	app.PersistentFlags().BoolVarP(&globalCmd.flagHelp, "help", "h", false, "Print help")
+
+	// callhook sub-command
+	callhookCmd := cmdCallhook{global: &globalCmd}
+	app.AddCommand(callhookCmd.Command())
 
 	// Version handling
 	app.SetVersionTemplate("{{.Version}}\n")

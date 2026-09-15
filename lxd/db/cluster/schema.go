@@ -29,12 +29,46 @@ CREATE TABLE auth_groups_permissions (
     FOREIGN KEY (auth_group_id) REFERENCES auth_groups (id) ON DELETE CASCADE,
     UNIQUE (auth_group_id, entity_type, entitlement, entity_id)
 );
+CREATE TABLE certificates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    certificate TEXT NOT NULL,
+    creation_date DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (fingerprint)
+);
 CREATE TABLE "cluster_groups" (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     name TEXT NOT NULL,
     description TEXT NOT NULL,
     UNIQUE (name)
 );
+CREATE TABLE cluster_links (
+	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+	identity_id INTEGER,
+	description TEXT NOT NULL,
+	name TEXT NOT NULL,
+	type INTEGER NOT NULL DEFAULT 0,
+	UNIQUE(identity_id),
+	UNIQUE(name),
+	FOREIGN KEY (identity_id) REFERENCES identities (id) ON DELETE CASCADE
+);
+CREATE TABLE cluster_links_certificates (
+	cluster_link_id INTEGER NOT NULL,
+	certificate_id INTEGER NOT NULL,
+	FOREIGN KEY (cluster_link_id) REFERENCES cluster_links (id) ON DELETE CASCADE,
+	FOREIGN KEY (certificate_id) REFERENCES certificates (id) ON DELETE CASCADE,
+	UNIQUE (certificate_id),
+	PRIMARY KEY (cluster_link_id,
+    certificate_id)
+) WITHOUT ROWID;
+CREATE TABLE "cluster_links_config" (
+	cluster_link_id INTEGER NOT NULL,
+	key TEXT NOT NULL,
+	value TEXT NOT NULL,
+	FOREIGN KEY (cluster_link_id) REFERENCES cluster_links (id) ON DELETE CASCADE,
+	PRIMARY KEY (cluster_link_id,
+    key)
+) WITHOUT ROWID;
 CREATE TABLE config (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     key TEXT NOT NULL,
@@ -62,6 +96,15 @@ CREATE TABLE identities_auth_groups (
     FOREIGN KEY (auth_group_id) REFERENCES auth_groups (id) ON DELETE CASCADE,
     UNIQUE (identity_id, auth_group_id)
 );
+CREATE TABLE identities_certificates (
+    identity_id INTEGER NOT NULL,
+    certificate_id INTEGER NOT NULL,
+    FOREIGN KEY (identity_id) REFERENCES identities (id) ON DELETE CASCADE,
+    FOREIGN KEY (certificate_id) REFERENCES certificates (id) ON DELETE CASCADE,
+    UNIQUE (certificate_id),
+    PRIMARY KEY (identity_id,
+    certificate_id)
+) WITHOUT ROWID;
 CREATE TABLE identities_projects (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     identity_id INTEGER NOT NULL,
@@ -70,6 +113,9 @@ CREATE TABLE identities_projects (
     FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
     UNIQUE (identity_id, project_id)
 );
+CREATE UNIQUE INDEX identities_type_initial_ui ON identities ((1)) WHERE type = 11 OR type = 16;
+CREATE INDEX identity_name_auth_method ON identities (auth_method,
+    name);
 CREATE TABLE identity_provider_groups (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     name TEXT NOT NULL,
@@ -299,6 +345,33 @@ CREATE TABLE "networks_forwards_config" (
 	UNIQUE (network_forward_id, key),
 	FOREIGN KEY (network_forward_id) REFERENCES "networks_forwards" (id) ON DELETE CASCADE
 );
+CREATE TABLE networks_load_balancer_pools (
+	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+	network_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+	UNIQUE (network_id, name),
+    FOREIGN KEY (network_id) REFERENCES networks (id) ON DELETE CASCADE
+);
+CREATE TABLE networks_load_balancer_pools_config (
+	network_load_balancer_pool_id INTEGER NOT NULL,
+	key TEXT NOT NULL,
+	value TEXT,
+	UNIQUE (network_load_balancer_pool_id, key),
+	FOREIGN KEY (network_load_balancer_pool_id) REFERENCES networks_load_balancer_pools (id) ON DELETE CASCADE,
+	PRIMARY KEY (network_load_balancer_pool_id,
+    key)
+) WITHOUT ROWID;
+CREATE TABLE networks_load_balancer_pools_instances (
+	network_load_balancer_pool_id INTEGER NOT NULL,
+	instance_id INTEGER NOT NULL,
+	target_port INTEGER NOT NULL,
+	UNIQUE (network_load_balancer_pool_id, instance_id),
+	FOREIGN KEY (network_load_balancer_pool_id) REFERENCES networks_load_balancer_pools (id) ON DELETE CASCADE,
+	FOREIGN KEY (instance_id) REFERENCES instances (id) ON DELETE CASCADE,
+	PRIMARY KEY (network_load_balancer_pool_id,
+    instance_id)
+) WITHOUT ROWID;
 CREATE TABLE "networks_load_balancers" (
 	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
 	network_id INTEGER NOT NULL,
@@ -424,15 +497,72 @@ CREATE TABLE "nodes_roles" (
     FOREIGN KEY (node_id) REFERENCES "nodes" (id) ON DELETE CASCADE,
     UNIQUE (node_id, role)
 );
-CREATE TABLE "operations" (
+CREATE TABLE oidc_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     uuid TEXT NOT NULL,
-    node_id TEXT NOT NULL,
+    identity_id INTEGER NOT NULL,
+    id_token TEXT NOT NULL,
+    access_token TEXT NOT NULL,
+    refresh_token TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    user_agent TEXT NOT NULL,
+    expiry_date DATETIME NOT NULL,
+    UNIQUE (uuid),
+    FOREIGN KEY (identity_id) REFERENCES identities (id) ON DELETE CASCADE
+);
+CREATE TABLE operations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    uuid TEXT NOT NULL,
+    node_id INTEGER NOT NULL,
     type INTEGER NOT NULL DEFAULT 0,
     project_id INTEGER,
+    requestor_protocol INTEGER,
+    requestor_identity_id INTEGER,
+    entity_id INTEGER NOT NULL DEFAULT 0,
+    metadata TEXT NOT NULL,
+    class INTEGER NOT NULL DEFAULT 0,
+    created_at DATETIME NOT NULL DEFAULT 0,
+    updated_at DATETIME NOT NULL DEFAULT 0,
+    inputs TEXT NOT NULL,
+    status_code INTEGER NOT NULL DEFAULT 100,
+    error TEXT NOT NULL,
+    conflict_reference TEXT NOT NULL,
+    parent INTEGER,
+    stage INTEGER NOT NULL DEFAULT 0,
+    error_code INTEGER NOT NULL DEFAULT 0,
     UNIQUE (uuid),
-    FOREIGN KEY (node_id) REFERENCES "nodes" (id) ON DELETE CASCADE,
-    FOREIGN KEY (project_id) REFERENCES "projects" (id) ON DELETE CASCADE
+    FOREIGN KEY (node_id) REFERENCES nodes (id) ON DELETE CASCADE,
+    FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
+    FOREIGN KEY (requestor_identity_id) REFERENCES identities (id) ON DELETE CASCADE,
+    FOREIGN KEY (parent) REFERENCES operations (id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX operations_conflict_reference ON operations (conflict_reference)
+    WHERE conflict_reference != ''
+    AND status_code IN (103,104);
+CREATE TABLE operations_resources (
+    operation_id INTEGER NOT NULL,
+	entity_id INTEGER NOT NULL,
+	entity_type INTEGER NOT NULL,
+	FOREIGN KEY (operation_id) REFERENCES operations (id) ON DELETE CASCADE,
+	PRIMARY KEY (entity_type,
+    entity_id,
+    operation_id)
+) WITHOUT ROWID;
+CREATE TABLE placement_groups (
+	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    project_id INTEGER NOT NULL,
+    FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
+    UNIQUE (project_id, name)
+);
+CREATE TABLE placement_groups_config (
+	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+	placement_group_id INTEGER NOT NULL,
+	key TEXT NOT NULL,
+	value TEXT,
+	UNIQUE (placement_group_id, key),
+	FOREIGN KEY (placement_group_id) REFERENCES placement_groups (id) ON DELETE CASCADE
 );
 CREATE TABLE "profiles" (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -471,6 +601,7 @@ CREATE TABLE "projects" (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     name TEXT NOT NULL,
     description TEXT NOT NULL,
+    replica_mode INTEGER NOT NULL DEFAULT 0,
     UNIQUE (name)
 );
 CREATE TABLE "projects_config" (
@@ -481,6 +612,50 @@ CREATE TABLE "projects_config" (
     FOREIGN KEY (project_id) REFERENCES "projects" (id) ON DELETE CASCADE,
     UNIQUE (project_id, key)
 );
+CREATE TABLE replicators (
+	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+	name TEXT NOT NULL,
+	project_id INTEGER NOT NULL,
+	description TEXT NOT NULL,
+	UNIQUE(project_id, name),
+	FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE
+);
+CREATE TABLE replicators_config (
+	replicator_id INTEGER NOT NULL,
+	key TEXT NOT NULL,
+	value TEXT NOT NULL,
+	FOREIGN KEY (replicator_id) REFERENCES replicators (id) ON DELETE CASCADE,
+	PRIMARY KEY (replicator_id,
+    key)
+) WITHOUT ROWID;
+CREATE TABLE replicators_status (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    mode INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    started_date DATETIME NOT NULL,
+    finished_date DATETIME,
+    snapshot_started_date DATETIME,
+    snapshot_finished_date DATETIME,
+    replicator_id INTEGER NOT NULL,
+    FOREIGN KEY (replicator_id) REFERENCES replicators (id) ON DELETE CASCADE
+);
+CREATE INDEX replicators_status_replicator_id_id ON replicators_status (replicator_id,
+    id);
+CREATE TABLE secrets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    entity_type INTEGER NOT NULL,
+    entity_id INTEGER NOT NULL,
+    type INTEGER NOT NULL,
+    value TEXT NOT NULL,
+    creation_date DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX secrets_bearer_identity_signing_key_unique ON secrets (entity_type, entity_id, type)
+	WHERE entity_type = 24
+	AND type = 2
+;
+CREATE INDEX secrets_entity_type_entity_id_type ON secrets (entity_type,
+    entity_id,
+    type);
 CREATE TABLE "storage_buckets" (
 	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
 	name TEXT NOT NULL,
@@ -605,7 +780,7 @@ CREATE TRIGGER storage_volumes_check_id
   WHEN NEW.id IN (SELECT id FROM storage_volumes_snapshots)
   BEGIN
     SELECT RAISE(FAIL,
-    "invalid ID");
+    'invalid ID');
   END;
 CREATE TABLE "storage_volumes_config" (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -631,7 +806,7 @@ CREATE TRIGGER storage_volumes_snapshots_check_id
   WHEN NEW.id IN (SELECT id FROM storage_volumes)
   BEGIN
     SELECT RAISE(FAIL,
-    "invalid ID");
+    'invalid ID');
   END;
 CREATE TABLE "storage_volumes_snapshots_config" (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -662,5 +837,5 @@ CREATE TABLE "warnings" (
 );
 CREATE UNIQUE INDEX warnings_unique_node_id_project_id_entity_type_code_entity_id_type_code ON warnings(IFNULL(node_id, -1), IFNULL(project_id, -1), entity_type_code, entity_id, type_code);
 
-INSERT INTO schema (version, updated_at) VALUES (73, strftime("%s"))
+INSERT INTO schema (version, updated_at) VALUES (90, strftime("%s"))
 `

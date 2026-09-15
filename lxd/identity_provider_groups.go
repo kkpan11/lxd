@@ -5,27 +5,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
+	"slices"
 
-	"github.com/gorilla/mux"
-
-	"github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/lxd/auth"
-	"github.com/canonical/lxd/lxd/cluster"
 	"github.com/canonical/lxd/lxd/db"
 	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/lifecycle"
 	"github.com/canonical/lxd/lxd/request"
+	"github.com/canonical/lxd/lxd/request/security"
 	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/lxd/util"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/entity"
 )
 
 var identityProviderGroupsCmd = APIEndpoint{
-	Name: "identity_provider_groups",
-	Path: "auth/identity-provider-groups",
+	Path:        "auth/identity-provider-groups",
+	MetricsType: entity.TypeIdentity,
 	Get: APIEndpointAction{
 		Handler:       getIdentityProviderGroups,
 		AccessHandler: allowAuthenticated,
@@ -37,8 +33,8 @@ var identityProviderGroupsCmd = APIEndpoint{
 }
 
 var identityProviderGroupCmd = APIEndpoint{
-	Name: "identity_provider_group",
-	Path: "auth/identity-provider-groups/{idpGroupName}",
+	Path:        "auth/identity-provider-groups/{idpGroupName}",
+	MetricsType: entity.TypeIdentity,
 	Get: APIEndpointAction{
 		Handler:       getIdentityProviderGroup,
 		AccessHandler: allowPermission(entity.TypeIdentityProviderGroup, auth.EntitlementCanView, "idpGroupName"),
@@ -142,7 +138,7 @@ var identityProviderGroupCmd = APIEndpoint{
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func getIdentityProviderGroups(d *Daemon, r *http.Request) response.Response {
-	recursion := r.URL.Query().Get("recursion")
+	recursion, _ := util.IsRecursionRequest(r)
 	s := d.State()
 
 	canViewIDPGroup, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeIdentityProviderGroup)
@@ -155,22 +151,28 @@ func getIdentityProviderGroups(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
+	withEntitlements, err := extractEntitlementsFromQuery(r, entity.TypeIdentityProviderGroup, true)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
 	var apiIDPGroups []*api.IdentityProviderGroup
-	var idpGroups []dbCluster.IdentityProviderGroup
+	var idpGroups []dbCluster.IdentityProviderGroupsRow
+	urlToIDPGroup := make(map[*api.URL]auth.EntitlementReporter)
 	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
 		allIDPGroups, err := dbCluster.GetIdentityProviderGroups(ctx, tx.Tx())
 		if err != nil {
 			return err
 		}
 
-		idpGroups = make([]dbCluster.IdentityProviderGroup, 0, len(allIDPGroups))
+		idpGroups = make([]dbCluster.IdentityProviderGroupsRow, 0, len(allIDPGroups))
 		for _, idpGroup := range allIDPGroups {
 			if canViewIDPGroup(entity.IdentityProviderGroupURL(idpGroup.Name)) {
 				idpGroups = append(idpGroups, idpGroup)
 			}
 		}
 
-		if recursion == "1" {
+		if recursion > 0 {
 			apiIDPGroups = make([]*api.IdentityProviderGroup, 0, len(idpGroups))
 			for _, idpGroup := range idpGroups {
 				apiIDPGroup, err := idpGroup.ToAPI(ctx, tx.Tx(), canViewGroup)
@@ -179,6 +181,7 @@ func getIdentityProviderGroups(d *Daemon, r *http.Request) response.Response {
 				}
 
 				apiIDPGroups = append(apiIDPGroups, apiIDPGroup)
+				urlToIDPGroup[entity.IdentityProviderGroupURL(idpGroup.Name)] = apiIDPGroup
 			}
 		}
 
@@ -188,7 +191,14 @@ func getIdentityProviderGroups(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	if recursion == "1" {
+	if recursion > 0 {
+		if len(withEntitlements) > 0 {
+			err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeIdentityProviderGroup, withEntitlements, urlToIDPGroup)
+			if err != nil {
+				return response.SmartError(err)
+			}
+		}
+
 		return response.SyncResponse(true, apiIDPGroups)
 	}
 
@@ -234,13 +244,15 @@ func getIdentityProviderGroups(d *Daemon, r *http.Request) response.Response {
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func getIdentityProviderGroup(d *Daemon, r *http.Request) response.Response {
-	idpGroupName, err := url.PathUnescape(mux.Vars(r)["idpGroupName"])
-	if err != nil {
-		return response.InternalError(fmt.Errorf("Failed to unescape identity provider group name path parameter: %w", err))
-	}
+	idpGroupName := r.PathValue("idpGroupName")
 
 	s := d.State()
 	canViewGroup, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeAuthGroup)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	withEntitlements, err := extractEntitlementsFromQuery(r, entity.TypeIdentityProviderGroup, false)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -263,6 +275,13 @@ func getIdentityProviderGroup(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
+	if len(withEntitlements) > 0 {
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeIdentityProviderGroup, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.IdentityProviderGroupURL(idpGroupName): apiIDPGroup})
+		if err != nil {
+			return response.SmartError(err)
+		}
+	}
+
 	return response.SyncResponseETag(true, apiIDPGroup, apiIDPGroup)
 }
 
@@ -283,7 +302,7 @@ func getIdentityProviderGroup(d *Daemon, r *http.Request) response.Response {
 //	    description: Identity provider request
 //	    required: true
 //	    schema:
-//	      $ref: "#/definitions/IdentityProviderGroup"
+//	      $ref: "#/definitions/IdentityProviderGroupsPost"
 //	responses:
 //	  "200":
 //	    $ref: "#/responses/EmptySyncResponse"
@@ -294,20 +313,24 @@ func getIdentityProviderGroup(d *Daemon, r *http.Request) response.Response {
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func createIdentityProviderGroup(d *Daemon, r *http.Request) response.Response {
-	var idpGroup api.IdentityProviderGroup
+	var idpGroup api.IdentityProviderGroupsPost
 	err := json.NewDecoder(r.Body).Decode(&idpGroup)
 	if err != nil {
-		return response.BadRequest(fmt.Errorf("Failed to unmarshal request body: %w", err))
+		return response.BadRequest(fmt.Errorf("Failed unmarshaling request body: %w", err))
 	}
 
 	s := d.State()
 	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
-		id, err := dbCluster.CreateIdentityProviderGroup(ctx, tx.Tx(), dbCluster.IdentityProviderGroup{Name: idpGroup.Name})
+		id, err := dbCluster.CreateIdentityProviderGroup(ctx, tx.Tx(), dbCluster.IdentityProviderGroupsRow{Name: idpGroup.Name})
 		if err != nil {
+			if api.StatusErrorCheck(err, http.StatusConflict) {
+				return api.StatusErrorf(http.StatusConflict, "Identity provider group %q already exists", idpGroup.Name)
+			}
+
 			return err
 		}
 
-		err = dbCluster.SetIdentityProviderGroupMapping(ctx, tx.Tx(), int(id), idpGroup.Groups)
+		err = dbCluster.SetIdentityProviderGroupMapping(ctx, tx.Tx(), id, idpGroup.Groups)
 		if err != nil {
 			return err
 		}
@@ -318,25 +341,12 @@ func createIdentityProviderGroup(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	// Notify other cluster members to update their identity cache.
-	notifier, err := cluster.NewNotifier(s, s.Endpoints.NetworkCert(), s.ServerCert(), cluster.NotifyAlive)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	err = notifier(func(client lxd.InstanceServer) error {
-		_, _, err := client.RawQuery(http.MethodPost, "/internal/identity-cache-refresh", nil, "")
-		return err
-	})
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	s.UpdateIdentityCache()
-
 	// Send a lifecycle event for the IDP group creation.
-	lc := lifecycle.IdentityProviderGroupCreated.Event(idpGroup.Name, request.CreateRequestor(r), nil)
-	s.Events.SendLifecycle(api.ProjectDefaultName, lc)
+	lc := lifecycle.IdentityProviderGroupCreated.Event(idpGroup.Name, request.CreateRequestor(r.Context()), nil)
+	s.Events.SendLifecycle("", lc)
+
+	secEvt := security.AuthzAdmin.WithSuffix("idp_group_create", idpGroup.Name).UserEvent(r.Context(), security.LevelInfo, "Identity provider group created")
+	s.Events.SendSecurity(secEvt)
 
 	return response.SyncResponseLocation(true, nil, entity.IdentityProviderGroupURL(idpGroup.Name).String())
 }
@@ -368,15 +378,12 @@ func createIdentityProviderGroup(d *Daemon, r *http.Request) response.Response {
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func renameIdentityProviderGroup(d *Daemon, r *http.Request) response.Response {
-	idpGroupName, err := url.PathUnescape(mux.Vars(r)["idpGroupName"])
-	if err != nil {
-		return response.InternalError(fmt.Errorf("Failed to unescape path argument: %w", err))
-	}
+	idpGroupName := r.PathValue("idpGroupName")
 
 	var idpGroupPost api.IdentityProviderGroupPost
-	err = json.NewDecoder(r.Body).Decode(&idpGroupPost)
+	err := json.NewDecoder(r.Body).Decode(&idpGroupPost)
 	if err != nil {
-		return response.BadRequest(fmt.Errorf("Failed to unmarshal request body: %w", err))
+		return response.BadRequest(fmt.Errorf("Failed unmarshaling request body: %w", err))
 	}
 
 	s := d.State()
@@ -384,28 +391,16 @@ func renameIdentityProviderGroup(d *Daemon, r *http.Request) response.Response {
 		return dbCluster.RenameIdentityProviderGroup(ctx, tx.Tx(), idpGroupName, idpGroupPost.Name)
 	})
 	if err != nil {
+		if api.StatusErrorCheck(err, http.StatusConflict) {
+			return response.Conflict(fmt.Errorf("Identity provider group %q already exists", idpGroupPost.Name))
+		}
+
 		return response.SmartError(err)
 	}
 
-	// Notify other cluster members to update their identity cache.
-	notifier, err := cluster.NewNotifier(s, s.Endpoints.NetworkCert(), s.ServerCert(), cluster.NotifyAlive)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	err = notifier(func(client lxd.InstanceServer) error {
-		_, _, err := client.RawQuery(http.MethodPost, "/internal/identity-cache-refresh", nil, "")
-		return err
-	})
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	// Send a lifecycle event for the IDP group rename.
-	lc := lifecycle.IdentityProviderGroupRenamed.Event(idpGroupPost.Name, request.CreateRequestor(r), map[string]any{"old_name": idpGroupName})
-	s.Events.SendLifecycle(api.ProjectDefaultName, lc)
-
-	s.UpdateIdentityCache()
+	// Rename is treated as an edit per spec, no separate idp_group_rename action.
+	secEvt := security.AuthzAdmin.WithSuffix("idp_group_edit", idpGroupPost.Name).UserEvent(r.Context(), security.LevelInfo, "Identity provider group renamed from "+idpGroupName)
+	s.Events.SendSecurity(secEvt)
 
 	return response.SyncResponseLocation(true, nil, entity.IdentityProviderGroupURL(idpGroupPost.Name).String())
 }
@@ -437,15 +432,12 @@ func renameIdentityProviderGroup(d *Daemon, r *http.Request) response.Response {
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func updateIdentityProviderGroup(d *Daemon, r *http.Request) response.Response {
-	idpGroupName, err := url.PathUnescape(mux.Vars(r)["idpGroupName"])
-	if err != nil {
-		return response.InternalError(fmt.Errorf("Failed to unescape path argument: %w", err))
-	}
+	idpGroupName := r.PathValue("idpGroupName")
 
 	var idpGroupPut api.IdentityProviderGroupPut
-	err = json.NewDecoder(r.Body).Decode(&idpGroupPut)
+	err := json.NewDecoder(r.Body).Decode(&idpGroupPut)
 	if err != nil {
-		return response.BadRequest(fmt.Errorf("Failed to unmarshal request body: %w", err))
+		return response.BadRequest(fmt.Errorf("Failed unmarshaling request body: %w", err))
 	}
 
 	s := d.State()
@@ -476,25 +468,8 @@ func updateIdentityProviderGroup(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	// Notify other cluster members to update their identity cache.
-	notifier, err := cluster.NewNotifier(s, s.Endpoints.NetworkCert(), s.ServerCert(), cluster.NotifyAlive)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	err = notifier(func(client lxd.InstanceServer) error {
-		_, _, err := client.RawQuery(http.MethodPost, "/internal/identity-cache-refresh", nil, "")
-		return err
-	})
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	// Send a lifecycle event for the IDP group update.
-	lc := lifecycle.IdentityProviderGroupUpdated.Event(idpGroupName, request.CreateRequestor(r), nil)
-	s.Events.SendLifecycle(api.ProjectDefaultName, lc)
-
-	s.UpdateIdentityCache()
+	secEvt := security.AuthzAdmin.WithSuffix("idp_group_edit", idpGroupName).UserEvent(r.Context(), security.LevelInfo, "Identity provider group updated")
+	s.Events.SendSecurity(secEvt)
 
 	return response.EmptySyncResponse
 }
@@ -526,15 +501,12 @@ func updateIdentityProviderGroup(d *Daemon, r *http.Request) response.Response {
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func patchIdentityProviderGroup(d *Daemon, r *http.Request) response.Response {
-	idpGroupName, err := url.PathUnescape(mux.Vars(r)["idpGroupName"])
-	if err != nil {
-		return response.InternalError(fmt.Errorf("Failed to unescape path argument: %w", err))
-	}
+	idpGroupName := r.PathValue("idpGroupName")
 
 	var idpGroupPut api.IdentityProviderGroupPut
-	err = json.NewDecoder(r.Body).Decode(&idpGroupPut)
+	err := json.NewDecoder(r.Body).Decode(&idpGroupPut)
 	if err != nil {
-		return response.BadRequest(fmt.Errorf("Failed to unmarshal request body: %w", err))
+		return response.BadRequest(fmt.Errorf("Failed unmarshaling request body: %w", err))
 	}
 
 	s := d.State()
@@ -561,7 +533,7 @@ func patchIdentityProviderGroup(d *Daemon, r *http.Request) response.Response {
 		}
 
 		for _, newGroup := range idpGroupPut.Groups {
-			if !shared.ValueInSlice(newGroup, apiIDPGroup.Groups) {
+			if !slices.Contains(apiIDPGroup.Groups, newGroup) {
 				apiIDPGroup.Groups = append(apiIDPGroup.Groups, newGroup)
 			}
 		}
@@ -572,25 +544,8 @@ func patchIdentityProviderGroup(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	// Notify other cluster members to update their identity cache.
-	notifier, err := cluster.NewNotifier(s, s.Endpoints.NetworkCert(), s.ServerCert(), cluster.NotifyAlive)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	err = notifier(func(client lxd.InstanceServer) error {
-		_, _, err := client.RawQuery(http.MethodPost, "/internal/identity-cache-refresh", nil, "")
-		return err
-	})
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	// Send a lifecycle event for the IDP group update.
-	lc := lifecycle.IdentityProviderGroupUpdated.Event(idpGroupName, request.CreateRequestor(r), nil)
-	s.Events.SendLifecycle(api.ProjectDefaultName, lc)
-
-	s.UpdateIdentityCache()
+	secEvt := security.AuthzAdmin.WithSuffix("idp_group_edit", idpGroupName).UserEvent(r.Context(), security.LevelInfo, "Identity provider group updated")
+	s.Events.SendSecurity(secEvt)
 
 	return response.EmptySyncResponse
 }
@@ -614,38 +569,18 @@ func patchIdentityProviderGroup(d *Daemon, r *http.Request) response.Response {
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func deleteIdentityProviderGroup(d *Daemon, r *http.Request) response.Response {
-	idpGroupName, err := url.PathUnescape(mux.Vars(r)["idpGroupName"])
-	if err != nil {
-		return response.InternalError(fmt.Errorf("Failed to unescape path argument: %w", err))
-	}
+	idpGroupName := r.PathValue("idpGroupName")
 
 	s := d.State()
-	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err := s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
 		return dbCluster.DeleteIdentityProviderGroup(ctx, tx.Tx(), idpGroupName)
 	})
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	// Notify other cluster members to update their identity cache.
-	notifier, err := cluster.NewNotifier(s, s.Endpoints.NetworkCert(), s.ServerCert(), cluster.NotifyAlive)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	err = notifier(func(client lxd.InstanceServer) error {
-		_, _, err := client.RawQuery(http.MethodPost, "/internal/identity-cache-refresh", nil, "")
-		return err
-	})
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	// Send a lifecycle event for the IDP group deletion.
-	lc := lifecycle.IdentityProviderGroupDeleted.Event(idpGroupName, request.CreateRequestor(r), nil)
-	s.Events.SendLifecycle(api.ProjectDefaultName, lc)
-
-	s.UpdateIdentityCache()
+	secEvt := security.AuthzAdmin.WithSuffix("idp_group_delete", idpGroupName).UserEvent(r.Context(), security.LevelInfo, "Identity provider group deleted")
+	s.Events.SendSecurity(secEvt)
 
 	return response.EmptySyncResponse
 }

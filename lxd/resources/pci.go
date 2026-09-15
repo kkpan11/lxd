@@ -18,7 +18,7 @@ func GetPCI() (*api.ResourcesPCI, error) {
 	pci := api.ResourcesPCI{}
 	pci.Devices = []api.ResourcesPCIDevice{}
 
-	if !sysfsExists(sysBusPci) {
+	if !pathExists(sysBusPci) {
 		return &pci, nil
 	}
 
@@ -32,13 +32,13 @@ func GetPCI() (*api.ResourcesPCI, error) {
 	uname := unix.Utsname{}
 	err = unix.Uname(&uname)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to get uname: %w", err)
+		return nil, fmt.Errorf("Failed getting uname: %w", err)
 	}
 
 	// List all PCI devices
 	entries, err := os.ReadDir(sysBusPci)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to list %q: %w", sysBusPci, err)
+		return nil, fmt.Errorf("Failed listing %q: %w", sysBusPci, err)
 	}
 
 	for _, entry := range entries {
@@ -49,10 +49,10 @@ func GetPCI() (*api.ResourcesPCI, error) {
 		// Get driver name
 		driverPath := filepath.Join(devicePath, "driver")
 
-		if sysfsExists(driverPath) {
+		if pathExists(driverPath) {
 			linkTarget, err := filepath.EvalSymlinks(driverPath)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to get driver of %q: %w", devicePath, err)
+				return nil, fmt.Errorf("Failed getting driver of %q: %w", devicePath, err)
 			}
 
 			device.Driver = filepath.Base(linkTarget)
@@ -67,10 +67,11 @@ func GetPCI() (*api.ResourcesPCI, error) {
 		}
 
 		// Get NUMA node
-		if sysfsExists(filepath.Join(devicePath, "numa_node")) {
-			numaNode, err := readInt(filepath.Join(devicePath, "numa_node"))
+		numaNodePath := filepath.Join(devicePath, "numa_node")
+		if pathExists(numaNodePath) {
+			numaNode, err := readInt(numaNodePath)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(devicePath, "numa_node"), err)
+				return nil, fmt.Errorf("Failed reading %q: %w", numaNodePath, err)
 			}
 
 			if numaNode > 0 {
@@ -83,10 +84,10 @@ func GetPCI() (*api.ResourcesPCI, error) {
 
 		// Get product ID node
 		deviceDevicePath := filepath.Join(devicePath, "device")
-		if sysfsExists(deviceDevicePath) {
+		if pathExists(deviceDevicePath) {
 			id, err := os.ReadFile(deviceDevicePath)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to read %q: %w", deviceDevicePath, err)
+				return nil, fmt.Errorf("Failed reading %q: %w", deviceDevicePath, err)
 			}
 
 			device.ProductID = strings.TrimPrefix(strings.TrimSpace(string(id)), "0x")
@@ -94,10 +95,10 @@ func GetPCI() (*api.ResourcesPCI, error) {
 
 		// Get vendor ID node
 		deviceVendorPath := filepath.Join(devicePath, "vendor")
-		if sysfsExists(deviceVendorPath) {
+		if pathExists(deviceVendorPath) {
 			id, err := os.ReadFile(deviceVendorPath)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to read %q: %w", deviceVendorPath, err)
+				return nil, fmt.Errorf("Failed reading %q: %w", deviceVendorPath, err)
 			}
 
 			device.VendorID = strings.TrimPrefix(strings.TrimSpace(string(id)), "0x")
@@ -120,16 +121,16 @@ func GetPCI() (*api.ResourcesPCI, error) {
 
 		// Get IOMMU Group
 		iommuGroupSymPath := filepath.Join(sysBusPci, device.PCIAddress, "iommu_group")
-		if sysfsExists(iommuGroupSymPath) {
+		if pathExists(iommuGroupSymPath) {
 			iommuGroupPath, err := os.Readlink(iommuGroupSymPath)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to readlink %q: %w", iommuGroupSymPath, err)
+				return nil, fmt.Errorf("Failed readlinking %q: %w", iommuGroupSymPath, err)
 			}
 
 			iommuGroup := filepath.Base(iommuGroupPath)
 			device.IOMMUGroup, err = strconv.ParseUint(iommuGroup, 10, 64)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to parse %q: %w", iommuGroup, err)
+				return nil, fmt.Errorf("Failed parsing %q: %w", iommuGroup, err)
 			}
 		} else {
 			device.IOMMUGroup = 0
@@ -137,7 +138,7 @@ func GetPCI() (*api.ResourcesPCI, error) {
 
 		// Get VPD info
 		vpdSysPath := filepath.Join(devicePath, "vpd")
-		if sysfsExists(vpdSysPath) {
+		if pathExists(vpdSysPath) {
 			data, err := os.ReadFile(vpdSysPath)
 
 			// If the file is readable, parse the VPD data.

@@ -1,46 +1,38 @@
+---
+myst:
+  html_meta:
+    description: An index of how-to guides for common LXD server and client operations, including how to configure the server and set up OIDC single sign-on.
+---
+
 (lxd-server)=
 # LXD server and client
 
-```{only} diataxis
-The following how-to guides cover common operations related to the LXD server:
+These how-to guides cover common operations related to the LXD server and client.
+
+## Configure the LXD server
+
+```{toctree}
+:titlesonly:
+:maxdepth: 1
+
+Configure the LXD server </howto/server_configure>
+Expose LXD to the network </howto/server_expose>
+Configure single sign-on with OIDC </howto/oidc>
 ```
 
-```{filtered-toctree}
+## Configure the LXD CLI client
+
+The LXD CLI client (`lxc`) can be configured to use remote servers instead of the local LXD daemon. For convenience, aliases can be set up for frequently used commands.
+
+```{toctree}
 :titlesonly:
 
-:diataxis:Expose LXD to the network </howto/server_expose>
-:diataxis:Configure the LXD server </howto/server_configure>
-```
-
-```{only} diataxis
-The following how-to guides cover common operations related to the LXD client (`lxc`):
-```
-
-```{filtered-toctree}
-:titlesonly:
-
-:diataxis:Add remote servers </remotes>
-:diataxis:Add command aliases </howto/lxc_alias>
+Add remote servers </remotes>
+Add command aliases </howto/lxc_alias>
 ```
 
 ## Related topics
 
-```{only} diataxis
 {{server_exp}}
 
 {{server_ref}}
-```
-
-```{filtered-toctree}
-:maxdepth: 1
-
-:topical:/explanation/lxd_lxc
-:topical:/database
-:topical:/explanation/lxc_show_info
-:topical:Configure the LXD server </howto/server_configure>
-:topical:Add remote servers </remotes>
-:topical:Add command aliases </howto/lxc_alias>
-:topical:/server
-:topical:/architectures
-:topical:/reference/manpages
-```

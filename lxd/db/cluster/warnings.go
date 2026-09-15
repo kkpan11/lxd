@@ -18,6 +18,7 @@ import (
 //go:generate mapper stmt -e warning objects-by-UUID
 //go:generate mapper stmt -e warning objects-by-Project
 //go:generate mapper stmt -e warning objects-by-Status
+//go:generate mapper stmt -e warning objects-by-Node-and-Status
 //go:generate mapper stmt -e warning objects-by-Node-and-TypeCode
 //go:generate mapper stmt -e warning objects-by-Node-and-TypeCode-and-Project
 //go:generate mapper stmt -e warning objects-by-Node-and-TypeCode-and-Project-and-EntityType-and-EntityID
@@ -31,6 +32,8 @@ import (
 //go:generate mapper method -i -e warning DeleteMany-by-EntityType-and-EntityID
 //go:generate mapper method -i -e warning ID
 //go:generate mapper method -i -e warning Exists struct=Warning
+//go:generate goimports -w warnings.mapper.go
+//go:generate goimports -w warnings.interface.mapper.go
 
 // Warning is a value object holding db-related details about a warning.
 type Warning struct {

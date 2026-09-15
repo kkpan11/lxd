@@ -19,7 +19,8 @@ func getPlatformVersionStrings() []string {
 		return versions
 	}
 
-	versions = append(versions, strings.Split(uname.Release, "-")[0])
+	kernelVersion, _, _ := strings.Cut(uname.Release, "-")
+	versions = append(versions, kernelVersion)
 
 	// Add distribution info
 	lsbRelease, err := osarch.GetLSBRelease()
@@ -33,11 +34,10 @@ func getPlatformVersionStrings() []string {
 	}
 
 	// Add chromebook info
-	if len(versions) == 1 && shared.PathExists("/run/cros_milestone") {
+	if len(versions) == 1 {
 		content, err := os.ReadFile("/run/cros_milestone")
 		if err == nil {
-			versions = append(versions, "Chrome OS")
-			versions = append(versions, strings.TrimSpace(string(content)))
+			versions = append(versions, "Chrome OS", strings.TrimSpace(string(content)))
 		}
 	}
 

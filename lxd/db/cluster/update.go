@@ -1,8 +1,13 @@
 package cluster
 
+// Have to run goimports first because the .mapper files are being generated at the same time.
+// This causes "freshschema" to be unable to import the cluster package.
+//go:generate go run ../freshschema/main.go cluster
+
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -10,7 +15,9 @@ import (
 
 	"github.com/canonical/lxd/lxd/db/query"
 	"github.com/canonical/lxd/lxd/db/schema"
+	"github.com/canonical/lxd/lxd/identity"
 	"github.com/canonical/lxd/shared"
+	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/osarch"
 )
@@ -30,7 +37,7 @@ func FreshSchema() string {
 // SchemaDotGo refreshes the schema.go file in this package, using the updates
 // defined here.
 func SchemaDotGo() error {
-	return schema.DotGo(updates, "schema")
+	return schema.DotGo(updates, "cluster", "schema.go")
 }
 
 // SchemaVersion is the current version of the cluster database schema.
@@ -110,6 +117,629 @@ var updates = map[int]schema.Update{
 	71: updateFromV70,
 	72: updateFromV71,
 	73: updateFromV72,
+	74: updateFromV73,
+	75: updateFromV74,
+	76: updateFromV75,
+	77: updateFromV76,
+	78: updateFromV77,
+	79: updateFromV78,
+	80: updateFromV79,
+	81: updateFromV80,
+	82: updateFromV81,
+	83: updateFromV82,
+	84: updateFromV83,
+	85: updateFromV84,
+	86: updateFromV85,
+	87: updateFromV86,
+	88: updateFromV87,
+	89: updateFromV88,
+	90: updateFromV89,
+}
+
+// updateFromV89 converts bearer identities that have no signing key to their pending type.
+//
+// A bearer identity has no usable token when it has no signing key and this is now reflected by
+// a distinct pending identity type. Identities that still hold a signing key keep their active type,
+// even if the issued token has already expired.
+func updateFromV89(ctx context.Context, tx *sql.Tx) error {
+	// Identity type codes:
+	// 9:  DevLXD token bearer
+	// 10: Client token bearer
+	// 11: Initial UI token bearer
+	// 14: Client token bearer (pending)
+	// 15: DevLXD token bearer (pending)
+	// 16: Initial UI token bearer (pending)
+	//
+	// Entity type codes:
+	// 24: Identity entities
+	//
+	// Secret type codes:
+	// 2:  Bearer signing keys
+	//
+	// There can only ever be one initial UI identity. The replacement index holds that invariant across both of its
+	// type codes by indexing a constant rather than the type, so that every covered row has the same key and a second
+	// one collides with the first whether or not the two share a type.
+	_, err := tx.ExecContext(ctx, `
+-- Replace the initial UI index with one that also covers the pending initial UI type.
+DROP INDEX identities_type_initial_ui;
+
+-- Index the same constant for both pending and non-pending initial UI identity to ensure only one exists.
+CREATE UNIQUE INDEX identities_type_initial_ui ON identities ((1)) WHERE type = 11 OR type = 16;
+
+-- Convert DevLXD bearer identities without a signing key to the pending type.
+UPDATE identities
+SET type = 15
+WHERE type = 9
+	AND NOT EXISTS (
+		SELECT 1 FROM secrets
+		WHERE secrets.entity_type = 24
+			AND secrets.entity_id = identities.id
+			AND secrets.type = 2
+	);
+
+-- Convert client bearer identities without a signing key to the pending type.
+UPDATE identities
+SET type = 14
+WHERE type = 10
+	AND NOT EXISTS (
+		SELECT 1 FROM secrets
+		WHERE secrets.entity_type = 24
+			AND secrets.entity_id = identities.id
+			AND secrets.type = 2
+	);
+
+-- Convert the initial UI bearer identity without a signing key to the pending type.
+UPDATE identities
+SET type = 16
+WHERE type = 11
+	AND NOT EXISTS (
+		SELECT 1 FROM secrets
+		WHERE secrets.entity_type = 24
+			AND secrets.entity_id = identities.id
+			AND secrets.type = 2
+	);
+`)
+
+	return err
+}
+
+func updateFromV88(ctx context.Context, tx *sql.Tx) error {
+	type replicatorStatus struct {
+		lastRunDate   sql.NullTime
+		lastRunStatus string
+	}
+
+	replicatorStatuses := make(map[int64]replicatorStatus)
+	err := query.Scan(ctx, tx, "SELECT id, last_run_status, last_run_date FROM replicators", func(scan func(dest ...any) error) error {
+		var rs replicatorStatus
+		var id int64
+		err := scan(&id, &rs.lastRunStatus, &rs.lastRunDate)
+		if err != nil {
+			return err
+		}
+
+		replicatorStatuses[id] = rs
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	replicatorConfigs, err := ReplicatorsConfigStore().GetAll(ctx, tx)
+	if err != nil {
+		return err
+	}
+
+	args := make([]any, 0, len(replicatorStatuses)*4)
+	values := make([]string, 0, len(replicatorStatuses))
+	for id, rs := range replicatorStatuses {
+		mode := replicatorRunModeCodeManual
+		if !rs.lastRunDate.Valid {
+			continue
+		}
+
+		values = append(values, query.Params(4))
+
+		config, ok := replicatorConfigs[id]
+		if !ok {
+			args = append(args, mode, rs.lastRunStatus, rs.lastRunDate.Time, id)
+			continue
+		}
+
+		schedule, ok := config["schedule"]
+		if !ok {
+			args = append(args, mode, rs.lastRunStatus, rs.lastRunDate.Time, id)
+			continue
+		}
+
+		specs := shared.SplitNTrimSpace(schedule, ", ", -1, true)
+		for _, spec := range specs {
+			isActive, err := shared.CronSpecIsActiveThisMinute(spec, rs.lastRunDate.Time)
+			if err == nil && isActive {
+				mode = replicatorRunModeCodeScheduled
+				break
+			}
+		}
+
+		args = append(args, mode, rs.lastRunStatus, rs.lastRunDate.Time, id)
+	}
+
+	_, err = tx.ExecContext(ctx, `
+CREATE TABLE replicators_status (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    mode INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    started_date DATETIME NOT NULL,
+    finished_date DATETIME,
+    snapshot_started_date DATETIME,
+    snapshot_finished_date DATETIME,
+    replicator_id INTEGER NOT NULL,
+    FOREIGN KEY (replicator_id) REFERENCES replicators (id) ON DELETE CASCADE
+);
+
+-- Create an index allowing performant queries for last replicator status.
+-- We will often want MAX(id) by replicator_id.
+CREATE INDEX replicators_status_replicator_id_id ON replicators_status (replicator_id, id);
+`)
+	if err != nil {
+		return fmt.Errorf("Failed creating replicator status table: %w", err)
+	}
+
+	if len(values) > 0 {
+		_, err = tx.ExecContext(ctx, `INSERT INTO replicators_status (mode, status, started_date, replicator_id) VALUES `+strings.Join(values, ", "), args...)
+		if err != nil {
+			return fmt.Errorf("Failed moving replicator run statuses: %w", err)
+		}
+	}
+
+	_, err = tx.ExecContext(ctx, `
+ALTER TABLE replicators DROP COLUMN last_run_date;
+ALTER TABLE replicators DROP COLUMN last_run_status;
+`)
+	if err != nil {
+		return fmt.Errorf("Failed dropping replicator last run columns: %w", err)
+	}
+
+	return nil
+}
+
+func updateFromV87(ctx context.Context, tx *sql.Tx) error {
+	// Recreate cluster_links with nullable identity_id to support unidirectional links.
+	// Add cluster_links_certificates to store the remote cert for unidirectional links.
+	//
+	// Renaming cluster_links to cluster_links_old causes cluster_links_config's
+	// foreign key to be rewritten to reference "cluster_links_old". We must recreate
+	// cluster_links_config to restore the correct foreign key reference to cluster_links.
+	_, err := tx.ExecContext(ctx, `
+ALTER TABLE cluster_links RENAME TO cluster_links_old;
+
+CREATE TABLE cluster_links (
+	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+	identity_id INTEGER,
+	description TEXT NOT NULL,
+	name TEXT NOT NULL,
+	type INTEGER NOT NULL DEFAULT 0,
+	UNIQUE(identity_id),
+	UNIQUE(name),
+	FOREIGN KEY (identity_id) REFERENCES identities (id) ON DELETE CASCADE
+);
+
+INSERT INTO cluster_links SELECT * FROM cluster_links_old;
+
+CREATE TABLE cluster_links_config_new (
+	cluster_link_id INTEGER NOT NULL,
+	key TEXT NOT NULL,
+	value TEXT NOT NULL,
+	FOREIGN KEY (cluster_link_id) REFERENCES cluster_links (id) ON DELETE CASCADE,
+	PRIMARY KEY (cluster_link_id, key)
+) WITHOUT ROWID;
+
+INSERT INTO cluster_links_config_new SELECT * FROM cluster_links_config;
+DROP TABLE cluster_links_config;
+ALTER TABLE cluster_links_config_new RENAME TO cluster_links_config;
+
+DROP TABLE cluster_links_old;
+
+CREATE TABLE cluster_links_certificates (
+	cluster_link_id INTEGER NOT NULL,
+	certificate_id INTEGER NOT NULL,
+	FOREIGN KEY (cluster_link_id) REFERENCES cluster_links (id) ON DELETE CASCADE,
+	FOREIGN KEY (certificate_id) REFERENCES certificates (id) ON DELETE CASCADE,
+	UNIQUE (certificate_id),
+	PRIMARY KEY (cluster_link_id, certificate_id)
+) WITHOUT ROWID;
+`)
+
+	return err
+}
+
+func updateFromV86(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `
+CREATE TABLE networks_load_balancer_pools (
+	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+	network_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+	UNIQUE (network_id, name),
+    FOREIGN KEY (network_id) REFERENCES networks (id) ON DELETE CASCADE
+);
+
+CREATE TABLE networks_load_balancer_pools_config (
+	network_load_balancer_pool_id INTEGER NOT NULL,
+	key TEXT NOT NULL,
+	value TEXT,
+	UNIQUE (network_load_balancer_pool_id, key),
+	FOREIGN KEY (network_load_balancer_pool_id) REFERENCES networks_load_balancer_pools (id) ON DELETE CASCADE,
+	PRIMARY KEY (network_load_balancer_pool_id, key)
+) WITHOUT ROWID;
+
+CREATE TABLE networks_load_balancer_pools_instances (
+	network_load_balancer_pool_id INTEGER NOT NULL,
+	instance_id INTEGER NOT NULL,
+	target_port INTEGER NOT NULL,
+	UNIQUE (network_load_balancer_pool_id, instance_id),
+	FOREIGN KEY (network_load_balancer_pool_id) REFERENCES networks_load_balancer_pools (id) ON DELETE CASCADE,
+	FOREIGN KEY (instance_id) REFERENCES instances (id) ON DELETE CASCADE,
+	PRIMARY KEY (network_load_balancer_pool_id, instance_id)
+) WITHOUT ROWID;
+`)
+
+	return err
+}
+
+func updateFromV85(ctx context.Context, tx *sql.Tx) error {
+	// Add replica_mode column to projects table as an integer.
+	// 0 = none (default), 1 = leader, 2 = standby.
+	_, err := tx.ExecContext(ctx, `ALTER TABLE projects ADD COLUMN replica_mode INTEGER NOT NULL DEFAULT 0`)
+	if err != nil {
+		return err
+	}
+
+	// Migrate existing replica.mode config values into the new column.
+	// This preserves leader/standby configuration for projects that had
+	// replica.mode set via the legacy config key on previous versions.
+	_, err = tx.ExecContext(ctx, `
+UPDATE projects
+SET replica_mode = (
+	SELECT CASE projects_config.value
+		WHEN 'leader'  THEN 1
+		WHEN 'standby' THEN 2
+		ELSE 0
+	END
+	FROM projects_config
+	WHERE projects_config.project_id = projects.id
+		AND projects_config.key = 'replica.mode'
+)
+WHERE EXISTS (
+	SELECT 1
+	FROM projects_config
+	WHERE projects_config.project_id = projects.id
+		AND projects_config.key = 'replica.mode'
+)`)
+	if err != nil {
+		return err
+	}
+
+	// Remove the legacy replica.mode config key now that it is stored in the projects table.
+	_, err = tx.ExecContext(ctx, `DELETE FROM projects_config WHERE key = 'replica.mode'`)
+	return err
+}
+
+func updateFromV84(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `
+DROP TRIGGER IF EXISTS identities_certificates_after_delete;
+`)
+
+	return err
+}
+
+func updateFromV83(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.Exec(`
+CREATE TABLE replicators (
+	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+	name TEXT NOT NULL,
+	project_id INTEGER NOT NULL,
+	description TEXT NOT NULL,
+	last_run_date DATETIME,
+	last_run_status TEXT NOT NULL,
+	UNIQUE(project_id, name),
+	FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE
+);
+
+CREATE TABLE replicators_config (
+	replicator_id INTEGER NOT NULL,
+	key TEXT NOT NULL,
+	value TEXT NOT NULL,
+	FOREIGN KEY (replicator_id) REFERENCES replicators (id) ON DELETE CASCADE,
+	PRIMARY KEY (replicator_id, key)
+) WITHOUT ROWID;
+`)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func updateFromV82(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `
+CREATE TABLE cluster_links (
+	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+	identity_id INTEGER NOT NULL,
+	description TEXT NOT NULL,
+	name TEXT NOT NULL,
+	type INTEGER NOT NULL DEFAULT 0,
+	UNIQUE(identity_id),
+	UNIQUE(name),
+	FOREIGN KEY (identity_id) REFERENCES identities (id) ON DELETE CASCADE
+);
+
+CREATE TABLE cluster_links_config (
+	cluster_link_id INTEGER NOT NULL,
+	key TEXT NOT NULL,
+	value TEXT NOT NULL,
+	FOREIGN KEY (cluster_link_id) REFERENCES cluster_links (id) ON DELETE CASCADE,
+	PRIMARY KEY (cluster_link_id, key)
+) WITHOUT ROWID;
+`)
+
+	return err
+}
+
+func updateFromV81(ctx context.Context, tx *sql.Tx) error {
+	q := `SELECT identities.id, identities.name, identities.identifier, identities.type, json_extract(identities.metadata, '$.cert') FROM identities WHERE json_valid(identities.metadata) = 1 AND json_extract(identities.metadata, '$.cert') IS NOT NULL`
+
+	type certIdentity struct {
+		name       string
+		identifier string
+		idType     IdentityType
+		cert       string
+	}
+
+	certIdentities := make(map[int64]certIdentity)
+	err := query.Scan(ctx, tx, q, func(scan func(dest ...any) error) error {
+		var id int64
+		var idType IdentityType
+		var name, identifier, cert string
+		err := scan(&id, &name, &identifier, &idType, &cert)
+		if err != nil {
+			return err
+		}
+
+		certIdentities[id] = certIdentity{
+			name:       name,
+			identifier: identifier,
+			idType:     idType,
+			cert:       cert,
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("Failed getting existing certificates: %w", err)
+	}
+
+	_, err = tx.ExecContext(ctx, `
+CREATE TABLE certificates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    certificate TEXT NOT NULL,
+    creation_date DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (fingerprint)
+);
+-- Associate identities to certificates. The certificate ID is unique because each identity
+-- may only reference the same certificate once, and no identities may share certificates.
+-- This enforces a 1:n association, rather than an m:n association.
+CREATE TABLE identities_certificates (
+    identity_id INTEGER NOT NULL,
+    certificate_id INTEGER NOT NULL,
+    FOREIGN KEY (identity_id) REFERENCES identities (id) ON DELETE CASCADE,
+    FOREIGN KEY (certificate_id) REFERENCES certificates (id) ON DELETE CASCADE,
+    UNIQUE (certificate_id),
+    PRIMARY KEY (identity_id, certificate_id)
+) WITHOUT ROWID;
+-- We can't cascade deletion from the identities tables to the certificates table.
+-- This trigger ensures that certificates are deleted when an identity is deleted via foreign key cascade deletion
+-- in the association table.
+CREATE TRIGGER identities_certificates_after_delete
+    AFTER DELETE ON identities_certificates
+	BEGIN
+	DELETE FROM certificates
+		WHERE certificates.id = OLD.certificate_id;
+	END;
+`)
+	if err != nil {
+		return fmt.Errorf("Failed writing certificates tables: %w", err)
+	}
+
+	for identityID, certIdentity := range certIdentities {
+		res, err := tx.ExecContext(ctx, `INSERT INTO certificates (fingerprint, certificate) VALUES (?, ?)`, certIdentity.identifier, certIdentity.cert)
+		if err != nil {
+			return fmt.Errorf("Failed writing certificate: %w", err)
+		}
+
+		certID, err := res.LastInsertId()
+		if err != nil {
+			return err
+		}
+
+		res, err = tx.ExecContext(ctx, `INSERT INTO identities_certificates (identity_id, certificate_id) VALUES (?, ?)`, identityID, certID)
+		if err != nil {
+			return fmt.Errorf("Failed writing identity certificate association: %w", err)
+		}
+
+		nInserts, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+
+		if nInserts != 1 {
+			return errors.New("Failed validating write of identity certificate association")
+		}
+	}
+
+	// Certificate metadata has only ever contained a JSON object with a single "cert" key containing the PEM encoded certificate.
+	// There are no other identities that authenticate via TLS whose certificate is stored anywhere else, and all of these
+	// certificates have now been moved into the certificates table. It is safe for us to remove the certificates from identity
+	// metadata now.
+	stmt := `UPDATE identities SET metadata = '' WHERE json_valid(metadata) = 1 AND json_extract(identities.metadata, '$.cert') IS NOT NULL`
+	res, err := tx.ExecContext(ctx, stmt)
+	if err != nil {
+		return fmt.Errorf("Failed unsetting identity metadata: %w", err)
+	}
+
+	nRowsUpdated, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+
+	if int(nRowsUpdated) != len(certIdentities) {
+		return fmt.Errorf("Expected to update %d rows but updated %d", len(certIdentities), nRowsUpdated)
+	}
+
+	return nil
+}
+
+func updateFromV80(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `
+ALTER TABLE operations ADD COLUMN error_code INTEGER NOT NULL DEFAULT 0;
+`)
+	return err
+}
+
+func updateFromV79(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `
+CREATE UNIQUE INDEX identities_type_initial_ui ON identities (type) WHERE type = `+strconv.FormatInt(identity.TokenBearerInitialUI{}.Code(), 10))
+	return err
+}
+
+func updateFromV78(ctx context.Context, tx *sql.Tx) error {
+	statusCodeRunning := strconv.Itoa(int(api.Running))
+	statusCodeCancelling := strconv.Itoa(int(api.Cancelling))
+
+	_, err := tx.ExecContext(ctx, `
+-- All nodes clear their entries in the operations table on node startup and shutdown.
+-- So there should be no entries in the operations table when the update is run and we can just drop it.
+DROP TABLE operations;
+
+-- Create the new version of the operations table.
+CREATE TABLE operations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    uuid TEXT NOT NULL,
+    node_id INTEGER NOT NULL,
+    type INTEGER NOT NULL DEFAULT 0,
+    project_id INTEGER,
+    requestor_protocol INTEGER,
+    requestor_identity_id INTEGER,
+    entity_id INTEGER NOT NULL DEFAULT 0,
+    metadata TEXT NOT NULL,
+    class INTEGER NOT NULL DEFAULT 0,
+    created_at DATETIME NOT NULL DEFAULT 0,
+    updated_at DATETIME NOT NULL DEFAULT 0,
+    inputs TEXT NOT NULL,
+    status_code INTEGER NOT NULL DEFAULT 100,
+    error TEXT NOT NULL,
+    conflict_reference TEXT NOT NULL,
+    parent INTEGER,
+    stage INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (uuid),
+    FOREIGN KEY (node_id) REFERENCES nodes (id) ON DELETE CASCADE,
+    FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
+    FOREIGN KEY (requestor_identity_id) REFERENCES identities (id) ON DELETE CASCADE,
+    FOREIGN KEY (parent) REFERENCES operations (id) ON DELETE CASCADE
+);
+
+-- Create a conditional unique index to prevent multiple running operations with the same conflict_reference.
+CREATE UNIQUE INDEX operations_conflict_reference ON operations (conflict_reference)
+    WHERE conflict_reference != ""
+    AND status_code IN (`+statusCodeRunning+`,`+statusCodeCancelling+`);
+
+-- Create new table to store operation resources.
+CREATE TABLE operations_resources (
+    operation_id INTEGER NOT NULL,
+	entity_id INTEGER NOT NULL,
+	entity_type INTEGER NOT NULL,
+	FOREIGN KEY (operation_id) REFERENCES operations (id) ON DELETE CASCADE,
+	PRIMARY KEY (entity_type, entity_id, operation_id)
+) WITHOUT ROWID;
+`)
+	return err
+}
+
+func updateFromV77(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `
+CREATE TABLE placement_groups (
+	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    project_id INTEGER NOT NULL,
+    FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
+    UNIQUE (project_id, name)
+);
+
+CREATE TABLE placement_groups_config (
+	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+	placement_group_id INTEGER NOT NULL,
+	key TEXT NOT NULL,
+	value TEXT,
+	UNIQUE (placement_group_id, key),
+	FOREIGN KEY (placement_group_id) REFERENCES placement_groups (id) ON DELETE CASCADE
+);
+`)
+	return err
+}
+
+func updateFromV76(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `
+CREATE TABLE oidc_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    uuid TEXT NOT NULL,
+    identity_id INTEGER NOT NULL,
+    id_token TEXT NOT NULL,
+    access_token TEXT NOT NULL,
+    refresh_token TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    user_agent TEXT NOT NULL,
+    expiry_date DATETIME NOT NULL,
+    UNIQUE (uuid),
+    FOREIGN KEY (identity_id) REFERENCES identities (id) ON DELETE CASCADE
+);
+`)
+	return err
+}
+
+func updateFromV75(ctx context.Context, tx *sql.Tx) error {
+	entityTypeCode := strconv.FormatInt(entityTypeCodeIdentity, 10)
+	secretTypeCode := strconv.FormatInt(secretTypeCodeBearerSigningKey, 10)
+	_, err := tx.ExecContext(ctx, `
+CREATE UNIQUE INDEX secrets_bearer_identity_signing_key_unique ON secrets (entity_type, entity_id, type)
+	WHERE entity_type = `+entityTypeCode+`
+	AND type = `+secretTypeCode+`
+`)
+	return err
+}
+
+func updateFromV74(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `
+CREATE INDEX identity_name_auth_method ON identities (auth_method, name);
+`)
+	return err
+}
+
+func updateFromV73(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `
+CREATE TABLE secrets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    entity_type INTEGER NOT NULL,
+    entity_id INTEGER NOT NULL,
+    type INTEGER NOT NULL,
+    value TEXT NOT NULL,
+    creation_date DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX secrets_entity_type_entity_id_type ON secrets (entity_type, entity_id, type);
+`)
+	return err
 }
 
 func updateFromV72(ctx context.Context, tx *sql.Tx) error {
@@ -146,7 +776,7 @@ ALTER TABLE identities ADD COLUMN updated_date DATETIME NOT NULL DEFAULT "0001-0
 	return nil
 }
 
-func updateFromV70(ctx context.Context, tx *sql.Tx) error {
+func updateFromV70(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 CREATE TABLE auth_groups (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -203,7 +833,7 @@ CREATE TABLE auth_groups_permissions (
 	return nil
 }
 
-func updateFromV69(ctx context.Context, tx *sql.Tx) error {
+func updateFromV69(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 CREATE TABLE identities (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -243,7 +873,7 @@ DROP TABLE certificates_projects;
 }
 
 // updateFromV68 fixes unique index for record name to make it zone specific.
-func updateFromV68(ctx context.Context, tx *sql.Tx) error {
+func updateFromV68(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 CREATE TABLE networks_zones_records_new (
 	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -316,7 +946,7 @@ func updateFromV67(ctx context.Context, tx *sql.Tx) error {
 	for _, projectID := range projectIDs {
 		_, err = tx.Exec(`INSERT OR REPLACE INTO projects_config (project_id,key,value) VALUES(?,?,?);`, projectID, "features.networks.zones", "true")
 		if err != nil {
-			return fmt.Errorf("Failed adding features.networks.zones=true to project ID %q: %w", projectID, err)
+			return fmt.Errorf("Failed adding features.networks.zones=true to project ID %d: %w", projectID, err)
 		}
 
 		logger.Info("Added features.networks.zones=true on project with features.networks=true", logger.Ctx{"projectID": projectID})
@@ -326,7 +956,7 @@ func updateFromV67(ctx context.Context, tx *sql.Tx) error {
 }
 
 // updateFromV66 adds creation_date column to storage_volumes and storage_volumes_snapshots tables.
-func updateFromV66(ctx context.Context, tx *sql.Tx) error {
+func updateFromV66(_ context.Context, tx *sql.Tx) error {
 	q := `
 ALTER TABLE storage_volumes ADD COLUMN creation_date DATETIME NOT NULL DEFAULT "0001-01-01T00:00:00Z";
 ALTER TABLE storage_volumes_snapshots ADD COLUMN creation_date DATETIME NOT NULL DEFAULT "0001-01-01T00:00:00Z";
@@ -372,7 +1002,7 @@ CREATE VIEW storage_volumes_all (
 }
 
 // updateFromV65 fixes typo in cephobject.radosgw.endpoint* settings.
-func updateFromV65(ctx context.Context, tx *sql.Tx) error {
+func updateFromV65(_ context.Context, tx *sql.Tx) error {
 	q := `
 	UPDATE storage_pools_config
 	SET key = REPLACE(key, "cephobject.radosgsw.endpoint", "cephobject.radosgw.endpoint")
@@ -387,7 +1017,7 @@ func updateFromV65(ctx context.Context, tx *sql.Tx) error {
 }
 
 // updatefromV64 updates nodes_cluster_groups to include an ID field so that it works well with lxd-generate.
-func updateFromV64(ctx context.Context, tx *sql.Tx) error {
+func updateFromV64(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 CREATE TABLE "nodes_cluster_groups_new" (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -535,7 +1165,7 @@ func updateFromV62(ctx context.Context, tx *sql.Tx) error {
 }
 
 // updateFromV61 converts config value fields to NOT NULL and config key fields to TEXT (from VARCHAR).
-func updateFromV61(ctx context.Context, tx *sql.Tx) error {
+func updateFromV61(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 CREATE TABLE "instances_config_new" (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -739,7 +1369,7 @@ ALTER TABLE "storage_volumes_snapshots_config_new" RENAME TO "storage_volumes_sn
 }
 
 // updateFromV60 creates the networks_load_balancers and networks_load_balancers_config tables.
-func updateFromV60(ctx context.Context, tx *sql.Tx) error {
+func updateFromV60(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 CREATE TABLE "networks_load_balancers" (
 	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -770,7 +1400,7 @@ CREATE TABLE "networks_load_balancers_config" (
 	return nil
 }
 
-func updateFromV59(ctx context.Context, tx *sql.Tx) error {
+func updateFromV59(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 CREATE TABLE networks_zones_records (
 	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -798,7 +1428,7 @@ CREATE TABLE networks_zones_records_config (
 	return nil
 }
 
-func updateFromV58(ctx context.Context, tx *sql.Tx) error {
+func updateFromV58(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 UPDATE sqlite_sequence SET seq = (
     SELECT max(
@@ -811,7 +1441,7 @@ WHERE name='storage_volumes';
 	return err
 }
 
-func updateFromV57(ctx context.Context, tx *sql.Tx) error {
+func updateFromV57(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 UPDATE sqlite_sequence SET seq = (
     SELECT coalesce(max(max(coalesce(storage_volumes.id, 0)), max(coalesce(storage_volumes_snapshots.id, 0))), 0)
@@ -822,7 +1452,7 @@ WHERE name='storage_volumes';
 	return err
 }
 
-func updateFromV56(ctx context.Context, tx *sql.Tx) error {
+func updateFromV56(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 UPDATE sqlite_sequence SET seq = (
     SELECT max(max(coalesce(storage_volumes.id, 0)), max(coalesce(storage_volumes_snapshots.id, 0)))
@@ -833,7 +1463,7 @@ WHERE name='storage_volumes';
 	return err
 }
 
-func updateFromV55(ctx context.Context, tx *sql.Tx) error {
+func updateFromV55(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 DROP VIEW storage_volumes_all;
 
@@ -1641,7 +2271,7 @@ CREATE VIEW storage_volumes_all (
 	return nil
 }
 
-func updateFromV54(ctx context.Context, tx *sql.Tx) error {
+func updateFromV54(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 DROP VIEW certificates_projects_ref;
 DROP VIEW instances_config_ref;
@@ -1656,14 +2286,14 @@ DROP VIEW projects_config_ref;
 DROP VIEW projects_used_by_ref;
 `)
 	if err != nil {
-		return fmt.Errorf("Failed to drop database views: %w", err)
+		return fmt.Errorf("Failed dropping database views: %w", err)
 	}
 
 	return nil
 }
 
 // updateFromV53 creates the cluster_groups and nodes_cluster_groups tables.
-func updateFromV53(ctx context.Context, tx *sql.Tx) error {
+func updateFromV53(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 CREATE TABLE "cluster_groups" (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -1692,7 +2322,7 @@ INSERT INTO nodes_cluster_groups (node_id, group_id) SELECT id, 1 FROM nodes;
 }
 
 // updateFromV52 creates the networks_zones and networks_zones_config tables.
-func updateFromV52(ctx context.Context, tx *sql.Tx) error {
+func updateFromV52(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 CREATE TABLE "networks_zones" (
 	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -1720,7 +2350,7 @@ CREATE TABLE "networks_zones_config" (
 }
 
 // updateFromV51 creates the networks_peers and networks_peers_config tables.
-func updateFromV51(ctx context.Context, tx *sql.Tx) error {
+func updateFromV51(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 CREATE TABLE "networks_peers" (
 	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -1753,7 +2383,7 @@ CREATE TABLE "networks_peers_config" (
 }
 
 // updateFromV50 creates the nodes_config table.
-func updateFromV50(ctx context.Context, tx *sql.Tx) error {
+func updateFromV50(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 CREATE TABLE "nodes_config" (
 id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -1773,7 +2403,7 @@ UNIQUE (node_id, key)
 }
 
 // updateFromV49 creates the networks_forwards and networks_forwards_config tables.
-func updateFromV49(ctx context.Context, tx *sql.Tx) error {
+func updateFromV49(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 CREATE TABLE "networks_forwards" (
 	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -1804,20 +2434,20 @@ CREATE TABLE "networks_forwards_config" (
 }
 
 // updateFromV48 renames the "pending" column to "state" in the "nodes" table.
-func updateFromV48(ctx context.Context, tx *sql.Tx) error {
+func updateFromV48(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 ALTER TABLE nodes
 RENAME COLUMN pending TO state;
 `)
 	if err != nil {
-		return fmt.Errorf(`Failed to rename column "pending" to "state" in table "nodes": %w`, err)
+		return fmt.Errorf(`Failed renaming column "pending" to "state" in table "nodes": %w`, err)
 	}
 
 	return nil
 }
 
 // updateFromV47 adds warnings.
-func updateFromV47(ctx context.Context, tx *sql.Tx) error {
+func updateFromV47(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 CREATE TABLE warnings (
 	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -1841,14 +2471,14 @@ CREATE TABLE warnings (
 CREATE UNIQUE INDEX warnings_unique_node_id_project_id_entity_type_code_entity_id_type_code ON warnings(IFNULL(node_id, -1), IFNULL(project_id, -1), entity_type_code, entity_id, type_code);
 `)
 	if err != nil {
-		return fmt.Errorf("Failed to create warnings table and warnings_unique_node_id_project_id_entity_type_code_entity_id_type_code index: %w", err)
+		return fmt.Errorf("Failed creating warnings table and warnings_unique_node_id_project_id_entity_type_code_entity_id_type_code index: %w", err)
 	}
 
 	return err
 }
 
 // updateFromV46 adds support for restricting certificates to projects.
-func updateFromV46(ctx context.Context, tx *sql.Tx) error {
+func updateFromV46(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 ALTER TABLE certificates ADD COLUMN restricted INTEGER NOT NULL DEFAULT 0;
 CREATE TABLE certificates_projects (
@@ -1872,7 +2502,7 @@ CREATE VIEW certificates_projects_ref (fingerprint, value) AS
 }
 
 // updateFromV45 updates projects_used_by_ref to include ceph volumes.
-func updateFromV45(ctx context.Context, tx *sql.Tx) error {
+func updateFromV45(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 DROP VIEW projects_used_by_ref;
 CREATE VIEW projects_used_by_ref (name,
@@ -1917,7 +2547,7 @@ CREATE VIEW projects_used_by_ref (name,
     FROM networks_acls JOIN projects ON project_id=projects.id;
 `)
 	if err != nil {
-		return fmt.Errorf("Failed to update projects_used_by_ref: %w", err)
+		return fmt.Errorf("Failed updating projects_used_by_ref: %w", err)
 	}
 
 	return nil
@@ -1925,7 +2555,7 @@ CREATE VIEW projects_used_by_ref (name,
 
 // updateFromV44 adds networks_acls table, and adds a foreign key relationship between networks and projects.
 // API extension: network_acl.
-func updateFromV44(ctx context.Context, tx *sql.Tx) error {
+func updateFromV44(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 DROP VIEW projects_used_by_ref;
 
@@ -2036,14 +2666,14 @@ CREATE VIEW projects_used_by_ref (name,
     FROM networks_acls JOIN projects ON project_id=projects.id;
 `)
 	if err != nil {
-		return fmt.Errorf("Failed to add networks_acls and networks_acls_config tables, and update projects_used_by_ref view: %w", err)
+		return fmt.Errorf("Failed adding networks_acls and networks_acls_config tables, and update projects_used_by_ref view: %w", err)
 	}
 
 	return nil
 }
 
 // updateFromV43 adds a unique index to the storage_pools_config and networks_config tables.
-func updateFromV43(ctx context.Context, tx *sql.Tx) error {
+func updateFromV43(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`CREATE UNIQUE INDEX storage_pools_unique_storage_pool_id_node_id_key ON storage_pools_config (storage_pool_id, IFNULL(node_id, -1), key);
 		CREATE UNIQUE INDEX networks_unique_network_id_node_id_key ON networks_config (network_id, IFNULL(node_id, -1), key);
 	`)
@@ -2102,7 +2732,7 @@ func updateFromV42(ctx context.Context, tx *sql.Tx) error {
 		rowIDs := strings.Split(r.dupeRowIDs, ",")
 
 		// Iterate and delete all but 1 of the rowIDs so we leave just one left.
-		for i := 0; i < len(rowIDs)-1; i++ {
+		for i := range len(rowIDs) - 1 {
 			rowID, err := strconv.Atoi(rowIDs[i])
 			if err != nil {
 				return fmt.Errorf("Failed converting row ID: %w", err)
@@ -2168,7 +2798,7 @@ func updateFromV41(ctx context.Context, tx *sql.Tx) error {
 		rowIDs := strings.Split(r.dupeRowIDs, ",")
 
 		// Iterate and delete all but 1 of the rowIDs so we leave just one left.
-		for i := 0; i < len(rowIDs)-1; i++ {
+		for i := range len(rowIDs) - 1 {
 			rowID, err := strconv.Atoi(rowIDs[i])
 			if err != nil {
 				return fmt.Errorf("Failed converting row ID: %w", err)
@@ -2187,7 +2817,7 @@ func updateFromV41(ctx context.Context, tx *sql.Tx) error {
 }
 
 // Add state column to storage_pools_nodes tables. Set existing row's state to 1 ("created").
-func updateFromV40(ctx context.Context, tx *sql.Tx) error {
+func updateFromV40(_ context.Context, tx *sql.Tx) error {
 	stmt := `
 		ALTER TABLE storage_pools_nodes ADD COLUMN state INTEGER NOT NULL DEFAULT 0;
 		UPDATE storage_pools_nodes SET state = 1;
@@ -2197,7 +2827,7 @@ func updateFromV40(ctx context.Context, tx *sql.Tx) error {
 }
 
 // Add state column to networks_nodes tables. Set existing row's state to 1 ("created").
-func updateFromV39(ctx context.Context, tx *sql.Tx) error {
+func updateFromV39(_ context.Context, tx *sql.Tx) error {
 	stmt := `
 		ALTER TABLE networks_nodes ADD COLUMN state INTEGER NOT NULL DEFAULT 0;
 		UPDATE networks_nodes SET state = 1;
@@ -2207,7 +2837,7 @@ func updateFromV39(ctx context.Context, tx *sql.Tx) error {
 }
 
 // Add storage_volumes_backups table.
-func updateFromV38(ctx context.Context, tx *sql.Tx) error {
+func updateFromV38(_ context.Context, tx *sql.Tx) error {
 	stmt := `
 CREATE TABLE storage_volumes_backups (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -2244,7 +2874,7 @@ func updateFromV37(ctx context.Context, tx *sql.Tx) error {
 }
 
 // Add networks to projects references.
-func updateFromV36(ctx context.Context, tx *sql.Tx) error {
+func updateFromV36(_ context.Context, tx *sql.Tx) error {
 	stmts := `
 DROP VIEW projects_used_by_ref;
 CREATE VIEW projects_used_by_ref (name,
@@ -2283,7 +2913,7 @@ CREATE VIEW projects_used_by_ref (name,
 
 // This fixes node IDs of storage volumes on non-remote pools which were
 // wrongly set to NULL.
-func updateFromV35(ctx context.Context, tx *sql.Tx) error {
+func updateFromV35(_ context.Context, tx *sql.Tx) error {
 	stmts := `
 WITH storage_volumes_tmp (id, node_id)
 AS (
@@ -2324,7 +2954,7 @@ ORDER BY storage_volumes.name
 	count, err := query.Count(ctx, tx, "storage_volumes JOIN storage_pools ON storage_pools.id=storage_volumes.storage_pool_id",
 		`storage_pools.driver IN ("ceph", "cephfs")`)
 	if err != nil {
-		return fmt.Errorf("Failed to get storage volumes count: %w", err)
+		return fmt.Errorf("Failed getting storage volumes count: %w", err)
 	}
 
 	type volume struct {
@@ -2351,7 +2981,7 @@ ORDER BY storage_volumes.name
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to fetch storage volumes with remote storage: %w", err)
+		return fmt.Errorf("Failed fetching storage volumes with remote storage: %w", err)
 	}
 
 	// Remove multiple entries of the same volume when using remote storage
@@ -2359,7 +2989,7 @@ ORDER BY storage_volumes.name
 		if volumes[i-1].Name == volumes[i].Name {
 			_, err = tx.Exec(`DELETE FROM storage_volumes WHERE id=?`, volumes[i-1].ID)
 			if err != nil {
-				return fmt.Errorf("Failed to delete row from storage_volumes: %w", err)
+				return fmt.Errorf("Failed deleting row from storage_volumes: %w", err)
 			}
 		}
 	}
@@ -2389,7 +3019,7 @@ CREATE TABLE storage_volumes_new (
 	// Copy rows from storage_volumes to storage_volumes_new
 	count, err = query.Count(ctx, tx, "storage_volumes", "")
 	if err != nil {
-		return fmt.Errorf("Failed to get storage_volumes count: %w", err)
+		return fmt.Errorf("Failed getting storage_volumes count: %w", err)
 	}
 
 	storageVolumes := make([]volume, 0, count)
@@ -2410,7 +3040,7 @@ FROM storage_volumes`
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to fetch storage volumes: %w", err)
+		return fmt.Errorf("Failed fetching storage volumes: %w", err)
 	}
 
 	for _, storageVolume := range storageVolumes {
@@ -2427,7 +3057,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);`,
 	// Store rows of storage_volumes_config as we need to re-add them at the end.
 	count, err = query.Count(ctx, tx, "storage_volumes_config", "")
 	if err != nil {
-		return fmt.Errorf("Failed to get storage_volumes_config count: %w", err)
+		return fmt.Errorf("Failed getting storage_volumes_config count: %w", err)
 	}
 
 	type volumeConfig struct {
@@ -2451,13 +3081,13 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);`,
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to fetch storage volume configs: %w", err)
+		return fmt.Errorf("Failed fetching storage volume configs: %w", err)
 	}
 
 	// Store rows of storage_volumes_snapshots as we need to re-add them at the end.
 	count, err = query.Count(ctx, tx, "storage_volumes_snapshots", "")
 	if err != nil {
-		return fmt.Errorf("Failed to get storage_volumes_snapshots count: %w", err)
+		return fmt.Errorf("Failed getting storage_volumes_snapshots count: %w", err)
 	}
 
 	type volumeSnapshot struct {
@@ -2482,13 +3112,13 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);`,
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to fetch storage volume snapshots: %w", err)
+		return fmt.Errorf("Failed fetching storage volume snapshots: %w", err)
 	}
 
 	// Store rows of storage_volumes_snapshots_config as we need to re-add them at the end.
 	count, err = query.Count(ctx, tx, "storage_volumes_snapshots_config", "")
 	if err != nil {
-		return fmt.Errorf("Failed to get storage_volumes_snapshots_config count: %w", err)
+		return fmt.Errorf("Failed getting storage_volumes_snapshots_config count: %w", err)
 	}
 
 	type volumeSnapshotConfig struct {
@@ -2513,7 +3143,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);`,
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to fetch storage volume snapshot configs: %w", err)
+		return fmt.Errorf("Failed fetching storage volume snapshot configs: %w", err)
 	}
 
 	_, err = tx.Exec(`
@@ -2574,7 +3204,7 @@ CREATE TRIGGER storage_volumes_check_id
 
 	count, err = query.Count(ctx, tx, "storage_volumes_all", "")
 	if err != nil {
-		return fmt.Errorf("Failed to get storage_volumes count: %w", err)
+		return fmt.Errorf("Failed getting storage_volumes count: %w", err)
 	}
 
 	if count > 0 {
@@ -2600,7 +3230,7 @@ CREATE TRIGGER storage_volumes_check_id
 // and set existing networks to project_id 1.
 // This is made a lot more complex because it requires re-creating the referenced tables as there is no way to
 // disable foreign keys temporarily within a transaction.
-func updateFromV33(ctx context.Context, tx *sql.Tx) error {
+func updateFromV33(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec(`
 CREATE TABLE networks_new (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -2650,24 +3280,24 @@ ALTER TABLE networks_nodes_new RENAME TO networks_nodes;
 ALTER TABLE networks_config_new RENAME TO networks_config;
 	`)
 	if err != nil {
-		return fmt.Errorf("Failed to add project_id column to networks table: %w", err)
+		return fmt.Errorf("Failed adding project_id column to networks table: %w", err)
 	}
 
 	return nil
 }
 
 // Add type field to networks.
-func updateFromV32(ctx context.Context, tx *sql.Tx) error {
+func updateFromV32(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec("ALTER TABLE networks ADD COLUMN type INTEGER NOT NULL DEFAULT 0;")
 	if err != nil {
-		return fmt.Errorf("Failed to add type column to networks table: %w", err)
+		return fmt.Errorf("Failed adding type column to networks table: %w", err)
 	}
 
 	return nil
 }
 
 // Add failure_domain column to nodes table.
-func updateFromV31(ctx context.Context, tx *sql.Tx) error {
+func updateFromV31(_ context.Context, tx *sql.Tx) error {
 	stmts := `
 CREATE TABLE nodes_failure_domains (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -2686,7 +3316,7 @@ ALTER TABLE nodes
 }
 
 // Add content type field to storage volumes.
-func updateFromV30(ctx context.Context, tx *sql.Tx) error {
+func updateFromV30(_ context.Context, tx *sql.Tx) error {
 	stmts := `ALTER TABLE storage_volumes ADD COLUMN content_type INTEGER NOT NULL DEFAULT 0;
 UPDATE storage_volumes SET content_type = 1 WHERE type = 3;
 UPDATE storage_volumes SET content_type = 1 WHERE storage_volumes.id IN (
@@ -2727,14 +3357,14 @@ CREATE VIEW storage_volumes_all (
 `
 	_, err := tx.Exec(stmts)
 	if err != nil {
-		return fmt.Errorf("Failed to add storage volume content type: %w", err)
+		return fmt.Errorf("Failed adding storage volume content type: %w", err)
 	}
 
 	return nil
 }
 
 // Add storage volumes to projects references and fix images.
-func updateFromV29(ctx context.Context, tx *sql.Tx) error {
+func updateFromV29(_ context.Context, tx *sql.Tx) error {
 	stmts := `
 DROP VIEW projects_used_by_ref;
 CREATE VIEW projects_used_by_ref (name,
@@ -2767,13 +3397,13 @@ CREATE VIEW projects_used_by_ref (name,
 }
 
 // Attempt to add missing project feature.
-func updateFromV28(ctx context.Context, tx *sql.Tx) error {
+func updateFromV28(_ context.Context, tx *sql.Tx) error {
 	_, _ = tx.Exec("INSERT INTO projects_config (project_id, key, value) VALUES (1, 'features.storage.volumes', 'true');")
 	return nil
 }
 
 // Add expiry date to storage volume snapshots.
-func updateFromV27(ctx context.Context, tx *sql.Tx) error {
+func updateFromV27(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec("ALTER TABLE storage_volumes_snapshots ADD COLUMN expiry_date DATETIME;")
 	return err
 }
@@ -2795,7 +3425,7 @@ func updateFromV25(ctx context.Context, tx *sql.Tx) error {
 	// Get the total number of snapshot rows in the storage_volumes table.
 	count, err := query.Count(ctx, tx, "storage_volumes", "snapshot=1")
 	if err != nil {
-		return fmt.Errorf("Failed to volume snapshot count: %w", err)
+		return fmt.Errorf("Failed getting volume snapshot count: %w", err)
 	}
 
 	type snapshot struct {
@@ -2829,7 +3459,7 @@ SELECT id, name, storage_pool_id, node_id, type, coalesce(description, ''), proj
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to fetch instances: %w", err)
+		return fmt.Errorf("Failed fetching instances: %w", err)
 	}
 
 	for i, snapshot := range snapshots {
@@ -2837,7 +3467,7 @@ SELECT id, name, storage_pool_id, node_id, type, coalesce(description, ''), proj
 			"storage_volumes_config", "storage_volume_id=?",
 			snapshot.ID)
 		if err != nil {
-			return fmt.Errorf("Failed to fetch volume snapshot config: %w", err)
+			return fmt.Errorf("Failed fetching volume snapshot config: %w", err)
 		}
 
 		snapshots[i].Config = config
@@ -2932,7 +3562,7 @@ CREATE VIEW storage_volumes_all (
 `
 	_, err = tx.Exec(stmts)
 	if err != nil {
-		return fmt.Errorf("Failed to create storage snapshots tables: %w", err)
+		return fmt.Errorf("Failed creating storage snapshots tables: %w", err)
 	}
 
 	// Migrate snapshots to the new tables.
@@ -2981,14 +3611,14 @@ func updateFromV24(ctx context.Context, tx *sql.Tx) error {
 	// Fetch the IDs of all existing Ceph pools.
 	poolIDs, err := query.SelectIntegers(ctx, tx, `SELECT id FROM storage_pools WHERE driver='ceph'`)
 	if err != nil {
-		return fmt.Errorf("Failed to get IDs of current ceph pools: %w", err)
+		return fmt.Errorf("Failed getting IDs of current ceph pools: %w", err)
 	}
 
 	for _, poolID := range poolIDs {
 		// Fetch the config for this Ceph pool.
 		config, err := query.SelectConfig(ctx, tx, "storage_pools_config", "storage_pool_id=?", poolID)
 		if err != nil {
-			return fmt.Errorf("Failed to fetch of ceph pool config: %w", err)
+			return fmt.Errorf("Failed fetching of ceph pool config: %w", err)
 		}
 
 		// Check if already set.
@@ -3000,7 +3630,7 @@ func updateFromV24(ctx context.Context, tx *sql.Tx) error {
 		// Add ceph.user.name config entry.
 		_, err = tx.Exec("INSERT INTO storage_pools_config (storage_pool_id, key, value) VALUES (?, 'ceph.user.name', 'admin')", poolID)
 		if err != nil {
-			return fmt.Errorf("Failed to create ceph.user.name config: %w", err)
+			return fmt.Errorf("Failed creating ceph.user.name config: %w", err)
 		}
 	}
 
@@ -3012,13 +3642,13 @@ func updateFromV23(ctx context.Context, tx *sql.Tx) error {
 	// Fetch the IDs of all existing nodes.
 	nodeIDs, err := query.SelectIntegers(ctx, tx, "SELECT id FROM nodes")
 	if err != nil {
-		return fmt.Errorf("Failed to get IDs of current nodes: %w", err)
+		return fmt.Errorf("Failed getting IDs of current nodes: %w", err)
 	}
 
 	// Fetch the IDs of all existing lvm pools.
 	poolIDs, err := query.SelectIntegers(ctx, tx, `SELECT id FROM storage_pools WHERE driver='lvm'`)
 	if err != nil {
-		return fmt.Errorf("Failed to get IDs of current lvm pools: %w", err)
+		return fmt.Errorf("Failed getting IDs of current lvm pools: %w", err)
 	}
 
 	for _, poolID := range poolIDs {
@@ -3026,7 +3656,7 @@ func updateFromV23(ctx context.Context, tx *sql.Tx) error {
 			// Fetch the config for this lvm pool.
 			config, err := query.SelectConfig(ctx, tx, "storage_pools_config", "storage_pool_id=? AND node_id=?", poolID, nodeID)
 			if err != nil {
-				return fmt.Errorf("Failed to fetch of lvm pool config: %w", err)
+				return fmt.Errorf("Failed fetching of lvm pool config: %w", err)
 			}
 
 			// Check if already set.
@@ -3041,7 +3671,7 @@ INSERT INTO storage_pools_config(storage_pool_id, node_id, key, value)
 SELECT ?, ?, 'lvm.vg_name', name FROM storage_pools WHERE id=?
 `, poolID, nodeID, poolID)
 			if err != nil {
-				return fmt.Errorf("Failed to create lvm.vg_name node config: %w", err)
+				return fmt.Errorf("Failed creating lvm.vg_name local config: %w", err)
 			}
 		}
 	}
@@ -3054,13 +3684,13 @@ func updateFromV22(ctx context.Context, tx *sql.Tx) error {
 	// Fetch the IDs of all existing nodes.
 	nodeIDs, err := query.SelectIntegers(ctx, tx, "SELECT id FROM nodes")
 	if err != nil {
-		return fmt.Errorf("Failed to get IDs of current nodes: %w", err)
+		return fmt.Errorf("Failed getting IDs of current nodes: %w", err)
 	}
 
 	// Fetch the IDs of all existing zfs pools.
 	poolIDs, err := query.SelectIntegers(ctx, tx, `SELECT id FROM storage_pools WHERE driver='zfs'`)
 	if err != nil {
-		return fmt.Errorf("Failed to get IDs of current zfs pools: %w", err)
+		return fmt.Errorf("Failed getting IDs of current zfs pools: %w", err)
 	}
 
 	for _, poolID := range poolIDs {
@@ -3068,7 +3698,7 @@ func updateFromV22(ctx context.Context, tx *sql.Tx) error {
 			// Fetch the config for this zfs pool.
 			config, err := query.SelectConfig(ctx, tx, "storage_pools_config", "storage_pool_id=? AND node_id=?", poolID, nodeID)
 			if err != nil {
-				return fmt.Errorf("Failed to fetch of zfs pool config: %w", err)
+				return fmt.Errorf("Failed fetching of zfs pool config: %w", err)
 			}
 
 			// Check if already set.
@@ -3083,7 +3713,7 @@ INSERT INTO storage_pools_config(storage_pool_id, node_id, key, value)
 SELECT ?, ?, 'zfs.pool_name', name FROM storage_pools WHERE id=?
 `, poolID, nodeID, poolID)
 			if err != nil {
-				return fmt.Errorf("Failed to create zfs.pool_name node config: %w", err)
+				return fmt.Errorf("Failed creating zfs.pool_name local config: %w", err)
 			}
 		}
 	}
@@ -3092,7 +3722,7 @@ SELECT ?, ?, 'zfs.pool_name', name FROM storage_pools WHERE id=?
 }
 
 // Fix "images_profiles" table (missing UNIQUE).
-func updateFromV21(ctx context.Context, tx *sql.Tx) error {
+func updateFromV21(_ context.Context, tx *sql.Tx) error {
 	stmts := `
 ALTER TABLE images_profiles RENAME TO old_images_profiles;
 CREATE TABLE images_profiles (
@@ -3110,7 +3740,7 @@ DROP TABLE old_images_profiles;
 }
 
 // Add "images_profiles" table.
-func updateFromV20(ctx context.Context, tx *sql.Tx) error {
+func updateFromV20(_ context.Context, tx *sql.Tx) error {
 	stmts := `
 CREATE TABLE images_profiles (
 	image_id INTEGER NOT NULL,
@@ -3142,7 +3772,7 @@ INSERT INTO images_profiles (image_id, profile_id)
 }
 
 // Add a new "arch" column to the "nodes" table.
-func updateFromV19(ctx context.Context, tx *sql.Tx) error {
+func updateFromV19(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec("PRAGMA ignore_check_constraints=on")
 	if err != nil {
 		return err
@@ -3173,7 +3803,7 @@ func updateFromV19(ctx context.Context, tx *sql.Tx) error {
 }
 
 // Rename 'containers' to 'instances' in *_used_by_ref views.
-func updateFromV18(ctx context.Context, tx *sql.Tx) error {
+func updateFromV18(_ context.Context, tx *sql.Tx) error {
 	stmts := `
 DROP VIEW profiles_used_by_ref;
 CREATE VIEW profiles_used_by_ref (project,
@@ -3215,7 +3845,7 @@ CREATE VIEW projects_used_by_ref (name,
 }
 
 // Add nodes_roles table.
-func updateFromV17(ctx context.Context, tx *sql.Tx) error {
+func updateFromV17(_ context.Context, tx *sql.Tx) error {
 	stmts := `
 CREATE TABLE nodes_roles (
     node_id INTEGER NOT NULL,
@@ -3229,7 +3859,7 @@ CREATE TABLE nodes_roles (
 }
 
 // Add image type column.
-func updateFromV16(ctx context.Context, tx *sql.Tx) error {
+func updateFromV16(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec("ALTER TABLE images ADD COLUMN type INTEGER NOT NULL DEFAULT 0;")
 	return err
 }
@@ -3313,13 +3943,13 @@ CREATE VIEW instances_snapshots_devices_ref (
 `
 	_, err := tx.Exec(stmts)
 	if err != nil {
-		return fmt.Errorf("Failed to create snapshots tables: %w", err)
+		return fmt.Errorf("Failed creating snapshots tables: %w", err)
 	}
 
 	// Get the total number of rows in the instances table.
 	count, err := query.Count(ctx, tx, "instances", "")
 	if err != nil {
-		return fmt.Errorf("Failed to count rows in instances table: %w", err)
+		return fmt.Errorf("Failed counting rows in instances table: %w", err)
 	}
 
 	// Fetch all rows in the instances table.
@@ -3347,7 +3977,7 @@ CREATE VIEW instances_snapshots_devices_ref (
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to fetch instances: %w", err)
+		return fmt.Errorf("Failed fetching instances: %w", err)
 	}
 
 	// Create an index mapping instance names to their IDs.
@@ -3368,7 +3998,7 @@ CREATE VIEW instances_snapshots_devices_ref (
 		"instances_config JOIN instances ON instances_config.instance_id = instances.id",
 		"instances.type = 1")
 	if err != nil {
-		return fmt.Errorf("Failed to count rows in instances_config table: %w", err)
+		return fmt.Errorf("Failed counting rows in instances_config table: %w", err)
 	}
 
 	type instanceConfig struct {
@@ -3397,7 +4027,7 @@ SELECT instances_config.id, instance_id, key, value
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to fetch snapshots config: %w", err)
+		return fmt.Errorf("Failed fetching snapshots config: %w", err)
 	}
 
 	configBySnapshotID := make(map[int]map[string]string)
@@ -3419,7 +4049,7 @@ SELECT instances_config.id, instance_id, key, value
 		"instances_devices JOIN instances ON instances_devices.instance_id = instances.id",
 		"instances.type = 1")
 	if err != nil {
-		return fmt.Errorf("Failed to count rows in instances_devices table: %w", err)
+		return fmt.Errorf("Failed counting rows in instances_devices table: %w", err)
 	}
 
 	type device struct {
@@ -3448,7 +4078,7 @@ SELECT instances_devices.id, instance_id, instances_devices.name, instances_devi
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to fetch snapshots devices: %w", err)
+		return fmt.Errorf("Failed fetching snapshots devices: %w", err)
 	}
 
 	devicesBySnapshotID := make(map[int]map[string]struct {
@@ -3467,7 +4097,7 @@ SELECT instances_devices.id, instance_id, instances_devices.name, instances_devi
 		// Fetch the config for this device.
 		config, err := query.SelectConfig(ctx, tx, "instances_devices_config", "instance_device_id = ?", device.ID)
 		if err != nil {
-			return fmt.Errorf("Failed to fetch snapshots devices config: %w", err)
+			return fmt.Errorf("Failed fetching snapshots devices config: %w", err)
 		}
 
 		d[device.Name] = struct {
@@ -3596,7 +4226,7 @@ SELECT instances_devices.id, instance_id, instances_devices.name, instances_devi
 
 		deleted, err := query.DeleteObject(tx, "instances", int64(instance.ID))
 		if err != nil {
-			return fmt.Errorf("Failed to delete snapshot %s: %w", instance.Name, err)
+			return fmt.Errorf("Failed deleting snapshot %s: %w", instance.Name, err)
 		}
 
 		if !deleted {
@@ -3607,7 +4237,7 @@ SELECT instances_devices.id, instance_id, instances_devices.name, instances_devi
 	// Make sure that no snapshot is left in the instances table.
 	count, err = query.Count(ctx, tx, "instances", "type = 1")
 	if err != nil {
-		return fmt.Errorf("Failed to count leftover snapshot rows: %w", err)
+		return fmt.Errorf("Failed counting leftover snapshot rows: %w", err)
 	}
 
 	if count != 0 {
@@ -3618,7 +4248,7 @@ SELECT instances_devices.id, instance_id, instances_devices.name, instances_devi
 }
 
 // Rename all containers* tables to instances*/.
-func updateFromV14(ctx context.Context, tx *sql.Tx) error {
+func updateFromV14(_ context.Context, tx *sql.Tx) error {
 	stmts := `
 ALTER TABLE containers RENAME TO instances;
 ALTER TABLE containers_backups RENAME COLUMN container_id TO instance_id;
@@ -3715,12 +4345,12 @@ CREATE VIEW profiles_used_by_ref (project,
 	return err
 }
 
-func updateFromV13(ctx context.Context, tx *sql.Tx) error {
+func updateFromV13(_ context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec("ALTER TABLE containers ADD COLUMN expiry_date DATETIME;")
 	return err
 }
 
-func updateFromV12(ctx context.Context, tx *sql.Tx) error {
+func updateFromV12(_ context.Context, tx *sql.Tx) error {
 	stmts := `
 DROP VIEW profiles_used_by_ref;
 CREATE VIEW profiles_used_by_ref (project,
@@ -3775,7 +4405,7 @@ DELETE FROM storage_volumes_config WHERE storage_volume_id NOT IN (SELECT id FRO
 	// check that we don't accidentally delete or add anything.
 	counts1, err := query.CountAll(ctx, tx)
 	if err != nil {
-		return fmt.Errorf("Failed to count rows in current tables: %w", err)
+		return fmt.Errorf("Failed counting rows in current tables: %w", err)
 	}
 
 	// Temporarily increase the cache size and disable page spilling, to
@@ -4109,7 +4739,7 @@ CREATE INDEX profiles_project_id_idx ON profiles (project_id);
 `
 	_, err = tx.ExecContext(ctx, stmts)
 	if err != nil {
-		return fmt.Errorf("Failed to add project_id column: %w", err)
+		return fmt.Errorf("Failed adding project_id column: %w", err)
 	}
 
 	// Create a view to easily query all resources using a certain project
@@ -4124,7 +4754,7 @@ CREATE VIEW projects_used_by_ref (name, value) AS
 `
 	_, err = tx.Exec(stmt)
 	if err != nil {
-		return fmt.Errorf("Failed to create projects_used_by_ref view: %w", err)
+		return fmt.Errorf("Failed creating projects_used_by_ref view: %w", err)
 	}
 
 	// Create a view to easily query all profiles used by a certain container
@@ -4140,7 +4770,7 @@ CREATE VIEW containers_profiles_ref (project, node, name, value) AS
 `
 	_, err = tx.Exec(stmt)
 	if err != nil {
-		return fmt.Errorf("Failed to containers_profiles_ref view: %w", err)
+		return fmt.Errorf("Failed creating containers_profiles_ref view: %w", err)
 	}
 
 	// Create a view to easily query the config of a certain container.
@@ -4154,7 +4784,7 @@ CREATE VIEW containers_config_ref (project, node, name, key, value) AS
 `
 	_, err = tx.Exec(stmt)
 	if err != nil {
-		return fmt.Errorf("Failed to containers_config_ref view: %w", err)
+		return fmt.Errorf("Failed creating containers_config_ref view: %w", err)
 	}
 
 	// Create a view to easily query the devices of a certain container.
@@ -4171,7 +4801,7 @@ CREATE VIEW containers_devices_ref (project, node, name, device, type, key, valu
 `
 	_, err = tx.Exec(stmt)
 	if err != nil {
-		return fmt.Errorf("Failed to containers_devices_ref view: %w", err)
+		return fmt.Errorf("Failed creating containers_devices_ref view: %w", err)
 	}
 
 	// Create a view to easily query the config of a certain profile.
@@ -4184,7 +4814,7 @@ CREATE VIEW profiles_config_ref (project, name, key, value) AS
 `
 	_, err = tx.Exec(stmt)
 	if err != nil {
-		return fmt.Errorf("Failed to profiles_config_ref view: %w", err)
+		return fmt.Errorf("Failed creating profiles_config_ref view: %w", err)
 	}
 
 	// Create a view to easily query the devices of a certain profile.
@@ -4200,7 +4830,7 @@ CREATE VIEW profiles_devices_ref (project, name, device, type, key, value) AS
 `
 	_, err = tx.Exec(stmt)
 	if err != nil {
-		return fmt.Errorf("Failed to profiles_devices_ref view: %w", err)
+		return fmt.Errorf("Failed creating profiles_devices_ref view: %w", err)
 	}
 
 	// Create a view to easily query all resources using a certain profile
@@ -4216,14 +4846,14 @@ CREATE VIEW profiles_used_by_ref (project, name, value) AS
 `
 	_, err = tx.Exec(stmt)
 	if err != nil {
-		return fmt.Errorf("Failed to create profiles_used_by_ref view: %w", err)
+		return fmt.Errorf("Failed creating profiles_used_by_ref view: %w", err)
 	}
 
 	// Check that the count of all rows in the database is unchanged
 	// (i.e. we didn't accidentally delete or add anything).
 	counts2, err := query.CountAll(ctx, tx)
 	if err != nil {
-		return fmt.Errorf("Failed to count rows in updated tables: %w", err)
+		return fmt.Errorf("Failed counting rows in updated tables: %w", err)
 	}
 
 	delete(counts2, "projects")
@@ -4235,7 +4865,7 @@ CREATE VIEW profiles_used_by_ref (project, name, value) AS
 
 		count2 := counts2[table]
 		if count1 != count2 {
-			return fmt.Errorf("Row count mismatch in table '%s': %d vs %d", table, count1, count2)
+			return fmt.Errorf("Row count mismatch in table %q: %d vs %d", table, count1, count2)
 		}
 	}
 
@@ -4253,7 +4883,7 @@ CREATE VIEW profiles_used_by_ref (project, name, value) AS
 	return err
 }
 
-func updateFromV10(ctx context.Context, tx *sql.Tx) error {
+func updateFromV10(_ context.Context, tx *sql.Tx) error {
 	stmt := `
 ALTER TABLE storage_volumes ADD COLUMN snapshot INTEGER NOT NULL DEFAULT 0;
 UPDATE storage_volumes SET snapshot = 0;
@@ -4263,7 +4893,7 @@ UPDATE storage_volumes SET snapshot = 0;
 }
 
 // Add a new 'type' column to the operations table.
-func updateFromV9(ctx context.Context, tx *sql.Tx) error {
+func updateFromV9(_ context.Context, tx *sql.Tx) error {
 	stmts := `
 	ALTER TABLE operations ADD COLUMN type INTEGER NOT NULL DEFAULT 0;
 	UPDATE operations SET type = 0;
@@ -4274,13 +4904,13 @@ func updateFromV9(ctx context.Context, tx *sql.Tx) error {
 
 // The lvm.thinpool_name and lvm.vg_name config keys are node-specific and need
 // to be linked to nodes.
-func updateFromV8(ctx context.Context, tx *sql.Tx) error {
+func updateFromV8(_ context.Context, _ *sql.Tx) error {
 	// Moved to patchLvmNodeSpecificConfigKeys, since there's no schema
 	// change. That makes it easier to backport.
 	return nil
 }
 
-func updateFromV7(ctx context.Context, tx *sql.Tx) error {
+func updateFromV7(_ context.Context, tx *sql.Tx) error {
 	stmts := `
 CREATE TABLE containers_backups (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -4304,20 +4934,20 @@ func updateFromV6(ctx context.Context, tx *sql.Tx) error {
 	// Fetch the IDs of all existing nodes.
 	nodeIDs, err := query.SelectIntegers(ctx, tx, "SELECT id FROM nodes")
 	if err != nil {
-		return fmt.Errorf("failed to get IDs of current nodes: %w", err)
+		return fmt.Errorf("failed getting IDs of current nodes: %w", err)
 	}
 
 	// Fetch the IDs of all existing zfs pools.
 	poolIDs, err := query.SelectIntegers(ctx, tx, `SELECT id FROM storage_pools WHERE driver='zfs'`)
 	if err != nil {
-		return fmt.Errorf("failed to get IDs of current zfs pools: %w", err)
+		return fmt.Errorf("failed getting IDs of current zfs pools: %w", err)
 	}
 
 	for _, poolID := range poolIDs {
 		// Fetch the config for this zfs pool and check if it has the zfs.pool_name key
 		config, err := query.SelectConfig(ctx, tx, "storage_pools_config", "storage_pool_id=? AND node_id IS NULL", poolID)
 		if err != nil {
-			return fmt.Errorf("failed to fetch of zfs pool config: %w", err)
+			return fmt.Errorf("failed fetching of zfs pool config: %w", err)
 		}
 
 		poolName, ok := config["zfs.pool_name"]
@@ -4330,7 +4960,7 @@ func updateFromV6(ctx context.Context, tx *sql.Tx) error {
 DELETE FROM storage_pools_config WHERE key='zfs.pool_name' AND storage_pool_id=? AND node_id IS NULL
 `, poolID)
 		if err != nil {
-			return fmt.Errorf("failed to delete zfs.pool_name config: %w", err)
+			return fmt.Errorf("failed deleting zfs.pool_name config: %w", err)
 		}
 
 		// Add zfs.pool_name config entry for each node
@@ -4340,7 +4970,7 @@ INSERT INTO storage_pools_config(storage_pool_id, node_id, key, value)
   VALUES(?, ?, 'zfs.pool_name', ?)
 `, poolID, nodeID, poolName)
 			if err != nil {
-				return fmt.Errorf("failed to create zfs.pool_name node config: %w", err)
+				return fmt.Errorf("failed creating zfs.pool_name local config: %w", err)
 			}
 		}
 	}
@@ -4354,7 +4984,7 @@ func updateFromV5(ctx context.Context, tx *sql.Tx) error {
 	// Fetch the IDs of all existing nodes.
 	nodeIDs, err := query.SelectIntegers(ctx, tx, "SELECT id FROM nodes")
 	if err != nil {
-		return fmt.Errorf("failed to get IDs of current nodes: %w", err)
+		return fmt.Errorf("failed getting IDs of current nodes: %w", err)
 	}
 
 	// Fetch the IDs of all existing ceph volumes.
@@ -4364,7 +4994,7 @@ SELECT storage_volumes.id FROM storage_volumes
     WHERE storage_pools.driver='ceph'
 `)
 	if err != nil {
-		return fmt.Errorf("failed to get IDs of current ceph volumes: %w", err)
+		return fmt.Errorf("failed getting IDs of current ceph volumes: %w", err)
 	}
 
 	// Fetch all existing ceph volumes.
@@ -4403,7 +5033,7 @@ FROM storage_volumes
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("failed to fetch current volumes: %w", err)
+		return fmt.Errorf("failed fetching current volumes: %w", err)
 	}
 
 	// Duplicate each volume row across all nodes, and keep track of the
@@ -4427,7 +5057,7 @@ FROM storage_volumes
 
 			id, err := query.UpsertObject(tx, "storage_volumes", columns, values)
 			if err != nil {
-				return fmt.Errorf("failed to insert new volume: %w", err)
+				return fmt.Errorf("failed inserting new volume: %w", err)
 			}
 
 			_, ok := created[volume.ID]
@@ -4443,7 +5073,7 @@ FROM storage_volumes
 	for id, newIDs := range created {
 		config, err := query.SelectConfig(ctx, tx, "storage_volumes_config", "storage_volume_id=?", id)
 		if err != nil {
-			return fmt.Errorf("failed to fetch volume config: %w", err)
+			return fmt.Errorf("failed fetching volume config: %w", err)
 		}
 
 		for _, newID := range newIDs {
@@ -4452,7 +5082,7 @@ FROM storage_volumes
 INSERT INTO storage_volumes_config(storage_volume_id, key, value) VALUES(?, ?, ?)
 `, newID, key, value)
 				if err != nil {
-					return fmt.Errorf("failed to insert new volume config: %w", err)
+					return fmt.Errorf("failed inserting new volume config: %w", err)
 				}
 			}
 		}
@@ -4461,13 +5091,13 @@ INSERT INTO storage_volumes_config(storage_volume_id, key, value) VALUES(?, ?, ?
 	return nil
 }
 
-func updateFromV4(ctx context.Context, tx *sql.Tx) error {
+func updateFromV4(_ context.Context, tx *sql.Tx) error {
 	stmt := "UPDATE networks SET state = 1"
 	_, err := tx.Exec(stmt)
 	return err
 }
 
-func updateFromV3(ctx context.Context, tx *sql.Tx) error {
+func updateFromV3(_ context.Context, tx *sql.Tx) error {
 	stmt := `
 CREATE TABLE storage_pools_nodes (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -4484,7 +5114,7 @@ UPDATE storage_pools SET state = 1;
 	return err
 }
 
-func updateFromV2(ctx context.Context, tx *sql.Tx) error {
+func updateFromV2(_ context.Context, tx *sql.Tx) error {
 	stmt := `
 CREATE TABLE operations (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -4498,7 +5128,7 @@ CREATE TABLE operations (
 	return err
 }
 
-func updateFromV1(ctx context.Context, tx *sql.Tx) error {
+func updateFromV1(_ context.Context, tx *sql.Tx) error {
 	stmt := `
 CREATE TABLE certificates (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -4705,7 +5335,7 @@ CREATE TABLE storage_volumes_config (
 	return err
 }
 
-func updateFromV0(ctx context.Context, tx *sql.Tx) error {
+func updateFromV0(_ context.Context, tx *sql.Tx) error {
 	// v0..v1 the dawn of clustering
 	stmt := `
 CREATE TABLE nodes (

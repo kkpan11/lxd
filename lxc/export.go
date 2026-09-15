@@ -3,9 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
-	"net/url"
 	"os"
-	"path"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -14,7 +12,7 @@ import (
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	cli "github.com/canonical/lxd/shared/cmd"
-	"github.com/canonical/lxd/shared/i18n"
+	"github.com/canonical/lxd/shared/logger"
 )
 
 type cmdExport struct {
@@ -23,24 +21,32 @@ type cmdExport struct {
 	flagInstanceOnly         bool
 	flagOptimizedStorage     bool
 	flagCompressionAlgorithm string
+	flagExportVersion        string
 }
 
 func (c *cmdExport) command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("export", i18n.G("[<remote>:]<instance> [target] [--instance-only] [--optimized-storage]"))
-	cmd.Short = i18n.G("Export instance backups")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Export instances as backup tarballs.`))
-	cmd.Example = cli.FormatSection("", i18n.G(
-		`lxc export u1 backup0.tar.gz
-    Download a backup tarball of the u1 instance.`))
+	cmd.Use = usage("export", "[<remote>:]<instance> [target] [--instance-only] [--optimized-storage]")
+	cmd.Short = "Export instance backups"
+	cmd.Long = cli.FormatSection("Description", `Export instances as backup tarballs.`)
+	cmd.Example = cli.FormatSection("", `lxc export u1 backup0.tar.gz
+    Download a backup tarball of the u1 instance.`)
 
 	cmd.RunE = c.run
 	cmd.Flags().BoolVar(&c.flagInstanceOnly, "instance-only", false,
-		i18n.G("Whether or not to only backup the instance (without snapshots)"))
-	cmd.Flags().BoolVar(&c.flagOptimizedStorage, "optimized-storage", false,
-		i18n.G("Use storage driver optimized format (can only be restored on a similar pool)"))
-	cmd.Flags().StringVar(&c.flagCompressionAlgorithm, "compression", "", i18n.G("Compression algorithm to use (none for uncompressed)")+"``")
+		"Whether or not to only backup the instance (without snapshots)")
+	cmd.Flags().BoolVar(&c.flagOptimizedStorage, "optimized-storage", false, "Use storage driver optimized format (can only be restored on a similar pool)")
+	cmd.Flags().StringVar(&c.flagCompressionAlgorithm, "compression", "", cli.FormatStringFlagLabel(`Compression algorithm to use (none for uncompressed)`))
+	cmd.Flags().StringVar(&c.flagExportVersion, "export-version", "",
+		cli.FormatStringFlagLabel("Use a different metadata format version than the latest one supported by the server (to support imports on older LXD versions)"))
+
+	cmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]cobra.Completion, cobra.ShellCompDirective) {
+		if len(args) > 0 {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+
+		return c.global.cmpTopLevelResource("instance", toComplete)
+	}
 
 	return cmd
 }
@@ -76,6 +82,11 @@ func (c *cmdExport) run(cmd *cobra.Command, args []string) error {
 		CompressionAlgorithm: c.flagCompressionAlgorithm,
 	}
 
+	req.Version, err = getExportVersion(d, c.flagExportVersion)
+	if err != nil {
+		return err
+	}
+
 	op, err := d.CreateInstanceBackup(name, req)
 	if err != nil {
 		return fmt.Errorf("Create instance backup: %w", err)
@@ -103,7 +114,7 @@ func (c *cmdExport) run(cmd *cobra.Command, args []string) error {
 
 	// Watch the background operation
 	progress := cli.ProgressRenderer{
-		Format: i18n.G("Backing up instance: %s"),
+		Format: "Backing up instance: %s",
 		Quiet:  c.global.flagQuiet,
 	}
 
@@ -128,41 +139,50 @@ func (c *cmdExport) run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Get name of backup
-	uStr := op.Get().Resources["backups"][0]
-	u, err := url.Parse(uStr)
-	if err != nil {
-		return fmt.Errorf("Invalid URL %q: %w", uStr, err)
+	var backupName string
+	if d.HasExtension("operation_metadata_entity_url") {
+		backupName, err = getEntityFromOperationMetadata(op.Get().Metadata)
+	} else {
+		// Use "backups" here and not "entity.TypeInstanceBackup" because the change to use entity type names happened
+		// after the operation_metadata_entity_url extension.
+		backupName, err = getEntityFromOperationResources(op.Get().Resources, "backups")
 	}
 
-	backupName, err := url.PathUnescape(path.Base(u.EscapedPath()))
 	if err != nil {
-		return fmt.Errorf("Invalid backup name segment in path %q: %w", u.EscapedPath(), err)
+		return fmt.Errorf("Failed getting instance backup name from operation: %w", err)
 	}
 
 	defer func() {
-		// Delete backup after we're done
+		// Delete the server-side backup after export. Log errors rather than
+		// discarding them silently so that cleanup failures are visible.
 		op, err = d.DeleteInstanceBackup(name, backupName)
-		if err == nil {
-			_ = op.Wait()
+		if err != nil {
+			logger.Warn("Failed deleting instance backup", logger.Ctx{"err": err})
+		} else {
+			err = op.Wait()
+			if err != nil {
+				logger.Warn("Failed waiting for instance backup deletion", logger.Ctx{"err": err})
+			}
 		}
 	}()
 
-	// Prepare the download request
-	progress = cli.ProgressRenderer{
-		Format: i18n.G("Exporting the backup: %s"),
+	// Prepare the download request.
+	// Assign the renderer to a new variable to not interfere with the old one.
+	exportProgress := cli.ProgressRenderer{
+		Format: "Exporting the backup: %s",
 		Quiet:  c.global.flagQuiet,
 	}
 
 	backupFileRequest := lxd.BackupFileRequest{
 		BackupFile:      io.WriteSeeker(target),
-		ProgressHandler: progress.UpdateProgress,
+		ProgressHandler: exportProgress.UpdateProgress,
 	}
 
 	// Export tarball
 	_, err = d.GetInstanceBackupFile(name, backupName, &backupFileRequest)
 	if err != nil {
 		_ = os.Remove(targetName)
-		progress.Done("")
+		exportProgress.Done("")
 		return fmt.Errorf("Fetch instance backup file: %w", err)
 	}
 
@@ -180,15 +200,15 @@ func (c *cmdExport) run(cmd *cobra.Command, args []string) error {
 
 		err = os.Rename(shared.HostPathFollow(targetName), shared.HostPathFollow(name+ext))
 		if err != nil {
-			return fmt.Errorf("Failed to rename export file: %w", err)
+			return fmt.Errorf("Failed renaming export file: %w", err)
 		}
 	}
 
 	err = target.Close()
 	if err != nil {
-		return fmt.Errorf("Failed to close export file: %w", err)
+		return fmt.Errorf("Failed closing export file: %w", err)
 	}
 
-	progress.Done(i18n.G("Backup exported successfully!"))
+	exportProgress.Done("Backup exported successfully!")
 	return nil
 }

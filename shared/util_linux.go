@@ -4,15 +4,19 @@ package shared
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -20,7 +24,6 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/canonical/lxd/shared/revert"
-	"github.com/canonical/lxd/shared/units"
 )
 
 // --- pure Go functions ---
@@ -60,6 +63,15 @@ func GetPathMode(path string) (os.FileMode, error) {
 // SetSize sets the terminal size to the specified width and height for the given file descriptor.
 func SetSize(fd int, width int, height int) (err error) {
 	var dimensions [4]uint16
+
+	if width > math.MaxUint16 || height > math.MaxUint16 {
+		return fmt.Errorf("Width or height too large: %d %d", width, height)
+	}
+
+	if width < 0 || height < 0 {
+		return fmt.Errorf("Width and height must not be negative: %d %d", width, height)
+	}
+
 	dimensions[0] = uint16(height)
 	dimensions[1] = uint16(width)
 
@@ -98,7 +110,7 @@ func GetAllXattr(path string) (map[string]string, error) {
 }
 
 // ErrObjectFound indicates that the requested object was found.
-var ErrObjectFound = fmt.Errorf("Found requested object")
+var ErrObjectFound = errors.New("Found requested object")
 
 // LookupUUIDByBlockDevPath finds and returns the UUID of a block device by its path.
 func LookupUUIDByBlockDevPath(diskDevice string) (string, error) {
@@ -130,11 +142,11 @@ func LookupUUIDByBlockDevPath(diskDevice string) (string, error) {
 
 	err := filepath.Walk("/dev/disk/by-uuid", readUUID)
 	if err != nil && err != ErrObjectFound {
-		return "", fmt.Errorf("Failed to detect UUID: %s", err)
+		return "", fmt.Errorf("Failed detecting UUID: %s", err)
 	}
 
 	if uuid == "" {
-		return "", fmt.Errorf("Failed to detect UUID")
+		return "", errors.New("Failed detecting UUID")
 	}
 
 	lastSlash := strings.LastIndex(uuid, "/")
@@ -201,8 +213,8 @@ func Uname() (*Utsname, error) {
 
 func intArrayToString(arr any) string {
 	slice := reflect.ValueOf(arr)
-	s := ""
-	for i := 0; i < slice.Len(); i++ {
+	var s bytes.Buffer
+	for i := range slice.Len() {
 		val := slice.Index(i)
 		valInt := int64(-1)
 
@@ -221,10 +233,10 @@ func intArrayToString(arr any) string {
 			break
 		}
 
-		s += string(byte(valInt))
+		s.WriteByte(byte(valInt))
 	}
 
-	return s
+	return s.String()
 }
 
 // DeviceTotalMemory returns the total memory of the device by reading /proc/meminfo.
@@ -247,34 +259,42 @@ func GetMeminfo(field string) (int64, error) {
 	for scan.Scan() {
 		line := scan.Text()
 
-		// We only care about MemTotal
-		if !strings.HasPrefix(line, field+":") {
+		// We only care about the requested field
+		rightHandSide, found := strings.CutPrefix(line, field+":")
+		if !found {
 			continue
 		}
 
-		// Extract the before last (value) and last (unit) fields
-		fields := strings.Split(line, " ")
-		value := fields[len(fields)-2] + fields[len(fields)-1]
+		// Most lines end with " kB" to indicate the value is in kilobytes
+		multiplier := int64(1)
+		value, found := strings.CutSuffix(rightHandSide, " kB")
+		if found {
+			multiplier = 1024
+		}
 
-		// Feed the result to units.ParseByteSizeString to get an int value
-		valueBytes, err := units.ParseByteSizeString(value)
+		// Remove spaces and convert to int.
+		valueInt, err := strconv.ParseInt(strings.TrimLeft(value, " "), 10, 64)
 		if err != nil {
 			return -1, err
 		}
 
-		return valueBytes, nil
+		// Multiply the value by the multiplier
+		return valueInt * multiplier, nil
 	}
 
-	return -1, fmt.Errorf("Couldn't find %s", field)
+	err = scan.Err()
+	if err != nil {
+		return -1, fmt.Errorf("Failed reading %q: %w", f.Name(), err)
+	}
+
+	return -1, fmt.Errorf("Could not find %s", field)
 }
 
 // OpenPtyInDevpts creates a new PTS pair, configures them and returns them.
-func OpenPtyInDevpts(devptsFD int, uid, gid int64) (*os.File, *os.File, error) {
+func OpenPtyInDevpts(devptsFD int, uid, gid int64) (ptx *os.File, pty *os.File, err error) {
 	revert := revert.New()
 	defer revert.Fail()
 	var fd int
-	var ptx *os.File
-	var err error
 
 	// Create a PTS pair.
 	if devptsFD >= 0 {
@@ -297,7 +317,6 @@ func OpenPtyInDevpts(devptsFD int, uid, gid int64) (*os.File, *os.File, error) {
 		return nil, nil, unix.Errno(errno)
 	}
 
-	var pty *os.File
 	ptyFd, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(ptx.Fd()), unix.TIOCGPTPEER, uintptr(unix.O_NOCTTY|unix.O_CLOEXEC|os.O_RDWR))
 	// We can only fallback to looking up the fd in /dev/pts when we aren't dealing with the container's devpts instance.
 	if errno == 0 {
@@ -311,7 +330,7 @@ func OpenPtyInDevpts(devptsFD int, uid, gid int64) (*os.File, *os.File, error) {
 		pty = os.NewFile(ptyFd, fmt.Sprintf("/dev/pts/%d", id))
 	} else {
 		if devptsFD >= 0 {
-			return nil, nil, fmt.Errorf("TIOCGPTPEER required but not available")
+			return nil, nil, errors.New("TIOCGPTPEER required but not available")
 		}
 
 		// Get the pty side.
@@ -379,7 +398,7 @@ func OpenPtyInDevpts(devptsFD int, uid, gid int64) (*os.File, *os.File, error) {
 }
 
 // OpenPty creates a new PTS pair, configures them and returns them.
-func OpenPty(uid, gid int64) (*os.File, *os.File, error) {
+func OpenPty(uid, gid int64) (ptx *os.File, pty *os.File, err error) {
 	return OpenPtyInDevpts(-1, uid, gid)
 }
 
@@ -392,12 +411,11 @@ func ExitStatus(err error) (int, error) {
 		return 0, err // No error exit status.
 	}
 
-	var exitErr *exec.ExitError
-
 	// Detect and extract ExitError to check the embedded exit status.
-	if errors.As(err, &exitErr) {
+	exitErr, ok := errors.AsType[*exec.ExitError](err)
+	if ok {
 		// If the process was signaled, extract the signal.
-		status, isWaitStatus := exitErr.Sys().(unix.WaitStatus)
+		status, isWaitStatus := exitErr.Sys().(syscall.WaitStatus)
 		if isWaitStatus && status.Signaled() {
 			return 128 + int(status.Signal()), nil // 128 + n == Fatal error signal "n"
 		}
@@ -472,9 +490,9 @@ func (w *execWrapper) Read(p []byte) (int, error) {
 			case err != nil:
 				opErr = err
 			case revents&unix.POLLERR > 0:
-				opErr = fmt.Errorf("Got POLLERR event")
+				opErr = errors.New("Got POLLERR event")
 			case revents&unix.POLLNVAL > 0:
-				opErr = fmt.Errorf("Got POLLNVAL event")
+				opErr = errors.New("Got POLLNVAL event")
 			case revents&(unix.POLLIN|unix.POLLPRI) > 0:
 				// If there is something to read then read it.
 				n, opErr = unix.Read(int(fd), p)

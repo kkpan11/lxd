@@ -2,11 +2,16 @@ package config
 
 import (
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 
+	"github.com/canonical/lxd/lxd/device/filters"
 	"github.com/canonical/lxd/shared/api"
 )
+
+// ConfigInitialPrefix indicates the prefix used for creation time initial device config keys.
+const ConfigInitialPrefix = "initial."
 
 // Device represents a LXD container device.
 type Device map[string]string
@@ -15,19 +20,14 @@ type Device map[string]string
 func (device Device) Clone() Device {
 	cpy := make(map[string]string, len(device))
 
-	for k, v := range device {
-		cpy[k] = v
-	}
+	maps.Copy(cpy, device)
 
 	return cpy
 }
 
 // Validate accepts a map of field/validation functions to run against the device's config.
 func (device Device) Validate(rules map[string]func(value string) error) error {
-	checkedFields := map[string]struct{}{}
-
 	for k, validator := range rules {
-		checkedFields[k] = struct{}{} // Mark field as checked.
 		err := validator(device[k])
 		if err != nil {
 			return fmt.Errorf("Invalid value for device option %q: %w", k, err)
@@ -36,7 +36,7 @@ func (device Device) Validate(rules map[string]func(value string) error) error {
 
 	// Look for any unchecked fields, as these are unknown fields and validation should fail.
 	for k := range device {
-		_, checked := checkedFields[k]
+		_, checked := rules[k]
 		if checked {
 			continue
 		}
@@ -60,7 +60,7 @@ func (device Device) Validate(rules map[string]func(value string) error) error {
 		//  type: n/a
 		//  required: no
 		//  shortdesc: Initial volume configuration
-		if strings.HasPrefix(k, "initial.") {
+		if strings.HasPrefix(k, ConfigInitialPrefix) {
 			continue
 		}
 
@@ -78,6 +78,33 @@ func (device Device) Validate(rules map[string]func(value string) error) error {
 	return nil
 }
 
+// InitialConfig returns a copy of all config in the device where the keys start with ConfigInitialPrefix.
+func (device Device) InitialConfig() Device {
+	initialConfig := Device{}
+
+	for devKey := range device {
+		if strings.HasPrefix(devKey, ConfigInitialPrefix) {
+			initialConfig[devKey] = device[devKey]
+		}
+	}
+
+	return initialConfig
+}
+
+// InitialConfigWithoutPrefix returns a copy of all config in the device where the keys start with ConfigInitialPrefix, but with the prefix removed.
+func (device Device) InitialConfigWithoutPrefix() Device {
+	initialConfig := make(Device)
+
+	for devKey := range device {
+		newKey, found := strings.CutPrefix(devKey, ConfigInitialPrefix)
+		if found {
+			initialConfig[newKey] = device[devKey]
+		}
+	}
+
+	return initialConfig
+}
+
 // Devices represents a set of LXD container devices.
 type Devices map[string]Device
 
@@ -87,9 +114,7 @@ func NewDevices(nativeSet map[string]map[string]string) Devices {
 
 	for devName, devConfig := range nativeSet {
 		newDev := Device{}
-		for k, v := range devConfig {
-			newDev[k] = v
-		}
+		maps.Copy(newDev, devConfig)
 
 		newDevices[devName] = newDev
 	}
@@ -102,7 +127,7 @@ func ApplyDeviceInitialValues(devices Devices, profiles []api.Profile) Devices {
 	for _, p := range profiles {
 		for devName, devConfig := range p.Devices {
 			// Apply only root disk device from profile devices to instance devices.
-			if devConfig["type"] != "disk" || devConfig["path"] != "/" || devConfig["source"] != "" {
+			if !filters.IsRootDisk(devConfig) {
 				continue
 			}
 
@@ -115,7 +140,7 @@ func ApplyDeviceInitialValues(devices Devices, profiles []api.Profile) Devices {
 
 			// If profile device contains an initial.* key, add it to the map of devices.
 			for k := range devConfig {
-				if strings.HasPrefix(k, "initial.") {
+				if strings.HasPrefix(k, ConfigInitialPrefix) {
 					devices[devName] = devConfig
 					break
 				}
@@ -135,7 +160,7 @@ func (list Devices) Contains(k string, d Device) bool {
 
 	old := list[k]
 
-	return deviceEquals(old, d)
+	return maps.Equal(old, d)
 }
 
 // Update returns the difference between two device sets (removed, added, updated devices) and a list of all
@@ -170,7 +195,8 @@ func (list Devices) Update(newlist Devices, updateFields func(Device, Device) []
 		}
 	}
 
-	allChangedKeys := []string{}
+	//nolint:prealloc
+	allChangedKeys := make([]string, 0)
 	for key, d := range addlist {
 		srcOldDevice := rmlist[key]
 		oldDevice := srcOldDevice.Clone()
@@ -192,7 +218,7 @@ func (list Devices) Update(newlist Devices, updateFields func(Device, Device) []
 		// If after removing the live-updatable keys the devices are equal, then we know the device has
 		// been updated rather than added or removed, so add it to the update list, and remove it from
 		// the added and removed lists.
-		if deviceEquals(oldDevice, newDevice) {
+		if maps.Equal(oldDevice, newDevice) {
 			delete(rmlist, key)
 			delete(addlist, key)
 			updatelist[key] = d
@@ -226,7 +252,7 @@ func (list Devices) CloneNative() map[string]map[string]string {
 
 // Sorted returns the name of all devices in the set, sorted properly.
 func (list Devices) Sorted() DevicesSortable {
-	sortable := DevicesSortable{}
+	sortable := make(DevicesSortable, 0, len(list))
 	for k, d := range list {
 		sortable = append(sortable, DeviceNamed{k, d})
 	}
@@ -237,11 +263,70 @@ func (list Devices) Sorted() DevicesSortable {
 
 // Reversed returns the name of all devices in the set, sorted reversed.
 func (list Devices) Reversed() DevicesSortable {
-	sortable := DevicesSortable{}
+	sortable := make(DevicesSortable, 0, len(list))
 	for k, d := range list {
 		sortable = append(sortable, DeviceNamed{k, d})
 	}
 
 	sort.Sort(sort.Reverse(sortable))
 	return sortable
+}
+
+// Filter returns the devices matching the provided filters.
+// The list of filters is applied using the AND operator.
+// Combining filters using the OR operator can be done using the filters.Or function.
+func (list Devices) Filter(filters ...func(map[string]string) bool) Devices {
+	filteredDevices := Devices{}
+
+	for deviceName, device := range list {
+		allFiltersPassed := true
+
+		for _, filter := range filters {
+			if !filter(device) {
+				// The first filter returned false which means the remaining ones can be skipped.
+				allFiltersPassed = false
+				break
+			}
+		}
+
+		if allFiltersPassed {
+			filteredDevices[deviceName] = device
+		}
+	}
+
+	return filteredDevices
+}
+
+// CutInitialConfig returns a copy of all config in the devices where the keys start with ConfigInitialPrefix and removes those keys from list Devices.
+func (list Devices) CutInitialConfig() Devices {
+	initialDevices := make(Devices)
+
+	for deviceName, device := range list {
+		initialConfig := device.InitialConfig()
+		if len(initialConfig) == 0 {
+			continue
+		}
+
+		initialDevices[deviceName] = initialConfig
+
+		// Delete found initial config keys from list Devices.
+		for key := range initialDevices[deviceName] {
+			delete(list[deviceName], key)
+		}
+	}
+
+	return initialDevices
+}
+
+// Copy copies all devices and their config from the list to the target.
+// If a device exists in both the list and the target, then the config of the device in the list will be merged
+// into the device in the target, overwriting any existing keys.
+func (list Devices) Copy(target Devices) {
+	for deviceName, device := range list {
+		if target[deviceName] == nil {
+			target[deviceName] = device.Clone() // Copy config into new device.
+		} else {
+			maps.Copy(target[deviceName], device) // Merge config into existing device.
+		}
+	}
 }

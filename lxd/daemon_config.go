@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"maps"
 
 	clusterConfig "github.com/canonical/lxd/lxd/cluster/config"
 	"github.com/canonical/lxd/lxd/db"
@@ -10,24 +11,20 @@ import (
 	"github.com/canonical/lxd/shared"
 )
 
-func daemonConfigRender(state *state.State) (map[string]any, error) {
-	config := map[string]any{}
+func daemonConfigRender(state *state.State) (map[string]string, error) {
+	config := map[string]string{}
 
 	// Turn the config into a JSON-compatible map.
-	for key, value := range state.GlobalConfig.Dump() {
-		config[key] = value
-	}
+	maps.Copy(config, state.GlobalConfig.Dump())
 
 	// Apply the local config.
-	err := state.DB.Node.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
+	err := state.DB.Node.Transaction(context.Background(), func(ctx context.Context, tx *db.NodeTx) error {
 		nodeConfig, err := node.ConfigLoad(ctx, tx)
 		if err != nil {
 			return err
 		}
 
-		for key, value := range nodeConfig.Dump() {
-			config[key] = value
-		}
+		maps.Copy(config, nodeConfig.Dump())
 
 		return nil
 	})
@@ -46,7 +43,8 @@ func daemonConfigSetProxy(d *Daemon, config *clusterConfig.Config) {
 		config.ProxyIgnoreHosts(),
 	)
 
-	if d.oidcVerifier != nil {
-		d.oidcVerifier.ExpireConfig()
+	oidcVerifier := d.oidcVerifier.Load()
+	if oidcVerifier != nil {
+		oidcVerifier.ExpireConfig()
 	}
 }

@@ -1,8 +1,7 @@
 test_fdleak() {
   LXD_FDLEAK_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
-  chmod +x "${LXD_FDLEAK_DIR}"
   spawn_lxd "${LXD_FDLEAK_DIR}" true
-  pid=$(cat "${LXD_FDLEAK_DIR}/lxd.pid")
+  pid=$(< "${LXD_FDLEAK_DIR}/lxd.pid")
 
   beforefds=$(/bin/ls "/proc/${pid}/fd" | wc -l)
   (
@@ -28,7 +27,10 @@ test_fdleak() {
   )
 
   # Check for open handles to liblxc lxc.log files.
-  ! find "/proc/${pid}/fd" -ls | grep lxc.log || false
+  if find "/proc/${pid}/fd" -ls | grep -F lxc.log; then
+    echo "Found open lxc.log file handles"
+    false
+  fi
 
   for i in $(seq 20); do
     afterfds=$(/bin/ls "/proc/${pid}/fd" | wc -l)
@@ -41,7 +43,7 @@ test_fdleak() {
   bad=0
   # shellcheck disable=SC2015
   [ "${leakedfds}" -gt 5 ] && bad=1 || true
-  if [ ${bad} -eq 1 ]; then
+  if [ "${bad}" -eq 1 ]; then
     echo "${leakedfds} FDS leaked"
     ls "/proc/${pid}/fd" -al
     netstat -anp 2>&1 | grep "${pid}/"

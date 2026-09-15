@@ -4,18 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"time"
 
-	"github.com/gorilla/mux"
-
 	"github.com/canonical/lxd/lxd/auth"
-	clusterRequest "github.com/canonical/lxd/lxd/cluster/request"
 	"github.com/canonical/lxd/lxd/db"
+	"github.com/canonical/lxd/lxd/db/operationtype"
 	"github.com/canonical/lxd/lxd/lifecycle"
 	"github.com/canonical/lxd/lxd/network/acl"
+	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/project"
 	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/response"
@@ -27,26 +26,61 @@ import (
 )
 
 var networkACLsCmd = APIEndpoint{
-	Path: "network-acls",
+	Path:            "network-acls",
+	MetricsType:     entity.TypeNetwork,
+	ProjectSpecific: true,
 
-	Get:  APIEndpointAction{Handler: networkACLsGet, AccessHandler: allowProjectResourceList},
-	Post: APIEndpointAction{Handler: networkACLsPost, AccessHandler: allowPermission(entity.TypeProject, auth.EntitlementCanCreateNetworkACLs)},
+	Get:  APIEndpointAction{Handler: networkACLsGet, AccessHandler: allowAuthenticated, AllProjectsMode: allProjectsModeDisallowRestrictedTLSClients},
+	Post: APIEndpointAction{Handler: networkACLsPost, AccessHandler: networkACLAccessHandler(auth.EntitlementCanCreateNetworkACLs)},
 }
 
 var networkACLCmd = APIEndpoint{
-	Path: "network-acls/{name}",
+	Path:            "network-acls/{name}",
+	MetricsType:     entity.TypeNetwork,
+	ProjectSpecific: true,
 
-	Delete: APIEndpointAction{Handler: networkACLDelete, AccessHandler: allowPermission(entity.TypeNetworkACL, auth.EntitlementCanDelete, "name")},
-	Get:    APIEndpointAction{Handler: networkACLGet, AccessHandler: allowPermission(entity.TypeNetworkACL, auth.EntitlementCanView, "name")},
-	Put:    APIEndpointAction{Handler: networkACLPut, AccessHandler: allowPermission(entity.TypeNetworkACL, auth.EntitlementCanEdit, "name")},
-	Patch:  APIEndpointAction{Handler: networkACLPut, AccessHandler: allowPermission(entity.TypeNetworkACL, auth.EntitlementCanEdit, "name")},
-	Post:   APIEndpointAction{Handler: networkACLPost, AccessHandler: allowPermission(entity.TypeNetworkACL, auth.EntitlementCanEdit, "name")},
+	Delete: APIEndpointAction{Handler: networkACLDelete, AccessHandler: networkACLAccessHandler(auth.EntitlementCanDelete)},
+	Get:    APIEndpointAction{Handler: networkACLGet, AccessHandler: networkACLAccessHandler(auth.EntitlementCanView)},
+	Put:    APIEndpointAction{Handler: networkACLPut, AccessHandler: networkACLAccessHandler(auth.EntitlementCanEdit)},
+	Patch:  APIEndpointAction{Handler: networkACLPut, AccessHandler: networkACLAccessHandler(auth.EntitlementCanEdit)},
+	Post:   APIEndpointAction{Handler: networkACLPost, AccessHandler: networkACLAccessHandler(auth.EntitlementCanEdit)},
 }
 
 var networkACLLogCmd = APIEndpoint{
-	Path: "network-acls/{name}/log",
+	Path:            "network-acls/{name}/log",
+	MetricsType:     entity.TypeNetwork,
+	ProjectSpecific: true,
 
-	Get: APIEndpointAction{Handler: networkACLLogGet, AccessHandler: allowPermission(entity.TypeNetworkACL, auth.EntitlementCanView, "name")},
+	Get: APIEndpointAction{Handler: networkACLLogGet, AccessHandler: networkACLAccessHandler(auth.EntitlementCanView)},
+}
+
+func networkACLAccessHandler(entitlement auth.Entitlement) func(d *Daemon, r *http.Request) response.Response {
+	return func(d *Daemon, r *http.Request) response.Response {
+		requestProject := request.ProjectParam(r)
+
+		s := d.State()
+		effectiveProject, _, err := project.NetworkProject(s.DB.Cluster, requestProject)
+		if err != nil {
+			return response.SmartError(err)
+		}
+
+		request.SetContextValue(r, request.CtxEffectiveProjectName, effectiveProject)
+
+		var u *api.URL
+		switch entitlement {
+		case auth.EntitlementCanCreateNetworkACLs:
+			u = entity.ProjectURL(effectiveProject)
+		default:
+			u = entity.NetworkACLURL(effectiveProject, r.PathValue("name"))
+		}
+
+		err = s.Authorizer.CheckPermission(r.Context(), u, entitlement)
+		if err != nil {
+			return response.SmartError(err)
+		}
+
+		return response.EmptySyncResponse
+	}
 }
 
 // API endpoints.
@@ -66,6 +100,11 @@ var networkACLLogCmd = APIEndpoint{
 //      description: Project name
 //      type: string
 //      example: default
+//    - in: query
+//      name: all-projects
+//      description: Retrieve network ACLs from all projects
+//      type: boolean
+//      example: true
 //  responses:
 //    "200":
 //      description: API endpoints
@@ -115,6 +154,11 @@ var networkACLLogCmd = APIEndpoint{
 //	    description: Project name
 //	    type: string
 //	    example: default
+//	  - in: query
+//	    name: all-projects
+//	    description: Retrieve network ACLs from all projects
+//	    type: boolean
+//	    example: true
 //	responses:
 //	  "200":
 //	    description: API endpoints
@@ -146,21 +190,50 @@ var networkACLLogCmd = APIEndpoint{
 func networkACLsGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	requestProjectName := request.ProjectParam(r)
-	effectiveProjectName, _, err := project.NetworkProject(s.DB.Cluster, requestProjectName)
+	requestProjectName, allProjects, err := request.ProjectParams(r)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	recursion := util.IsRecursionRequest(r)
+	var effectiveProjectName string
+	if !allProjects {
+		// Project specific requests require an effective project, when "features.networks" is enabled this is the requested project, otherwise it is the default project.
+		effectiveProjectName, _, err = project.NetworkProject(s.DB.Cluster, requestProjectName)
+		if err != nil {
+			return response.SmartError(err)
+		}
 
-	var aclNames []string
+		// If the request is project specific, then set effective project name in the request context so that the authorizer can generate the correct URL.
+		request.SetContextValue(r, request.CtxEffectiveProjectName, effectiveProjectName)
+	}
 
-	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	recursion, _ := util.IsRecursionRequest(r)
+	withEntitlements, err := extractEntitlementsFromQuery(r, entity.TypeNetworkACL, true)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	var aclNames map[string][]string
+	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
 		var err error
 
-		// Get list of Network ACLs.
-		aclNames, err = tx.GetNetworkACLs(ctx, effectiveProjectName)
+		if allProjects {
+			// Get list of Network ACLs across all projects.
+			aclNames, err = tx.GetNetworkACLsAllProjects(ctx)
+			if err != nil {
+				return err
+			}
+		} else {
+			// Get list of Network ACLs.
+			acls, err := tx.GetNetworkACLs(ctx, effectiveProjectName)
+			if err != nil {
+				return err
+			}
+
+			// ACL names should be mapped to the requested project for project specific requests.
+			aclNames = map[string][]string{}
+			aclNames[requestProjectName] = acls
+		}
 
 		return err
 	})
@@ -168,37 +241,59 @@ func networkACLsGet(d *Daemon, r *http.Request) response.Response {
 		return response.InternalError(err)
 	}
 
-	request.SetCtxValue(r, request.CtxEffectiveProjectName, effectiveProjectName)
 	userHasPermission, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeNetworkACL)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	resultString := []string{}
-	resultMap := []api.NetworkACL{}
-	for _, aclName := range aclNames {
-		if !userHasPermission(entity.NetworkACLURL(requestProjectName, aclName)) {
-			continue
-		}
+	resultMap := []*api.NetworkACL{}
+	urlToNetworkACL := make(map[*api.URL]auth.EntitlementReporter)
+	for projectName, acls := range aclNames {
+		for _, aclName := range acls {
+			authProjectName := projectName
+			if !allProjects {
+				authProjectName = effectiveProjectName
+			}
 
-		if !recursion {
-			resultString = append(resultString, fmt.Sprintf("/%s/network-acls/%s", version.APIVersion, aclName))
-		} else {
-			netACL, err := acl.LoadByName(s, effectiveProjectName, aclName)
-			if err != nil {
+			if !userHasPermission(entity.NetworkACLURL(authProjectName, aclName)) {
 				continue
 			}
 
-			netACLInfo := netACL.Info()
-			netACLInfo.UsedBy, _ = netACL.UsedBy() // Ignore errors in UsedBy, will return nil.
-			netACLInfo.UsedBy = project.FilterUsedBy(s.Authorizer, r, netACLInfo.UsedBy)
+			if recursion == 0 {
+				resultString = append(resultString, api.NewURL().Path(version.APIVersion, "network-acls", aclName).String())
+			} else {
+				var netACL acl.NetworkACL
+				if !allProjects {
+					netACL, err = acl.LoadByName(r.Context(), s, effectiveProjectName, aclName)
+				} else {
+					netACL, err = acl.LoadByName(r.Context(), s, projectName, aclName)
+				}
 
-			resultMap = append(resultMap, *netACLInfo)
+				if err != nil {
+					return response.SmartError(err)
+				}
+
+				netACLInfo := netACL.Info()
+				netACLInfo.UsedBy, _ = netACL.UsedBy() // Ignore errors in UsedBy, will return nil.
+				netACLInfo.UsedBy = project.FilterUsedBy(r.Context(), s.Authorizer, netACLInfo.UsedBy)
+				netACLInfo.Project = projectName
+
+				resultMap = append(resultMap, netACLInfo)
+				urlToNetworkACL[entity.NetworkACLURL(authProjectName, aclName)] = netACLInfo
+			}
 		}
 	}
 
-	if !recursion {
+	if recursion == 0 {
 		return response.SyncResponse(true, resultString)
+	}
+
+	if len(withEntitlements) > 0 {
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeNetworkACL, withEntitlements, urlToNetworkACL)
+		if err != nil {
+			return response.SmartError(err)
+		}
 	}
 
 	return response.SyncResponse(true, resultMap)
@@ -228,8 +323,8 @@ func networkACLsGet(d *Daemon, r *http.Request) response.Response {
 //	    schema:
 //	      $ref: "#/definitions/NetworkACLsPost"
 //	responses:
-//	  "200":
-//	    $ref: "#/responses/EmptySyncResponse"
+//	  "202":
+//	    $ref: "#/responses/Operation"
 //	  "400":
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
@@ -239,7 +334,8 @@ func networkACLsGet(d *Daemon, r *http.Request) response.Response {
 func networkACLsPost(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	projectName, _, err := project.NetworkProject(s.DB.Cluster, request.ProjectParam(r))
+	requestProject := request.ProjectParam(r)
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -252,25 +348,44 @@ func networkACLsPost(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
-	_, err = acl.LoadByName(s, projectName, req.Name)
+	_, err = acl.LoadByName(r.Context(), s, effectiveProjectName, req.Name)
 	if err == nil {
-		return response.BadRequest(fmt.Errorf("The network ACL already exists"))
+		return response.BadRequest(errors.New("The network ACL already exists"))
 	}
 
-	err = acl.Create(s, projectName, &req)
+	run := func(ctx context.Context, op *operations.Operation) error {
+		err = acl.Create(ctx, s, effectiveProjectName, &req)
+		if err != nil {
+			return err
+		}
+
+		netACL, err := acl.LoadByName(ctx, s, effectiveProjectName, req.Name)
+		if err != nil {
+			return err
+		}
+
+		s.Events.SendLifecycle(effectiveProjectName, lifecycle.NetworkACLCreated.Event(netACL, request.CreateRequestor(ctx), nil))
+
+		return nil
+	}
+
+	args := operations.OperationArgs{
+		ProjectName: requestProject,
+		Type:        operationtype.NetworkACLCreate,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     run,
+		EntityURL:   entity.ProjectURL(effectiveProjectName),
+		Metadata: map[string]any{
+			api.MetadataEntityURL: entity.NetworkACLURL(requestProject, req.Name).String(),
+		},
+	}
+
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
-		return response.SmartError(err)
+		return response.InternalError(err)
 	}
 
-	netACL, err := acl.LoadByName(s, projectName, req.Name)
-	if err != nil {
-		return response.BadRequest(err)
-	}
-
-	lc := lifecycle.NetworkACLCreated.Event(netACL, request.CreateRequestor(r), nil)
-	s.Events.SendLifecycle(projectName, lc)
-
-	return response.SyncResponseLocation(true, nil, lc.Source)
+	return response.OperationResponse(op)
 }
 
 // swagger:operation DELETE /1.0/network-acls/{name} network-acls network_acl_delete
@@ -289,40 +404,74 @@ func networkACLsPost(d *Daemon, r *http.Request) response.Response {
 //	    type: string
 //	    example: default
 //	responses:
-//	  "200":
-//	    $ref: "#/responses/EmptySyncResponse"
+//	  "202":
+//	    $ref: "#/responses/Operation"
 //	  "400":
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func networkACLDelete(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	projectName, _, err := project.NetworkProject(s.DB.Cluster, request.ProjectParam(r))
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	aclName, err := url.PathUnescape(mux.Vars(r)["name"])
+	aclName := r.PathValue("name")
+	requestor, err := request.GetRequestor(r.Context())
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	netACL, err := acl.LoadByName(s, projectName, aclName)
+	clientType := requestor.ClientType()
+
+	// Load the ACL before creating the operation so we can return a synchronous 404 if not found.
+	netACL, err := acl.LoadByName(r.Context(), s, effectiveProjectName, aclName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	err = netACL.Delete()
-	if err != nil {
-		return response.SmartError(err)
+	run := func(ctx context.Context, op *operations.Operation) error {
+		err := netACL.Delete(ctx)
+		if err != nil {
+			return fmt.Errorf("Failed deleting network ACL %q: %w", netACL.Info().Name, err)
+		}
+
+		if !clientType.IsClusterOperationNotification() {
+			s.Events.SendLifecycle(effectiveProjectName, lifecycle.NetworkACLDeleted.Event(netACL, request.CreateRequestor(ctx), nil))
+		}
+
+		return nil
 	}
 
-	s.Events.SendLifecycle(projectName, lifecycle.NetworkACLDeleted.Event(netACL, request.CreateRequestor(r), nil))
+	if clientType.IsClusterOperationNotification() {
+		err := run(r.Context(), nil)
+		if err != nil {
+			return response.SmartError(err)
+		}
 
-	return response.EmptySyncResponse
+		return response.EmptySyncResponse
+	}
+
+	args := operations.OperationArgs{
+		ProjectName: request.ProjectParam(r),
+		Type:        operationtype.NetworkACLDelete,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     run,
+		EntityURL:   entity.NetworkACLURL(effectiveProjectName, aclName),
+	}
+
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
+	if err != nil {
+		return response.InternalError(err)
+	}
+
+	return response.OperationResponse(op)
 }
 
 // swagger:operation GET /1.0/network-acls/{name} network-acls network_acl_get
@@ -368,17 +517,18 @@ func networkACLDelete(d *Daemon, r *http.Request) response.Response {
 func networkACLGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	projectName, _, err := project.NetworkProject(s.DB.Cluster, request.ProjectParam(r))
+	projectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	aclName, err := url.PathUnescape(mux.Vars(r)["name"])
+	aclName := r.PathValue("name")
+	withEntitlements, err := extractEntitlementsFromQuery(r, entity.TypeNetworkACL, false)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	netACL, err := acl.LoadByName(s, projectName, aclName)
+	netACL, err := acl.LoadByName(r.Context(), s, projectName, aclName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -389,7 +539,14 @@ func networkACLGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	info.UsedBy = project.FilterUsedBy(s.Authorizer, r, info.UsedBy)
+	info.UsedBy = project.FilterUsedBy(r.Context(), s.Authorizer, info.UsedBy)
+	if len(withEntitlements) > 0 {
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeNetworkACL, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.NetworkACLURL(projectName, aclName): info})
+		if err != nil {
+			return response.SmartError(err)
+		}
+	}
+
 	return response.SyncResponseETag(true, info, netACL.Etag())
 }
 
@@ -417,8 +574,8 @@ func networkACLGet(d *Daemon, r *http.Request) response.Response {
 //      schema:
 //        $ref: "#/definitions/NetworkACLPut"
 //  responses:
-//    "200":
-//      $ref: "#/responses/EmptySyncResponse"
+//    "202":
+//      $ref: "#/responses/Operation"
 //    "400":
 //      $ref: "#/responses/BadRequest"
 //    "403":
@@ -452,12 +609,14 @@ func networkACLGet(d *Daemon, r *http.Request) response.Response {
 //	    schema:
 //	      $ref: "#/definitions/NetworkACLPut"
 //	responses:
-//	  "200":
-//	    $ref: "#/responses/EmptySyncResponse"
+//	  "202":
+//	    $ref: "#/responses/Operation"
 //	  "400":
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
 //	  "412":
 //	    $ref: "#/responses/PreconditionFailed"
 //	  "500":
@@ -465,18 +624,14 @@ func networkACLGet(d *Daemon, r *http.Request) response.Response {
 func networkACLPut(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	projectName, _, err := project.NetworkProject(s.DB.Cluster, request.ProjectParam(r))
+	projectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	aclName, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	aclName := r.PathValue("name")
 	// Get the existing Network ACL.
-	netACL, err := acl.LoadByName(s, projectName, aclName)
+	netACL, err := acl.LoadByName(r.Context(), s, projectName, aclName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -506,16 +661,51 @@ func networkACLPut(d *Daemon, r *http.Request) response.Response {
 		}
 	}
 
-	clientType := clusterRequest.UserAgentClientType(r.Header.Get("User-Agent"))
-
-	err = netACL.Update(&req, clientType)
+	requestor, err := request.GetRequestor(r.Context())
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	s.Events.SendLifecycle(projectName, lifecycle.NetworkACLUpdated.Event(netACL, request.CreateRequestor(r), nil))
+	clientType := requestor.ClientType()
 
-	return response.EmptySyncResponse
+	run := func(ctx context.Context, op *operations.Operation) error {
+		err = netACL.Update(ctx, &req, clientType)
+		if err != nil {
+			return err
+		}
+
+		if !clientType.IsClusterOperationNotification() {
+			requestor := request.CreateRequestor(ctx)
+			s.Events.SendLifecycle(projectName, lifecycle.NetworkACLUpdated.Event(netACL, requestor, nil))
+		}
+
+		return nil
+	}
+
+	if clientType.IsClusterOperationNotification() {
+		// Operation notification from the leader node: handle synchronously.
+		err := run(r.Context(), nil)
+		if err != nil {
+			return response.SmartError(err)
+		}
+
+		return response.EmptySyncResponse
+	}
+
+	args := operations.OperationArgs{
+		ProjectName: request.ProjectParam(r),
+		Type:        operationtype.NetworkACLUpdate,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     run,
+		EntityURL:   entity.NetworkACLURL(projectName, aclName),
+	}
+
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
+	if err != nil {
+		return response.InternalError(err)
+	}
+
+	return response.OperationResponse(op)
 }
 
 // swagger:operation POST /1.0/network-acls/{name} network-acls network_acl_post
@@ -542,8 +732,8 @@ func networkACLPut(d *Daemon, r *http.Request) response.Response {
 //	    schema:
 //	      $ref: "#/definitions/NetworkACLPost"
 //	responses:
-//	  "200":
-//	    $ref: "#/responses/EmptySyncResponse"
+//	  "202":
+//	    $ref: "#/responses/Operation"
 //	  "400":
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
@@ -553,12 +743,9 @@ func networkACLPut(d *Daemon, r *http.Request) response.Response {
 func networkACLPost(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	aclName, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	projectName, _, err := project.NetworkProject(s.DB.Cluster, request.ProjectParam(r))
+	aclName := r.PathValue("name")
+	requestProject := request.ProjectParam(r)
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -572,20 +759,42 @@ func networkACLPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Get the existing Network ACL.
-	netACL, err := acl.LoadByName(s, projectName, aclName)
+	netACL, err := acl.LoadByName(r.Context(), s, effectiveProjectName, aclName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	err = netACL.Rename(req.Name)
-	if err != nil {
-		return response.SmartError(err)
+	run := func(ctx context.Context, op *operations.Operation) error {
+		err = netACL.Rename(ctx, req.Name)
+		if err != nil {
+			return err
+		}
+
+		requestor := request.CreateRequestor(ctx)
+		lc := lifecycle.NetworkACLRenamed.Event(netACL, requestor, logger.Ctx{"old_name": aclName})
+		s.Events.SendLifecycle(effectiveProjectName, lc)
+
+		return nil
 	}
 
-	lc := lifecycle.NetworkACLRenamed.Event(netACL, request.CreateRequestor(r), logger.Ctx{"old_name": aclName})
-	s.Events.SendLifecycle(projectName, lc)
+	args := operations.OperationArgs{
+		ProjectName: requestProject,
+		Type:        operationtype.NetworkACLRename,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     run,
+		EntityURL:   entity.NetworkACLURL(effectiveProjectName, aclName),
+		Metadata: map[string]any{
+			api.MetadataOriginalEntityURL: entity.NetworkACLURL(requestProject, aclName).String(),
+			api.MetadataEntityURL:         entity.NetworkACLURL(requestProject, req.Name).String(),
+		},
+	}
 
-	return response.SyncResponseLocation(true, nil, lc.Source)
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
+	if err != nil {
+		return response.InternalError(err)
+	}
+
+	return response.OperationResponse(op)
 }
 
 // swagger:operation GET /1.0/network-acls/{name}/log network-acls network_acl_log_get
@@ -618,23 +827,23 @@ func networkACLPost(d *Daemon, r *http.Request) response.Response {
 func networkACLLogGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	projectName, _, err := project.NetworkProject(s.DB.Cluster, request.ProjectParam(r))
+	projectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	aclName, err := url.PathUnescape(mux.Vars(r)["name"])
+	aclName := r.PathValue("name")
+	netACL, err := acl.LoadByName(r.Context(), s, projectName, aclName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	netACL, err := acl.LoadByName(s, projectName, aclName)
+	requestor, err := request.GetRequestor(r.Context())
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	clientType := clusterRequest.UserAgentClientType(r.Header.Get("User-Agent"))
-	log, err := netACL.GetLog(clientType)
+	log, err := netACL.GetLog(r.Context(), requestor.ClientType())
 	if err != nil {
 		return response.SmartError(err)
 	}

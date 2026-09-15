@@ -44,6 +44,48 @@ type simpleListenerConnection struct {
 	lock sync.Mutex
 }
 
+// readerCommon implements the common reader logic for stream and simple connections.
+func readerCommon(ctx context.Context, lock *sync.Mutex, rc io.ReadCloser) {
+	ctx, cancelFunc := context.WithCancel(ctx)
+
+	closeFunc := func() {
+		lock.Lock()
+		defer lock.Unlock()
+
+		if ctx.Err() != nil {
+			return
+		}
+
+		err := rc.Close()
+		if err != nil {
+			logger.Warn("Failed closing connection", logger.Ctx{"err": err})
+		}
+
+		cancelFunc()
+	}
+
+	defer closeFunc()
+
+	// Start reader from client.
+	go func() {
+		defer closeFunc()
+
+		buf := make([]byte, 1)
+
+		// This is used to determine whether the client has terminated.
+		_, err := rc.Read(buf)
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				logger.Warn("Failed reading from connection", logger.Ctx{"err": err})
+			}
+
+			return
+		}
+	}()
+
+	<-ctx.Done()
+}
+
 // NewWebsocketListenerConnection returns a new websocket listener connection.
 func NewWebsocketListenerConnection(connection *websocket.Conn) EventListenerConnection {
 	return &websockListenerConnection{
@@ -51,41 +93,72 @@ func NewWebsocketListenerConnection(connection *websocket.Conn) EventListenerCon
 	}
 }
 
+// Reader for the websocket connection.
 func (e *websockListenerConnection) Reader(ctx context.Context, recvFunc EventHandler) {
 	ctx, cancel := context.WithCancel(ctx)
 
-	close := func() {
+	// closer is used to clean up the connection and cancel the context when either
+	// the reader or ping/pong goroutine detects a problem and returns.
+	closer := func() {
 		e.lock.Lock()
 		defer e.lock.Unlock()
 
 		if ctx.Err() != nil {
-			return
+			return // Context already cancelled, no need to close again.
 		}
 
-		_ = e.Close()
+		err := e.Close() // This may unblock the reader and ping/pong goroutines.
+		if err != nil {
+			logger.Warn("Failed closing connection", logger.Ctx{"err": err, "remote": e.RemoteAddr()})
+		}
+
 		cancel()
 	}
 
-	defer close()
-
 	pingInterval := time.Second * 10
 	e.pongsPending = 0
+	const maxPongsPending = 2
+
+	getNextReadDeadline := func() time.Time {
+		// This means that if we miss more than maxPongsPending pongs, the reading goroutine will end.
+		return time.Now().Add((maxPongsPending+1)*pingInterval + 5*time.Second)
+	}
+
+	// Set read deadline to prevent goroutine from blocking indefinitely.
+	// This ensures the goroutine will unblock even if e.Close() does not immediately
+	// interrupt the read operation due to buffering or network delays.
+	err := e.SetReadDeadline(getNextReadDeadline())
+	if err != nil {
+		logger.Warn("Failed setting read deadline on connection", logger.Ctx{"err": err, "remote": e.RemoteAddr()})
+		closer()
+		return
+	}
 
 	e.SetPongHandler(func(msg string) error {
 		e.lock.Lock()
-		e.pongsPending = 0
-		e.lock.Unlock()
+		defer e.lock.Unlock()
+
+		e.pongsPending = 0 // Reset pending pongs on receiving a pong.
+
+		// Extend the read deadline each time we get a pong.
+		err := e.SetReadDeadline(getNextReadDeadline())
+		if err != nil {
+			return fmt.Errorf("Failed setting read deadline on connection: %w", err)
+		}
+
 		return nil
 	})
 
+	var wg sync.WaitGroup
+
 	// Start reader from client.
-	go func() {
-		defer close()
+	wg.Go(func() {
+		defer closer() // Clean up connection and cancel context when reader exits.
 
 		if recvFunc != nil {
 			for {
 				var event api.Event
-				err := e.Conn.ReadJSON(&event)
+				err := e.ReadJSON(&event)
 				if err != nil {
 					return // This detects if client has disconnected or sent invalid data.
 				}
@@ -96,46 +169,54 @@ func (e *websockListenerConnection) Reader(ctx context.Context, recvFunc EventHa
 		} else {
 			// Run a blocking reader to detect if the client has disconnected. We don't expect to get
 			// anything from the remote side, so this should remain blocked until disconnected.
-			_, _, _ = e.Conn.NextReader()
+			_, _, _ = e.NextReader()
 		}
-	}()
+	})
 
-	t := time.NewTicker(pingInterval)
-	defer t.Stop()
+	// Start ping/pong handler.
+	wg.Go(func() {
+		defer closer() // Clean up connection and cancel context when ping/pong handler exits.
 
-	for {
-		if ctx.Err() != nil {
-			return
-		}
+		t := time.NewTicker(pingInterval)
+		defer t.Stop()
 
-		e.lock.Lock()
-		if e.pongsPending > 2 {
+		for {
+			if ctx.Err() != nil {
+				return // Context cancelled, exit goroutine.
+			}
+
+			e.lock.Lock()
+			if e.pongsPending > maxPongsPending {
+				e.lock.Unlock()
+				return // Too many pongs pending, assume the connection is dead.
+			}
+
+			err := e.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
+			if err != nil {
+				e.lock.Unlock()
+				return // Failed to send ping, assume the connection is dead.
+			}
+
+			e.pongsPending++ // Increment pending pongs after sending a ping.
 			e.lock.Unlock()
-			return
-		}
 
-		err := e.WriteControl(websocket.PingMessage, []byte("keepalive"), time.Now().Add(5*time.Second))
-		if err != nil {
-			e.lock.Unlock()
-			return
+			select {
+			case <-t.C:
+			case <-ctx.Done():
+				return // Context cancelled, exit goroutine.
+			}
 		}
+	})
 
-		e.pongsPending++
-		e.lock.Unlock()
-
-		select {
-		case <-t.C:
-		case <-ctx.Done():
-			return
-		}
-	}
+	wg.Wait() // Wait for both goroutines to clean up before returning.
 }
 
+// WriteJSON sends a JSON event to the websocket connection.
 func (e *websockListenerConnection) WriteJSON(event any) error {
 	e.lock.Lock()
 	defer e.lock.Unlock()
 
-	err := e.Conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	err := e.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if err != nil {
 		return fmt.Errorf("Failed setting write deadline: %w", err)
 	}
@@ -167,52 +248,17 @@ X-Content-Type-Options: nosniff
 	}, nil
 }
 
+// Reader for the stream connection.
 func (e *streamListenerConnection) Reader(ctx context.Context, recvFunc EventHandler) {
-	ctx, cancelFunc := context.WithCancel(ctx)
-
-	close := func() {
-		e.lock.Lock()
-		defer e.lock.Unlock()
-
-		if ctx.Err() != nil {
-			return
-		}
-
-		err := e.Close()
-		if err != nil {
-			logger.Warn("Failed closing connection", logger.Ctx{"err": err})
-		}
-
-		cancelFunc()
-	}
-
-	defer close()
-
-	// Start reader from client.
-	go func() {
-		defer close()
-
-		buf := make([]byte, 1)
-
-		// This is used to determine whether the client has terminated.
-		_, err := e.Read(buf)
-		if err != nil && errors.Is(err, io.EOF) {
-			return
-		}
-	}()
-
-	if ctx.Err() != nil {
-		return
-	}
-
-	<-ctx.Done()
+	readerCommon(ctx, &e.lock, e.Conn)
 }
 
+// WriteJSON sends a JSON event to the stream connection.
 func (e *streamListenerConnection) WriteJSON(event any) error {
 	e.lock.Lock()
 	defer e.lock.Unlock()
 
-	err := e.SetWriteDeadline(time.Now().Add(5 * (time.Second)))
+	err := e.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if err != nil {
 		return fmt.Errorf("Failed setting write deadline: %w", err)
 	}
@@ -225,6 +271,7 @@ func (e *streamListenerConnection) WriteJSON(event any) error {
 	return nil
 }
 
+// Close closes the stream connection.
 func (e *streamListenerConnection) Close() error {
 	return e.Conn.Close()
 }
@@ -236,48 +283,16 @@ func NewSimpleListenerConnection(rwc io.ReadWriteCloser) EventListenerConnection
 	}
 }
 
+// Reader for the simple connection.
 func (e *simpleListenerConnection) Reader(ctx context.Context, recvFunc EventHandler) {
-	ctx, cancelFunc := context.WithCancel(ctx)
-
-	close := func() {
-		e.lock.Lock()
-		defer e.lock.Unlock()
-
-		if ctx.Err() != nil {
-			return
-		}
-
-		err := e.Close()
-		if err != nil {
-			logger.Warn("Failed closing connection", logger.Ctx{"err": err})
-		}
-
-		cancelFunc()
-	}
-
-	defer close()
-
-	// Start reader from client.
-	go func() {
-		defer close()
-
-		buf := make([]byte, 1)
-
-		// This is used to determine whether the client has terminated.
-		_, err := e.rwc.Read(buf)
-		if err != nil && errors.Is(err, io.EOF) {
-			return
-		}
-	}()
-
-	if ctx.Err() != nil {
-		return
-	}
-
-	<-ctx.Done()
+	readerCommon(ctx, &e.lock, e.rwc)
 }
 
+// WriteJSON sends a JSON event to the simple connection.
 func (e *simpleListenerConnection) WriteJSON(event any) error {
+	e.lock.Lock()
+	defer e.lock.Unlock()
+
 	err := json.NewEncoder(e.rwc).Encode(event)
 	if err != nil {
 		return err
@@ -286,14 +301,17 @@ func (e *simpleListenerConnection) WriteJSON(event any) error {
 	return nil
 }
 
+// Close closes the simple connection.
 func (e *simpleListenerConnection) Close() error {
 	return e.rwc.Close()
 }
 
-func (e *simpleListenerConnection) LocalAddr() net.Addr { // Used for logging
+// LocalAddr returns nil for logging purposes.
+func (e *simpleListenerConnection) LocalAddr() net.Addr {
 	return nil
 }
 
-func (e *simpleListenerConnection) RemoteAddr() net.Addr { // Used for logging
+// RemoteAddr returns nil for logging purposes.
+func (e *simpleListenerConnection) RemoteAddr() net.Addr {
 	return nil
 }

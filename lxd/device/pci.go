@@ -1,8 +1,10 @@
 package device
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
+	"strconv"
 
 	deviceConfig "github.com/canonical/lxd/lxd/device/config"
 	pcidev "github.com/canonical/lxd/lxd/device/pci"
@@ -35,7 +37,7 @@ func (d *pci) validateConfig(instConf instance.ConfigReader) error {
 
 	err := d.config.Validate(rules)
 	if err != nil {
-		return fmt.Errorf("Failed to validate config: %w", err)
+		return fmt.Errorf("Failed validating config: %w", err)
 	}
 
 	d.config["address"] = pcidev.NormaliseAddress(d.config["address"])
@@ -46,7 +48,7 @@ func (d *pci) validateConfig(instConf instance.ConfigReader) error {
 // validateEnvironment checks if the PCI device is available.
 func (d *pci) validateEnvironment() error {
 	if d.inst.Type() == instancetype.VM && shared.IsTrue(d.inst.ExpandedConfig()["migration.stateful"]) {
-		return fmt.Errorf("PCI devices cannot be used when migration.stateful is enabled")
+		return errors.New("PCI devices cannot be used when migration.stateful is enabled")
 	}
 
 	return validatePCIDevice(d.config["address"])
@@ -56,7 +58,7 @@ func (d *pci) validateEnvironment() error {
 func (d *pci) Start() (*deviceConfig.RunConfig, error) {
 	err := d.validateEnvironment()
 	if err != nil {
-		return nil, fmt.Errorf("Failed to validate environment: %w", err)
+		return nil, fmt.Errorf("Failed validating environment: %w", err)
 	}
 
 	runConf := deviceConfig.RunConfig{}
@@ -73,21 +75,27 @@ func (d *pci) Start() (*deviceConfig.RunConfig, error) {
 	devicePath := filepath.Join("/sys/bus/pci/devices", pciAddress)
 	pciDev, err := pcidev.ParseUeventFile(filepath.Join(devicePath, "uevent"))
 	if err != nil {
-		return nil, fmt.Errorf("Failed to get PCI device info for %q: %w", pciAddress, err)
+		return nil, fmt.Errorf("Failed getting PCI device info for %q: %w", pciAddress, err)
 	}
 
 	saveData["last_state.pci.slot.name"] = pciDev.SlotName
 	saveData["last_state.pci.driver"] = pciDev.Driver
 
+	pciIOMMUGroup, err := pcidev.DeviceIOMMUGroup(saveData["last_state.pci.slot.name"])
+	if err != nil {
+		return nil, err
+	}
+
 	err = pcidev.DeviceDriverOverride(pciDev, "vfio-pci")
 	if err != nil {
-		return nil, fmt.Errorf("Failed to override IOMMU group driver: %w", err)
+		return nil, fmt.Errorf("Failed overriding IOMMU group driver: %w", err)
 	}
 
 	runConf.PCIDevice = append(runConf.PCIDevice,
 		[]deviceConfig.RunConfigItem{
 			{Key: "devName", Value: d.name},
 			{Key: "pciSlotName", Value: saveData["last_state.pci.slot.name"]},
+			{Key: "pciIOMMUGroup", Value: strconv.FormatUint(pciIOMMUGroup, 10)},
 		}...)
 
 	err = d.volatileSet(saveData)
@@ -96,6 +104,11 @@ func (d *pci) Start() (*deviceConfig.RunConfig, error) {
 	}
 
 	return &runConf, nil
+}
+
+// CanHotPlug returns whether the device can be managed whilst the instance is running.
+func (d *pci) CanHotPlug() bool {
+	return true
 }
 
 // Stop is run when the device is removed from the instance.

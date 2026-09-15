@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"github.com/canonical/lxd/lxd/auth"
 	"github.com/canonical/lxd/lxd/db"
 	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
+	"github.com/canonical/lxd/lxd/db/warningtype"
 	"github.com/canonical/lxd/lxd/instance"
 	instanceDrivers "github.com/canonical/lxd/lxd/instance/drivers"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
@@ -22,7 +25,6 @@ import (
 	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/lxd/state"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/entity"
 	"github.com/canonical/lxd/shared/logger"
@@ -37,7 +39,8 @@ var metricsCache map[string]metricsCacheEntry
 var metricsCacheLock sync.Mutex
 
 var metricsCmd = APIEndpoint{
-	Path: "metrics",
+	Path:        "metrics",
+	MetricsType: entity.TypeServer,
 
 	Get: APIEndpointAction{Handler: metricsGet, AccessHandler: allowMetrics, AllowUntrusted: true},
 }
@@ -97,7 +100,8 @@ func metricsGet(d *Daemon, r *http.Request) response.Response {
 	compress := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
 
 	// Forward if requested.
-	resp := forwardedResponseIfTargetIsRemote(s, r)
+	target := request.QueryParam(r, "target")
+	resp := forwardedResponseToNode(r.Context(), s, target)
 	if resp != nil {
 		return resp
 	}
@@ -128,7 +132,7 @@ func metricsGet(d *Daemon, r *http.Request) response.Response {
 		}
 
 		// Register internal metrics.
-		intMetrics = internalMetrics(ctx, s.StartTime, tx)
+		intMetrics = internalMetrics(ctx, s, tx, projectNames)
 		return nil
 	})
 	if err != nil {
@@ -171,7 +175,7 @@ func metricsGet(d *Daemon, r *http.Request) response.Response {
 		return getFilteredMetrics(s, r, compress, metricSet)
 	}
 
-	cacheDuration := time.Duration(8) * time.Second
+	cacheDuration := 8 * time.Second
 
 	// Acquire update lock.
 	lockCtx, lockCtxCancel := context.WithTimeout(r.Context(), cacheDuration)
@@ -245,7 +249,7 @@ func metricsGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Start metrics builder routines.
-	for i := 0; i < maxConcurrent; i++ {
+	for range maxConcurrent {
 		go func(instMetricsCh <-chan instance.Instance) {
 			for inst := range instMetricsCh {
 				projectName := inst.Project().Name
@@ -332,7 +336,7 @@ func metricsGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	for _, project := range projectsToFetch {
-		if shared.ValueInSlice(*project.Project, updatedProjects) {
+		if slices.Contains(updatedProjects, *project.Project) {
 			continue
 		}
 
@@ -377,20 +381,155 @@ func getFilteredMetrics(s *state.State, r *http.Request, compress bool, metricSe
 	return response.SyncResponsePlain(true, compress, metricSet.String())
 }
 
-func internalMetrics(ctx context.Context, daemonStartTime time.Time, tx *db.ClusterTx) *metrics.MetricSet {
+// clusterMemberWarnings returns the list of unresolved and unacknowledged warnings related to this cluster member.
+// If this member is the leader, also include nodeless warnings.
+// This way we include them while avoiding counting them redundantly across cluster members.
+func clusterMemberWarnings(ctx context.Context, s *state.State, tx *db.ClusterTx) ([]dbCluster.Warning, error) {
+	var filters []dbCluster.WarningFilter
+
+	leaderInfo, err := s.LeaderInfo()
+	if err != nil {
+		return nil, err
+	}
+
+	// Use local variable to get pointer.
+	emptyNode := ""
+
+	for status := range warningtype.Statuses {
+		// Do not include resolved warnings that are resolved but not yet pruned neither those that were acknowledged.
+		if status != warningtype.StatusResolved && status != warningtype.StatusAcknowledged {
+			filters = append(filters, dbCluster.WarningFilter{Node: &s.ServerName, Status: &status})
+			if leaderInfo.Leader {
+				// Count the nodeless warnings as belonging to the leader node.
+				filters = append(filters, dbCluster.WarningFilter{Node: &emptyNode, Status: &status})
+			}
+		}
+	}
+
+	return dbCluster.GetWarnings(ctx, tx.Tx(), filters...)
+}
+
+// replicatorMetrics returns the replicator gauges for the given projects.
+//
+// Replicator state is global to the cluster while the metrics endpoint is scraped per cluster
+// member, so only the leader reports these gauges. Otherwise every member would emit a sample
+// for the same replicator and aggregations such as sum() would over-count by the number of
+// members. This mirrors how nodeless warnings are attributed to the leader.
+func replicatorMetrics(ctx context.Context, s *state.State, tx *db.ClusterTx, projectNames []string) (*metrics.MetricSet, error) {
+	leaderInfo, err := s.LeaderInfo()
+	if err != nil {
+		return nil, err
+	}
+
+	if !leaderInfo.Leader {
+		return nil, nil
+	}
+
+	replicators, _, err := dbCluster.GetReplicatorsAndURLs(ctx, tx.Tx(), nil, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	statuses, err := dbCluster.GetReplicatorStatuses(ctx, tx.Tx(), nil)
+	if err != nil {
+		return nil, err
+	}
+
 	out := metrics.NewMetricSet(nil)
 
-	warnings, err := dbCluster.GetWarnings(ctx, tx.Tx())
+	replicatorCounts := make(map[string]int, len(projectNames))
+	for _, projectName := range projectNames {
+		replicatorCounts[projectName] = 0
+	}
+
+	allStatuses := []string{
+		api.ReplicatorStatusPending,
+		api.ReplicatorStatusRunning,
+		api.ReplicatorStatusCompleted,
+		api.ReplicatorStatusFailed,
+	}
+
+	for _, replicator := range replicators {
+		_, ok := replicatorCounts[replicator.ProjectName]
+		if !ok {
+			// Not a project the caller asked about.
+			continue
+		}
+
+		replicatorCounts[replicator.ProjectName]++
+
+		labels := map[string]string{"project": replicator.ProjectName, "name": replicator.Row.Name}
+
+		// Don't care about config here, just statuses
+		apiReplicator := replicator.ToAPI(map[int64]map[string]string{}, statuses)
+		status := apiReplicator.LastRunStatus
+
+		// Emit a sample for every status rather than only the current one, so a status
+		// transition never leaves a stale series behind: the series for the previous status
+		// drops to 0 in the same scrape that raises the new one to 1.
+		for _, candidate := range allStatuses {
+			statusLabels := maps.Clone(labels)
+			statusLabels["status"] = candidate
+
+			value := float64(0)
+			if candidate == status {
+				value = 1
+			}
+
+			out.AddSamples(metrics.ReplicatorLastRunStatus, metrics.Sample{Labels: statusLabels, Value: value})
+		}
+
+		// A zero value means the replicator has never completed a run successfully.
+		var lastSuccess float64
+		if !apiReplicator.LastSuccessAt.IsZero() {
+			lastSuccess = float64(apiReplicator.LastSuccessAt.Unix())
+		}
+
+		out.AddSamples(metrics.ReplicatorLastSuccessTimestamp, metrics.Sample{Labels: maps.Clone(labels), Value: lastSuccess})
+
+		// A zero value means the last successful run replicated no snapshots, so there is no
+		// recovery point to report.
+		var oldestSnapshot float64
+		if !apiReplicator.LastSuccessOldestSnapshotAt.IsZero() {
+			oldestSnapshot = float64(apiReplicator.LastSuccessOldestSnapshotAt.Unix())
+		}
+
+		out.AddSamples(metrics.ReplicatorLastSuccessOldestSnapshotTimestamp, metrics.Sample{Labels: maps.Clone(labels), Value: oldestSnapshot})
+	}
+
+	// Emit a sample for every project, including 0 for projects with no replicators, so that
+	// queries such as `lxd_replicators == 0` can identify unprotected projects.
+	for _, projectName := range projectNames {
+		out.AddSamples(metrics.Replicators, metrics.Sample{Labels: map[string]string{"project": projectName}, Value: float64(replicatorCounts[projectName])})
+	}
+
+	return out, nil
+}
+
+func internalMetrics(ctx context.Context, s *state.State, tx *db.ClusterTx, projectNames []string) *metrics.MetricSet {
+	out := metrics.NewMetricSet(nil)
+
+	warnings, err := clusterMemberWarnings(ctx, s, tx)
+
 	if err != nil {
-		logger.Warn("Failed to get warnings", logger.Ctx{"err": err})
+		logger.Warn("Failed getting warnings", logger.Ctx{"err": err})
 	} else {
 		// Total number of warnings
 		out.AddSamples(metrics.WarningsTotal, metrics.Sample{Value: float64(len(warnings))})
 	}
 
-	operations, err := dbCluster.GetOperations(ctx, tx.Tx())
+	replicatorSet, err := replicatorMetrics(ctx, s, tx, projectNames)
 	if err != nil {
-		logger.Warn("Failed to get operations", logger.Ctx{"err": err})
+		logger.Warn("Failed getting replicator metrics", logger.Ctx{"err": err})
+	} else {
+		out.Merge(replicatorSet)
+	}
+
+	// Create local variable to get a pointer.
+	nodeID := tx.GetNodeID()
+	operations, err := dbCluster.GetOperationsByNodeID(ctx, tx.Tx(), nodeID)
+	if err != nil {
+		logger.Warn("Failed getting operations", logger.Ctx{"err": err})
 	} else {
 		// Total number of operations
 		out.AddSamples(metrics.OperationsTotal, metrics.Sample{Value: float64(len(operations))})
@@ -418,7 +557,7 @@ func internalMetrics(ctx context.Context, daemonStartTime time.Time, tx *db.Clus
 	}
 
 	// Daemon uptime
-	out.AddSamples(metrics.UptimeSeconds, metrics.Sample{Value: time.Since(daemonStartTime).Seconds()})
+	out.AddSamples(metrics.UptimeSeconds, metrics.Sample{Value: time.Since(s.StartTime).Seconds()})
 
 	// Number of goroutines
 	out.AddSamples(metrics.GoGoroutines, metrics.Sample{Value: float64(runtime.NumGoroutine())})

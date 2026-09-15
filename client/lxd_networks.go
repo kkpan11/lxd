@@ -2,6 +2,7 @@ package lxd
 
 import (
 	"fmt"
+	"net/http"
 	"net/url"
 
 	"github.com/canonical/lxd/shared/api"
@@ -17,7 +18,7 @@ func (r *ProtocolLXD) GetNetworkNames() ([]string, error) {
 	// Fetch the raw values.
 	urls := []string{}
 	baseURL := "/networks"
-	_, err = r.queryStruct("GET", baseURL, nil, "", &urls)
+	_, err = r.queryStruct(http.MethodGet, baseURL, nil, "", &urls)
 	if err != nil {
 		return nil, err
 	}
@@ -36,7 +37,25 @@ func (r *ProtocolLXD) GetNetworks() ([]api.Network, error) {
 	networks := []api.Network{}
 
 	// Fetch the raw value
-	_, err = r.queryStruct("GET", "/networks?recursion=1", nil, "", &networks)
+	_, err = r.queryStruct(http.MethodGet, "/networks?recursion=1", nil, "", &networks)
+	if err != nil {
+		return nil, err
+	}
+
+	return networks, nil
+}
+
+// GetNetworksAllProjects returns a list of networks across all projects.
+func (r *ProtocolLXD) GetNetworksAllProjects() ([]api.Network, error) {
+	err := r.CheckExtension("networks_all_projects")
+	if err != nil {
+		return nil, err
+	}
+
+	networks := []api.Network{}
+
+	u := api.NewURL().Path("networks").WithQuery("recursion", "1").WithQuery("all-projects", "true")
+	_, err = r.queryStruct(http.MethodGet, u.String(), nil, "", &networks)
 	if err != nil {
 		return nil, err
 	}
@@ -54,7 +73,7 @@ func (r *ProtocolLXD) GetNetwork(name string) (*api.Network, string, error) {
 	network := api.Network{}
 
 	// Fetch the raw value
-	etag, err := r.queryStruct("GET", fmt.Sprintf("/networks/%s", url.PathEscape(name)), nil, "", &network)
+	etag, err := r.queryStruct(http.MethodGet, "/networks/"+url.PathEscape(name), nil, "", &network)
 	if err != nil {
 		return nil, "", err
 	}
@@ -72,7 +91,7 @@ func (r *ProtocolLXD) GetNetworkLeases(name string) ([]api.NetworkLease, error) 
 	leases := []api.NetworkLease{}
 
 	// Fetch the raw value
-	_, err = r.queryStruct("GET", fmt.Sprintf("/networks/%s/leases", url.PathEscape(name)), nil, "", &leases)
+	_, err = r.queryStruct(http.MethodGet, fmt.Sprintf("/networks/%s/leases", url.PathEscape(name)), nil, "", &leases)
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +109,7 @@ func (r *ProtocolLXD) GetNetworkState(name string) (*api.NetworkState, error) {
 	state := api.NetworkState{}
 
 	// Fetch the raw value
-	_, err = r.queryStruct("GET", fmt.Sprintf("/networks/%s/state", url.PathEscape(name)), nil, "", &state)
+	_, err = r.queryStruct(http.MethodGet, fmt.Sprintf("/networks/%s/state", url.PathEscape(name)), nil, "", &state)
 	if err != nil {
 		return nil, err
 	}
@@ -99,65 +118,115 @@ func (r *ProtocolLXD) GetNetworkState(name string) (*api.NetworkState, error) {
 }
 
 // CreateNetwork defines a new network using the provided Network struct.
-func (r *ProtocolLXD) CreateNetwork(network api.NetworksPost) error {
+func (r *ProtocolLXD) CreateNetwork(network api.NetworksPost) (Operation, error) {
 	err := r.CheckExtension("network")
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	var op Operation
 
 	// Send the request
-	_, _, err = r.query("POST", "/networks", network, "")
-	if err != nil {
-		return err
+	err = r.CheckExtension("storage_and_network_operations")
+	if err != nil || r.isClusterOperationNotification() {
+		// Use a synchronous request when the server lacks async endpoint support
+		// or when handling a cluster operation notification.
+		op = noopOperation{}
+		_, _, err = r.query(http.MethodPost, "/networks", network, "")
+	} else {
+		op, _, err = r.queryOperation(http.MethodPost, "/networks", network, "", true)
 	}
 
-	return nil
+	if err != nil {
+		return nil, err
+	}
+
+	return op, nil
 }
 
 // UpdateNetwork updates the network to match the provided Network struct.
-func (r *ProtocolLXD) UpdateNetwork(name string, network api.NetworkPut, ETag string) error {
+func (r *ProtocolLXD) UpdateNetwork(name string, network api.NetworkPut, ETag string) (Operation, error) {
 	err := r.CheckExtension("network")
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	path := api.NewURL().Path("networks", name)
+
+	var op Operation
 
 	// Send the request
-	_, _, err = r.query("PUT", fmt.Sprintf("/networks/%s", url.PathEscape(name)), network, ETag)
-	if err != nil {
-		return err
+	err = r.CheckExtension("storage_and_network_operations")
+	if err != nil || r.isClusterOperationNotification() {
+		// Use a synchronous request when the server lacks async endpoint support
+		// or when handling a cluster operation notification.
+		op = noopOperation{}
+		_, _, err = r.query(http.MethodPut, path.String(), network, ETag)
+	} else {
+		op, _, err = r.queryOperation(http.MethodPut, path.String(), network, ETag, true)
 	}
 
-	return nil
+	if err != nil {
+		return nil, err
+	}
+
+	return op, nil
 }
 
 // RenameNetwork renames an existing network entry.
-func (r *ProtocolLXD) RenameNetwork(name string, network api.NetworkPost) error {
+func (r *ProtocolLXD) RenameNetwork(name string, network api.NetworkPost) (Operation, error) {
 	err := r.CheckExtension("network")
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	path := api.NewURL().Path("networks", name)
+
+	var op Operation
 
 	// Send the request
-	_, _, err = r.query("POST", fmt.Sprintf("/networks/%s", url.PathEscape(name)), network, "")
-	if err != nil {
-		return err
+	err = r.CheckExtension("storage_and_network_operations")
+	if err != nil || r.isClusterOperationNotification() {
+		// Use a synchronous request when the server lacks async endpoint support
+		// or when handling a cluster operation notification.
+		op = noopOperation{}
+		_, _, err = r.query(http.MethodPost, path.String(), network, "")
+	} else {
+		op, _, err = r.queryOperation(http.MethodPost, path.String(), network, "", true)
 	}
 
-	return nil
+	if err != nil {
+		return nil, err
+	}
+
+	return op, nil
 }
 
 // DeleteNetwork deletes an existing network.
-func (r *ProtocolLXD) DeleteNetwork(name string) error {
+func (r *ProtocolLXD) DeleteNetwork(name string) (Operation, error) {
 	err := r.CheckExtension("network")
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	path := api.NewURL().Path("networks", name)
+
+	var op Operation
 
 	// Send the request
-	_, _, err = r.query("DELETE", fmt.Sprintf("/networks/%s", url.PathEscape(name)), nil, "")
-	if err != nil {
-		return err
+	err = r.CheckExtension("storage_and_network_operations")
+	if err != nil || r.isClusterOperationNotification() {
+		// Use a synchronous request when the server lacks async endpoint support
+		// or when handling a cluster operation notification.
+		op = noopOperation{}
+		_, _, err = r.query(http.MethodDelete, path.String(), nil, "")
+	} else {
+		op, _, err = r.queryOperation(http.MethodDelete, path.String(), nil, "", true)
 	}
 
-	return nil
+	if err != nil {
+		return nil, err
+	}
+
+	return op, nil
 }

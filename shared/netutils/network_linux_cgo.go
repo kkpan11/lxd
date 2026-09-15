@@ -9,13 +9,15 @@ package netutils
 import "C"
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
-	"strings"
+	"strconv"
 	"unsafe"
 
+	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 )
 
@@ -77,7 +79,7 @@ func NetnsGetifaddrs(initPID int32, hostInterfaces []net.Interface) (map[string]
 
 		netnsID = C.netns_get_nsid(C.__s32(f.Fd()))
 		if netnsID < 0 {
-			return nil, fmt.Errorf("Failed to retrieve network namespace id")
+			return nil, errors.New("Failed retrieving network namespace id")
 		}
 	} else {
 		netnsID = -1
@@ -85,13 +87,13 @@ func NetnsGetifaddrs(initPID int32, hostInterfaces []net.Interface) (map[string]
 
 	ret := C.netns_getifaddrs(&ifaddrs, netnsID, &netnsidAware)
 	if ret < 0 {
-		return nil, fmt.Errorf("Failed to retrieve network interfaces and addresses")
+		return nil, errors.New("Failed retrieving network interfaces and addresses")
 	}
 
 	defer C.netns_freeifaddrs(ifaddrs)
 
 	if netnsID >= 0 && !netnsidAware {
-		return nil, fmt.Errorf("Netlink requests are not fully network namespace id aware")
+		return nil, errors.New("Netlink requests are not fully network namespace id aware")
 	}
 
 	// We're using the interface name as key here but we should really
@@ -150,12 +152,12 @@ func NetnsGetifaddrs(initPID int32, hostInterfaces []net.Interface) (map[string]
 
 			addrPtr := C.get_addr_ptr(addr.ifa_addr)
 			if addrPtr == nil {
-				return nil, fmt.Errorf("Failed to retrieve valid address pointer")
+				return nil, errors.New("Failed retrieving valid address pointer")
 			}
 
 			addressStr := C.inet_ntop(C.int(addr.ifa_addr.sa_family), addrPtr, &address[0], C.INET6_ADDRSTRLEN)
 			if addressStr == nil {
-				return nil, fmt.Errorf("Failed to retrieve address string")
+				return nil, errors.New("Failed retrieving address string")
 			}
 
 			if addNetwork.Addresses == nil {
@@ -163,28 +165,11 @@ func NetnsGetifaddrs(initPID int32, hostInterfaces []net.Interface) (map[string]
 			}
 
 			goAddrString := C.GoString(addressStr)
-			scope := "global"
-			if strings.HasPrefix(goAddrString, "127") {
-				scope = "local"
-			}
-
-			if goAddrString == "::1" {
-				scope = "local"
-			}
-
-			if strings.HasPrefix(goAddrString, "169.254") {
-				scope = "link"
-			}
-
-			if strings.HasPrefix(goAddrString, "fe80:") {
-				scope = "link"
-			}
-
 			address := api.InstanceStateNetworkAddress{}
 			address.Family = family
 			address.Address = goAddrString
-			address.Netmask = fmt.Sprintf("%d", int(addr.ifa_prefixlen))
-			address.Scope = scope
+			address.Netmask = strconv.Itoa(int(addr.ifa_prefixlen))
+			address.Scope = shared.GetIPScope(goAddrString)
 
 			addNetwork.Addresses = append(addNetwork.Addresses, address)
 		} else if addr.ifa_addr != nil && addr.ifa_addr.sa_family == C.AF_PACKET {
@@ -193,7 +178,7 @@ func NetnsGetifaddrs(initPID int32, hostInterfaces []net.Interface) (map[string]
 
 				hwaddr := C.get_packet_address(addr.ifa_addr, &buf[0], 1024)
 				if hwaddr == nil {
-					return nil, fmt.Errorf("Failed to retrieve hardware address")
+					return nil, errors.New("Failed retrieving hardware address")
 				}
 
 				addNetwork.Hwaddr = C.GoString(hwaddr)
@@ -201,14 +186,14 @@ func NetnsGetifaddrs(initPID int32, hostInterfaces []net.Interface) (map[string]
 		}
 
 		if addr.ifa_stats_type == C.IFLA_STATS64 {
-			addNetwork.Counters.BytesReceived = int64(addr.ifa_stats64.rx_bytes)
-			addNetwork.Counters.BytesSent = int64(addr.ifa_stats64.tx_bytes)
-			addNetwork.Counters.PacketsReceived = int64(addr.ifa_stats64.rx_packets)
-			addNetwork.Counters.PacketsSent = int64(addr.ifa_stats64.tx_packets)
-			addNetwork.Counters.ErrorsReceived = int64(addr.ifa_stats64.rx_errors)
-			addNetwork.Counters.ErrorsSent = int64(addr.ifa_stats64.tx_errors)
-			addNetwork.Counters.PacketsDroppedInbound = int64(addr.ifa_stats64.rx_dropped)
-			addNetwork.Counters.PacketsDroppedOutbound = int64(addr.ifa_stats64.tx_dropped)
+			addNetwork.Counters.BytesReceived = uint64(addr.ifa_stats64.rx_bytes)
+			addNetwork.Counters.BytesSent = uint64(addr.ifa_stats64.tx_bytes)
+			addNetwork.Counters.PacketsReceived = uint64(addr.ifa_stats64.rx_packets)
+			addNetwork.Counters.PacketsSent = uint64(addr.ifa_stats64.tx_packets)
+			addNetwork.Counters.ErrorsReceived = uint64(addr.ifa_stats64.rx_errors)
+			addNetwork.Counters.ErrorsSent = uint64(addr.ifa_stats64.tx_errors)
+			addNetwork.Counters.PacketsDroppedInbound = uint64(addr.ifa_stats64.rx_dropped)
+			addNetwork.Counters.PacketsDroppedOutbound = uint64(addr.ifa_stats64.tx_dropped)
 		}
 
 		ifName := C.GoString(addr.ifa_name)
@@ -225,7 +210,7 @@ func AbstractUnixSendFd(sockFD int, sendFD int) error {
 	skFd := C.int(sockFD)
 	ret := C.lxc_abstract_unix_send_fds(skFd, &fd, C.int(1), nil, C.size_t(0))
 	if ret < 0 {
-		return fmt.Errorf("Failed to send file descriptor via abstract unix socket")
+		return errors.New("Failed sending file descriptor via abstract unix socket")
 	}
 
 	return nil
@@ -239,11 +224,11 @@ func AbstractUnixReceiveFd(sockFD int, flags uint) (*os.File, error) {
 	fds.flags = C.__u32(flags)
 	ret := C.lxc_abstract_unix_recv_fds(skFd, &fds, nil, C.size_t(0))
 	if ret < 0 {
-		return nil, fmt.Errorf("Failed to receive file descriptor via abstract unix socket")
+		return nil, errors.New("Failed receiving file descriptor via abstract unix socket")
 	}
 
 	if fds.fd_count_max != fds.fd_count_ret {
-		return nil, fmt.Errorf("Failed to receive file descriptor via abstract unix socket")
+		return nil, errors.New("Failed receiving file descriptor via abstract unix socket")
 	}
 
 	file := os.NewFile(uintptr(fds.fd[0]), "")
@@ -255,7 +240,7 @@ func AbstractUnixReceiveFdData(sockFD int, numFds int, flags uint, iov unsafe.Po
 	fds := C.struct_unix_fds{}
 
 	if numFds >= C.KERNEL_SCM_MAX_FD {
-		return 0, []C.int{-C.EBADF}, fmt.Errorf("Excessive number of file descriptors requested")
+		return 0, []C.int{-C.EBADF}, errors.New("Excessive number of file descriptors requested")
 	}
 
 	fds.fd_count_max = C.__u32(numFds)
@@ -264,7 +249,7 @@ func AbstractUnixReceiveFdData(sockFD int, numFds int, flags uint, iov unsafe.Po
 	skFd := C.int(sockFD)
 	ret, errno := C.lxc_abstract_unix_recv_fds_iov(skFd, &fds, (*C.struct_iovec)(iov), C.size_t(iovLen))
 	if ret < 0 {
-		return 0, []C.int{-C.EBADF}, fmt.Errorf("Failed to receive file descriptor via abstract unix socket: errno=%d", errno)
+		return 0, []C.int{-C.EBADF}, fmt.Errorf("Failed receiving file descriptor via abstract unix socket: errno=%d", errno)
 	}
 
 	if ret == 0 {

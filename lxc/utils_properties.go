@@ -8,15 +8,17 @@ import (
 	"time"
 
 	"github.com/mitchellh/mapstructure"
-
-	"github.com/canonical/lxd/shared/i18n"
 )
 
 // stringToTimeHookFunc is a custom decoding hook that converts string values to time.Time using the given layout.
 func stringToTimeHookFunc(layout string) mapstructure.DecodeHookFuncType {
-	return func(from reflect.Type, to reflect.Type, data interface{}) (interface{}, error) {
-		if from.Kind() == reflect.String && to == reflect.TypeOf(time.Time{}) {
-			strValue := data.(string)
+	return func(from reflect.Type, to reflect.Type, data any) (any, error) {
+		if from.Kind() == reflect.String && to == reflect.TypeFor[time.Time]() {
+			strValue, ok := data.(string)
+			if !ok {
+				return nil, fmt.Errorf("Expected string, got %T", data)
+			}
+
 			t, err := time.Parse(layout, strValue)
 			if err != nil {
 				return nil, err
@@ -31,12 +33,16 @@ func stringToTimeHookFunc(layout string) mapstructure.DecodeHookFuncType {
 
 // stringToBoolHookFunc is a custom decoding hook that converts string values to bool.
 func stringToBoolHookFunc() mapstructure.DecodeHookFunc {
-	return func(f reflect.Kind, t reflect.Kind, data interface{}) (interface{}, error) {
+	return func(f reflect.Kind, t reflect.Kind, data any) (any, error) {
 		if f != reflect.String || t != reflect.Bool {
 			return data, nil
 		}
 
-		str := data.(string)
+		str, ok := data.(string)
+		if !ok {
+			return data, fmt.Errorf("Expected string, got %T", data)
+		}
+
 		str = strings.ToLower(str)
 		switch str {
 		case "1", "t", "true":
@@ -51,12 +57,16 @@ func stringToBoolHookFunc() mapstructure.DecodeHookFunc {
 
 // stringToIntHookFunc is a custom decoding hook that converts string values to int.
 func stringToIntHookFunc() mapstructure.DecodeHookFunc {
-	return func(f reflect.Kind, t reflect.Kind, data interface{}) (interface{}, error) {
+	return func(f reflect.Kind, t reflect.Kind, data any) (any, error) {
 		if f != reflect.String || (t != reflect.Int && t != reflect.Int8 && t != reflect.Int16 && t != reflect.Int32 && t != reflect.Int64) {
 			return data, nil
 		}
 
-		str := data.(string)
+		str, ok := data.(string)
+		if !ok {
+			return data, fmt.Errorf("Expected string, got %T", data)
+		}
+
 		value, err := strconv.Atoi(str)
 		if err != nil {
 			return data, err
@@ -68,12 +78,16 @@ func stringToIntHookFunc() mapstructure.DecodeHookFunc {
 
 // stringToFloatHookFunc is a custom decoding hook that converts string values to float.
 func stringToFloatHookFunc() mapstructure.DecodeHookFunc {
-	return func(f reflect.Kind, t reflect.Kind, data interface{}) (interface{}, error) {
+	return func(f reflect.Kind, t reflect.Kind, data any) (any, error) {
 		if f != reflect.String || (t != reflect.Float32 && t != reflect.Float64) {
 			return data, nil
 		}
 
-		str := data.(string)
+		str, ok := data.(string)
+		if !ok {
+			return data, fmt.Errorf("Expected string, got %T", data)
+		}
+
 		value, err := strconv.ParseFloat(str, 64)
 		if err != nil {
 			return data, err
@@ -83,11 +97,11 @@ func stringToFloatHookFunc() mapstructure.DecodeHookFunc {
 	}
 }
 
-// getFieldByJsonTag gets the value of a struct field by its JSON tag.
-func getFieldByJsonTag(obj any, tag string) (any, error) {
+// getFieldByJSONTag gets the value of a struct field by its JSON tag.
+func getFieldByJSONTag(obj any, tag string) (any, error) {
 	var res any
 	v := reflect.ValueOf(obj)
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
 
@@ -105,7 +119,7 @@ func getFieldByJsonTag(obj any, tag string) (any, error) {
 
 // getFromStruct scans a struct for a field with the given JSON tag, including fields of inline structs.
 func getFromStruct(v reflect.Value, tag string) (bool, any) {
-	for i := 0; i < v.NumField(); i++ {
+	for i := range v.NumField() {
 		field := v.Field(i)
 		jsonTag := v.Type().Field(i).Tag.Get("json")
 
@@ -120,7 +134,7 @@ func getFromStruct(v reflect.Value, tag string) (bool, any) {
 		}
 
 		if v.Type().Field(i).Anonymous {
-			if field.Kind() == reflect.Ptr {
+			if field.Kind() == reflect.Pointer {
 				field = field.Elem()
 			}
 
@@ -136,12 +150,12 @@ func getFromStruct(v reflect.Value, tag string) (bool, any) {
 	return false, nil
 }
 
-// setFieldByJsonTag sets the value of a struct field by its JSON tag.
-func setFieldByJsonTag(obj any, tag string, value any) {
+// setFieldByJSONTag sets the value of a struct field by its JSON tag.
+func setFieldByJSONTag(obj any, tag string, value any) {
 	v := reflect.ValueOf(obj).Elem()
 	var fieldName string
 
-	for i := 0; i < v.NumField(); i++ {
+	for i := range v.NumField() {
 		jsonTag := v.Type().Field(i).Tag.Get("json")
 		commaIdx := strings.Index(jsonTag, ",")
 		if commaIdx > 0 {
@@ -160,26 +174,26 @@ func setFieldByJsonTag(obj any, tag string, value any) {
 	}
 }
 
-// unsetFieldByJsonTag unsets (give a default value) the value of a struct field by its JSON tag.
-func unsetFieldByJsonTag(obj any, tag string) error {
-	v, err := getFieldByJsonTag(obj, tag)
+// unsetFieldByJSONTag unsets (give a default value) the value of a struct field by its JSON tag.
+func unsetFieldByJSONTag(obj any, tag string) error {
+	v, err := getFieldByJSONTag(obj, tag)
 	if err != nil {
 		return err
 	}
 
 	switch v.(type) {
 	case string:
-		setFieldByJsonTag(obj, tag, "")
+		setFieldByJSONTag(obj, tag, "")
 	case int:
-		setFieldByJsonTag(obj, tag, 0)
+		setFieldByJSONTag(obj, tag, 0)
 	case bool:
-		setFieldByJsonTag(obj, tag, false)
+		setFieldByJSONTag(obj, tag, false)
 	case float32, float64:
-		setFieldByJsonTag(obj, tag, 0.0)
+		setFieldByJSONTag(obj, tag, 0.0)
 	case time.Time:
-		setFieldByJsonTag(obj, tag, time.Time{})
+		setFieldByJSONTag(obj, tag, time.Time{})
 	case *time.Time:
-		setFieldByJsonTag(obj, tag, &time.Time{})
+		setFieldByJSONTag(obj, tag, &time.Time{})
 	}
 
 	return nil
@@ -203,13 +217,68 @@ func unpackKVToWritable(writable any, keys map[string]string) error {
 		),
 	})
 	if err != nil {
-		return fmt.Errorf(i18n.G("Error creating decoder: %v"), err)
+		return fmt.Errorf("Error creating decoder: %w", err)
 	}
 
 	err = decoder.Decode(data)
 	if err != nil {
-		return fmt.Errorf(i18n.G("Error decoding data: %v"), err)
+		return fmt.Errorf("Error decoding data: %w", err)
 	}
 
 	return nil
+}
+
+// getEditableYAMLFields uses reflection to extract YAML field names from a struct.
+func getEditableYAMLFields(v any) []string {
+	var fields []string
+	typ := reflect.TypeOf(v)
+
+	// Handle pointer types
+	if typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+
+	// Only process struct types
+	if typ.Kind() != reflect.Struct {
+		return fields
+	}
+
+	for field := range typ.Fields() {
+		yamlTag := field.Tag.Get("yaml")
+
+		// Skip fields without yaml tags or with "-"
+		if yamlTag == "" || yamlTag == "-" {
+			continue
+		}
+
+		// Extract the field name from the yaml tag (handle "name,omitempty" format)
+		fieldName, _, _ := strings.Cut(yamlTag, ",")
+		if fieldName != "" {
+			fields = append(fields, fieldName)
+		}
+	}
+
+	return fields
+}
+
+// formatFieldList formats a slice of field names as a quoted, comma-separated list.
+func formatFieldList(fields []string) string {
+	if len(fields) == 0 {
+		return ""
+	}
+
+	quoted := make([]string, 0, len(fields))
+	for _, field := range fields {
+		quoted = append(quoted, fmt.Sprintf("%q", field))
+	}
+
+	switch len(quoted) {
+	case 1:
+		return quoted[0]
+	case 2:
+		return quoted[0] + " and " + quoted[1]
+	default:
+		// For 3+ fields: "field1", "field2", and "field3"
+		return strings.Join(quoted[:len(quoted)-1], ", ") + ", and " + quoted[len(quoted)-1]
+	}
 }

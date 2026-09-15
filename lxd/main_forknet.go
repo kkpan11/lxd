@@ -34,12 +34,12 @@ static int dosetns_file(char *file, char *nstype)
 
 	ns_fd = open(file, O_RDONLY);
 	if (ns_fd < 0) {
-		fprintf(stderr, "%m - Failed to open \"%s\"", file);
+		fprintf(stderr, "%m - Failed opening \"%s\"", file);
 		return -1;
 	}
 
 	if (setns(ns_fd, 0) < 0) {
-		fprintf(stderr, "%m - Failed to attach to namespace \"%s\"", file);
+		fprintf(stderr, "%m - Failed attaching to namespace \"%s\"", file);
 		return -1;
 	}
 
@@ -54,12 +54,12 @@ static void forkdonetdetach(char *file) {
 	}
 
 	if (unshare(CLONE_NEWNS) < 0) {
-		fprintf(stderr, "Failed to create new mount namespace: %s\n", strerror(errno));
+		fprintf(stderr, "Failed creating new mount namespace: %s\n", strerror(errno));
 		_exit(1);
 	}
 
 	if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
-		fprintf(stderr, "Failed to mark / private: %s\n", strerror(errno));
+		fprintf(stderr, "Failed marking / private: %s\n", strerror(errno));
 		_exit(1);
 	}
 
@@ -119,7 +119,9 @@ void forknet(void)
 import "C"
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -196,20 +198,20 @@ func (c *cmdForknet) RunDetach(cmd *cobra.Command, args []string) error {
 	hostName := args[3]
 
 	if lxdPID == "" {
-		return fmt.Errorf("LXD PID argument is required")
+		return errors.New("LXD PID argument is required")
 	}
 
 	if ifName == "" {
-		return fmt.Errorf("ifname argument is required")
+		return errors.New("ifname argument is required")
 	}
 
 	if hostName == "" {
-		return fmt.Errorf("hostname argument is required")
+		return errors.New("hostname argument is required")
 	}
 
 	// Check if the interface exists.
-	if !shared.PathExists(fmt.Sprintf("/sys/class/net/%s", ifName)) {
-		return fmt.Errorf("Couldn't restore host interface %q as container interface %q couldn't be found", hostName, ifName)
+	if !shared.PathExists("/sys/class/net/" + ifName) {
+		return fmt.Errorf("Could not restore host interface %q as container interface %q could not be found", hostName, ifName)
 	}
 
 	// Remove all IP addresses from interface before moving to parent netns.
@@ -235,7 +237,7 @@ func (c *cmdForknet) RunDetach(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		// If the interface has an altname that matches the target name, this can prevent rename of the
 		// interface, so try removing it and trying the rename again if succeeds.
-		_, altErr := shared.RunCommand("ip", "link", "property", "del", "dev", ifName, "altname", hostName)
+		_, altErr := shared.RunCommand(context.TODO(), "ip", "link", "property", "del", "dev", ifName, "altname", hostName)
 		if altErr == nil {
 			err = link.SetName(hostName)
 		}
@@ -244,26 +246,23 @@ func (c *cmdForknet) RunDetach(cmd *cobra.Command, args []string) error {
 	}
 
 	// Move it back to the host.
-	phyPath := fmt.Sprintf("/sys/class/net/%s/phy80211/name", hostName)
-	if shared.PathExists(phyPath) {
-		// Get the phy name.
-		phyName, err := os.ReadFile(phyPath)
-		if err != nil {
-			return err
-		}
-
+	phyPath := "/sys/class/net/" + hostName + "/phy80211/name"
+	phyName, err := os.ReadFile(phyPath)
+	if err == nil {
 		// Wifi cards (move the phy instead).
-		_, err = shared.RunCommand("iw", "phy", strings.TrimSpace(string(phyName)), "set", "netns", lxdPID)
+		_, err = shared.RunCommand(context.TODO(), "iw", "phy", strings.TrimSpace(string(phyName)), "set", "netns", lxdPID)
 		if err != nil {
 			return err
 		}
-	} else {
+	} else if os.IsNotExist(err) {
 		// Regular NICs.
 		link = &ip.Link{Name: hostName}
 		err = link.SetNetns(lxdPID)
 		if err != nil {
 			return err
 		}
+	} else {
+		return err
 	}
 
 	return nil

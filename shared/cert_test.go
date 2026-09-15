@@ -15,14 +15,14 @@ import (
 func TestKeyPairAndCA(t *testing.T) {
 	dir, err := os.MkdirTemp("", "lxd-shared-test-")
 	if err != nil {
-		t.Errorf("failed to create temporary dir: %v", err)
+		t.Fatalf("failed creating temporary dir: %v", err)
 	}
 
 	defer func() { _ = os.RemoveAll(dir) }()
 
 	info, err := shared.KeyPairAndCA(dir, "test", shared.CertServer, shared.CertOptions{AddHosts: true})
 	if err != nil {
-		t.Errorf("initial call to KeyPairAndCA failed: %v", err)
+		t.Fatalf("initial call to KeyPairAndCA failed: %v", err)
 	}
 
 	if info.CA() != nil {
@@ -43,11 +43,13 @@ func TestKeyPairAndCA(t *testing.T) {
 
 	cert, err := x509.ParseCertificate(info.KeyPair().Certificate[0])
 	if err != nil {
-		t.Errorf("failed to parse generated public x509 key cert: %v", err)
+		t.Errorf("failed parsing generated public x509 key cert: %v", err)
 	}
 
-	if cert.ExtKeyUsage[0] != x509.ExtKeyUsageServerAuth {
-		t.Errorf("expected to find server auth key usage extension")
+	if len(cert.ExtKeyUsage) == 0 {
+		t.Fatalf("expected certificate to include at least one extended key usage")
+	} else if cert.ExtKeyUsage[0] != x509.ExtKeyUsageServerAuth {
+		t.Fatalf("expected to find server auth key usage extension")
 	}
 
 	block, _ := pem.Decode(info.PublicKey())
@@ -58,15 +60,11 @@ func TestKeyPairAndCA(t *testing.T) {
 
 	_, err = x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		t.Errorf("failed to parse encoded public x509 key cert: %v", err)
+		t.Errorf("failed parsing encoded public x509 key cert: %v", err)
 	}
 }
 
 func TestGenerateMemCert(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping cert generation in short mode")
-	}
-
 	cert, key, err := shared.GenerateMemCert(false, shared.CertOptions{AddHosts: true})
 	if err != nil {
 		t.Error(err)
@@ -98,6 +96,6 @@ func TestGenerateMemCert(t *testing.T) {
 	}
 
 	if block.Type != "EC PRIVATE KEY" {
-		t.Errorf("GenerateMemCert returned a cert with Type %q not \"EC PRIVATE KEY\"", block.Type)
+		t.Errorf("GenerateMemCert returned a key with Type %q not \"EC PRIVATE KEY\"", block.Type)
 	}
 }

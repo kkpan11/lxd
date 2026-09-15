@@ -6,11 +6,13 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/canonical/lxd/shared/entity"
 )
 
 func TestEntityStatementValidity(t *testing.T) {
 	schema := Schema()
-	db, err := schema.ExerciseUpdate(71, nil)
+	db, err := schema.ExerciseUpdate(SchemaVersion, nil)
 	require.NoError(t, err)
 
 	for entityType, info := range entityTypes {
@@ -24,7 +26,7 @@ func TestEntityStatementValidity(t *testing.T) {
 	}
 
 	for entityType, info := range entityTypes {
-		urlByIDQuery := info.urlByIDQuery()
+		urlByIDQuery := info.urlsByIDsQuery(1)
 		if urlByIDQuery == "" {
 			continue
 		}
@@ -50,7 +52,7 @@ func TestEntityStatementValidity(t *testing.T) {
 		}
 
 		for middleEntityType, middleEntityInfo := range entityTypes {
-			middleQuery := middleEntityInfo.urlByIDQuery()
+			middleQuery := middleEntityInfo.urlsByIDsQuery(1)
 			if middleQuery == "" {
 				continue
 			}
@@ -85,5 +87,15 @@ func TestEntityStatementValidity(t *testing.T) {
 			_, err = db.Prepare(strings.Join([]string{outerQuery, innerQuery}, " UNION "))
 			assert.NoErrorf(t, err, "Union entity ID from URL statement (outer: %q; inner: %q): %v", outerEntityType, innerEntityType, err)
 		}
+	}
+}
+
+// TestEntityTypesCoversAllEntityTypes checks that every type in [entity.AllTypes] has a corresponding
+// entry in the local entityTypes map. If a new entity type is added to shared/entity/type.go without
+// a corresponding DB entry here, this test will fail.
+func TestEntityTypesCoversAllEntityTypes(t *testing.T) {
+	for _, entityType := range entity.AllTypes() {
+		_, ok := entityTypes[entityType]
+		assert.Truef(t, ok, "entity type %q is missing from lxd/db/cluster entityTypes map", entityType)
 	}
 }

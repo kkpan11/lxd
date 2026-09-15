@@ -2,72 +2,45 @@
 
 <!-- Include start contributing -->
 
-The LXD team appreciates contributions to the project, through pull requests, issues on the [GitHub repository](https://github.com/canonical/lxd/issues), or discussions or questions on the [forum](https://discourse.ubuntu.com/c/lxd/126).
+The LXD team welcomes contributions through pull requests, issue reports, and discussions.
 
-Check the following guidelines before contributing to the project.
+- Contribute to the code or documentation, report bugs, or request features in the [GitHub repository](https://github.com/canonical/lxd)
+- Ask questions or join discussions in the [LXD forum](https://discourse.ubuntu.com/c/project/lxd/126).
+
+Review the following guidelines before contributing to the project.
 
 ## Code of Conduct
 
-When contributing, you must adhere to the Code of Conduct, which is available at: [`https://github.com/canonical/lxd/blob/main/CODE_OF_CONDUCT.md`](https://github.com/canonical/lxd/blob/main/CODE_OF_CONDUCT.md)
+All contributors must adhere to the [Ubuntu Code of Conduct](https://ubuntu.com/community/docs/ethos/code-of-conduct).
 
 ## License and copyright
 
-All contributors must sign the [Canonical contributor license agreement](https://ubuntu.com/legal/contributors), which gives Canonical permission to use the contributions. The author of a change remains the copyright holder of their code (no copyright assignment).
+All contributors must sign the [Canonical contributor license agreement (CCLA)](https://canonical.com/legal/contributors), which grants Canonical permission to use the contributions.
 
-By default, any contribution to this project is licensed out under the project license: AGPL-3.0-only.
-
-By exception, Canonical may import code under licenses compatible with AGPL-3.0-only, such as Apache-2.0.
-Such code will remain under its original license and will be identified as such in the commit message or its file header.
-
-Some files and commits are licensed out under Apache-2.0 rather than AGPL-3.0-only.
-These are marked as Apache-2.0 in their package-level COPYING file, file header or commit message.
+- You retain copyright ownership of your contributions (no copyright assignment).
+- By default, contributions are licensed under the project's **AGPL-3.0-only** license.
+- Exceptions:
+  - Canonical may import code under AGPL-3.0-only compatible licenses, such as Apache-2.0.
+  - Such code retains its original license and is marked as such in commit messages or file headers.
+  - Some files and commits are licensed under Apache-2.0 rather than AGPL-3.0-only. These are indicated in their package-level COPYING file, file header, or commit message.
 
 ## Pull requests
 
-Changes to this project should be proposed as pull requests on GitHub
-at: [`https://github.com/canonical/lxd`](https://github.com/canonical/lxd)
+Submit pull requests on GitHub at: [`https://github.com/canonical/lxd`](https://github.com/canonical/lxd).
 
-Proposed changes will then go through review there and once approved,
-be merged in the main branch.
+All pull requests undergo review and must be approved before being merged into the main branch.
 
 ### Commit structure
 
-Separate commits should be used for:
+See [`COMMITS.md`](https://github.com/canonical/lxd/blob/main/COMMITS.md) for the full commit prefix table and signing requirements.
 
-- API extension (`api: Add XYZ extension`, contains `doc/api-extensions.md` and `shared/version/api.go`)
-- Documentation (`doc: Update XYZ` for files in `doc/`)
-- API structure (`shared/api: Add XYZ` for changes to `shared/api/`)
-- Go client package (`client: Add XYZ` for changes to `client/`)
-- CLI (`lxc/<command>: Change XYZ` for changes to `lxc/`)
-- LXD daemon (`lxd/<package>: Add support for XYZ` for changes to `lxd/`)
-- Tests (`tests: Add test for XYZ` for changes to `tests/`)
+Depending on complexity, large changes might be further split into smaller, logical commits. This commit structure facilitates the review process and simplifies backporting fixes to stable branches.
 
-The same kind of pattern extends to the other tools in the LXD code tree
-and depending on complexity, things may be split into even smaller chunks.
+### Developer Certificate of Origin sign-off
 
-When updating strings in the CLI tool (`lxc/`), you may need a commit to update the templates:
+To ensure transparency and accountability in contributions to this project, all contributors must include a **Signed-off-by** line in their commits in accordance with DCO 1.1:
 
-    make i18n
-    git commit -a -s -m "i18n: Update translation templates" po/
-
-When updating API (`shared/api`), you may need a commit to update the swagger YAML:
-
-    make update-api
-    git commit -s -m "doc/rest-api: Refresh swagger YAML" doc/rest-api.yaml
-
-This structure makes it easier for contributions to be reviewed and also
-greatly simplifies the process of back-porting fixes to stable branches.
-
-### Developer Certificate of Origin
-
-To improve tracking of contributions to this project we use the DCO 1.1
-and use a "sign-off" procedure for all changes going into the branch.
-
-The sign-off is a simple line at the end of the explanation for the
-commit which certifies that you wrote it or otherwise have the right
-to pass it on as an open-source contribution.
-
-```
+```text
 Developer Certificate of Origin
 Version 1.1
 
@@ -105,20 +78,142 @@ By making a contribution to this project, I certify that:
     this project or the open source license(s) involved.
 ```
 
-An example of a valid sign-off line is:
+#### Including a Signed-off-by line in your commits
 
+Every commit must include a **Signed-off-by** line, even when part of a larger set of contributions. To do this, use the `-s` flag when committing:
+
+```sh
+git commit -s -m "Your commit message"
 ```
-Signed-off-by: Random J Developer <random@developer.org>
+
+This automatically adds the following to your commit message:
+
+```text
+Signed-off-by: Your Name <your.email@example.com>
 ```
 
-Use a known identity and a valid e-mail address.
-Sorry, no anonymous contributions are allowed.
+By including this line, you acknowledge your agreement to the DCO 1.1 for that specific contribution.
 
-We also require each commit be individually signed-off by their author,
-even when part of a larger set. You may find `git commit -s` useful.
+- Use a valid name and email address—anonymous contributions are not accepted.
+- Ensure your email matches the one associated with your GitHub account.
+
+If you forgot to sign off on one or more commits and the DCO check fails, you can retroactively add the sign-off to all commits on your branch with:
+
+```sh
+git rebase --signoff main
+git push --force-with-lease
+```
+
+### Commit signature verification
+
+In addition to the sign-off requirement, contributors must also cryptographically sign their commits to verify authenticity. See: [GitHub's documentation on commit signature verification](https://docs.github.com/en/authentication/managing-commit-signature-verification).
+
+### Make-generated files
+
+Some changes require regenerating certain files using Makefile commands.
+
+After you run any of the commands below, you'll be prompted whether to commit the changes. If you respond `Y`, only the re-generated files are committed—any other staged files are ignored.
+
+#### Formatting
+
+If you modify any Go source files, format them:
+
+```sh
+make update-fmt
+```
+
+#### API updates
+
+If you modify the LXD API (`shared/api`), regenerate and commit the Swagger YAML file (`doc/rest-api.yaml`) used for API reference documentation:
+
+```sh
+make update-api
+```
+
+#### Configuration options updates
+
+If you add or update configuration options, regenerate and commit the documentation metadata files (`lxd/metadata/configuration.json` and `doc/metadata.txt`):
+
+```sh
+make update-metadata
+```
+
+#### Development environment setup
+
+Several pieces of software are needed in order to build and test LXD. Here is an easy way to create a virtual-machine to use as a development environment. LXD itself is needed to power that virtual-machine so install it first: {ref}`installing`.
+
+Once LXD is installed and {ref}`initialized <initialize>`, a special profile (`lxd-test`) needs to be loaded. The profile includes a `lxd-git` device (see {ref}`devices-disk-types` for details) that will share LXD's git repository with the virtual-machine. Since this path is specific to your environment you need to adjust it when loading the profile:
+
+```sh
+# this needs to be run from inside the git repository
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+# create or edit the profile based on the provided template
+lxc profile list | grep -qwF lxd-test || lxc profile create lxd-test
+sed "s|@@PATH_TO_LXD_GIT@@|${GIT_ROOT}|" "${GIT_ROOT}/doc/lxd-test.yaml" | lxc profile edit lxd-test
+```
+
+The `lxd-test` profile assigns CPU and memory limits similar to those available in free GitHub Action runners. Those can be adapted to the specifications of a more modest physical machine:
+
+```sh
+lxc profile set lxd-test limits.cpu=2
+lxc profile set lxd-test limits.memory=4GiB
+lxc profile device set lxd-test root size=8GiB
+```
+
+This profile can then be used to launch an Ubuntu VM and start using it:
+
+```sh
+lxc launch ubuntu-minimal-daily:26.04 v1 --vm -p lxd-test
+sleep 30
+# this may take a while as many packages need to be installed
+lxc exec v1 -- cloud-init status --wait --long
+```
+
+If testing with the `ceph` storage backend, it is also possible to attach an ephemeral disk to be assigned to MicroCeph automatically during tests:
+
+```sh
+# The volume name must **end** with `lxd-ephemeral` to be considered for auto-assignment to MicroCeph
+lxc storage volume create default v1-lxd-ephemeral --type=block size=32GiB
+lxc storage volume attach default v1-lxd-ephemeral v1
+```
+
+Then it is possible to build all the dependencies, LXD binaries and even run tests either automatically or manually:
+
+```sh
+# start a root shell in the VM
+lxc exec v1 -- bash
+
+# go into the git repo
+cd lxd
+
+# build deps and LXD binaries
+make deps && make
+
+# get an interactive test shell session with all the needed environment variables to use and test LXD
+make test-shell
+
+# run the `exec` and `query` tests
+./main.sh exec
+./main.sh query
+
+# or manually interact with LXD, for example:
+lxc launch ubuntu:24.04 u1
+lxc exec u1 -- hostname
+lxc delete --force u1
+
+# for a barebones test instance with just busybox (note: no IP automatically configured)
+./deps/import-busybox --alias testimage
+lxc launch testimage c1
+```
+
+At this point you might want to learn more on {doc}`debugging`.
+
+#### Copilot instructions file updates
+
+The LXD repository includes a [Copilot instructions file](https://github.com/canonical/lxd/blob/main/.github/copilot-instructions.md) to improve Copilot Code Review responses. When updating this file, include concise context about LXD's architecture, coding standards, and best practices. Clear guidance helps Copilot produce accurate, relevant suggestions. For details and tips, see the documentation on [GitHub Copilot repository custom instructions](https://docs.github.com/en/copilot/how-tos/copilot-on-github/customize-copilot/add-custom-instructions/add-repository-instructions).
 
 <!-- Include end contributing -->
 
 ## More information
 
-For more information, see [Contributing](https://documentation.ubuntu.com/lxd/en/latest/contributing/) in the documentation.
+For more information, including details about contributing to the code as well as the documentation for LXD, see [How to contribute to LXD](https://canonical.com/lxd/docs/latest/contributing/) in the documentation.

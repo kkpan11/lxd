@@ -4,18 +4,17 @@ import (
 	"bytes"
 	"context"
 	"crypto/rsa"
+	"crypto/subtle"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
-
-	"github.com/gorilla/mux"
 
 	"github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/lxd/auth"
@@ -27,24 +26,26 @@ import (
 	"github.com/canonical/lxd/lxd/lifecycle"
 	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/request"
+	"github.com/canonical/lxd/lxd/request/security"
 	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/entity"
-	"github.com/canonical/lxd/shared/version"
 )
 
 var certificatesCmd = APIEndpoint{
-	Path: "certificates",
+	Path:        "certificates",
+	MetricsType: entity.TypeCertificate,
 
 	Get:  APIEndpointAction{Handler: certificatesGet, AccessHandler: allowAuthenticated},
 	Post: APIEndpointAction{Handler: certificatesPost, AllowUntrusted: true},
 }
 
 var certificateCmd = APIEndpoint{
-	Path: "certificates/{fingerprint}",
+	Path:        "certificates/{fingerprint}",
+	MetricsType: entity.TypeCertificate,
 
 	Delete: APIEndpointAction{Handler: certificateDelete, AccessHandler: allowAuthenticated},
 	Get:    APIEndpointAction{Handler: certificateGet, AccessHandler: allowAuthenticated},
@@ -133,7 +134,7 @@ var certificateCmd = APIEndpoint{
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func certificatesGet(d *Daemon, r *http.Request) response.Response {
-	recursion := util.IsRecursionRequest(r)
+	recursion, _ := util.IsRecursionRequest(r)
 	s := d.State()
 
 	userHasPermission, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeCertificate)
@@ -141,68 +142,76 @@ func certificatesGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	if recursion {
-		var certResponses []api.Certificate
-		var baseCerts []dbCluster.Certificate
-		var err error
-		err = d.State().DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
-			baseCerts, err = dbCluster.GetCertificates(ctx, tx.Tx())
-			if err != nil {
-				return err
-			}
+	withEntitlements, err := extractEntitlementsFromQuery(r, entity.TypeCertificate, true)
+	if err != nil {
+		return response.SmartError(err)
+	}
 
-			certResponses = make([]api.Certificate, 0, len(baseCerts))
-			for _, baseCert := range baseCerts {
-				if !userHasPermission(entity.CertificateURL(baseCert.Fingerprint)) {
-					continue
-				}
-
-				apiCert, err := baseCert.ToAPI(ctx, tx.Tx())
-				if err != nil {
-					return err
-				}
-
-				certResponses = append(certResponses, *apiCert)
-			}
-
-			return nil
+	var certificates []dbCluster.CertificateLegacy
+	var certificateIDToProjects map[int64][]string
+	var certURLs []string
+	err = d.State().DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+		certificates, certURLs, err = dbCluster.GetCertificatesAndURLsLegacy(ctx, tx.Tx(), func(c dbCluster.CertificateLegacy) bool {
+			return userHasPermission(entity.CertificateURL(c.Fingerprint))
 		})
+		if err != nil {
+			return err
+		}
+
+		if recursion == 0 || len(certificates) == 0 {
+			return nil
+		}
+
+		certificateIDToProjects, err = dbCluster.GetCertificateLegacyProjects(ctx, tx.Tx(), nil)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if recursion == 0 {
+		return response.SyncResponse(true, certURLs)
+	}
+
+	urlToCertificate := make(map[*api.URL]auth.EntitlementReporter)
+	certResponses := make([]*api.Certificate, 0, len(certificates))
+	for _, cert := range certificates {
+		certResponse, err := cert.ToAPI(certificateIDToProjects)
 		if err != nil {
 			return response.SmartError(err)
 		}
 
-		return response.SyncResponse(true, certResponses)
+		certResponses = append(certResponses, certResponse)
+		urlToCertificate[entity.CertificateURL(cert.Fingerprint)] = certResponse
 	}
 
-	body := []string{}
-	for _, identity := range d.identityCache.GetByAuthenticationMethod(api.AuthenticationMethodTLS) {
-		if !userHasPermission(entity.CertificateURL(identity.Identifier)) {
-			continue
+	if len(withEntitlements) > 0 {
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeCertificate, withEntitlements, urlToCertificate)
+		if err != nil {
+			return response.SmartError(err)
 		}
-
-		certificateURL := fmt.Sprintf("/%s/certificates/%s", version.APIVersion, identity.Identifier)
-		body = append(body, certificateURL)
 	}
 
-	return response.SyncResponse(true, body)
+	return response.SyncResponse(true, certResponses)
 }
 
 // clusterMemberJoinTokenValid searches for cluster join token that matches the join token provided.
 // Returns matching operation if found and cancels the operation, otherwise returns nil.
-func clusterMemberJoinTokenValid(s *state.State, r *http.Request, projectName string, joinToken *api.ClusterMemberJoinToken) (*api.Operation, error) {
-	ops, err := operationsGetByType(s, r, projectName, operationtype.ClusterJoinToken)
+func clusterMemberJoinTokenValid(s *state.State, r *http.Request, joinToken *api.ClusterMemberJoinToken) (*api.Operation, error) {
+	ops, err := operationsGetByType(r.Context(), s, "", operationtype.ClusterJoinToken, false)
 	if err != nil {
 		return nil, fmt.Errorf("Failed getting cluster join token operations: %w", err)
 	}
 
 	var foundOp *api.Operation
+	joinTokenSecretBytes := []byte(joinToken.Secret)
 	for _, op := range ops {
 		if op.StatusCode != api.Running {
 			continue // Tokens are single use, so if cancelled but not deleted yet its not available.
-		}
-
-		if op.Resources == nil {
-			continue
 		}
 
 		opSecret, ok := op.Metadata["secret"]
@@ -215,7 +224,17 @@ func clusterMemberJoinTokenValid(s *state.State, r *http.Request, projectName st
 			continue
 		}
 
-		if opServerName == joinToken.ServerName && opSecret == joinToken.Secret {
+		if opServerName != joinToken.ServerName {
+			continue
+		}
+
+		// Assert opSecret is a string then convert to []byte for constant time comparison.
+		opSecretStr, ok := opSecret.(string)
+		if !ok {
+			continue
+		}
+
+		if subtle.ConstantTimeCompare([]byte(opSecretStr), joinTokenSecretBytes) == 1 {
 			foundOp = op
 			break
 		}
@@ -223,31 +242,21 @@ func clusterMemberJoinTokenValid(s *state.State, r *http.Request, projectName st
 
 	if foundOp != nil {
 		// Token is single-use, so cancel it now.
-		err = operationCancel(s, r, projectName, foundOp)
+		err = operationCancelToken(r.Context(), s, "", foundOp)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to cancel operation %q: %w", foundOp.ID, err)
+			return nil, fmt.Errorf("Failed canceling operation %q: %w", foundOp.ID, err)
 		}
 
 		expiresAt, ok := foundOp.Metadata["expiresAt"]
 		if ok {
-			var expiry time.Time
+			expiryStr, ok := expiresAt.(string)
+			if !ok {
+				return nil, fmt.Errorf("Unexpected expiry type in cluster join token operation: %T (%v)", expiresAt, expiresAt)
+			}
 
-			// Depending on whether it's a local operation or not, expiry will either be a time.Time or a string.
-			if s.ServerName == foundOp.Location {
-				expiry, ok = expiresAt.(time.Time)
-				if !ok {
-					return nil, fmt.Errorf("Unexpected expiry type in cluster join token operation: %T (%v)", expiresAt, expiresAt)
-				}
-			} else {
-				expiryStr, ok := expiresAt.(string)
-				if !ok {
-					return nil, fmt.Errorf("Unexpected expiry type in cluster join token operation: %T (%v)", expiresAt, expiresAt)
-				}
-
-				expiry, err = time.Parse(time.RFC3339Nano, expiryStr)
-				if err != nil {
-					return nil, fmt.Errorf("Invalid expiry format in cluster join token operation: %w (%q)", err, expiryStr)
-				}
+			expiry, err := time.Parse(time.RFC3339Nano, expiryStr)
+			if err != nil {
+				return nil, fmt.Errorf("Invalid expiry format in cluster join token operation: %w (%q)", err, expiryStr)
 			}
 
 			// Check if token has expired.
@@ -267,12 +276,13 @@ func clusterMemberJoinTokenValid(s *state.State, r *http.Request, projectName st
 // If an operation is found it is cancelled and the request metadata is returned. If no operation is found then a nil value
 // is returned. An error is only returned if an internal error occurs, or if a token is found but is not valid.
 func certificateTokenValid(s *state.State, r *http.Request, addToken *api.CertificateAddToken) (*api.CertificatesPost, error) {
-	ops, err := operationsGetByType(s, r, api.ProjectDefaultName, operationtype.CertificateAddToken)
+	ops, err := operationsGetByType(r.Context(), s, api.ProjectDefaultName, operationtype.CertificateAddToken, false)
 	if err != nil {
 		return nil, fmt.Errorf("Failed getting certificate token operations: %w", err)
 	}
 
 	var foundOp *api.Operation
+	addTokenSecretBytes := []byte(addToken.Secret)
 	for _, op := range ops {
 		if op.StatusCode != api.Running {
 			continue // Tokens are single use, so if cancelled but not deleted yet its not available.
@@ -283,43 +293,48 @@ func certificateTokenValid(s *state.State, r *http.Request, addToken *api.Certif
 			continue
 		}
 
-		if opSecret == addToken.Secret {
+		// Assert opSecret is a string then convert to []byte for constant time comparison.
+		opSecretStr, ok := opSecret.(string)
+		if !ok {
+			continue
+		}
+
+		if subtle.ConstantTimeCompare([]byte(opSecretStr), addTokenSecretBytes) == 1 {
 			foundOp = op
 			break
 		}
 	}
 
 	if foundOp == nil {
+		err := s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+			var err error
+			_, err = dbCluster.GetPendingTLSIdentityByTokenSecret(ctx, tx.Tx(), addToken.Secret)
+			return err
+		})
+		if err == nil {
+			return nil, api.NewStatusError(http.StatusBadRequest, "TLS Identity token detected (you must update your client)")
+		}
+
 		// No operation found.
 		return nil, nil
 	}
 
 	// Token is single-use, so cancel it now.
-	err = operationCancel(s, r, api.ProjectDefaultName, foundOp)
+	err = operationCancelToken(r.Context(), s, api.ProjectDefaultName, foundOp)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to cancel operation %q: %w", foundOp.ID, err)
+		return nil, fmt.Errorf("Failed canceling operation %q: %w", foundOp.ID, err)
 	}
 
 	expiresAt, ok := foundOp.Metadata["expiresAt"]
 	if ok {
-		var expiry time.Time
+		expiryStr, ok := expiresAt.(string)
+		if !ok {
+			return nil, fmt.Errorf("Unexpected expiry type in certificate add operation: %T (%v)", expiresAt, expiresAt)
+		}
 
-		// Depending on whether it's a local operation or not, expiry will either be a time.Time or a string.
-		if s.ServerName == foundOp.Location {
-			expiry, ok = expiresAt.(time.Time)
-			if !ok {
-				return nil, fmt.Errorf("Unexpected expiry type in certificate add operation: %T (%v)", expiresAt, expiresAt)
-			}
-		} else {
-			expiryStr, ok := expiresAt.(string)
-			if !ok {
-				return nil, fmt.Errorf("Unexpected expiry type in certificate add operation: %T (%v)", expiresAt, expiresAt)
-			}
-
-			expiry, err = time.Parse(time.RFC3339Nano, expiryStr)
-			if err != nil {
-				return nil, fmt.Errorf("Invalid expiry format in certificate add operation: %w (%q)", err, expiryStr)
-			}
+		expiry, err := time.Parse(time.RFC3339Nano, expiryStr)
+		if err != nil {
+			return nil, fmt.Errorf("Invalid expiry format in certificate add operation: %w (%q)", err, expiryStr)
 		}
 
 		// Check if token has expired.
@@ -331,32 +346,19 @@ func certificateTokenValid(s *state.State, r *http.Request, addToken *api.Certif
 	// Certificate add tokens must have a request field in the metadata.
 	tokenReqAny, ok := foundOp.Metadata["request"]
 	if !ok {
-		return nil, fmt.Errorf(`Missing "request" key in certificate add operation data`)
+		return nil, errors.New(`Missing "request" key in certificate add operation data`)
 	}
 
 	var tokenReq api.CertificatesPost
+	buf := bytes.NewBuffer(nil)
+	err = json.NewEncoder(buf).Encode(tokenReqAny)
+	if err != nil {
+		return nil, fmt.Errorf("Bad certificate add operation data: %w", err)
+	}
 
-	// Depending on whether it's a local operation or not, request field will either be a api.CertificatesPost
-	// or a JSON string of api.CertificatesPost.
-	if s.ServerName == foundOp.Location {
-		tokenReq, ok = tokenReqAny.(api.CertificatesPost)
-		if !ok {
-			return nil, fmt.Errorf("Unexpected request type in certificate add operation: %T", tokenReqAny)
-		}
-	} else {
-		// If the operation is running on another member, the returned metadata will have been unmarshalled
-		// into a map[string]any. Rather than wrangling type assertions, just marshal and unmarshal the
-		// data into the correct type.
-		buf := bytes.NewBuffer(nil)
-		err = json.NewEncoder(buf).Encode(tokenReqAny)
-		if err != nil {
-			return nil, fmt.Errorf("Bad certificate add operation data: %w", err)
-		}
-
-		err = json.NewDecoder(buf).Decode(&tokenReq)
-		if err != nil {
-			return nil, fmt.Errorf("Bad certificate add operation data: %w", err)
-		}
+	err = json.NewDecoder(buf).Decode(&tokenReq)
+	if err != nil {
+		return nil, fmt.Errorf("Bad certificate add operation data: %w", err)
 	}
 
 	return &tokenReq, nil
@@ -436,8 +438,8 @@ func certificatesPost(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
-	if req.Password != "" {
-		return response.NotImplemented(fmt.Errorf("Password authentication is no longer supported, please update your client"))
+	if req.Password != "" { //nolint:staticcheck
+		return response.NotImplemented(errors.New("Password authentication is no longer supported, please update your client"))
 	}
 
 	// Validate name.
@@ -447,18 +449,27 @@ func certificatesPost(d *Daemon, r *http.Request) response.Response {
 
 	localHTTPSAddress := s.LocalConfig.HTTPSAddress()
 
-	// Quick check.
-	if req.Token && req.Certificate != "" {
-		return response.BadRequest(fmt.Errorf("Can't use certificate if token is requested"))
+	// Reject projects list without restricted flag to prevent misleading configurations.
+	if len(req.Projects) > 0 && !req.Restricted {
+		return response.BadRequest(errors.New("Projects can only be specified for restricted certificates. Set restricted=true or remove projects"))
 	}
 
+	// Validate request for creating certificate add token.
 	if req.Token {
+		if req.Certificate != "" {
+			return response.BadRequest(errors.New("Cannot use certificate if token is requested"))
+		}
+
 		if req.Type != "client" {
-			return response.BadRequest(fmt.Errorf("Tokens can only be issued for client certificates"))
+			return response.BadRequest(errors.New("Tokens can only be issued for client certificates"))
+		}
+
+		if req.Name == "" {
+			return response.BadRequest(errors.New("Client name must not be empty"))
 		}
 
 		if localHTTPSAddress == "" {
-			return response.BadRequest(fmt.Errorf("Can't issue token when server isn't listening on network"))
+			return response.BadRequest(errors.New("Cannot issue token when server is not listening on network"))
 		}
 	}
 
@@ -471,14 +482,36 @@ func certificatesPost(d *Daemon, r *http.Request) response.Response {
 		userCanCreateCertificates = true
 	}
 
-	trusted, err := request.GetCtxValue[bool](r.Context(), request.CtxTrusted)
+	requestor, err := request.GetRequestor(r.Context())
 	if err != nil {
-		return response.SmartError(fmt.Errorf("Failed to get authentication status: %w", err))
+		return response.SmartError(errors.New("Failed getting authentication status: Missing request context info"))
+	}
+
+	// If caller is already trusted and the trust token is provided, we validate the token and cancel
+	// the corresponding token operation.
+	if requestor.IsTrusted() && req.TrustToken != "" {
+		// Decode the trust token.
+		joinToken, err := shared.CertificateTokenDecode(req.TrustToken)
+		if err != nil {
+			return response.Forbidden(nil)
+		}
+
+		// Validate the token and cancel the corresponding operation.
+		tokenReq, err := certificateTokenValid(s, r, joinToken)
+		if err != nil {
+			return response.InternalError(fmt.Errorf("Failed during search for certificate add token operation: %w", err))
+		}
+
+		if tokenReq == nil {
+			return response.Forbidden(errors.New("No matching certificate add operation found"))
+		}
+
+		return response.Conflict(errors.New("Client is already trusted"))
 	}
 
 	// If caller is already trusted and does not have permission to create certificates, they cannot create more certificates.
-	if trusted && !userCanCreateCertificates && req.Certificate == "" && !req.Token {
-		return response.BadRequest(fmt.Errorf("Client is already trusted"))
+	if requestor.IsTrusted() && !userCanCreateCertificates && req.Certificate == "" && !req.Token {
+		return response.BadRequest(errors.New("Client is already trusted"))
 	}
 
 	if !userCanCreateCertificates {
@@ -496,13 +529,13 @@ func certificatesPost(d *Daemon, r *http.Request) response.Response {
 		joinToken, err := shared.JoinTokenDecode(req.TrustToken)
 		if err == nil {
 			// If so then check there is a matching join operation.
-			joinOp, err := clusterMemberJoinTokenValid(s, r, api.ProjectDefaultName, joinToken)
+			joinOp, err := clusterMemberJoinTokenValid(s, r, joinToken)
 			if err != nil {
 				return response.InternalError(fmt.Errorf("Failed during search for join token operation: %w", err))
 			}
 
 			if joinOp == nil {
-				return response.Forbidden(fmt.Errorf("No matching cluster join operation found"))
+				return response.Forbidden(errors.New("No matching cluster join operation found"))
 			}
 		} else {
 			// Check if certificate add token supplied as token.
@@ -514,11 +547,11 @@ func certificatesPost(d *Daemon, r *http.Request) response.Response {
 			// If so then check there is a matching join operation.
 			tokenReq, err := certificateTokenValid(s, r, joinToken)
 			if err != nil {
-				return response.InternalError(fmt.Errorf("Failed during search for certificate add token operation: %w", err))
+				return response.SmartError(fmt.Errorf("Failed during search for certificate add token operation: %w", err))
 			}
 
 			if tokenReq == nil {
-				return response.Forbidden(fmt.Errorf("No matching certificate add operation found"))
+				return response.Forbidden(errors.New("No matching certificate add operation found"))
 			}
 
 			// Create a new request from the token data as the user isn't allowed to override anything.
@@ -550,27 +583,9 @@ func certificatesPost(d *Daemon, r *http.Request) response.Response {
 			return response.BadRequest(fmt.Errorf("Invalid certificate material: %w", err))
 		}
 	} else if req.Token {
-		// Get all addresses the server is listening on. This is encoded in the certificate token,
-		// so that the client will not have to specify a server address. The client will iterate
-		// through all these addresses until it can connect to one of them.
-		addresses, err := util.ListenAddresses(localHTTPSAddress)
+		token, err := createCertificateAddToken(s, req.Name, "")
 		if err != nil {
-			return response.InternalError(err)
-		}
-
-		// Generate join secret for new client. This will be stored inside the join token operation and will be
-		// supplied by the joining client (encoded inside the join token) which will allow us to lookup the correct
-		// operation in order to validate the requested joining client name is correct and authorised.
-		joinSecret, err := shared.RandomCryptoString()
-		if err != nil {
-			return response.InternalError(err)
-		}
-
-		// Generate fingerprint of network certificate so joining member can automatically trust the correct
-		// certificate when it is presented during the join process.
-		fingerprint, err := shared.CertFingerprintStr(string(s.Endpoints.NetworkPublicKey()))
-		if err != nil {
-			return response.InternalError(err)
+			return response.SmartError(fmt.Errorf("Failed creating certificate add token: %w", err))
 		}
 
 		if req.Projects == nil {
@@ -578,9 +593,9 @@ func certificatesPost(d *Daemon, r *http.Request) response.Response {
 		}
 
 		meta := map[string]any{
-			"secret":      joinSecret,
-			"fingerprint": fingerprint,
-			"addresses":   addresses,
+			"secret":      token.Secret,
+			"fingerprint": token.Fingerprint,
+			"addresses":   token.Addresses,
 			"request":     req,
 		}
 
@@ -596,36 +611,36 @@ func certificatesPost(d *Daemon, r *http.Request) response.Response {
 			meta["expiresAt"] = expiresAt
 		}
 
-		op, err := operations.OperationCreate(s, api.ProjectDefaultName, operations.OperationClassToken, operationtype.CertificateAddToken, nil, meta, nil, nil, nil, r)
+		args := operations.OperationArgs{
+			ProjectName: api.ProjectDefaultName,
+			Type:        operationtype.CertificateAddToken,
+			Class:       operationtype.OperationClassToken,
+			Metadata:    meta,
+		}
+
+		op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 		if err != nil {
 			return response.InternalError(err)
 		}
 
-		return operations.OperationResponse(op)
+		return response.OperationResponse(op)
 	} else if r.TLS != nil {
 		// Add client's certificate.
 		if len(r.TLS.PeerCertificates) < 1 {
 			// This can happen if the client doesn't send a client certificate or if the server is in
 			// CA mode. We rely on this check to prevent non-CA trusted client certificates from being
 			// added when in CA mode.
-			return response.BadRequest(fmt.Errorf("No client certificate provided"))
+			return response.BadRequest(errors.New("No client certificate provided"))
 		}
 
 		cert = r.TLS.PeerCertificates[len(r.TLS.PeerCertificates)-1]
-		networkCert := s.Endpoints.NetworkCert()
-		if networkCert.CA() != nil {
-			// If we are in CA mode, we only allow adding certificates that are signed by the CA.
-			trusted, _, _ := util.CheckCASignature(*cert, networkCert)
-			if !trusted {
-				return response.Forbidden(fmt.Errorf("The certificate is not trusted by the CA or has been revoked"))
-			}
-		}
 	} else {
-		return response.BadRequest(fmt.Errorf("Can't use TLS data on non-TLS link"))
+		return response.BadRequest(errors.New("Cannot use TLS data on non-TLS link"))
 	}
 
 	// Check validity.
-	err = certificateValidate(cert)
+	networkCert := d.endpoints.NetworkCert()
+	err = certificateValidate(networkCert, cert)
 	if err != nil {
 		return response.BadRequest(err)
 	}
@@ -649,15 +664,15 @@ func certificatesPost(d *Daemon, r *http.Request) response.Response {
 		}
 	}
 
-	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
 		// Check if we already have the certificate.
-		existingCert, _ := dbCluster.GetCertificateByFingerprintPrefix(ctx, tx.Tx(), fingerprint)
+		existingCert, _ := dbCluster.GetCertificateLegacyByFingerprintPrefix(ctx, tx.Tx(), fingerprint)
 		if existingCert != nil {
 			return api.StatusErrorf(http.StatusConflict, "Certificate already in trust store")
 		}
 
 		// Store the certificate in the cluster database.
-		dbCert := dbCluster.Certificate{
+		dbCert := dbCluster.CertificateLegacy{
 			Fingerprint: shared.CertFingerprint(cert),
 			Type:        dbReqType,
 			Name:        name,
@@ -665,7 +680,7 @@ func certificatesPost(d *Daemon, r *http.Request) response.Response {
 			Restricted:  req.Restricted,
 		}
 
-		_, err := dbCluster.CreateCertificateWithProjects(ctx, tx.Tx(), dbCert, req.Projects)
+		_, err := dbCluster.CreateCertificateLegacyWithProjects(ctx, tx.Tx(), dbCert, req.Projects)
 		return err
 	})
 	if err != nil {
@@ -673,18 +688,12 @@ func certificatesPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Send a notification to other cluster members to refresh their identity cache.
-	notifier, err := cluster.NewNotifier(s, s.Endpoints.NetworkCert(), s.ServerCert(), cluster.NotifyAlive)
+	notifier, err := cluster.NewNotifier(s, networkCert, s.ServerCert(), cluster.NotifyAlive)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	req = api.CertificatesPost{
-		Certificate: base64.StdEncoding.EncodeToString(cert.Raw),
-		Name:        name,
-		Type:        api.CertificateTypeClient,
-	}
-
-	err = notifier(func(client lxd.InstanceServer) error {
+	err = notifier(func(member db.NodeInfo, client lxd.InstanceServer) error {
 		_, _, err := client.RawQuery(http.MethodPost, "/internal/identity-cache-refresh", nil, "")
 		return err
 	})
@@ -695,8 +704,8 @@ func certificatesPost(d *Daemon, r *http.Request) response.Response {
 	// Reload the identity cache to add the new certificate.
 	s.UpdateIdentityCache()
 
-	lc := lifecycle.CertificateCreated.Event(fingerprint, request.CreateRequestor(r), nil)
-	s.Events.SendLifecycle(api.ProjectDefaultName, lc)
+	lc := lifecycle.CertificateCreated.Event(fingerprint, request.CreateRequestor(r.Context()), nil)
+	s.Events.SendLifecycle("", lc)
 
 	return response.SyncResponseLocation(true, nil, lc.Source)
 }
@@ -737,21 +746,28 @@ func certificatesPost(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/InternalServerError"
 func certificateGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
-	fingerprint, err := url.PathUnescape(mux.Vars(r)["fingerprint"])
+	fingerprint := r.PathValue("fingerprint")
+	withEntitlements, err := extractEntitlementsFromQuery(r, entity.TypeCertificate, false)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	var cert *api.Certificate
-	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
-		dbCertInfo, err := dbCluster.GetCertificateByFingerprintPrefix(ctx, tx.Tx(), fingerprint)
+	var cert *dbCluster.CertificateLegacy
+	var projects map[int64][]string
+	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+		cert, err = dbCluster.GetCertificateLegacyByFingerprintPrefix(ctx, tx.Tx(), fingerprint)
 		if err != nil {
 			return err
 		}
 
-		cert, err = dbCertInfo.ToAPI(ctx, tx.Tx())
+		projects, err = dbCluster.GetCertificateLegacyProjects(ctx, tx.Tx(), &cert.ID)
 		return err
 	})
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	apiCert, err := cert.ToAPI(projects)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -761,7 +777,14 @@ func certificateGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	return response.SyncResponseETag(true, cert, cert)
+	if len(withEntitlements) > 0 {
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeCertificate, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.CertificateURL(cert.Fingerprint): apiCert})
+		if err != nil {
+			return response.SmartError(err)
+		}
+	}
+
+	return response.SyncResponseETag(true, apiCert, apiCert)
 }
 
 // swagger:operation PUT /1.0/certificates/{fingerprint} certificates certificate_put
@@ -794,22 +817,25 @@ func certificateGet(d *Daemon, r *http.Request) response.Response {
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func certificatePut(d *Daemon, r *http.Request) response.Response {
-	fingerprint, err := url.PathUnescape(mux.Vars(r)["fingerprint"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	fingerprint := r.PathValue("fingerprint")
 	// Get current database record.
-	var apiEntry *api.Certificate
-	err = d.State().DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
-		oldEntry, err := dbCluster.GetCertificateByFingerprintPrefix(ctx, tx.Tx(), fingerprint)
+	var cert *dbCluster.CertificateLegacy
+	var projectMap map[int64][]string
+	var err error
+	err = d.State().DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+		cert, err = dbCluster.GetCertificateLegacyByFingerprintPrefix(ctx, tx.Tx(), fingerprint)
 		if err != nil {
 			return err
 		}
 
-		apiEntry, err = oldEntry.ToAPI(ctx, tx.Tx())
+		projectMap, err = dbCluster.GetCertificateLegacyProjects(ctx, tx.Tx(), &cert.ID)
 		return err
 	})
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	apiEntry, err := cert.ToAPI(projectMap)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -828,7 +854,7 @@ func certificatePut(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Apply the update.
-	return doCertificateUpdate(d, *apiEntry, req, r)
+	return doCertificateUpdate(r.Context(), d, *cert, apiEntry.Projects, req, r)
 }
 
 // swagger:operation PATCH /1.0/certificates/{fingerprint} certificates certificate_patch
@@ -861,22 +887,25 @@ func certificatePut(d *Daemon, r *http.Request) response.Response {
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func certificatePatch(d *Daemon, r *http.Request) response.Response {
-	fingerprint, err := url.PathUnescape(mux.Vars(r)["fingerprint"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	fingerprint := r.PathValue("fingerprint")
 	// Get current database record.
-	var apiEntry *api.Certificate
-	err = d.State().DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
-		oldEntry, err := dbCluster.GetCertificateByFingerprintPrefix(ctx, tx.Tx(), fingerprint)
+	var cert *dbCluster.CertificateLegacy
+	var projectMap map[int64][]string
+	var err error
+	err = d.State().DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+		cert, err = dbCluster.GetCertificateLegacyByFingerprintPrefix(ctx, tx.Tx(), fingerprint)
 		if err != nil {
 			return err
 		}
 
-		apiEntry, err = oldEntry.ToAPI(ctx, tx.Tx())
+		projectMap, err = dbCluster.GetCertificateLegacyProjects(ctx, tx.Tx(), &cert.ID)
 		return err
 	})
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	apiEntry, err := cert.ToAPI(projectMap)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -894,125 +923,82 @@ func certificatePatch(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
-	return doCertificateUpdate(d, *apiEntry, req.Writable(), r)
+	return doCertificateUpdate(r.Context(), d, *cert, apiEntry.Projects, req.Writable(), r)
 }
 
-func doCertificateUpdate(d *Daemon, dbInfo api.Certificate, req api.CertificatePut, r *http.Request) response.Response {
+func doCertificateUpdate(ctx context.Context, d *Daemon, cert dbCluster.CertificateLegacy, certProjects []string, req api.CertificatePut, r *http.Request) response.Response {
 	s := d.State()
 
-	reqDBType, err := certificate.FromAPIType(req.Type)
+	reqCertType, err := certificate.FromAPIType(req.Type)
 	if err != nil {
-		return response.BadRequest(err)
+		return response.BadRequest(fmt.Errorf("Invalid certificate type: %w", err))
 	}
 
-	// Convert to the database type.
-	dbCert := dbCluster.Certificate{
-		Certificate: dbInfo.Certificate,
-		Fingerprint: dbInfo.Fingerprint,
-		Restricted:  req.Restricted,
-		Name:        req.Name,
-		Type:        reqDBType,
+	if reqCertType != cert.Type {
+		return response.Forbidden(errors.New("The certificate type cannot be changed"))
 	}
 
-	var userCanEditCertificate bool
-	err = s.Authorizer.CheckPermission(r.Context(), entity.CertificateURL(dbInfo.Fingerprint), auth.EntitlementCanEdit)
-	if err != nil && !auth.IsDeniedError(err) {
-		return response.SmartError(err)
-	} else if err == nil {
-		userCanEditCertificate = true
+	err = s.Authorizer.CheckPermission(r.Context(), entity.CertificateURL(cert.Fingerprint), auth.EntitlementCanEdit)
+	if err != nil {
+		if !auth.IsDeniedError(err) {
+			return response.SmartError(err)
+		}
+
+		// If the caller does not have permission to edit the certificate, they may be trying to edit their own certificate.
+		// We allow all TLS identities to update their own certificates. This is useful if their client certificate is about to expire.
+		// They are prevented from modifying any other fields.
+		return doCertificateUpdateUnprivileged(ctx, s, cert, certProjects, req)
 	}
 
-	// Non-admins are able to change their own certificate but no other fields.
-	// In order to prevent possible future security issues, the certificate information is
-	// reset in case a non-admin user is performing the update.
-	certProjects := req.Projects
-	if !userCanEditCertificate {
-		if r.TLS == nil {
-			response.Forbidden(fmt.Errorf("Cannot update certificate information"))
-		}
-
-		// Ensure the user in not trying to change fields other than the certificate.
-		if dbInfo.Restricted != req.Restricted || dbInfo.Name != req.Name || len(dbInfo.Projects) != len(req.Projects) {
-			return response.Forbidden(fmt.Errorf("Only the certificate can be changed"))
-		}
-
-		for i := 0; i < len(dbInfo.Projects); i++ {
-			if dbInfo.Projects[i] != req.Projects[i] {
-				return response.Forbidden(fmt.Errorf("Only the certificate can be changed"))
-			}
-		}
-
-		// Reset dbCert in order to prevent possible future security issues.
-		dbCert = dbCluster.Certificate{
-			Certificate: dbInfo.Certificate,
-			Fingerprint: dbInfo.Fingerprint,
-			Restricted:  dbInfo.Restricted,
-			Name:        dbInfo.Name,
-			Type:        reqDBType,
-		}
-
-		certProjects = dbInfo.Projects
-
-		if req.Certificate != "" && dbInfo.Certificate != req.Certificate {
-			certBlock, _ := pem.Decode([]byte(dbInfo.Certificate))
-
-			oldCert, err := x509.ParseCertificate(certBlock.Bytes)
-			if err != nil {
-				// This should not happen
-				return response.InternalError(err)
-			}
-
-			trustedCerts := map[string]x509.Certificate{
-				dbInfo.Name: *oldCert,
-			}
-
-			trusted := false
-			for _, i := range r.TLS.PeerCertificates {
-				trusted, _ = util.CheckMutualTLS(*i, trustedCerts)
-
-				if trusted {
-					break
-				}
-			}
-
-			if !trusted {
-				return response.Forbidden(fmt.Errorf("Certificate cannot be changed"))
-			}
-		}
-	}
-
-	if req.Certificate != "" && dbInfo.Certificate != req.Certificate {
+	networkCert := d.endpoints.NetworkCert()
+	oldFingerprint := cert.Fingerprint
+	certChanged := false
+	if req.Certificate != "" && cert.Certificate != req.Certificate {
 		// Add supplied certificate.
-		block, _ := pem.Decode([]byte(req.Certificate))
-
-		cert, err := x509.ParseCertificate(block.Bytes)
+		x509Cert, err := shared.ParseCert([]byte(req.Certificate))
 		if err != nil {
 			return response.BadRequest(fmt.Errorf("Invalid certificate material: %w", err))
 		}
 
-		dbCert.Certificate = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}))
-		dbCert.Fingerprint = shared.CertFingerprint(cert)
+		cert.Certificate = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: x509Cert.Raw}))
+		cert.Fingerprint = shared.CertFingerprint(x509Cert)
+		certChanged = true
 
 		// Check validity.
-		err = certificateValidate(cert)
+		err = certificateValidate(networkCert, x509Cert)
 		if err != nil {
 			return response.BadRequest(err)
 		}
 	}
 
+	// Reject projects list without restricted flag to prevent misleading configurations.
+	if len(req.Projects) > 0 && !req.Restricted {
+		return response.BadRequest(errors.New("Projects can only be specified for restricted certificates"))
+	}
+
+	cert.Name = req.Name
+	cert.Restricted = req.Restricted
+
 	// Update the database record.
-	err = s.DB.UpdateCertificate(context.Background(), dbInfo.Fingerprint, dbCert, certProjects)
+	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		err = dbCluster.UpdateCertificateLegacy(ctx, tx.Tx(), cert)
+		if err != nil {
+			return err
+		}
+
+		return dbCluster.UpdateCertificateLegacyProjects(ctx, tx.Tx(), cert.ID, req.Projects)
+	})
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	// Notify other cluster members to update their identity cache.
-	notifier, err := cluster.NewNotifier(s, s.Endpoints.NetworkCert(), s.ServerCert(), cluster.NotifyAlive)
+	notifier, err := cluster.NewNotifier(s, networkCert, s.ServerCert(), cluster.NotifyAlive)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	err = notifier(func(client lxd.InstanceServer) error {
+	err = notifier(func(member db.NodeInfo, client lxd.InstanceServer) error {
 		_, _, err := client.RawQuery(http.MethodPost, "/internal/identity-cache-refresh", nil, "")
 		return err
 	})
@@ -1023,7 +1009,97 @@ func doCertificateUpdate(d *Daemon, dbInfo api.Certificate, req api.CertificateP
 	// Reload the identity cache.
 	s.UpdateIdentityCache()
 
-	s.Events.SendLifecycle(api.ProjectDefaultName, lifecycle.CertificateUpdated.Event(dbInfo.Fingerprint, request.CreateRequestor(r), nil))
+	s.Events.SendLifecycle("", lifecycle.CertificateUpdated.Event(cert.Fingerprint, request.CreateRequestor(r.Context()), nil))
+
+	// Only emit when the certificate material actually changed; name,
+	// restricted, or projects edits are not a credential change. The old
+	// fingerprint is the event suffix so audit consumers can correlate the
+	// event with the previous credential.
+	if certChanged {
+		ev := security.AuthnCertificateChange.WithSuffix(oldFingerprint).
+			UserEvent(r.Context(), security.LevelInfo, "TLS client certificate changed")
+		s.Events.SendSecurity(ev)
+	}
+
+	return response.EmptySyncResponse
+}
+
+func doCertificateUpdateUnprivileged(ctx context.Context, s *state.State, cert dbCluster.CertificateLegacy, certProjects []string, req api.CertificatePut) response.Response {
+	requestor, err := request.GetRequestor(ctx)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	// The caller may only update their own certificate.
+	if requestor.Username != cert.Fingerprint {
+		return response.Forbidden(nil)
+	}
+
+	// Ensure the user is not trying to change fields other than the certificate.
+	// The certificate type has already been checked in doCertificateUpdate
+	if cert.Restricted != req.Restricted || cert.Name != req.Name || len(certProjects) != len(req.Projects) {
+		return response.Forbidden(errors.New("Only the certificate can be changed"))
+	}
+
+	for i := range certProjects {
+		if certProjects[i] != req.Projects[i] {
+			return response.Forbidden(errors.New("Only the certificate can be changed"))
+		}
+	}
+
+	// Add supplied certificate.
+	x509Cert, err := shared.ParseCert([]byte(req.Certificate))
+	if err != nil {
+		return response.BadRequest(fmt.Errorf("Invalid certificate material: %w", err))
+	}
+
+	// Check validity.
+	networkCert := s.Endpoints.NetworkCert()
+	err = certificateValidate(networkCert, x509Cert)
+	if err != nil {
+		return response.BadRequest(err)
+	}
+
+	oldFingerprint := cert.Fingerprint
+	cert.Certificate = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: x509Cert.Raw}))
+	cert.Fingerprint = shared.CertFingerprint(x509Cert)
+
+	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		return dbCluster.UpdateCertificateLegacy(ctx, tx.Tx(), cert)
+	})
+	if err != nil {
+		return response.SmartError(fmt.Errorf("Failed updating certificate: %w", err))
+	}
+
+	// Notify other cluster members to update their identity cache.
+	notifier, err := cluster.NewNotifier(s, networkCert, s.ServerCert(), cluster.NotifyAlive)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	err = notifier(func(member db.NodeInfo, client lxd.InstanceServer) error {
+		_, _, err := client.RawQuery(http.MethodPost, "/internal/identity-cache-refresh", nil, "")
+		return err
+	})
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	// Reload the identity cache.
+	s.UpdateIdentityCache()
+
+	s.Events.SendLifecycle("", lifecycle.CertificateUpdated.Event(cert.Fingerprint, request.CreateRequestor(ctx), nil))
+
+	// Emit the same event as the privileged path so certificate replacements
+	// are auditable regardless of who triggered them. The fingerprint changes
+	// whenever the certificate material does, and the helpers above already
+	// require Certificate to be supplied in the request, so the gate exists
+	// purely as a safety net against accidental no-op updates.
+	if cert.Fingerprint != oldFingerprint {
+		ev := security.AuthnCertificateChange.WithSuffix(oldFingerprint).
+			UserEvent(ctx, security.LevelInfo, "TLS client certificate changed (self-update)")
+		s.Events.SendSecurity(ev)
+	}
 
 	return response.EmptySyncResponse
 }
@@ -1049,16 +1125,12 @@ func doCertificateUpdate(d *Daemon, dbInfo api.Certificate, req api.CertificateP
 func certificateDelete(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	fingerprint, err := url.PathUnescape(mux.Vars(r)["fingerprint"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	var certInfo *dbCluster.Certificate
-	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	fingerprint := r.PathValue("fingerprint")
+	var certInfo *dbCluster.CertificateLegacy
+	err := s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
 		// Get current database record.
 		var err error
-		certInfo, err = dbCluster.GetCertificateByFingerprintPrefix(ctx, tx.Tx(), fingerprint)
+		certInfo, err = dbCluster.GetCertificateLegacyByFingerprintPrefix(ctx, tx.Tx(), fingerprint)
 		if err != nil {
 			return err
 		}
@@ -1067,6 +1139,11 @@ func certificateDelete(d *Daemon, r *http.Request) response.Response {
 	})
 	if err != nil {
 		return response.SmartError(err)
+	}
+
+	// Disallow deletion of server certificates.
+	if certInfo.Type == certificate.TypeServer {
+		return response.BadRequest(errors.New("Cannot delete a server certificate. Remove the cluster member instead"))
 	}
 
 	var userCanEditCertificate bool
@@ -1080,12 +1157,10 @@ func certificateDelete(d *Daemon, r *http.Request) response.Response {
 	// Non-admins are able to delete only their own certificate.
 	if !userCanEditCertificate {
 		if r.TLS == nil {
-			response.Forbidden(fmt.Errorf("Cannot delete certificate"))
+			return response.Forbidden(errors.New("Cannot delete certificate"))
 		}
 
-		certBlock, _ := pem.Decode([]byte(certInfo.Certificate))
-
-		cert, err := x509.ParseCertificate(certBlock.Bytes)
+		cert, err := shared.ParseCert([]byte(certInfo.Certificate))
 		if err != nil {
 			// This should not happen
 			return response.InternalError(err)
@@ -1105,13 +1180,13 @@ func certificateDelete(d *Daemon, r *http.Request) response.Response {
 		}
 
 		if !trusted {
-			return response.Forbidden(fmt.Errorf("Certificate cannot be deleted"))
+			return response.Forbidden(errors.New("Certificate cannot be deleted"))
 		}
 	}
 
 	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		// Perform the delete with the expanded fingerprint.
-		return dbCluster.DeleteCertificate(ctx, tx.Tx(), certInfo.Fingerprint)
+		return dbCluster.DeleteCertificateLegacy(ctx, tx.Tx(), certInfo.Fingerprint)
 	})
 	if err != nil {
 		return response.SmartError(err)
@@ -1123,7 +1198,7 @@ func certificateDelete(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	err = notifier(func(client lxd.InstanceServer) error {
+	err = notifier(func(member db.NodeInfo, client lxd.InstanceServer) error {
 		_, _, err := client.RawQuery(http.MethodPost, "/internal/identity-cache-refresh", nil, "")
 		return err
 	})
@@ -1134,29 +1209,39 @@ func certificateDelete(d *Daemon, r *http.Request) response.Response {
 	// Reload the cache.
 	s.UpdateIdentityCache()
 
-	s.Events.SendLifecycle(api.ProjectDefaultName, lifecycle.CertificateDeleted.Event(fingerprint, request.CreateRequestor(r), nil))
+	s.Events.SendLifecycle("", lifecycle.CertificateDeleted.Event(fingerprint, request.CreateRequestor(r.Context()), nil))
 
 	return response.EmptySyncResponse
 }
 
-func certificateValidate(cert *x509.Certificate) error {
-	if time.Now().Before(cert.NotBefore) {
-		return fmt.Errorf("The provided certificate isn't valid yet")
+func certificateValidate(networkCert *shared.CertInfo, cert *x509.Certificate) error {
+	// Verify cert is valid.
+	now := time.Now()
+	if now.Before(cert.NotBefore) {
+		return api.NewStatusError(http.StatusBadRequest, "The provided certificate is not valid yet")
 	}
 
-	if time.Now().After(cert.NotAfter) {
-		return fmt.Errorf("The provided certificate is expired")
+	if now.After(cert.NotAfter) {
+		return api.NewStatusError(http.StatusBadRequest, "The provided certificate is expired")
+	}
+
+	if networkCert != nil && networkCert.CA() != nil {
+		// If we are in CA mode, we only allow adding certificates that are signed by the CA.
+		trusted, _, _ := util.CheckCASignature(*cert, networkCert)
+		if !trusted {
+			return api.NewStatusError(http.StatusForbidden, "The certificate is not trusted by the CA or has been revoked")
+		}
 	}
 
 	if cert.PublicKeyAlgorithm == x509.RSA {
 		pubKey, ok := cert.PublicKey.(*rsa.PublicKey)
 		if !ok {
-			return fmt.Errorf("Unable to validate the RSA certificate")
+			return errors.New("Cannot validate the RSA certificate")
 		}
 
 		// Check that we're dealing with at least 2048bit (Size returns a value in bytes).
 		if pubKey.Size()*8 < 2048 {
-			return fmt.Errorf("RSA key is too weak (minimum of 2048bit)")
+			return api.NewStatusError(http.StatusBadRequest, "RSA key is too weak (minimum of 2048bit)")
 		}
 	}
 

@@ -2,8 +2,10 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 
 	"github.com/canonical/lxd/lxd/db"
@@ -34,57 +36,11 @@ func InstancePath(instanceType instancetype.Type, projectName, instanceName stri
 	return shared.VarPath("containers", fullName)
 }
 
-// InstanceImportingFilePath returns the file path used to indicate an instance import is in progress.
-// This marker file is created when using `lxd import` to import an instance that exists on the storage device
-// but does not exist in the LXD database. The presence of this file causes the instance not to be removed from
-// the storage device if the import should fail for some reason.
-func InstanceImportingFilePath(instanceType instancetype.Type, poolName, projectName, instanceName string) string {
-	fullName := project.Instance(projectName, instanceName)
-
-	typeDir := "containers"
-	if instanceType == instancetype.VM {
-		typeDir = "virtual-machines"
-	}
-
-	return shared.VarPath("storage-pools", poolName, typeDir, fullName, ".importing")
-}
-
-// GetStoragePoolMountPoint returns the mountpoint of the given pool.
-// {LXD_DIR}/storage-pools/<pool>
-// Deprecated, use GetPoolMountPath in storage/drivers package.
-func GetStoragePoolMountPoint(poolName string) string {
-	return shared.VarPath("storage-pools", poolName)
-}
-
-// GetSnapshotMountPoint returns the mountpoint of the given container snapshot.
-// ${LXD_DIR}/storage-pools/<pool>/containers-snapshots/<snapshot_name>.
-func GetSnapshotMountPoint(projectName, poolName string, snapshotName string) string {
-	return shared.VarPath("storage-pools", poolName, "containers-snapshots", project.Instance(projectName, snapshotName))
-}
-
-// GetImageMountPoint returns the mountpoint of the given image.
-// ${LXD_DIR}/storage-pools/<pool>/images/<fingerprint>.
-func GetImageMountPoint(poolName string, fingerprint string) string {
-	return shared.VarPath("storage-pools", poolName, "images", fingerprint)
-}
-
-// GetStoragePoolVolumeSnapshotMountPoint returns the mountpoint of the given pool volume snapshot.
-// ${LXD_DIR}/storage-pools/<pool>/custom-snapshots/<custom volume name>/<snapshot name>.
-func GetStoragePoolVolumeSnapshotMountPoint(poolName string, snapshotName string) string {
-	return shared.VarPath("storage-pools", poolName, "custom-snapshots", snapshotName)
-}
-
 // CreateContainerMountpoint creates the provided container mountpoint and symlink.
 func CreateContainerMountpoint(mountPoint string, mountPointSymlink string, privileged bool) error {
-	mntPointSymlinkExist := shared.PathExists(mountPointSymlink)
-	mntPointSymlinkTargetExist := shared.PathExists(mountPoint)
-
-	var err error
-	if !mntPointSymlinkTargetExist {
-		err = os.MkdirAll(mountPoint, 0711)
-		if err != nil {
-			return err
-		}
+	err := os.MkdirAll(mountPoint, 0711)
+	if err != nil {
+		return err
 	}
 
 	err = os.Chmod(mountPoint, 0100)
@@ -92,11 +48,9 @@ func CreateContainerMountpoint(mountPoint string, mountPointSymlink string, priv
 		return err
 	}
 
-	if !mntPointSymlinkExist {
-		err := os.Symlink(mountPoint, mountPointSymlink)
-		if err != nil {
-			return err
-		}
+	err = os.Symlink(mountPoint, mountPointSymlink)
+	if err != nil && !errors.Is(err, os.ErrExist) {
+		return err
 	}
 
 	return nil
@@ -105,21 +59,14 @@ func CreateContainerMountpoint(mountPoint string, mountPointSymlink string, priv
 // CreateSnapshotMountpoint creates the provided container snapshot mountpoint
 // and symlink.
 func CreateSnapshotMountpoint(snapshotMountpoint string, snapshotsSymlinkTarget string, snapshotsSymlink string) error {
-	snapshotMntPointExists := shared.PathExists(snapshotMountpoint)
-	mntPointSymlinkExist := shared.PathExists(snapshotsSymlink)
-
-	if !snapshotMntPointExists {
-		err := os.MkdirAll(snapshotMountpoint, 0711)
-		if err != nil {
-			return err
-		}
+	err := os.MkdirAll(snapshotMountpoint, 0711)
+	if err != nil {
+		return err
 	}
 
-	if !mntPointSymlinkExist {
-		err := os.Symlink(snapshotsSymlinkTarget, snapshotsSymlink)
-		if err != nil {
-			return err
-		}
+	err = os.Symlink(snapshotsSymlinkTarget, snapshotsSymlink)
+	if err != nil && !errors.Is(err, os.ErrExist) {
+		return err
 	}
 
 	return nil
@@ -144,12 +91,13 @@ func UsedBy(ctx context.Context, s *state.State, pool Pool, firstOnly bool, memb
 		for _, vol := range volumes {
 			var u *api.URL
 
-			if shared.ValueInSlice(vol.Type, ignoreVolumeType) {
+			if slices.Contains(ignoreVolumeType, vol.Type) {
 				continue
 			}
 
 			// Generate URL for volume based on types that map to other entities.
-			if vol.Type == cluster.StoragePoolVolumeTypeNameContainer || vol.Type == cluster.StoragePoolVolumeTypeNameVM {
+			switch vol.Type {
+			case cluster.StoragePoolVolumeTypeNameContainer, cluster.StoragePoolVolumeTypeNameVM:
 				volName, snapName, isSnap := api.GetParentAndSnapshotName(vol.Name)
 				if isSnap {
 					u = api.NewURL().Path(version.APIVersion, "instances", volName, "snapshots", snapName).Project(vol.Project)
@@ -158,7 +106,7 @@ func UsedBy(ctx context.Context, s *state.State, pool Pool, firstOnly bool, memb
 				}
 
 				usedBy = append(usedBy, u.String())
-			} else if vol.Type == cluster.StoragePoolVolumeTypeNameImage {
+			case cluster.StoragePoolVolumeTypeNameImage:
 				imgProjectNames, err := tx.GetProjectsUsingImage(ctx, vol.Name)
 				if err != nil {
 					return fmt.Errorf("Failed loading projects using image %q: %w", vol.Name, err)
@@ -174,7 +122,8 @@ func UsedBy(ctx context.Context, s *state.State, pool Pool, firstOnly bool, memb
 					u = vol.URL(version.APIVersion)
 					usedBy = append(usedBy, u.String())
 				}
-			} else {
+
+			default:
 				u = vol.URL(version.APIVersion)
 				usedBy = append(usedBy, u.String())
 			}
@@ -209,13 +158,14 @@ func UsedBy(ctx context.Context, s *state.State, pool Pool, firstOnly bool, memb
 			return fmt.Errorf("Failed loading profiles: %w", err)
 		}
 
-		for _, profile := range profiles {
-			profileDevices, err := cluster.GetProfileDevices(ctx, tx.Tx(), profile.ID)
-			if err != nil {
-				return fmt.Errorf("Failed loading profile devices: %w", err)
-			}
+		// Get all the profile devices.
+		profileDevices, err := cluster.GetDevices(ctx, tx.Tx(), "profile")
+		if err != nil {
+			return fmt.Errorf("Failed loading profile devices: %w", err)
+		}
 
-			for _, device := range profileDevices {
+		for _, profile := range profiles {
+			for _, device := range profileDevices[profile.ID] {
 				if device.Type != cluster.TypeDisk {
 					continue
 				}

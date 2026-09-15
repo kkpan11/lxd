@@ -1,9 +1,11 @@
 package version
 
 import (
-	"fmt"
+	"errors"
 	"runtime"
+	"slices"
 	"strings"
+	"unicode"
 
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
@@ -27,26 +29,27 @@ func getUserAgent() string {
 		panic(err)
 	}
 
-	osTokens := []string{cases.Title(language.English).String(runtime.GOOS), arch}
-	osTokens = append(osTokens, getPlatformVersionStrings()...)
-
+	versionInfo := getPlatformVersionStrings()
+	osTokens := make([]string, 0, 2+len(versionInfo))
+	osTokens = append(osTokens, cases.Title(language.English).String(runtime.GOOS), arch)
+	osTokens = append(osTokens, versionInfo...)
 	// Initial version string
-	agent := fmt.Sprintf("LXD %s", Version)
+	agent := "LXD " + Version
 	if IsLTSVersion {
-		agent = fmt.Sprintf("%s LTS", agent)
+		agent = agent + " LTS"
 	}
 
 	// OS information
-	agent = fmt.Sprintf("%s (%s)", agent, strings.Join(osTokens, "; "))
+	agent = agent + " (" + strings.Join(osTokens, "; ") + ")"
 
 	// Storage information
 	if len(userAgentStorageBackends) > 0 {
-		agent = fmt.Sprintf("%s (%s)", agent, strings.Join(userAgentStorageBackends, "; "))
+		agent = agent + " (" + strings.Join(userAgentStorageBackends, "; ") + ")"
 	}
 
 	// Feature information
 	if len(userAgentFeatures) > 0 {
-		agent = fmt.Sprintf("%s (%s)", agent, strings.Join(userAgentFeatures, "; "))
+		agent = agent + " (" + strings.Join(userAgentFeatures, "; ") + ")"
 	}
 
 	return agent
@@ -59,7 +62,17 @@ func UserAgentStorageBackends(backends []string) {
 }
 
 // UserAgentFeatures updates the list of advertised features.
-func UserAgentFeatures(features []string) {
-	userAgentFeatures = features
+func UserAgentFeatures(features []string) error {
+	hasWhiteSpace := func(s string) bool {
+		return strings.ContainsFunc(s, unicode.IsSpace)
+	}
+
+	if slices.ContainsFunc(features, hasWhiteSpace) {
+		return errors.New("User agent features may not contain whitespace")
+	}
+
+	userAgentFeatures = append(userAgentFeatures, features...)
+
 	UserAgent = getUserAgent()
+	return nil
 }

@@ -5,6 +5,8 @@ package cluster
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"strings"
 
 	"github.com/canonical/lxd/shared/api"
 )
@@ -26,13 +28,14 @@ import (
 //go:generate mapper stmt -e profile delete-by-Project-and-Name
 //
 //go:generate mapper method -i -e profile ID
-//go:generate mapper method -i -e profile Exists
 //go:generate mapper method -i -e profile GetMany references=Config,Device
 //go:generate mapper method -i -e profile GetOne
 //go:generate mapper method -i -e profile Create references=Config,Device
 //go:generate mapper method -i -e profile Rename
 //go:generate mapper method -i -e profile Update references=Config,Device
 //go:generate mapper method -i -e profile DeleteOne-by-Project-and-Name
+//go:generate goimports -w profiles.mapper.go
+//go:generate goimports -w profiles.interface.mapper.go
 
 // Profile is a value object holding db-related details about a profile.
 type Profile struct {
@@ -51,22 +54,42 @@ type ProfileFilter struct {
 }
 
 // ToAPI returns a cluster Profile as an API struct.
-func (p *Profile) ToAPI(ctx context.Context, tx *sql.Tx) (*api.Profile, error) {
-	config, err := GetProfileConfig(ctx, tx, p.ID)
-	if err != nil {
-		return nil, err
+func (p *Profile) ToAPI(ctx context.Context, tx *sql.Tx, profileConfigs map[int]map[string]string, profileDevices map[int][]Device) (*api.Profile, error) {
+	var err error
+
+	var dbConfig map[string]string
+	if profileConfigs != nil {
+		dbConfig = profileConfigs[p.ID]
+		if dbConfig == nil {
+			dbConfig = map[string]string{}
+		}
+	} else {
+		dbConfig, err = GetProfileConfig(ctx, tx, p.ID)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	devices, err := GetProfileDevices(ctx, tx, p.ID)
-	if err != nil {
-		return nil, err
+	var dbDevices map[string]Device
+	if profileDevices != nil {
+		dbDevices = map[string]Device{}
+
+		for _, dev := range profileDevices[p.ID] {
+			dbDevices[dev.Name] = dev
+		}
+	} else {
+		dbDevices, err = GetProfileDevices(ctx, tx, p.ID)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	profile := &api.Profile{
 		Name:        p.Name,
 		Description: p.Description,
-		Config:      config,
-		Devices:     DevicesToAPI(devices),
+		Config:      dbConfig,
+		Devices:     DevicesToAPI(dbDevices),
+		Project:     p.Project,
 	}
 
 	return profile, nil
@@ -95,4 +118,69 @@ func GetProfilesIfEnabled(ctx context.Context, tx *sql.Tx, projectName string, n
 	}
 
 	return profiles, nil
+}
+
+// GetProfileIDsByProjectAndName finds profile IDs matching specific names within
+// a specific list of projects.
+func GetProfileIDsByProjectAndName(ctx context.Context, tx *sql.Tx, projectNames []string, profileNames []string) ([]int64, error) {
+	if len(projectNames) == 0 || len(profileNames) == 0 {
+		return []int64{}, nil
+	}
+
+	args := make([]any, 0, len(projectNames)+len(profileNames))
+	var stmt strings.Builder
+
+	stmt.WriteString("SELECT profiles.id FROM profiles ")
+	stmt.WriteString("JOIN projects ON profiles.project_id = projects.id ")
+	stmt.WriteString("WHERE projects.name IN (")
+
+	// Add project name placeholders.
+	for i, projectName := range projectNames {
+		if i > 0 {
+			stmt.WriteString(",")
+		}
+
+		stmt.WriteString("?")
+		args = append(args, projectName)
+	}
+
+	stmt.WriteString(") AND profiles.name IN (")
+
+	// Add profile name placeholders.
+	for i, profileName := range profileNames {
+		if i > 0 {
+			stmt.WriteString(",")
+		}
+
+		stmt.WriteString("?")
+		args = append(args, profileName)
+	}
+
+	stmt.WriteString(")")
+
+	rows, err := tx.QueryContext(ctx, stmt.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("Failed fetching profile IDs: %w", err)
+	}
+
+	defer func() { _ = rows.Close() }()
+
+	profileIDs := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+
+		err := rows.Scan(&id)
+		if err != nil {
+			return nil, fmt.Errorf("Failed scanning profile ID: %w", err)
+		}
+
+		profileIDs = append(profileIDs, id)
+	}
+
+	err = rows.Err()
+	if err != nil {
+		return nil, err
+	}
+
+	return profileIDs, nil
 }

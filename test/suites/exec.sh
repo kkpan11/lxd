@@ -1,74 +1,58 @@
+exec_container_noninteractive() {
+    [ "$(echo "abc${1}" | lxc exec x1 --force-noninteractive -- cat)" = "abc${1}" ]
+}
+
+exec_container_interactive() {
+    [ "$(echo "abc${1}" | lxc exec x1 -- cat)" = "abc${1}" ]
+}
+
 test_exec() {
   ensure_import_testimage
 
-  name=x1
   lxc launch testimage x1
-  lxc list ${name} | grep RUNNING
-
-  exec_container_noninteractive() {
-    echo "abc${1}" | lxc exec "${name}" --force-noninteractive -- cat | grep abc
-  }
-
-  exec_container_interactive() {
-    echo "abc${1}" | lxc exec "${name}" -- cat | grep abc
-  }
+  [ "$(lxc list -f csv -c s x1)" = "RUNNING" ]
 
   for i in $(seq 1 25); do
-    exec_container_interactive "${i}" > "${LXD_DIR}/exec-${i}.out" 2>&1
+    exec_container_interactive "${i}"
   done
 
   for i in $(seq 1 25); do
-    exec_container_noninteractive "${i}" > "${LXD_DIR}/exec-${i}.out" 2>&1
+    exec_container_noninteractive "${i}"
   done
 
   # Check non-websocket based exec works.
-  opID=$(lxc query -X POST -d '{\"command\":[\"touch\",\"/root/foo1\"],\"record-output\":false}' /1.0/instances/x1/exec | jq -r .id)
-  sleep 1
-  [ "$(lxc query  /1.0/operations/"${opID}" | jq .metadata.return)" = "0" ]
+  opID="$(lxc query -X POST -d '{"command":["touch","/root/foo1"],"record-output":false}' /1.0/instances/x1/exec | jq --raw-output --exit-status .id)"
+  sleep 0.1
+  lxc query  "/1.0/operations/${opID}" | jq --exit-status '.metadata.return == 0'
   lxc exec x1 -- stat /root/foo1
 
-  opID=$(lxc query -X POST -d '{\"command\":[\"missingcmd\"],\"record-output\":false}' /1.0/instances/x1/exec | jq -r .id)
-  sleep 1
-  [ "$(lxc query  /1.0/operations/"${opID}" | jq .metadata.return)" = "127" ]
+  opID="$(lxc query -X POST -d '{"command":["missingcmd"],"record-output":false}' /1.0/instances/x1/exec | jq --raw-output --exit-status .id)"
+  sleep 0.1
+  lxc query "/1.0/operations/${opID}" | jq --exit-status '.metadata.return == 127'
 
   echo "hello" | lxc exec x1 -- tee /root/foo1
-  opID=$(lxc query -X POST -d '{\"command\":[\"cat\",\"/root/foo1\"],\"record-output\":true}' /1.0/instances/x1/exec | jq -r .id)
-  sleep 1
-  stdOutURL="$(lxc query /1.0/operations/"${opID}" | jq '.metadata.output["1"]')"
+  opID="$(lxc query -X POST -d '{"command":["cat","/root/foo1"],"record-output":true}' /1.0/instances/x1/exec | jq --raw-output --exit-status .id)"
+  sleep 0.1
+  stdOutURL="$(lxc query "/1.0/operations/${opID}" | jq --raw-output --exit-status '.metadata.output["1"]')"
   [ "$(lxc query "${stdOutURL}")" = "hello" ]
 
-  lxc stop "${name}" --force
-  lxc delete "${name}"
+  lxc delete --force x1
 }
 
 test_concurrent_exec() {
-  if [ -z "${LXD_CONCURRENT:-}" ]; then
-    echo "==> SKIP: LXD_CONCURRENT isn't set"
-    return
-  fi
-
   ensure_import_testimage
 
-  name=x1
   lxc launch testimage x1
-  lxc list ${name} | grep RUNNING
-
-  exec_container_noninteractive() {
-    echo "abc${1}" | lxc exec "${name}" --force-noninteractive -- cat | grep abc
-  }
-
-  exec_container_interactive() {
-    echo "abc${1}" | lxc exec "${name}" -- cat | grep abc
-  }
+  [ "$(lxc list -f csv -c s x1)" = "RUNNING" ]
 
   PIDS=""
   for i in $(seq 1 25); do
-    exec_container_interactive "${i}" > "${LXD_DIR}/exec-${i}.out" 2>&1 &
+    exec_container_interactive "${i}" &
     PIDS="${PIDS} $!"
   done
 
   for i in $(seq 1 25); do
-    exec_container_noninteractive "${i}" > "${LXD_DIR}/exec-${i}.out" 2>&1 &
+    exec_container_noninteractive "${i}" &
     PIDS="${PIDS} $!"
   done
 
@@ -76,11 +60,18 @@ test_concurrent_exec() {
     wait "${pid}"
   done
 
-  lxc stop "${name}" --force
-  lxc delete "${name}"
+  lxc delete --force x1
 }
 
 test_exec_exit_code() {
+  local initial_unprivileged_unconfined
+  initial_unprivileged_unconfined="$(sysctl -n kernel.apparmor_restrict_unprivileged_unconfined 2>/dev/null || echo 0)"
+
+  if [ "${initial_unprivileged_unconfined}" -ne 0 ]; then
+    echo "==> Enabling unprivileged unconfined support in the kernel"
+    sysctl --write kernel.apparmor_restrict_unprivileged_unconfined=0
+  fi
+
   ensure_import_testimage
   lxc launch testimage x1
 
@@ -90,22 +81,36 @@ test_exec_exit_code() {
   lxc exec x1 -- false || exitCode=$?
   [ "${exitCode:-0}" -eq 1 ]
 
+  lxc exec x1 -- /root || exitCode=$?
+  [ "${exitCode:-0}" -eq 126 ]
+
   lxc exec x1 -- invalid-command || exitCode=$?
   [ "${exitCode:-0}" -eq 127 ]
 
-  # Try disconnecting a container stopping forcefully and gracefully to make sure they differ appropriately.
-  (sleep 1 && lxc stop -f x1) &
-  lxc exec x1 -- sleep 10 || exitCode=$?
+  # Signaling the process spawned by lxc exec and checking its exit code.
+  # Simulates what can happen if the container stops in the middle of lxc exec.
+  (sleep 0.1 && lxc exec x1 -- killall -TERM sleep) &
+  lxc exec x1 -- sleep 60 || exitCode=$?
+  [ "${exitCode:-0}" -eq 143 ] # 128 + 15(SIGTERM)
+
+  (sleep 0.1 && lxc exec x1 -- killall -HUP sleep) &
+  lxc exec x1 -- sleep 60 || exitCode=$?
+  [ "${exitCode:-0}" -eq 129 ] # 128 + 1(SIGHUP)
+
+  (sleep 0.1 && lxc exec x1 -- killall -KILL sleep) &
+  lxc exec x1 -- sleep 60 || exitCode=$?
+  [ "${exitCode:-0}" -eq 137 ] # 128 + 9(SIGKILL)
+
+  # Try disconnecting a container stopping forcefully.
+  (sleep 0.1 && lxc stop -f x1) &
+  lxc exec x1 -- sleep 60 || exitCode=$?
   [ "${exitCode:-0}" -eq 137 ]
-
   wait $!
-  lxc start x1
-  sleep 2
-  (sleep 1 && lxc stop x1) &
-  lxc exec x1 -- sleep 10 || exitCode=$?
-  # Both 129 and 143 have been seen and both make sense here.
-  [ "${exitCode:-0}" -eq 129 ] || [ "${exitCode:-0}" -eq 143 ]
 
-  wait $!
-  lxc delete --force x1
+  lxc delete x1
+
+  if [ "${initial_unprivileged_unconfined}" -ne 0 ]; then
+    echo "==> Restoring unprivileged unconfined support in the kernel"
+    sysctl --write kernel.apparmor_restrict_unprivileged_unconfined="${initial_unprivileged_unconfined}"
+  fi
 }

@@ -1,6 +1,7 @@
 package endpoints
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/logger"
+	"github.com/canonical/lxd/shared/tcp"
 )
 
 // NetworkPublicKey returns the public key of the TLS certificate used by the
@@ -67,7 +69,7 @@ func (e *Endpoints) NetworkUpdateAddress(address string) error {
 
 	clusterAddress := e.clusterAddress()
 
-	logger.Infof("Update network address")
+	logger.Info("Update network address", logger.Ctx{"address": address, "oldAddress": oldAddress})
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -87,12 +89,12 @@ func (e *Endpoints) NetworkUpdateAddress(address string) error {
 	}
 
 	// Attempt to setup the new listening socket
-	getListener := func(address string) (*net.Listener, error) {
+	getListener := func(address string) (net.Listener, error) {
 		var err error
 		var listener net.Listener
 
-		for i := 0; i < 10; i++ { // Ten retries over a second seems reasonable.
-			listener, err = net.Listen("tcp", address)
+		for range 10 { // Ten retries over a second seems reasonable.
+			listener, err = networkCreateListener(address, e.cert)
 			if err == nil {
 				break
 			}
@@ -104,7 +106,7 @@ func (e *Endpoints) NetworkUpdateAddress(address string) error {
 			return nil, fmt.Errorf("Cannot listen on network HTTPS socket %q: %w", address, err)
 		}
 
-		return &listener, nil
+		return listener, nil
 	}
 
 	// If setting a new address, setup the listener
@@ -114,14 +116,14 @@ func (e *Endpoints) NetworkUpdateAddress(address string) error {
 			// Attempt to revert to the previous address
 			listener, err1 := getListener(oldAddress)
 			if err1 == nil {
-				e.listeners[network] = listeners.NewFancyTLSListener(*listener, e.cert)
+				e.listeners[network] = listener
 				e.serve(network)
 			}
 
 			return err
 		}
 
-		e.listeners[network] = listeners.NewFancyTLSListener(*listener, e.cert)
+		e.listeners[network] = listener
 		e.serve(network)
 	}
 
@@ -138,7 +140,7 @@ func (e *Endpoints) NetworkUpdateCert(cert *shared.CertInfo) {
 	defer e.mu.Unlock()
 	e.cert = cert
 
-	for _, listenerKey := range []kind{network, cluster, vmvsock, storageBuckets, metrics} {
+	for _, listenerKey := range []kind{network, cluster, vmvsock, metrics} {
 		listener, found := e.listeners[listenerKey]
 		if found {
 			listener.(*listeners.FancyTLSListener).Config(cert)
@@ -148,7 +150,7 @@ func (e *Endpoints) NetworkUpdateCert(cert *shared.CertInfo) {
 
 // NetworkUpdateTrustedProxy updates the https trusted proxy used by the network endpoint.
 func (e *Endpoints) NetworkUpdateTrustedProxy(trustedProxy string) {
-	var proxies []net.IP
+	var proxies []net.IP //nolint:prealloc
 	for _, p := range shared.SplitNTrimSpace(trustedProxy, ",", -1, true) {
 		proxyIP := net.ParseIP(p)
 		if proxyIP == nil {
@@ -176,22 +178,34 @@ func (e *Endpoints) NetworkUpdateTrustedProxy(trustedProxy string) {
 	}
 }
 
-// Create a new net.Listener bound to the tcp socket of the network endpoint.
-func networkCreateListener(address string, cert *shared.CertInfo) (net.Listener, error) {
-	// Listening on `tcp` network with address 0.0.0.0 will end up with listening
-	// on both IPv4 and IPv6 interfaces. Pass `tcp4` to make it
-	// work only on 0.0.0.0. https://go-review.googlesource.com/c/go/+/45771/
-	listenAddress := util.CanonicalNetworkAddress(address, shared.HTTPSDefaultPort)
+// createTLSListener creates a new TLS listener bound to the given address, using defaultPort if none is specified.
+// Listening on `tcp` network with address 0.0.0.0 will end up with listening
+// on both IPv4 and IPv6 interfaces. Pass `tcp4` to make it
+// work only on 0.0.0.0. https://go-review.googlesource.com/c/go/+/45771/
+func createTLSListener(address string, defaultPort int64, cert *shared.CertInfo) (net.Listener, error) {
+	listenAddress := util.CanonicalNetworkAddress(address, defaultPort)
 	protocol := "tcp"
 
-	if strings.HasPrefix(listenAddress, "0.0.0.0") {
+	// Including the ':' avoids accidentally matching on listenAddress like
+	// `0.0.0.0.example.com:8443`.
+	if strings.HasPrefix(listenAddress, "0.0.0.0:") {
 		protocol = "tcp4"
 	}
 
-	listener, err := net.Listen(protocol, listenAddress)
+	kaConfig, _ := tcp.KeepAliveTimeouts()
+	lc := net.ListenConfig{
+		KeepAliveConfig: kaConfig,
+	}
+
+	listener, err := lc.Listen(context.TODO(), protocol, listenAddress)
 	if err != nil {
-		return nil, fmt.Errorf("Bind network address: %w", err)
+		return nil, fmt.Errorf("Failed listening on address %q: %w", listenAddress, err)
 	}
 
 	return listeners.NewFancyTLSListener(listener, cert), nil
+}
+
+// Create a new net.Listener bound to the tcp socket of the network endpoint.
+func networkCreateListener(address string, cert *shared.CertInfo) (net.Listener, error) {
+	return createTLSListener(address, shared.HTTPSDefaultPort, cert)
 }

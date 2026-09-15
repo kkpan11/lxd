@@ -102,6 +102,8 @@ type StorageVolumePostTarget struct {
 //
 // API extension: storage.
 type StorageVolume struct {
+	WithEntitlements `yaml:",inline"` //nolint:musttag
+
 	// Volume name
 	// Example: foo
 	Name string `json:"name" yaml:"name"`
@@ -203,7 +205,7 @@ type StorageVolumeSource struct {
 
 	// Source type (copy or migration)
 	// Example: copy
-	Type string `json:"type" yaml:"type"`
+	Type SourceType `json:"type" yaml:"type"`
 
 	// Source storage pool (for copy)
 	// Example: local

@@ -3,6 +3,7 @@
 package device
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -16,12 +17,24 @@ import (
 	"github.com/canonical/lxd/shared/validate"
 )
 
-// unixHotplugIsOurDevice indicates whether the unixHotplug device event qualifies as part of our device.
-// This function is not defined against the unixHotplug struct type so that it can be used in event
-// callbacks without needing to keep a reference to the unixHotplug device struct.
-func unixHotplugIsOurDevice(config deviceConfig.Device, unixHotplug *UnixHotplugEvent) bool {
-	// Check if event matches criteria for this device, if not return.
-	if (config["vendorid"] != "" && config["vendorid"] != unixHotplug.Vendor) || (config["productid"] != "" && config["productid"] != unixHotplug.Product) {
+// unixHotplugDeviceMatch matches a unix-hotplug device based on vendorid, productid and/or subsystem. USB bus and devices with a major number of 0 are ignored. This function is used to indicate whether a unix hotplug event qualifies as part of our registered devices, and to load matching devices.
+func unixHotplugDeviceMatch(config deviceConfig.Device, vendorid string, productid string, subsystem string, major uint32) bool {
+	// Ignore devices with a major number of 0, since this indicates they are unnamed devices (e.g. non-device mounts).
+	// Ignore USB bus devices (handled by `usb` device type) since we don't want `unix-hotplug` and `usb` devices conflicting.
+	// We want to add all device nodes besides those with a `usb` subsystem.
+	if major == 0 || strings.HasPrefix(subsystem, "usb") {
+		return false
+	}
+
+	if config["vendorid"] != "" && config["vendorid"] != vendorid {
+		return false
+	}
+
+	if config["productid"] != "" && config["productid"] != productid {
+		return false
+	}
+
+	if config["subsystem"] != "" && config["subsystem"] != subsystem {
 		return false
 	}
 
@@ -69,10 +82,32 @@ func (d *unixHotplug) validateConfig(instConf instance.ConfigReader) error {
 		//  type: string
 		//  shortdesc: Product ID of the USB device
 		"productid": validate.Optional(validate.IsDeviceID),
+
+		// lxdmeta:generate(entities=device-unix-hotplug; group=device-conf; key=subsystem)
+		//
+		// ---
+		// type: string
+		// shortdesc: Subsystem of the Unix device
+		"subsystem": validate.IsAny,
 		"uid":       unixValidUserID,
 		"gid":       unixValidUserID,
 		"mode":      unixValidOctalFileMode,
-		"required":  validate.Optional(validate.IsBool),
+
+		// lxdmeta:generate(entities=device-unix-hotplug; group=device-conf; key=required)
+		// The default is `false`, which means that all devices can be hotplugged.
+		// ---
+		//  type: bool
+		//  defaultdesc: `false`
+		//  shortdesc: Whether this device is required to start the container
+		"required": validate.Optional(validate.IsBool),
+
+		// lxdmeta:generate(entities=device-unix-hotplug; group=device-conf; key=ownership.inherit)
+		//
+		// ---
+		// type: bool
+		// defaultdesc: `false`
+		// shortdesc: Whether this device inherits ownership (GID and/or UID) from the host
+		"ownership.inherit": validate.Optional(validate.IsBool),
 	}
 
 	err := d.config.Validate(rules)
@@ -80,8 +115,12 @@ func (d *unixHotplug) validateConfig(instConf instance.ConfigReader) error {
 		return err
 	}
 
-	if d.config["vendorid"] == "" && d.config["productid"] == "" {
-		return fmt.Errorf("Unix hotplug devices require a vendorid or a productid")
+	if d.config["vendorid"] == "" && d.config["productid"] == "" && d.config["subsystem"] == "" {
+		return errors.New("Unix hotplug devices require a vendorid, productid or subsystem")
+	}
+
+	if d.config["gid"] != "" && d.config["uid"] != "" && shared.IsTrue(d.config["ownership.inherit"]) {
+		return errors.New("Unix hotplug device ownership cannot be inherited from host while GID and UID are set")
 	}
 
 	return nil
@@ -89,8 +128,7 @@ func (d *unixHotplug) validateConfig(instConf instance.ConfigReader) error {
 
 // Register is run after the device is started or when LXD starts.
 func (d *unixHotplug) Register() error {
-	// Extract variables needed to run the event hook so that the reference to this device
-	// struct is not needed to be kept in memory.
+	// Extract variables needed to run the event hook so that the reference to this device struct is not required to be stored in memory.
 	devicesPath := d.inst.DevicesPath()
 	devConfig := d.config
 	deviceName := d.name
@@ -100,8 +138,9 @@ func (d *unixHotplug) Register() error {
 	f := func(e UnixHotplugEvent) (*deviceConfig.RunConfig, error) {
 		runConf := deviceConfig.RunConfig{}
 
-		if e.Action == "add" {
-			if !unixHotplugIsOurDevice(devConfig, &e) {
+		switch e.Action {
+		case "add":
+			if !unixHotplugDeviceMatch(devConfig, e.Vendor, e.Product, e.Subsystem, e.Major) {
 				return nil, nil
 			}
 
@@ -116,7 +155,7 @@ func (d *unixHotplug) Register() error {
 					return nil, err
 				}
 			}
-		} else if e.Action == "remove" {
+		case "remove":
 			relativeTargetPath := strings.TrimPrefix(e.Path, "/")
 			err := unixDeviceRemove(devicesPath, "unix", deviceName, relativeTargetPath, &runConf)
 			if err != nil {
@@ -127,7 +166,7 @@ func (d *unixHotplug) Register() error {
 			runConf.PostHooks = []func() error{func() error {
 				err := unixDeviceDeleteFiles(state, devicesPath, "unix", deviceName, relativeTargetPath)
 				if err != nil {
-					return fmt.Errorf("Failed to delete files for device '%s': %w", deviceName, err)
+					return fmt.Errorf("Failed deleting files for device %q: %w", deviceName, err)
 				}
 
 				return nil
@@ -149,29 +188,34 @@ func (d *unixHotplug) Start() (*deviceConfig.RunConfig, error) {
 	runConf := deviceConfig.RunConfig{}
 	runConf.PostHooks = []func() error{d.Register}
 
-	device := d.loadUnixDevice()
-	if d.isRequired() && device == nil {
-		return nil, fmt.Errorf("Required Unix Hotplug device not found")
+	devices := d.loadUnixDevices()
+	if d.isRequired() && len(devices) <= 0 {
+		return nil, errors.New("Required unix hotplug device not found")
 	}
 
-	if device == nil {
-		return &runConf, nil
-	}
+	for _, device := range devices {
+		devnum := device.Devnum()
+		major := uint32(devnum.Major())
+		minor := uint32(devnum.Minor())
 
-	devnum := device.Devnum()
-	major := uint32(devnum.Major())
-	minor := uint32(devnum.Minor())
+		// Setup device.
+		var err error
+		if device.Subsystem() == "block" {
+			err = unixDeviceSetupBlockNum(d.state, d.inst.DevicesPath(), "unix", d.name, d.config, major, minor, device.Devnode(), false, &runConf)
 
-	// setup device
-	var err error
-	if device.Subsystem() == "block" {
-		err = unixDeviceSetupBlockNum(d.state, d.inst.DevicesPath(), "unix", d.name, d.config, major, minor, device.Devnode(), false, &runConf)
-	} else {
-		err = unixDeviceSetupCharNum(d.state, d.inst.DevicesPath(), "unix", d.name, d.config, major, minor, device.Devnode(), false, &runConf)
-	}
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			err = unixDeviceSetupCharNum(d.state, d.inst.DevicesPath(), "unix", d.name, d.config, major, minor, device.Devnode(), false, &runConf)
 
-	if err != nil {
-		return nil, err
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// Remove unix device on failure to setup device.
+		runConf.Revert = func() { _ = unixDeviceRemove(d.inst.DevicesPath(), "unix", d.name, "", &runConf) }
 	}
 
 	return &runConf, nil
@@ -197,15 +241,14 @@ func (d *unixHotplug) Stop() (*deviceConfig.RunConfig, error) {
 func (d *unixHotplug) postStop() error {
 	err := unixDeviceDeleteFiles(d.state, d.inst.DevicesPath(), "unix", d.name, "")
 	if err != nil {
-		return fmt.Errorf("Failed to delete files for device '%s': %w", d.name, err)
+		return fmt.Errorf("Failed deleting files for device %q: %w", d.name, err)
 	}
 
 	return nil
 }
 
-// loadUnixDevice scans the host machine for unix devices with matching product/vendor ids
-// and returns the first matching device with the subsystem type char or block.
-func (d *unixHotplug) loadUnixDevice() *udev.Device {
+// loadUnixDevices scans the host machine for unix devices with matching product/vendor ids and returns the matching devices with subsystem types of char or block.
+func (d *unixHotplug) loadUnixDevices() []udev.Device {
 	// Find device if exists
 	u := udev.Udev{}
 	e := u.NewEnumerate()
@@ -213,44 +256,47 @@ func (d *unixHotplug) loadUnixDevice() *udev.Device {
 	if d.config["vendorid"] != "" {
 		err := e.AddMatchProperty("ID_VENDOR_ID", d.config["vendorid"])
 		if err != nil {
-			logger.Warn("Failed to add property to device", logger.Ctx{"property_name": "ID_VENDOR_ID", "property_value": d.config["vendorid"], "err": err})
+			logger.Warn("Failed adding property to device", logger.Ctx{"property_name": "ID_VENDOR_ID", "property_value": d.config["vendorid"], "err": err})
 		}
 	}
 
 	if d.config["productid"] != "" {
 		err := e.AddMatchProperty("ID_MODEL_ID", d.config["productid"])
 		if err != nil {
-			logger.Warn("Failed to add property to device", logger.Ctx{"property_name": "ID_MODEL_ID", "property_value": d.config["productid"], "err": err})
+			logger.Warn("Failed adding property to device", logger.Ctx{"property_name": "ID_MODEL_ID", "property_value": d.config["productid"], "err": err})
+		}
+	}
+
+	if d.config["subsystem"] != "" {
+		err := e.AddMatchProperty("SUBSYSTEM", d.config["subsystem"])
+		if err != nil {
+			logger.Warn("Failed adding property to device", logger.Ctx{"property_name": "SUBSYSTEM", "property_value": d.config["subsystem"]})
 		}
 	}
 
 	err := e.AddMatchIsInitialized()
 	if err != nil {
-		logger.Warn("Failed to add initialised property to device", logger.Ctx{"err": err})
+		logger.Warn("Failed adding initialised property to device", logger.Ctx{"err": err})
 	}
 
 	devices, _ := e.Devices()
-	var device *udev.Device
+	var matchingDevices []udev.Device //nolint:prealloc
 	for i := range devices {
-		device = devices[i]
+		device := devices[i]
 
-		if device == nil {
+		// We ignore devices without an associated device node file name, as this indicates they are not accessible via the standard interface in /dev/.
+		if device == nil || device.Devnode() == "" {
 			continue
 		}
 
-		devnum := device.Devnum()
-		if devnum.Major() == 0 || devnum.Minor() == 0 {
+		match := unixHotplugDeviceMatch(d.config, device.PropertyValue("ID_VENDOR_ID"), device.PropertyValue("ID_MODEL_ID"), device.Subsystem(), uint32(device.Devnum().Major()))
+
+		if !match {
 			continue
 		}
 
-		if device.Devnode() == "" {
-			continue
-		}
-
-		if !strings.HasPrefix(device.Subsystem(), "usb") {
-			return device
-		}
+		matchingDevices = append(matchingDevices, *device)
 	}
 
-	return nil
+	return matchingDevices
 }

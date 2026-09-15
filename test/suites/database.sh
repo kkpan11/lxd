@@ -1,16 +1,12 @@
 # Test restore database backups after a failed upgrade.
 test_database_restore() {
-  LXD_RESTORE_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
+  local LXD_RESTORE_DIR
+  LXD_RESTORE_DIR="$(mktemp -d -p "${TEST_DIR}" XXX)"
 
   spawn_lxd "${LXD_RESTORE_DIR}" true
 
   # Set a config value before the broken upgrade.
-  (
-    set -e
-    # shellcheck disable=SC2034
-    LXD_DIR=${LXD_RESTORE_DIR}
-    lxc config set "core.https_allowed_credentials" "true"
-  )
+  LXD_DIR="${LXD_RESTORE_DIR}" lxc config set core.https_allowed_credentials=true
 
   shutdown_lxd "${LXD_RESTORE_DIR}"
 
@@ -21,31 +17,25 @@ INSERT INTO broken(n) VALUES(1);
 EOF
 
   # Starting LXD fails.
-  ! LXD_DIR="${LXD_RESTORE_DIR}" lxd --logfile "${LXD_RESTORE_DIR}/lxd.log" "${DEBUG-}" 2>&1 || false
+  ! LXD_DIR="${LXD_RESTORE_DIR}" lxd --logfile "${LXD_RESTORE_DIR}/lxd.log" "${SERVER_DEBUG-}" 2>&1 || false
 
   # Remove the broken patch
   rm -f "${LXD_RESTORE_DIR}/database/patch.global.sql"
 
   # Restore the backup
-  rm -rf "${LXD_RESTORE_DIR}/database/global"
-  cp -a "${LXD_RESTORE_DIR}/database/global.bak" "${LXD_RESTORE_DIR}/database/global"
+  mv "${LXD_RESTORE_DIR}/database/global" "${LXD_RESTORE_DIR}/database/global.old"
+  mv "${LXD_RESTORE_DIR}/database/global.bak" "${LXD_RESTORE_DIR}/database/global"
 
   # Restart the daemon and check that our previous settings are still there
   respawn_lxd "${LXD_RESTORE_DIR}" true
-  (
-    set -e
-    # shellcheck disable=SC2034
-    LXD_DIR=${LXD_RESTORE_DIR}
-    lxc config get "core.https_allowed_credentials" | grep -q "true"
-  )
+  [ "$(LXD_DIR="${LXD_RESTORE_DIR}" lxc config get core.https_allowed_credentials)" = "true" ]
 
   kill_lxd "${LXD_RESTORE_DIR}"
 }
 
 test_database_no_disk_space() {
-  local LXD_DIR
-
-  LXD_NOSPACE_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
+  local LXD_NOSPACE_DIR
+  LXD_NOSPACE_DIR="$(mktemp -d -p "${TEST_DIR}" XXX)"
 
   # Mount a tmpfs with limited space in the global database directory and create
   # a very big file in it, which will eventually cause database transactions to
@@ -53,8 +43,8 @@ test_database_no_disk_space() {
   GLOBAL_DB_DIR="${LXD_NOSPACE_DIR}/database/global"
   BIG_FILE="${GLOBAL_DB_DIR}/bigfile"
   mkdir -p "${GLOBAL_DB_DIR}"
-  mount -t tmpfs -o size=67108864 tmpfs "${GLOBAL_DB_DIR}"
-  dd bs=1024 count=51200 if=/dev/zero of="${BIG_FILE}"
+  mount -t tmpfs -o size=16M tmpfs "${GLOBAL_DB_DIR}"
+  fallocate -l 2M "${BIG_FILE}"
 
   spawn_lxd "${LXD_NOSPACE_DIR}" true
 
@@ -63,8 +53,7 @@ test_database_no_disk_space() {
     # shellcheck disable=SC2034,SC2030
     LXD_DIR="${LXD_NOSPACE_DIR}"
 
-    ensure_import_testimage
-    lxc init testimage c
+    lxc init --empty c
 
     # Set a custom user property with a big value, so we eventually eat up all
     # available disk space in the database directory.
@@ -76,17 +65,21 @@ test_database_no_disk_space() {
         fi
     done
 
+    # Ensure the for loop broke out early due to `lxc config set` failing.
+    [ "${i}" -lt 20 ]
+
     # Commands that involve writing to the database keep failing.
-    ! lxc config set c "user.propX" - < "${DATA}" || false
     ! lxc config set c "user.propY" - < "${DATA}" || false
 
     # Removing the big file makes the database happy again.
     rm "${BIG_FILE}"
     lxc config set c "user.propZ" - < "${DATA}"
-    lxc delete -f c
+    lxc delete c
   )
 
-  shutdown_lxd "${LXD_NOSPACE_DIR}"
-  umount "${GLOBAL_DB_DIR}"
+  # XXX: forcibly kill LXD as it takes a long time to shut down due to
+  # LXD/dqlite recovery from the out of disk space condition.
+  # Use lazy umount to allow umounting before LXD is killed.
+  umount --lazy "${GLOBAL_DB_DIR}"
   kill_lxd "${LXD_NOSPACE_DIR}"
 }

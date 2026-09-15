@@ -1,19 +1,24 @@
 package resources
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jaypipes/pcidb"
 	"golang.org/x/sys/unix"
 
+	"github.com/canonical/lxd/lxd/network/openvswitch"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
+	"github.com/canonical/lxd/shared/validate"
 )
 
 var sysClassNet = "/sys/class/net"
@@ -27,7 +32,7 @@ var netProtocols = map[uint64]string{
 func networkAddDeviceInfo(devicePath string, pciDB *pcidb.PCIDB, uname unix.Utsname, card *api.ResourcesNetworkCard) error {
 	deviceDeviceDir, err := getDeviceDir(devicePath)
 	if err != nil {
-		return fmt.Errorf("Failed to read %q: %w", devicePath, err)
+		return fmt.Errorf("Failed reading %q: %w", devicePath, err)
 	}
 
 	// VDPA
@@ -39,37 +44,37 @@ func networkAddDeviceInfo(devicePath string, pciDB *pcidb.PCIDB, uname unix.Utsn
 	if len(vDPAMatches) > 0 {
 		vdpa := api.ResourcesNetworkCardVDPA{}
 
-		splittedPath := strings.Split(vDPAMatches[0], "/")
-		vdpa.Name = splittedPath[len(splittedPath)-1]
+		vdpa.Name = filepath.Base(vDPAMatches[0])
 		vDPADevMatches, err := filepath.Glob(filepath.Join(vDPAMatches[0], "vhost-vdpa-*"))
 		if err != nil {
 			return fmt.Errorf("Malformed VDPA device name search pattern: %w", err)
 		}
 
-		if len(vDPADevMatches) > 0 {
-			splittedPath = strings.Split(vDPADevMatches[0], "/")
-			vdpa.Device = splittedPath[len(splittedPath)-1]
-		} else {
-			return fmt.Errorf("Failed to find VDPA device at device path %q", vDPAMatches[0])
+		if len(vDPADevMatches) == 0 {
+			return fmt.Errorf("Failed finding VDPA device at device path %q", vDPAMatches[0])
 		}
+
+		vdpa.Device = filepath.Base(vDPADevMatches[0])
 
 		// Add the VDPA data to the card
 		card.VDPA = &vdpa
 	}
 
 	// SRIOV
-	if sysfsExists(filepath.Join(deviceDeviceDir, "sriov_numvfs")) {
+	sriovNumVFsPath := filepath.Join(deviceDeviceDir, "sriov_numvfs")
+	if pathExists(sriovNumVFsPath) {
 		sriov := api.ResourcesNetworkCardSRIOV{}
 
 		// Get maximum and current VF count
-		vfMaximum, err := readUint(filepath.Join(deviceDeviceDir, "sriov_totalvfs"))
+		sriovTotalVFsPath := filepath.Join(deviceDeviceDir, "sriov_totalvfs")
+		vfMaximum, err := readUint(sriovTotalVFsPath)
 		if err != nil {
-			return fmt.Errorf("Failed to read %q: %w", filepath.Join(deviceDeviceDir, "sriov_totalvfs"), err)
+			return fmt.Errorf("Failed reading %q: %w", sriovTotalVFsPath, err)
 		}
 
-		vfCurrent, err := readUint(filepath.Join(deviceDeviceDir, "sriov_numvfs"))
+		vfCurrent, err := readUint(sriovNumVFsPath)
 		if err != nil {
-			return fmt.Errorf("Failed to read %q: %w", filepath.Join(deviceDeviceDir, "sriov_numvfs"), err)
+			return fmt.Errorf("Failed reading %q: %w", sriovNumVFsPath, err)
 		}
 
 		sriov.MaximumVFs = vfMaximum
@@ -80,10 +85,11 @@ func networkAddDeviceInfo(devicePath string, pciDB *pcidb.PCIDB, uname unix.Utsn
 	}
 
 	// NUMA node
-	if sysfsExists(filepath.Join(deviceDeviceDir, "numa_node")) {
-		numaNode, err := readInt(filepath.Join(deviceDeviceDir, "numa_node"))
+	numaNodePath := filepath.Join(deviceDeviceDir, "numa_node")
+	if pathExists(numaNodePath) {
+		numaNode, err := readInt(numaNodePath)
 		if err != nil {
-			return fmt.Errorf("Failed to read %q: %w", filepath.Join(deviceDeviceDir, "numa_node"), err)
+			return fmt.Errorf("Failed reading %q: %w", numaNodePath, err)
 		}
 
 		if numaNode > 0 {
@@ -94,7 +100,7 @@ func networkAddDeviceInfo(devicePath string, pciDB *pcidb.PCIDB, uname unix.Utsn
 	// USB address
 	usbAddr, err := usbAddress(deviceDeviceDir)
 	if err != nil {
-		return fmt.Errorf("Failed to find USB address for %q: %w", deviceDeviceDir, err)
+		return fmt.Errorf("Failed finding USB address for %q: %w", deviceDeviceDir, err)
 	}
 
 	if usbAddr != "" {
@@ -103,20 +109,20 @@ func networkAddDeviceInfo(devicePath string, pciDB *pcidb.PCIDB, uname unix.Utsn
 
 	// Vendor and product
 	deviceVendorPath := filepath.Join(deviceDeviceDir, "vendor")
-	if sysfsExists(deviceVendorPath) {
+	if pathExists(deviceVendorPath) {
 		id, err := os.ReadFile(deviceVendorPath)
 		if err != nil {
-			return fmt.Errorf("Failed to read %q: %w", deviceVendorPath, err)
+			return fmt.Errorf("Failed reading %q: %w", deviceVendorPath, err)
 		}
 
 		card.VendorID = strings.TrimPrefix(strings.TrimSpace(string(id)), "0x")
 	}
 
 	deviceDevicePath := filepath.Join(deviceDeviceDir, "device")
-	if sysfsExists(deviceDevicePath) {
+	if pathExists(deviceDevicePath) {
 		id, err := os.ReadFile(deviceDevicePath)
 		if err != nil {
-			return fmt.Errorf("Failed to read %q: %w", deviceDevicePath, err)
+			return fmt.Errorf("Failed reading %q: %w", deviceDevicePath, err)
 		}
 
 		card.ProductID = strings.TrimPrefix(strings.TrimSpace(string(id)), "0x")
@@ -139,10 +145,10 @@ func networkAddDeviceInfo(devicePath string, pciDB *pcidb.PCIDB, uname unix.Utsn
 
 	// Driver information
 	driverPath := filepath.Join(deviceDeviceDir, "driver")
-	if sysfsExists(driverPath) {
+	if pathExists(driverPath) {
 		linkTarget, err := filepath.EvalSymlinks(driverPath)
 		if err != nil {
-			return fmt.Errorf("Failed to find device directory %q: %w", driverPath, err)
+			return fmt.Errorf("Failed finding device directory %q: %w", driverPath, err)
 		}
 
 		// Set the driver name
@@ -159,12 +165,12 @@ func networkAddDeviceInfo(devicePath string, pciDB *pcidb.PCIDB, uname unix.Utsn
 
 	// Port information
 	netPath := filepath.Join(devicePath, "net")
-	if sysfsExists(netPath) {
+	if pathExists(netPath) {
 		card.Ports = []api.ResourcesNetworkCardPort{}
 
 		entries, err := os.ReadDir(netPath)
 		if err != nil {
-			return fmt.Errorf("Failed to list %q: %w", netPath, err)
+			return fmt.Errorf("Failed listing %q: %w", netPath, err)
 		}
 
 		// Iterate and record port data
@@ -175,10 +181,11 @@ func networkAddDeviceInfo(devicePath string, pciDB *pcidb.PCIDB, uname unix.Utsn
 			}
 
 			// Add type
-			if sysfsExists(filepath.Join(interfacePath, "type")) {
-				devType, err := readUint(filepath.Join(interfacePath, "type"))
+			typePath := filepath.Join(interfacePath, "type")
+			if pathExists(typePath) {
+				devType, err := readUint(typePath)
 				if err != nil {
-					return fmt.Errorf("Failed to read %q: %w", filepath.Join(interfacePath, "type"), err)
+					return fmt.Errorf("Failed reading %q: %w", typePath, err)
 				}
 
 				protocol, ok := netProtocols[devType]
@@ -190,56 +197,61 @@ func networkAddDeviceInfo(devicePath string, pciDB *pcidb.PCIDB, uname unix.Utsn
 			}
 
 			// Add MAC address
-			if info.Address == "" && sysfsExists(filepath.Join(interfacePath, "address")) {
-				address, err := os.ReadFile(filepath.Join(interfacePath, "address"))
+			addressPath := filepath.Join(interfacePath, "address")
+			if info.Address == "" && pathExists(addressPath) {
+				address, err := os.ReadFile(addressPath)
 				if err != nil {
-					return fmt.Errorf("Failed to read %q: %w", filepath.Join(interfacePath, "address"), err)
+					return fmt.Errorf("Failed reading %q: %w", addressPath, err)
 				}
 
 				info.Address = strings.TrimSpace(string(address))
 			}
 
 			// Add port number
-			if sysfsExists(filepath.Join(interfacePath, "dev_port")) {
-				port, err := readUint(filepath.Join(interfacePath, "dev_port"))
+			devPortPath := filepath.Join(interfacePath, "dev_port")
+			if pathExists(devPortPath) {
+				port, err := readUint(devPortPath)
 				if err != nil {
-					return fmt.Errorf("Failed to read %q: %w", filepath.Join(interfacePath, "dev_port"), err)
+					return fmt.Errorf("Failed reading %q: %w", devPortPath, err)
 				}
 
 				info.Port = port
 			}
 
 			// Add infiniband specific information
-			if info.Protocol == "infiniband" && sysfsExists(filepath.Join(devicePath, "infiniband")) {
+			if info.Protocol == "infiniband" && pathExists(filepath.Join(devicePath, "infiniband")) {
 				infiniband := &api.ResourcesNetworkCardPortInfiniband{}
 
 				madPath := filepath.Join(devicePath, "infiniband_mad")
-				if sysfsExists(madPath) {
+				if pathExists(madPath) {
 					ibPort := info.Port + 1
 
 					entries, err := os.ReadDir(madPath)
 					if err != nil {
-						return fmt.Errorf("Failed to list %q: %w", madPath, err)
+						return fmt.Errorf("Failed listing %q: %w", madPath, err)
 					}
 
 					for _, entry := range entries {
 						entryName := entry.Name()
-						currentPort, err := readUint(filepath.Join(madPath, entryName, "port"))
+						madEntryPath := filepath.Join(madPath, entryName)
+						madEntryPortPath := filepath.Join(madEntryPath, "port")
+						currentPort, err := readUint(madEntryPortPath)
 						if err != nil {
-							return fmt.Errorf("Failed to read %q: %w", filepath.Join(madPath, entryName, "port"), err)
+							return fmt.Errorf("Failed reading %q: %w", madEntryPortPath, err)
 						}
 
 						if currentPort != ibPort {
 							continue
 						}
 
-						if !sysfsExists(filepath.Join(madPath, entryName, "dev")) {
+						madEntryDevPath := filepath.Join(madEntryPath, "dev")
+						if !pathExists(madEntryDevPath) {
 							continue
 						}
 
-						dev, err := os.ReadFile(filepath.Join(madPath, entryName, "dev"))
+						dev, err := os.ReadFile(madEntryDevPath)
 						if err != nil {
-							return fmt.Errorf("Failed to read %q: %w", filepath.Join(madPath, entryName, "dev"), err)
+							return fmt.Errorf("Failed reading %q: %w", madEntryDevPath, err)
 						}
 
 						if strings.HasPrefix(entryName, "issm") {
@@ -255,23 +267,24 @@ func networkAddDeviceInfo(devicePath string, pciDB *pcidb.PCIDB, uname unix.Utsn
 				}
 
 				verbsPath := filepath.Join(devicePath, "infiniband_verbs")
-				if sysfsExists(verbsPath) {
+				if pathExists(verbsPath) {
 					entries, err := os.ReadDir(verbsPath)
 					if err != nil {
-						return fmt.Errorf("Failed to list %q: %w", verbsPath, err)
+						return fmt.Errorf("Failed listing %q: %w", verbsPath, err)
 					}
 
 					if len(entries) == 1 {
 						verbName := entries[0].Name()
 						infiniband.VerbName = verbName
 
-						if !sysfsExists(filepath.Join(verbsPath, verbName, "dev")) {
+						verbDevPath := filepath.Join(verbsPath, verbName, "dev")
+						if !pathExists(verbDevPath) {
 							continue
 						}
 
-						dev, err := os.ReadFile(filepath.Join(verbsPath, verbName, "dev"))
+						dev, err := os.ReadFile(verbDevPath)
 						if err != nil {
-							return fmt.Errorf("Failed to read %q: %w", filepath.Join(verbsPath, verbName, "dev"), err)
+							return fmt.Errorf("Failed reading %q: %w", verbDevPath, err)
 						}
 
 						infiniband.VerbDevice = strings.TrimSpace(string(dev))
@@ -281,7 +294,7 @@ func networkAddDeviceInfo(devicePath string, pciDB *pcidb.PCIDB, uname unix.Utsn
 				info.Infiniband = infiniband
 			}
 
-			if sysfsExists(filepath.Join(devicePath, "physfn")) {
+			if pathExists(filepath.Join(devicePath, "physfn")) {
 				// Getting physical port info for VFs makes no sense
 				card.Ports = append(card.Ports, *info)
 				continue
@@ -299,7 +312,7 @@ func networkAddDeviceInfo(devicePath string, pciDB *pcidb.PCIDB, uname unix.Utsn
 		if len(card.Ports) > 0 {
 			err = ethtoolAddCardInfo(card.Ports[0].ID, card)
 			if err != nil {
-				return fmt.Errorf("Failed to add card info: %w", err)
+				return fmt.Errorf("Failed adding card info: %w", err)
 			}
 		}
 	}
@@ -316,7 +329,7 @@ func GetNetwork() (*api.ResourcesNetwork, error) {
 	uname := unix.Utsname{}
 	err := unix.Uname(&uname)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to get uname: %w", err)
+		return nil, fmt.Errorf("Failed getting uname: %w", err)
 	}
 
 	// Load PCI database
@@ -330,10 +343,10 @@ func GetNetwork() (*api.ResourcesNetwork, error) {
 	pciVFs := map[string][]api.ResourcesNetworkCard{}
 
 	// Detect all Networks available through kernel network interface
-	if sysfsExists(sysClassNet) {
+	if pathExists(sysClassNet) {
 		entries, err := os.ReadDir(sysClassNet)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to list %q: %w", sysClassNet, err)
+			return nil, fmt.Errorf("Failed listing %q: %w", sysClassNet, err)
 		}
 
 		// Iterate and add to our list
@@ -343,7 +356,7 @@ func GetNetwork() (*api.ResourcesNetwork, error) {
 			devicePath := filepath.Join(entryPath, "device")
 
 			// Only keep physical network devices
-			if !sysfsExists(filepath.Join(entryPath, "device")) {
+			if !pathExists(devicePath) {
 				continue
 			}
 
@@ -353,14 +366,14 @@ func GetNetwork() (*api.ResourcesNetwork, error) {
 			// PCI address.
 			pciAddr, err := pciAddress(devicePath)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to find PCI address for %q: %w", devicePath, err)
+				return nil, fmt.Errorf("Failed finding PCI address for %q: %w", devicePath, err)
 			}
 
 			if pciAddr != "" {
 				card.PCIAddress = pciAddr
 
 				// Skip devices we already know about
-				if shared.ValueInSlice(card.PCIAddress, pciKnown) {
+				if slices.Contains(pciKnown, card.PCIAddress) {
 					continue
 				}
 
@@ -370,15 +383,16 @@ func GetNetwork() (*api.ResourcesNetwork, error) {
 			// Add device information for PFs
 			err = networkAddDeviceInfo(devicePath, pciDB, uname, &card)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to add device information for %q: %w", devicePath, err)
+				return nil, fmt.Errorf("Failed adding device information for %q: %w", devicePath, err)
 			}
 
 			// Add to list
-			if sysfsExists(filepath.Join(devicePath, "physfn")) {
+			physfnPath := filepath.Join(devicePath, "physfn")
+			if pathExists(physfnPath) {
 				// Virtual functions need to be added to the parent
-				linkTarget, err := filepath.EvalSymlinks(filepath.Join(devicePath, "physfn"))
+				linkTarget, err := filepath.EvalSymlinks(physfnPath)
 				if err != nil {
-					return nil, fmt.Errorf("Failed to find %q: %w", filepath.Join(devicePath, "physfn"), err)
+					return nil, fmt.Errorf("Failed finding %q: %w", physfnPath, err)
 				}
 
 				parentAddress := filepath.Base(linkTarget)
@@ -396,10 +410,10 @@ func GetNetwork() (*api.ResourcesNetwork, error) {
 	}
 
 	// Detect remaining Networks on PCI bus
-	if sysfsExists(sysBusPci) {
+	if pathExists(sysBusPci) {
 		entries, err := os.ReadDir(sysBusPci)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to list %q: %w", sysBusPci, err)
+			return nil, fmt.Errorf("Failed listing %q: %w", sysBusPci, err)
 		}
 
 		// Iterate and add to our list
@@ -408,18 +422,19 @@ func GetNetwork() (*api.ResourcesNetwork, error) {
 			devicePath := filepath.Join(sysBusPci, entryName)
 
 			// Skip devices we already know about
-			if shared.ValueInSlice(entryName, pciKnown) {
+			if slices.Contains(pciKnown, entryName) {
 				continue
 			}
 
 			// Only care about identifiable devices
-			if !sysfsExists(filepath.Join(devicePath, "class")) {
+			classPath := filepath.Join(devicePath, "class")
+			if !pathExists(classPath) {
 				continue
 			}
 
-			class, err := os.ReadFile(filepath.Join(devicePath, "class"))
+			class, err := os.ReadFile(classPath)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(devicePath, "class"), err)
+				return nil, fmt.Errorf("Failed reading %q: %w", classPath, err)
 			}
 
 			// Only care about VGA devices
@@ -434,15 +449,16 @@ func GetNetwork() (*api.ResourcesNetwork, error) {
 			// Add device information
 			err = networkAddDeviceInfo(devicePath, pciDB, uname, &card)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to add device information for %q: %w", devicePath, err)
+				return nil, fmt.Errorf("Failed adding device information for %q: %w", devicePath, err)
 			}
 
 			// Add to list
-			if sysfsExists(filepath.Join(devicePath, "physfn")) {
+			physfnPath := filepath.Join(devicePath, "physfn")
+			if pathExists(physfnPath) {
 				// Virtual functions need to be added to the parent
-				linkTarget, err := filepath.EvalSymlinks(filepath.Join(devicePath, "physfn"))
+				linkTarget, err := filepath.EvalSymlinks(physfnPath)
 				if err != nil {
-					return nil, fmt.Errorf("Failed to find %q: %w", filepath.Join(devicePath, "physfn"), err)
+					return nil, fmt.Errorf("Failed finding %q: %w", physfnPath, err)
 				}
 
 				parentAddress := filepath.Base(linkTarget)
@@ -473,8 +489,118 @@ func GetNetwork() (*api.ResourcesNetwork, error) {
 	return &network, nil
 }
 
+// Fetch native linux bridge information.
+func getNativeBridgeState(bridgePath string, name string) *api.NetworkStateBridge {
+	bridge := api.NetworkStateBridge{}
+	// Bridge ID.
+	strValue, err := os.ReadFile(filepath.Join(bridgePath, "bridge_id"))
+	if err == nil {
+		bridge.ID = strings.TrimSpace(string(strValue))
+	}
+
+	// Bridge STP.
+	uintValue, err := readUint(filepath.Join(bridgePath, "stp_state"))
+	if err == nil {
+		bridge.STP = uintValue == 1
+	}
+
+	// Bridge forward delay.
+	uintValue, err = readUint(filepath.Join(bridgePath, "forward_delay"))
+	if err == nil {
+		bridge.ForwardDelay = uintValue
+	}
+
+	// Bridge default VLAN.
+	uintValue, err = readUint(filepath.Join(bridgePath, "default_pvid"))
+	if err == nil {
+		bridge.VLANDefault = uintValue
+	}
+
+	// Bridge VLAN filtering.
+	uintValue, err = readUint(filepath.Join(bridgePath, "vlan_filtering"))
+	if err == nil {
+		bridge.VLANFiltering = uintValue == 1
+	}
+
+	// Upper devices.
+	bridgeIfPath := fmt.Sprintf("/sys/class/net/%s/brif", name)
+	if pathExists(bridgeIfPath) {
+		entries, err := os.ReadDir(bridgeIfPath)
+		if err == nil {
+			bridge.UpperDevices = []string{}
+			for _, entry := range entries {
+				bridge.UpperDevices = append(bridge.UpperDevices, entry.Name())
+			}
+		}
+	}
+
+	return &bridge
+}
+
+// Fetch OVS bridge information.
+// Returns nil if interface is not an OVS bridge.
+func getOVSBridgeState(name string) *api.NetworkStateBridge {
+	ovs := openvswitch.NewOVS()
+	isOVSBridge := false
+	if ovs.Installed() {
+		isOVSBridge, _ = ovs.BridgeExists(name)
+	}
+
+	if !isOVSBridge {
+		return nil
+	}
+
+	bridge := api.NetworkStateBridge{}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*20)
+	defer cancel()
+
+	// Bridge ID
+	strValue, err := ovs.GenerateOVSBridgeID(ctx, name)
+	if err == nil {
+		bridge.ID = strValue
+	}
+
+	// Bridge STP
+	boolValue, err := ovs.STPEnabled(ctx, name)
+	if err == nil {
+		bridge.STP = boolValue
+	}
+
+	// Bridge Forwards Delay
+	uintValue, err := ovs.GetSTPForwardDelay(ctx, name)
+	if err == nil {
+		bridge.ForwardDelay = uintValue
+	}
+
+	// Bridge default VLAN (PVID)
+	uintValue, err = ovs.GetVLANPVID(ctx, name)
+	if err == nil {
+		bridge.VLANDefault = uintValue
+	}
+
+	// Bridge VLAN filtering
+	boolValue, err = ovs.VLANFilteringEnabled(ctx, name)
+	if err == nil {
+		bridge.VLANFiltering = boolValue
+	}
+
+	// Upper devices
+	entries, err := ovs.BridgePortList(name)
+	if err == nil {
+		bridge.UpperDevices = append(bridge.UpperDevices, entries...)
+	}
+
+	return &bridge
+}
+
 // GetNetworkState returns the OS configuration for the network interface.
 func GetNetworkState(name string) (*api.NetworkState, error) {
+	// Reject known bad names that might cause problem when dealing with paths.
+	err := validate.IsInterfaceName(name)
+	if err != nil {
+		return nil, api.StatusErrorf(http.StatusBadRequest, "Invalid network interface name %q: %v", name, err)
+	}
+
 	// Get some information
 	netIf, err := net.InterfaceByName(name)
 	if err != nil {
@@ -513,58 +639,42 @@ func GetNetworkState(name string) (*api.NetworkState, error) {
 	addrs, err := netIf.Addrs()
 	if err == nil {
 		for _, addr := range addrs {
-			fields := strings.SplitN(addr.String(), "/", 2)
-			if len(fields) != 2 {
+			address, netmask, found := strings.Cut(addr.String(), "/")
+			if !found {
 				continue
 			}
 
 			family := "inet"
-			if strings.Contains(fields[0], ":") {
+			if strings.Contains(address, ":") {
 				family = "inet6"
 			}
 
-			scope := "global"
-			if strings.HasPrefix(fields[0], "127") {
-				scope = "local"
+			networkAddress := api.NetworkStateAddress{
+				Family:  family,
+				Address: address,
+				Netmask: netmask,
+				Scope:   shared.GetIPScope(address),
 			}
 
-			if fields[0] == "::1" {
-				scope = "local"
-			}
-
-			if strings.HasPrefix(fields[0], "169.254") {
-				scope = "link"
-			}
-
-			if strings.HasPrefix(fields[0], "fe80:") {
-				scope = "link"
-			}
-
-			address := api.NetworkStateAddress{}
-			address.Family = family
-			address.Address = fields[0]
-			address.Netmask = fields[1]
-			address.Scope = scope
-
-			network.Addresses = append(network.Addresses, address)
+			network.Addresses = append(network.Addresses, networkAddress)
 		}
 	}
 
 	// Populate bond details.
 	bondPath := fmt.Sprintf("/sys/class/net/%s/bonding", name)
-	if sysfsExists(bondPath) {
+	if pathExists(bondPath) {
 		bonding := api.NetworkStateBond{}
 
 		// Bond mode.
 		strValue, err := os.ReadFile(filepath.Join(bondPath, "mode"))
 		if err == nil {
-			bonding.Mode = strings.Split(strings.TrimSpace(string(strValue)), " ")[0]
+			bonding.Mode, _, _ = strings.Cut(strings.TrimSpace(string(strValue)), " ")
 		}
 
 		// Bond transmit policy.
 		strValue, err = os.ReadFile(filepath.Join(bondPath, "xmit_hash_policy"))
 		if err == nil {
-			bonding.TransmitPolicy = strings.Split(strings.TrimSpace(string(strValue)), " ")[0]
+			bonding.TransmitPolicy, _, _ = strings.Cut(strings.TrimSpace(string(strValue)), " ")
 		}
 
 		// Up delay.
@@ -600,54 +710,12 @@ func GetNetworkState(name string) (*api.NetworkState, error) {
 		network.Bond = &bonding
 	}
 
-	// Populate bridge details.
+	// Populate bridge details
 	bridgePath := fmt.Sprintf("/sys/class/net/%s/bridge", name)
-	if sysfsExists(bridgePath) {
-		bridge := api.NetworkStateBridge{}
-
-		// Bridge ID.
-		strValue, err := os.ReadFile(filepath.Join(bridgePath, "bridge_id"))
-		if err == nil {
-			bridge.ID = strings.TrimSpace(string(strValue))
-		}
-
-		// Bridge STP.
-		uintValue, err := readUint(filepath.Join(bridgePath, "stp_state"))
-		if err == nil {
-			bridge.STP = uintValue == 1
-		}
-
-		// Bridge forward delay.
-		uintValue, err = readUint(filepath.Join(bridgePath, "forward_delay"))
-		if err == nil {
-			bridge.ForwardDelay = uintValue
-		}
-
-		// Bridge default VLAN.
-		uintValue, err = readUint(filepath.Join(bridgePath, "default_pvid"))
-		if err == nil {
-			bridge.VLANDefault = uintValue
-		}
-
-		// Bridge VLAN filtering.
-		uintValue, err = readUint(filepath.Join(bridgePath, "vlan_filtering"))
-		if err == nil {
-			bridge.VLANFiltering = uintValue == 1
-		}
-
-		// Upper devices.
-		bridgeIfPath := fmt.Sprintf("/sys/class/net/%s/brif", name)
-		if sysfsExists(bridgeIfPath) {
-			entries, err := os.ReadDir(bridgeIfPath)
-			if err == nil {
-				bridge.UpperDevices = []string{}
-				for _, entry := range entries {
-					bridge.UpperDevices = append(bridge.UpperDevices, entry.Name())
-				}
-			}
-		}
-
-		network.Bridge = &bridge
+	if pathExists(bridgePath) {
+		network.Bridge = getNativeBridgeState(bridgePath, name)
+	} else {
+		network.Bridge = getOVSBridgeState(name)
 	}
 
 	// Populate VLAN details.
@@ -659,13 +727,13 @@ func GetNetworkState(name string) (*api.NetworkState, error) {
 	vlans := map[string]vlan{}
 
 	vlanPath := "/proc/net/vlan/config"
-	if sysfsExists(vlanPath) {
+	if pathExists(vlanPath) {
 		entries, err := os.ReadFile(vlanPath)
 		if err != nil {
 			return nil, err
 		}
 
-		for _, line := range strings.Split(string(entries), "\n") {
+		for line := range strings.SplitSeq(string(entries), "\n") {
 			fields := strings.Split(line, "|")
 			if len(fields) != 3 {
 				continue
@@ -720,34 +788,34 @@ func GetNetworkCounters(name string) (*api.NetworkStateCounters, error) {
 		return nil, err
 	}
 
-	for _, line := range strings.Split(string(content), "\n") {
+	// A sample line:
+	// eth0: 1024 0 0 0 0 0 0 0 2048 0 0 0 0 0 0 0
+	for line := range strings.SplitSeq(string(content), "\n") {
 		fields := strings.Fields(line)
-
 		if len(fields) != 17 {
 			continue
 		}
 
-		intName := strings.TrimSuffix(fields[0], ":")
-		if intName != name {
+		if fields[0] != name+":" {
 			continue
 		}
 
-		rxBytes, err := strconv.ParseInt(fields[1], 10, 64)
+		rxBytes, err := strconv.ParseUint(fields[1], 10, 64)
 		if err != nil {
 			return nil, err
 		}
 
-		rxPackets, err := strconv.ParseInt(fields[2], 10, 64)
+		rxPackets, err := strconv.ParseUint(fields[2], 10, 64)
 		if err != nil {
 			return nil, err
 		}
 
-		txBytes, err := strconv.ParseInt(fields[9], 10, 64)
+		txBytes, err := strconv.ParseUint(fields[9], 10, 64)
 		if err != nil {
 			return nil, err
 		}
 
-		txPackets, err := strconv.ParseInt(fields[10], 10, 64)
+		txPackets, err := strconv.ParseUint(fields[10], 10, 64)
 		if err != nil {
 			return nil, err
 		}

@@ -1,6 +1,7 @@
 package drivers
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/canonical/lxd/lxd/storage/quota"
@@ -64,7 +65,7 @@ func (d *dir) deleteQuota(path string, volID int64) error {
 	}
 
 	if volID == 0 {
-		return fmt.Errorf("Missing volume ID")
+		return errors.New("Missing volume ID")
 	}
 
 	ok, err := quota.Supported(path)
@@ -99,14 +100,14 @@ func (d *dir) setQuota(path string, volID int64, sizeBytes int64) error {
 	}
 
 	if volID == 0 {
-		return fmt.Errorf("Missing volume ID")
+		return errors.New("Missing volume ID")
 	}
 
 	ok, err := quota.Supported(path)
 	if err != nil || !ok {
 		if sizeBytes > 0 {
 			// Skipping quota as underlying filesystem doesn't support project quotas.
-			d.logger.Warn("The backing filesystem doesn't support quotas, skipping set quota", logger.Ctx{"path": path, "size": sizeBytes, "volID": volID})
+			d.logger.Warn("The backing filesystem does not support quotas, skipping set quota", logger.Ctx{"path": path, "size": sizeBytes, "volID": volID})
 		}
 
 		return nil

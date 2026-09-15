@@ -3,27 +3,35 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net"
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/lxd/auth"
 	"github.com/canonical/lxd/lxd/auth/oidc"
+	backupConfig "github.com/canonical/lxd/lxd/backup/config"
 	"github.com/canonical/lxd/lxd/cluster"
 	clusterConfig "github.com/canonical/lxd/lxd/cluster/config"
 	"github.com/canonical/lxd/lxd/config"
 	"github.com/canonical/lxd/lxd/db"
+	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
+	dbOIDC "github.com/canonical/lxd/lxd/db/oidc"
 	instanceDrivers "github.com/canonical/lxd/lxd/instance/drivers"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/lifecycle"
 	"github.com/canonical/lxd/lxd/node"
 	"github.com/canonical/lxd/lxd/request"
+	"github.com/canonical/lxd/lxd/request/security"
 	"github.com/canonical/lxd/lxd/response"
-	scriptletLoad "github.com/canonical/lxd/lxd/scriptlet/load"
+	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
@@ -35,6 +43,8 @@ import (
 )
 
 var api10Cmd = APIEndpoint{
+	MetricsType: entity.TypeServer,
+
 	Get:   APIEndpointAction{Handler: api10Get, AllowUntrusted: true},
 	Patch: APIEndpointAction{Handler: api10Patch, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanEdit)},
 	Put:   APIEndpointAction{Handler: api10Put, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanEdit)},
@@ -48,10 +58,16 @@ var api10 = []APIEndpoint{
 	clusterCmd,
 	clusterGroupCmd,
 	clusterGroupsCmd,
-	clusterNodeCmd,
-	clusterNodeStateCmd,
-	clusterNodesCmd,
+	clusterMemberCmd,
+	clusterMemberStateCmd,
+	clusterMembersCmd,
+	clusterLinkCmd,
+	clusterLinksCmd,
+	clusterLinkStateCmd,
 	clusterCertificateCmd,
+	replicatorCmd,
+	replicatorsCmd,
+	replicatorStateCmd,
 	instanceBackupCmd,
 	instanceBackupExportCmd,
 	instanceBackupsCmd,
@@ -73,13 +89,9 @@ var api10 = []APIEndpoint{
 	instanceStateCmd,
 	instanceUEFIVarsCmd,
 	eventsCmd,
-	imageAliasCmd,
 	imageAliasesCmd,
-	imageCmd,
-	imageExportCmd,
-	imageRefreshCmd,
 	imagesCmd,
-	imageSecretCmd,
+	imageSubCmd,
 	metadataConfigurationCmd,
 	networkCmd,
 	networkLeasesCmd,
@@ -93,6 +105,9 @@ var api10 = []APIEndpoint{
 	networkForwardsCmd,
 	networkLoadBalancerCmd,
 	networkLoadBalancersCmd,
+	networkLoadBalancerPoolCmd,
+	networkLoadBalancerPoolStateCmd,
+	networkLoadBalancerPoolsCmd,
 	networkPeerCmd,
 	networkPeersCmd,
 	networkZoneCmd,
@@ -128,8 +143,14 @@ var api10 = []APIEndpoint{
 	warningCmd,
 	metricsCmd,
 	identitiesCmd,
-	identitiesByAuthenticationMethodCmd,
-	identityCmd,
+	currentIdentityCmd,
+	tlsIdentityCmd,
+	oidcIdentityCmd,
+	tlsIdentitiesCmd,
+	oidcIdentitiesCmd,
+	bearerIdentitiesCmd,
+	bearerIdentityCmd,
+	bearerIdentityTokenCmd,
 	authGroupsCmd,
 	authGroupCmd,
 	identityProviderGroupsCmd,
@@ -137,6 +158,10 @@ var api10 = []APIEndpoint{
 	permissionsCmd,
 	storageVolumesCmd,
 	storageVolumesTypeCmd,
+	oidcSessionsCmd,
+	oidcSessionCmd,
+	placementGroupsCmd,
+	placementGroupCmd,
 }
 
 // swagger:operation GET /1.0?public server server_get_untrusted
@@ -223,34 +248,49 @@ func api10Get(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	// Get the authentication methods.
-	authMethods := []string{api.AuthenticationMethodTLS}
+	authMethods := []string{
+		api.AuthenticationMethodTLS,
+		api.AuthenticationMethodBearer,
+	}
 
-	oidcIssuer, oidcClientID, _, _ := s.GlobalConfig.OIDCServer()
-	if oidcIssuer != "" && oidcClientID != "" {
+	if d.oidcVerifier.Load() != nil {
 		authMethods = append(authMethods, api.AuthenticationMethodOIDC)
 	}
 
 	srv := api.ServerUntrusted{
-		APIExtensions: version.APIExtensions,
-		APIStatus:     "stable",
-		APIVersion:    version.APIVersion,
-		Public:        false,
-		Auth:          "untrusted",
-		AuthMethods:   authMethods,
+		APIExtensions:     version.APIExtensions,
+		APIStatus:         "stable",
+		APIVersion:        version.APIVersion,
+		Public:            false,
+		Auth:              api.AuthUntrusted,
+		AuthMethods:       authMethods,
+		ClientCertificate: r.TLS != nil && len(r.TLS.PeerCertificates) > 0,
+	}
+
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
 	}
 
 	// If not authenticated, return now.
-	if !auth.IsTrusted(r.Context()) {
+	if !requestor.IsTrusted() {
+		srv.Config = s.GlobalConfig.DumpPublic(false)
 		return response.SyncResponseETag(true, srv, nil)
 	}
 
+	withEntitlements, err := extractEntitlementsFromQuery(r, entity.TypeServer, false)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
 	// If a target was specified, forward the request to the relevant node.
-	resp := forwardedResponseIfTargetIsRemote(s, r)
+	target := request.QueryParam(r, "target")
+	resp := forwardedResponseToNode(r.Context(), s, target)
 	if resp != nil {
 		return resp
 	}
 
-	srv.Auth = "trusted"
+	srv.Auth = api.AuthTrusted
 
 	localHTTPSAddress := s.LocalConfig.HTTPSAddress()
 
@@ -298,34 +338,36 @@ func api10Get(d *Daemon, r *http.Request) response.Response {
 	}
 
 	env := api.ServerEnvironment{
-		Addresses:              addresses,
-		Architectures:          architectures,
-		Certificate:            certificate,
-		CertificateFingerprint: certificateFingerprint,
-		Kernel:                 s.OS.Uname.Sysname,
-		KernelArchitecture:     s.OS.Uname.Machine,
-		KernelVersion:          s.OS.Uname.Release,
-		OSName:                 s.OS.ReleaseInfo["NAME"],
-		OSVersion:              s.OS.ReleaseInfo["VERSION_ID"],
-		Project:                projectName,
-		Server:                 "lxd",
-		ServerPid:              os.Getpid(),
-		ServerVersion:          version.Version,
-		ServerLTS:              version.IsLTSVersion,
-		ServerClustered:        s.ServerClustered,
-		ServerEventMode:        string(cluster.ServerEventMode()),
-		ServerName:             serverName,
-		Firewall:               s.Firewall.String(),
+		Addresses:                  addresses,
+		Architectures:              architectures,
+		BackupMetadataVersionRange: []uint32{api.BackupMetadataVersion1, backupConfig.MaxMetadataVersion},
+		Certificate:                certificate,
+		CertificateFingerprint:     certificateFingerprint,
+		Kernel:                     s.OS.Uname.Sysname,
+		KernelArchitecture:         s.OS.Uname.Machine,
+		KernelVersion:              s.OS.Uname.Release,
+		OSName:                     s.OS.ReleaseInfo["NAME"],
+		OSVersion:                  s.OS.ReleaseInfo["VERSION_ID"],
+		Project:                    projectName,
+		Server:                     "lxd",
+		ServerPid:                  os.Getpid(),
+		ServerVersion:              version.Version,
+		ServerLTS:                  version.IsLTSVersion,
+		ServerClustered:            s.ServerClustered,
+		ServerEventMode:            string(cluster.ServerEventMode()),
+		ServerName:                 serverName,
+		Firewall:                   s.Firewall.String(),
 	}
 
 	env.KernelFeatures = map[string]string{
-		"netnsid_getifaddrs":        fmt.Sprintf("%v", s.OS.NetnsGetifaddrs),
-		"uevent_injection":          fmt.Sprintf("%v", s.OS.UeventInjection),
-		"unpriv_binfmt":             fmt.Sprintf("%v", s.OS.UnprivBinfmt),
-		"unpriv_fscaps":             fmt.Sprintf("%v", s.OS.VFS3Fscaps),
-		"seccomp_listener":          fmt.Sprintf("%v", s.OS.SeccompListener),
-		"seccomp_listener_continue": fmt.Sprintf("%v", s.OS.SeccompListenerContinue),
-		"idmapped_mounts":           fmt.Sprintf("%v", s.OS.IdmappedMounts),
+		"bpf_token":                 strconv.FormatBool(s.OS.BPFToken),
+		"netnsid_getifaddrs":        strconv.FormatBool(s.OS.NetnsGetifaddrs),
+		"uevent_injection":          strconv.FormatBool(s.OS.UeventInjection),
+		"unpriv_binfmt":             strconv.FormatBool(s.OS.UnprivBinfmt),
+		"unpriv_fscaps":             strconv.FormatBool(s.OS.VFS3Fscaps),
+		"seccomp_listener":          strconv.FormatBool(s.OS.SeccompListener),
+		"seccomp_listener_continue": strconv.FormatBool(s.OS.SeccompListenerContinue),
+		"idmapped_mounts":           strconv.FormatBool(s.OS.IdmappedMounts),
 	}
 
 	drivers := instanceDrivers.DriverStatuses()
@@ -361,7 +403,7 @@ func api10Get(d *Daemon, r *http.Request) response.Response {
 
 		// Add supported instance types.
 		instType := driver.Info.Type.String()
-		if !shared.ValueInSlice(instType, env.InstanceTypes) {
+		if !slices.Contains(env.InstanceTypes, instType) {
 			env.InstanceTypes = append(env.InstanceTypes, instType)
 		}
 	}
@@ -369,7 +411,7 @@ func api10Get(d *Daemon, r *http.Request) response.Response {
 	if s.OS.LXCFeatures != nil {
 		env.LXCFeatures = map[string]string{}
 		for k, v := range s.OS.LXCFeatures {
-			env.LXCFeatures[k] = fmt.Sprintf("%v", v)
+			env.LXCFeatures[k] = strconv.FormatBool(v)
 		}
 	}
 
@@ -391,20 +433,36 @@ func api10Get(d *Daemon, r *http.Request) response.Response {
 
 	env.StorageSupportedDrivers = supportedStorageDrivers
 
-	fullSrv := api.Server{ServerUntrusted: srv}
+	fullSrv := &api.Server{ServerUntrusted: srv}
 	fullSrv.Environment = env
-	requestor := request.CreateRequestor(r)
 	fullSrv.AuthUserName = requestor.Username
 	fullSrv.AuthUserMethod = requestor.Protocol
 
 	// Only allow identities that can edit configuration to view it as sensitive information may be stored there.
 	err = s.Authorizer.CheckPermission(r.Context(), entity.ServerURL(), auth.EntitlementCanEdit)
-	if err != nil && !auth.IsDeniedError(err) {
-		return response.SmartError(err)
-	} else if err == nil {
-		fullSrv.Config, err = daemonConfigRender(s)
+	if err != nil {
+		if !auth.IsDeniedError(err) {
+			return response.SmartError(err)
+		}
+
+		fullSrv.Config = s.GlobalConfig.DumpPublic(true)
+	} else {
+		daemonConfig, err := daemonConfigRender(s)
 		if err != nil {
 			return response.InternalError(err)
+		}
+
+		// Convert the internal map[string]string config to the API format of map[string]any.
+		fullSrv.Config = make(map[string]any, len(daemonConfig))
+		for key, value := range daemonConfig {
+			fullSrv.Config[key] = value
+		}
+	}
+
+	if len(withEntitlements) > 0 {
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeServer, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.ServerURL(): fullSrv})
+		if err != nil {
+			return response.SmartError(err)
 		}
 	}
 
@@ -449,7 +507,8 @@ func api10Put(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	// If a target was specified, forward the request to the relevant node.
-	resp := forwardedResponseIfTargetIsRemote(s, r)
+	target := request.QueryParam(r, "target")
+	resp := forwardedResponseToNode(r.Context(), s, target)
 	if resp != nil {
 		return resp
 	}
@@ -463,13 +522,23 @@ func api10Put(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
 	// If this is a notification from a cluster node, just run the triggers
 	// for reacting to the values that changed.
-	if isClusterNotification(r) {
+	if requestor.IsClusterNotification() {
 		logger.Debug("Handling config changed notification")
 		changed := make(map[string]string)
 		for key, value := range req.Config {
-			changed[key], _ = value.(string)
+			stringValue, ok := value.(string)
+			if !ok {
+				return response.BadRequest(fmt.Errorf("Invalid config value type for %q: expected string", key))
+			}
+
+			changed[key] = stringValue
 		}
 
 		// Get the current (updated) config.
@@ -488,8 +557,12 @@ func api10Put(d *Daemon, r *http.Request) response.Response {
 		d.globalConfig = config
 		d.globalConfigMu.Unlock()
 
+		// Copy the old config so that the update triggers have access to it.
+		// In this case it will not be used as we are not changing any node values.
+		oldNodeConfig := s.LocalConfig.Dump()
+
 		// Run any update triggers.
-		err = doAPI10UpdateTriggers(d, nil, changed, s.LocalConfig, config)
+		err = doAPI10UpdateTriggers(d, nil, changed, oldNodeConfig, s.LocalConfig, config)
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -548,7 +621,8 @@ func api10Patch(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	// If a target was specified, forward the request to the relevant node.
-	resp := forwardedResponseIfTargetIsRemote(s, r)
+	target := request.QueryParam(r, "target")
+	resp := forwardedResponseToNode(r.Context(), s, target)
 	if resp != nil {
 		return resp
 	}
@@ -579,69 +653,267 @@ func api10Patch(d *Daemon, r *http.Request) response.Response {
 	return doAPI10Update(d, r, req, true)
 }
 
-func doAPI10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) response.Response {
-	s := d.State()
+func validateStorageVolumes(s *state.State, ctx context.Context, nodeValues map[string]string, oldNodeConfig map[string]string, newNodeConfig *node.Config) error {
+	var err error
+	projectsImagesStorage := make(map[string]string)
+	projectsBackupsStorage := make(map[string]string)
+	for key, value := range nodeValues {
+		if !strings.HasPrefix(key, "storage.") {
+			continue
+		}
 
-	// First deal with config specific to the local daemon
-	nodeValues := map[string]any{}
+		// Validate the storage volume.
+		if nodeValues[key] != oldNodeConfig[key] {
+			// Store validated name back into nodeValues to ensure its not classifed as raw user input.
+			nodeValues[key], err = daemonStorageValidate(s, nodeValues[key])
+			if err != nil {
+				return fmt.Errorf("Failed validation of %q: %w", key, err)
+			}
+		}
 
-	for key := range node.ConfigSchema {
-		value, ok := req.Config[key]
-		if ok {
-			nodeValues[key] = value
-			delete(req.Config, key)
+		// Validate project storage settings.
+		projectName, _ := config.ParseDaemonStorageConfigKey(key)
+		if projectName == "" {
+			continue
+		}
+
+		var project *api.Project
+		err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+			dbProject, err := dbCluster.GetProject(ctx, tx.Tx(), projectName)
+			if err != nil {
+				return err
+			}
+
+			project, err = dbProject.ToAPI(ctx, tx.Tx())
+			if err != nil {
+				return err
+			}
+
+			project.UsedBy, err = projectUsedBy(ctx, tx, dbProject)
+			return err
+		})
+		if err != nil {
+			return fmt.Errorf("Failed loading project %q: %w", projectName, err)
+		}
+
+		// Disallow setting external storage on non-empty projects.
+		if nodeValues[key] != oldNodeConfig[key] && isProjectInUse(project.UsedBy) {
+			return fmt.Errorf("Project config %q cannot be changed on non-empty projects", key)
+		}
+
+		// Disallow setting external storage for images on projects without images.
+		if strings.HasSuffix(key, ".images_volume") && shared.IsFalseOrEmpty(project.Config["features.images"]) {
+			return fmt.Errorf("Project %q does not have `features.images` set, so it cannot have images storage configured", project)
+		}
+
+		// Don't allow setting the project storage the same as as the daemon-level storage volume.
+		if value != "" && strings.HasSuffix(key, ".images_volume") {
+			if value == newNodeConfig.StorageImagesVolume("") {
+				return fmt.Errorf(`Failed validation of %q: storage volume already configured as the daemon images storage`, key)
+			}
+
+			projectsImagesStorage[value] = projectName
+		}
+
+		if value != "" && strings.HasSuffix(key, ".backups_volume") {
+			if value == newNodeConfig.StorageBackupsVolume("") {
+				return fmt.Errorf(`Failed validation of %q: storage volume already configured as the daemon backups storage`, key)
+			}
+
+			projectsBackupsStorage[value] = projectName
 		}
 	}
 
-	nodeChanged := map[string]string{}
-	var newNodeConfig *node.Config
-	oldNodeConfig := make(map[string]any)
+	// Don't allow the daemon-level storage to be set the same as any of the project settings.
+	if nodeValues["storage.backups_volume"] != "" && nodeValues["storage.backups_volume"] != newNodeConfig.StorageBackupsVolume("") {
+		volume := nodeValues["storage.backups_volume"]
+		if projectsBackupsStorage[volume] != "" {
+			return fmt.Errorf(`Failed validation of %q: storage volume already configured as backups storage of project %q`, "storage.backups_volume", projectsBackupsStorage[nodeValues["storage.backups_volume"]])
+		}
+	}
 
-	err := s.DB.Node.Transaction(r.Context(), func(ctx context.Context, tx *db.NodeTx) error {
+	if nodeValues["storage.images_volume"] != "" && nodeValues["storage.images_volume"] != newNodeConfig.StorageImagesVolume("") {
+		volume := nodeValues["storage.images_volume"]
+		if projectsImagesStorage[volume] != "" {
+			return fmt.Errorf(`Failed validation of %q: storage volume already configured as images storage of project %q`, "storage.images_volume", projectsImagesStorage[nodeValues["storage.images_volume"]])
+		}
+	}
+
+	return nil
+}
+
+// validateOIDCConfiguration inspects the OIDC related values in a configuration update to enforce certain constraints.
+// This can't be handled by the config map, as the validation functions don't have access to other configuration values,
+// so we need to validate separately.
+func validateOIDCConfiguration(config *clusterConfig.Config, requestConfig map[string]string, patch bool) error {
+	// Enforce that "oidc.session.expiry" is not greater than "core.auth_secret_expiry". We cannot allow this, otherwise
+	// we might encounter OIDC session tokens that ought to be valid, but that we can't verify because they have been
+	// signed by a key derived from a core secret that is too old and has been rotated out and deleted.
+	coreAuthSecretExpiry := requestConfig["core.auth_secret_expiry"]
+	if coreAuthSecretExpiry == "" {
+		// If value is unset in request. For PATCH it is unchanged, but for PUT it will reset to the default.
+		if patch {
+			coreAuthSecretExpiry = config.AuthSecretExpiry()
+		} else {
+			coreAuthSecretExpiry = "1m"
+		}
+	}
+
+	oidcSessionExpiry := requestConfig["oidc.session.expiry"]
+	if oidcSessionExpiry == "" {
+		// If value is unset in request. For PATCH it is unchanged, but for PUT it will reset to the default.
+		if patch {
+			oidcSessionExpiry = config.OIDCSessionExpiry()
+		} else {
+			oidcSessionExpiry = "1w"
+		}
+	}
+
+	// Calculate expirations with reference to the current time.
+	now := time.Now().UTC()
+	coreAuthSecretExpiryTime, err := shared.GetExpiry(now, coreAuthSecretExpiry)
+	if err != nil {
+		return api.StatusErrorf(http.StatusBadRequest, "Failed validating core auth secret expiry: %w", err)
+	}
+
+	oidcSessionExpiryTime, err := shared.GetExpiry(now, oidcSessionExpiry)
+	if err != nil {
+		return api.StatusErrorf(http.StatusBadRequest, "Failed validating oidc session expiry: %w", err)
+	}
+
+	// Check if an OIDC session created now, would expire after a core auth secret created now.
+	if oidcSessionExpiryTime.After(coreAuthSecretExpiryTime) {
+		return api.StatusErrorf(http.StatusBadRequest, "OIDC session expiry %q must not be greater than the auth secret expiry %q", oidcSessionExpiry, coreAuthSecretExpiry)
+	}
+
+	// Check that the oidc.device.client.id will not be set without oidc.client.id being set.
+	newClientID, hasNewClientID := requestConfig["oidc.client.id"]
+	newDeviceClientID, hasNewDeviceClientID := requestConfig["oidc.device.client.id"]
+	var clientIDWillBeUnset, deviceClientIDWillBeSet bool
+	if patch {
+		// Get the current client ID.
+		_, currentClientID, _, _, _, _, _ := config.OIDCServer()
+
+		// Get the current device client ID. Note that we are not using the value returned from config.OIDCServer here
+		// because that value defaults to the client ID if not set.
+		currentDeviceClientID := config.OIDCDeviceClientID()
+
+		// Client ID will be unset if the current value is not set and no new value was sent or if a new empty value was sent.
+		clientIDWillBeUnset = (!hasNewClientID && currentClientID == "") || (hasNewClientID && newClientID == "")
+
+		// Device client ID will be set if the current value is set and no new value was sent or if a new non-empty value was sent.
+		deviceClientIDWillBeSet = (!hasNewDeviceClientID && currentDeviceClientID != "") || (hasNewDeviceClientID && newDeviceClientID != "")
+	} else {
+		// For PUT we can just check the sent values.
+		clientIDWillBeUnset = newClientID == ""
+		deviceClientIDWillBeSet = newDeviceClientID != ""
+	}
+
+	if clientIDWillBeUnset && deviceClientIDWillBeSet {
+		return api.NewStatusError(http.StatusBadRequest, `"oidc.device.client.id" cannot be set if "oidc.client.id" is unset`)
+	}
+
+	return nil
+}
+
+func doAPI10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) response.Response {
+	s := d.State()
+
+	// Convert the request config to a map[string]string.
+	stringReqConfig := make(map[string]string, len(req.Config))
+	for key, value := range req.Config {
+		var ok bool
+		stringReqConfig[key], ok = value.(string)
+		if !ok {
+			return response.BadRequest(fmt.Errorf("Unexpected type for %q: %T", key, value))
+		}
+	}
+
+	// Validate the cluster UUID has not been changed.
+	clusterUUID := s.GlobalConfig.ClusterUUID()
+	receivedClusterUUID, ok := stringReqConfig["volatile.uuid"]
+
+	// If present, it must be identical (for both PUT and PATCH requests).
+	if ok {
+		if receivedClusterUUID != clusterUUID {
+			return response.BadRequest(errors.New("The cluster UUID cannot be changed"))
+		}
+	} else if !patch {
+		// If not present, this is allowed for PATCH but not for PUT.
+		return response.BadRequest(errors.New("The cluster UUID cannot be changed"))
+	}
+
+	d.globalConfigMu.Lock()
+	currentGlobalConfig := d.globalConfig
+	d.globalConfigMu.Unlock()
+
+	err := validateOIDCConfiguration(currentGlobalConfig, stringReqConfig, patch)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	// First deal with config specific to the local daemon
+	nodeValues := map[string]string{}
+
+	node.ConfigSchema.RLock()
+	for key := range node.ConfigSchema.Types {
+		value, ok := stringReqConfig[key]
+		if ok {
+			nodeValues[key] = value
+			delete(stringReqConfig, key)
+		}
+	}
+	node.ConfigSchema.RUnlock()
+
+	// The config load validation has to allow loading of arbitrary per-project `storage.project.{name}` keys,
+	// as the list of projects is stored in the cluster database which is not available at the time when node
+	// config is loaded from the local database.
+	// In order not to allow setting any of these arbitrary values, we disallow that for those which were not
+	// explicitly added to the ConfigSchema above here.
+	for key := range stringReqConfig {
+		if config.IsProjectStorageConfig(key) {
+			return response.BadRequest(fmt.Errorf("Cannot set %q: Unknown key", key))
+		}
+	}
+
+	var nodeChanged map[string]string
+	var newNodeConfig *node.Config
+	var oldNodeConfig map[string]string
+
+	err = s.DB.Node.Transaction(r.Context(), func(ctx context.Context, tx *db.NodeTx) error {
 		var err error
 		newNodeConfig, err = node.ConfigLoad(ctx, tx)
 		if err != nil {
-			return fmt.Errorf("Failed to load node config: %w", err)
+			return fmt.Errorf("Failed loading local config: %w", err)
 		}
 
 		// Keep old config around in case something goes wrong. In that case the config will be reverted.
-		for k, v := range newNodeConfig.Dump() {
-			oldNodeConfig[k] = v
-		}
+		oldNodeConfig = newNodeConfig.Dump()
 
 		// We currently don't allow changing the cluster.https_address once it's set.
 		if s.ServerClustered {
 			curConfig, err := tx.Config(ctx)
 			if err != nil {
-				return fmt.Errorf("Cannot fetch node config from database: %w", err)
+				return fmt.Errorf("Cannot fetch local config from database: %w", err)
 			}
 
 			newClusterHTTPSAddress := ""
 			newClusterHTTPSAddressAny, found := nodeValues["cluster.https_address"]
 			if found {
-				newClusterHTTPSAddress, _ = newClusterHTTPSAddressAny.(string)
+				newClusterHTTPSAddress = newClusterHTTPSAddressAny
 			} else if patch {
 				newClusterHTTPSAddress = curConfig["cluster.https_address"]
 			}
 
 			if curConfig["cluster.https_address"] != newClusterHTTPSAddress {
-				return fmt.Errorf("Changing cluster.https_address is currently not supported")
+				return api.StatusErrorf(http.StatusBadRequest, "Changing cluster.https_address is currently not supported")
 			}
 		}
 
-		// Validate the storage volumes
-		if nodeValues["storage.backups_volume"] != nil && nodeValues["storage.backups_volume"] != newNodeConfig.StorageBackupsVolume() {
-			err := daemonStorageValidate(s, nodeValues["storage.backups_volume"].(string))
-			if err != nil {
-				return fmt.Errorf("Failed validation of %q: %w", "storage.backups_volume", err)
-			}
-		}
-
-		if nodeValues["storage.images_volume"] != nil && nodeValues["storage.images_volume"] != newNodeConfig.StorageImagesVolume() {
-			err := daemonStorageValidate(s, nodeValues["storage.images_volume"].(string))
-			if err != nil {
-				return fmt.Errorf("Failed validation of %q: %w", "storage.images_volume", err)
-			}
+		// Validate the storage volumes.
+		err = validateStorageVolumes(s, r.Context(), nodeValues, oldNodeConfig, newNodeConfig)
+		if err != nil {
+			return fmt.Errorf("Failed validating storage volumes: %w", err)
 		}
 
 		if patch {
@@ -664,56 +936,48 @@ func doAPI10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) re
 	revert := revert.New()
 	defer revert.Fail()
 
-	revert.Add(func() {
-		for key := range nodeValues {
-			val, ok := oldNodeConfig[key]
-			if !ok {
-				nodeValues[key] = nil
-			} else {
-				nodeValues[key] = val
-			}
-		}
+	if len(nodeChanged) > 0 {
+		revert.Add(func() {
+			// Use context.Background for revert in case client disconnects after changes made and an error occurs.
+			err := s.DB.Node.Transaction(context.Background(), func(ctx context.Context, tx *db.NodeTx) error {
+				newNodeConfig, err := node.ConfigLoad(ctx, tx)
+				if err != nil {
+					return fmt.Errorf("Failed loading local config: %w", err)
+				}
 
-		err = s.DB.Node.Transaction(r.Context(), func(ctx context.Context, tx *db.NodeTx) error {
-			newNodeConfig, err := node.ConfigLoad(ctx, tx)
+				_, err = newNodeConfig.Replace(oldNodeConfig)
+				if err != nil {
+					return fmt.Errorf("Failed updating local config: %w", err)
+				}
+
+				return nil
+			})
+
 			if err != nil {
-				return fmt.Errorf("Failed to load node config: %w", err)
+				logger.Warn("Failed reverting local config", logger.Ctx{"err": err})
 			}
-
-			_, err = newNodeConfig.Replace(nodeValues)
-			if err != nil {
-				return fmt.Errorf("Failed updating node config: %w", err)
-			}
-
-			return nil
 		})
-
-		if err != nil {
-			logger.Warn("Failed reverting node config", logger.Ctx{"err": err})
-		}
-	})
+	}
 
 	// Then deal with cluster wide configuration
 	var clusterChanged map[string]string
 	var newClusterConfig *clusterConfig.Config
-	oldClusterConfig := make(map[string]any)
+	var oldClusterConfig map[string]string
 
-	err = s.DB.Cluster.Transaction(context.Background(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
 		var err error
 		newClusterConfig, err = clusterConfig.Load(ctx, tx)
 		if err != nil {
-			return fmt.Errorf("Failed to load cluster config: %w", err)
+			return fmt.Errorf("Failed loading cluster config: %w", err)
 		}
 
 		// Keep old config around in case something goes wrong. In that case the config will be reverted.
-		for k, v := range newClusterConfig.Dump() {
-			oldClusterConfig[k] = v
-		}
+		oldClusterConfig = newClusterConfig.Dump()
 
 		if patch {
-			clusterChanged, err = newClusterConfig.Patch(req.Config)
+			clusterChanged, err = newClusterConfig.Patch(tx, stringReqConfig)
 		} else {
-			clusterChanged, err = newClusterConfig.Replace(req.Config)
+			clusterChanged, err = newClusterConfig.Replace(tx, stringReqConfig)
 		}
 
 		return err
@@ -727,84 +991,91 @@ func doAPI10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) re
 		}
 	}
 
-	revert.Add(func() {
-		for key := range req.Config {
-			val, ok := oldClusterConfig[key]
-			if !ok {
-				req.Config[key] = nil
-			} else {
-				req.Config[key] = val
-			}
-		}
+	if len(clusterChanged) > 0 {
+		revert.Add(func() {
+			// Use context.Background for revert in case client disconnects after changes made and an error occurs.
+			err := s.DB.Cluster.Transaction(context.Background(), func(ctx context.Context, tx *db.ClusterTx) error {
+				newClusterConfig, err := clusterConfig.Load(ctx, tx)
+				if err != nil {
+					return fmt.Errorf("Failed loading cluster config: %w", err)
+				}
 
-		err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
-			newClusterConfig, err = clusterConfig.Load(ctx, tx)
+				_, err = newClusterConfig.Replace(tx, oldClusterConfig)
+				if err != nil {
+					return fmt.Errorf("Failed updating cluster config: %w", err)
+				}
+
+				return nil
+			})
+
 			if err != nil {
-				return fmt.Errorf("Failed to load cluster config: %w", err)
+				logger.Warn("Failed reverting cluster config", logger.Ctx{"err": err})
 			}
-
-			_, err = newClusterConfig.Replace(req.Config)
-			if err != nil {
-				return fmt.Errorf("Failed updating cluster config: %w", err)
-			}
-
-			return nil
 		})
 
+		// Notify the other nodes about cluster config changes
+		notifier, err := cluster.NewNotifier(s, s.Endpoints.NetworkCert(), s.ServerCert(), cluster.NotifyAlive)
 		if err != nil {
-			logger.Warn("Failed reverting cluster config", logger.Ctx{"err": err})
+			return response.SmartError(err)
 		}
-	})
 
-	// Notify the other nodes about changes
-	notifier, err := cluster.NewNotifier(s, s.Endpoints.NetworkCert(), s.ServerCert(), cluster.NotifyAlive)
-	if err != nil {
-		return response.SmartError(err)
-	}
+		err = notifier(func(member db.NodeInfo, client lxd.InstanceServer) error {
+			server, etag, err := client.GetServer()
+			if err != nil {
+				return err
+			}
 
-	err = notifier(func(client lxd.InstanceServer) error {
-		server, etag, err := client.GetServer()
+			serverPut := server.Writable()
+			serverPut.Config = make(map[string]any)
+			// Only propagate cluster-wide changes.
+			for key, value := range clusterChanged {
+				serverPut.Config[key] = value
+			}
+
+			return client.UpdateServer(serverPut, etag)
+		})
 		if err != nil {
-			return err
+			logger.Error("Failed notifying other members about config change", logger.Ctx{"err": err})
+			return response.SmartError(err)
 		}
-
-		serverPut := server.Writable()
-		serverPut.Config = make(map[string]any)
-		// Only propagated cluster-wide changes
-		for key, value := range clusterChanged {
-			serverPut.Config[key] = value
-		}
-
-		return client.UpdateServer(serverPut, etag)
-	})
-	if err != nil {
-		logger.Error("Failed to notify other members about config change", logger.Ctx{"err": err})
-		return response.SmartError(err)
 	}
 
 	// Update the daemon config.
 	d.globalConfigMu.Lock()
+
+	// Keep old config around in case something goes wrong. In that case the config will be reverted.
+	currentClusterConfig := d.globalConfig
+	currentNodeConfig := d.localConfig
+
+	// Replace with new config
 	d.globalConfig = newClusterConfig
 	d.localConfig = newNodeConfig
 	d.globalConfigMu.Unlock()
 
+	// Ensures old daemon config to be replaced on failure.
+	revert.Add(func() {
+		d.globalConfigMu.Lock()
+		d.globalConfig = currentClusterConfig
+		d.localConfig = currentNodeConfig
+		d.globalConfigMu.Unlock()
+	})
+
 	// Run any update triggers.
-	err = doAPI10UpdateTriggers(d, nodeChanged, clusterChanged, newNodeConfig, newClusterConfig)
+	err = doAPI10UpdateTriggers(d, nodeChanged, clusterChanged, oldNodeConfig, newNodeConfig, newClusterConfig)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	revert.Success()
 
-	s.Events.SendLifecycle(api.ProjectDefaultName, lifecycle.ConfigUpdated.Event(request.CreateRequestor(r), nil))
+	s.Events.SendLifecycle("", lifecycle.ConfigUpdated.Event(request.CreateRequestor(r.Context()), nil))
 
 	return response.EmptySyncResponse
 }
 
-func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]string, nodeConfig *node.Config, clusterConfig *clusterConfig.Config) error {
+func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]string, oldNodeConfig map[string]string, newNodeConfig *node.Config, newClusterConfig *clusterConfig.Config) error {
 	s := d.State()
 
-	maasChanged := false
 	bgpChanged := false
 	dnsChanged := false
 	lokiChanged := false
@@ -822,11 +1093,7 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 		case "core.proxy_https":
 			fallthrough
 		case "core.proxy_ignore_hosts":
-			daemonConfigSetProxy(d, clusterConfig)
-		case "maas.api.url":
-			fallthrough
-		case "maas.api.key":
-			maasChanged = true
+			daemonConfigSetProxy(d, newClusterConfig)
 		case "cluster.images_minimal_replica":
 			err := autoSyncImages(s.ShutdownCtx, s)
 			if err != nil {
@@ -834,7 +1101,7 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 			}
 
 		case "cluster.offline_threshold":
-			d.gateway.HeartbeatOfflineThreshold = clusterConfig.OfflineThreshold()
+			d.gateway.HeartbeatOfflineThreshold = newClusterConfig.OfflineThreshold()
 			d.taskClusterHeartbeat.Reset()
 		case "images.auto_update_interval":
 			fallthrough
@@ -865,15 +1132,14 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 			acmeCAURLChanged = true
 		case "acme.domain":
 			acmeDomainChanged = true
-		case "oidc.issuer", "oidc.client.id", "oidc.audience", "oidc.groups.claim":
+		case "oidc.issuer", "oidc.client.id", "oidc.client.secret", "oidc.scopes", "oidc.audience", "oidc.groups.claim", "oidc.device.client.id":
 			oidcChanged = true
 		}
 	}
 
+	projectVolumeConfigKeys := make([]string, 0)
 	for key := range nodeChanged {
 		switch key {
-		case "maas.machine":
-			maasChanged = true
 		case "core.bgp_address":
 			fallthrough
 		case "core.bgp_routerid":
@@ -882,6 +1148,11 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 			dnsChanged = true
 		case "core.syslog_socket":
 			syslogSocketChanged = true
+		default:
+			projectName, _ := config.ParseDaemonStorageConfigKey(key)
+			if projectName != "" {
+				projectVolumeConfigKeys = append(projectVolumeConfigKeys, key)
+			}
 		}
 	}
 
@@ -889,25 +1160,31 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 	// correlated with others, and need to be processed first (for example
 	// core.https_address need to be processed before
 	// cluster.https_address).
-
 	value, ok := nodeChanged["core.https_address"]
+	coreHTTPSAddressUnset := false
 	if ok {
+		if value == "" {
+			coreHTTPSAddressUnset = true
+		}
+
 		err := s.Endpoints.NetworkUpdateAddress(value)
 		if err != nil {
 			return err
 		}
 
-		s.Endpoints.NetworkUpdateTrustedProxy(clusterConfig.HTTPSTrustedProxy())
+		s.Endpoints.NetworkUpdateTrustedProxy(newClusterConfig.HTTPSTrustedProxy())
 	}
 
-	value, ok = nodeChanged["cluster.https_address"]
-	if ok {
-		err := s.Endpoints.ClusterUpdateAddress(value)
+	// If the cluster.https_address is changed, or if the core.https_address is unset then we need to ensure
+	// that, if set, the cluster's HTTPS address is re-activated.
+	_, ok = nodeChanged["cluster.https_address"]
+	if ok || (coreHTTPSAddressUnset && newNodeConfig.ClusterAddress() != "") {
+		err := s.Endpoints.ClusterUpdateAddress(newNodeConfig.ClusterAddress())
 		if err != nil {
 			return err
 		}
 
-		s.Endpoints.NetworkUpdateTrustedProxy(clusterConfig.HTTPSTrustedProxy())
+		s.Endpoints.NetworkUpdateTrustedProxy(newClusterConfig.HTTPSTrustedProxy())
 	}
 
 	value, ok = nodeChanged["core.debug_address"]
@@ -926,17 +1203,10 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 		}
 	}
 
-	value, ok = nodeChanged["core.storage_buckets_address"]
-	if ok {
-		err := s.Endpoints.StorageBucketsUpdateAddress(value, s.Endpoints.NetworkCert())
-		if err != nil {
-			return err
-		}
-	}
-
 	value, ok = nodeChanged["storage.backups_volume"]
 	if ok {
-		err := daemonStorageMove(s, "backups", value)
+		oldValue := oldNodeConfig["storage.backups_volume"]
+		err := daemonStorageMove(s, config.DaemonStorageTypeBackups, oldValue, value)
 		if err != nil {
 			return err
 		}
@@ -944,38 +1214,39 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 
 	value, ok = nodeChanged["storage.images_volume"]
 	if ok {
-		err := daemonStorageMove(s, "images", value)
+		oldValue := oldNodeConfig["storage.images_volume"]
+		err := daemonStorageMove(s, config.DaemonStorageTypeImages, oldValue, value)
 		if err != nil {
 			return err
 		}
 	}
 
-	if maasChanged {
-		url, key := clusterConfig.MAASController()
-		machine := nodeConfig.MAASMachine()
-		err := d.setupMAASController(url, key, machine)
+	for _, projectVolumeConfigKey := range projectVolumeConfigKeys {
+		oldValue := oldNodeConfig[projectVolumeConfigKey]
+		_, storageType := config.ParseDaemonStorageConfigKey(projectVolumeConfigKey)
+		err := projectStorageVolumeChange(s, oldValue, nodeChanged[projectVolumeConfigKey], storageType)
 		if err != nil {
-			return err
+			return fmt.Errorf("Failed setting local config %q: %w", projectVolumeConfigKey, err)
 		}
 	}
 
 	if bgpChanged {
-		address := nodeConfig.BGPAddress()
-		asn := clusterConfig.BGPASN()
-		routerid := nodeConfig.BGPRouterID()
+		address := newNodeConfig.BGPAddress()
+		asn := newClusterConfig.BGPASN()
+		routerid := newNodeConfig.BGPRouterID()
 
 		if asn > math.MaxUint32 {
-			return fmt.Errorf("Cannot convert BGP ASN to uint32: Upper bound exceeded")
+			return errors.New("Cannot convert BGP ASN to uint32: Upper bound exceeded")
 		}
 
-		err := s.BGP.Reconfigure(address, uint32(asn), net.ParseIP(routerid))
+		err := s.BGP.Configure(address, uint32(asn), net.ParseIP(routerid))
 		if err != nil {
 			return fmt.Errorf("Failed reconfiguring BGP: %w", err)
 		}
 	}
 
 	if dnsChanged {
-		address := nodeConfig.DNSAddress()
+		address := newNodeConfig.DNSAddress()
 
 		err := s.DNS.Reconfigure(address)
 		if err != nil {
@@ -984,10 +1255,20 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 	}
 
 	if lokiChanged {
-		lokiURL, lokiUsername, lokiPassword, lokiCACert, lokiInstance, lokiLoglevel, lokiLabels, lokiTypes := clusterConfig.LokiServer()
+		lokiURL, lokiUsername, lokiPassword, lokiCACert, lokiInstance, lokiLoglevel, lokiLabels, lokiTypes := newClusterConfig.LokiServer()
 
 		if lokiURL == "" || lokiLoglevel == "" || len(lokiTypes) == 0 {
+			if d.lokiClient != nil {
+				// Emit "monitoring disabled" security event, since loki configuration is being unset.
+				// This should be the last log entry that is sent to loki.
+				d.events.SendSecurity(security.SysMonitorDisabled.ServerEvent(security.LevelWarning, "Loki monitoring disabled"))
+			}
+
 			d.internalListener.RemoveHandler("loki")
+			if d.lokiClient != nil {
+				d.lokiClient.Stop()
+				d.lokiClient = nil
+			}
 		} else {
 			err := d.setupLoki(lokiURL, lokiUsername, lokiPassword, lokiCACert, lokiInstance, lokiLoglevel, lokiLabels, lokiTypes)
 			if err != nil {
@@ -1003,20 +1284,11 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 		}
 	}
 
-	// Compile and load the instance placement scriptlet.
-	value, ok = clusterChanged["instances.placement.scriptlet"]
-	if ok {
-		err := scriptletLoad.InstancePlacementSet(value)
-		if err != nil {
-			return fmt.Errorf("Failed saving instance placement scriptlet: %w", err)
-		}
-	}
-
 	if oidcChanged {
-		oidcIssuer, oidcClientID, oidcAudience, oidcGroupsClaim := clusterConfig.OIDCServer()
+		oidcIssuer, oidcClientID, oidcClientSecret, oidcScopes, oidcAudience, oidcGroupsClaim, oidcDeviceClientID := newClusterConfig.OIDCServer()
 
 		if oidcIssuer == "" || oidcClientID == "" {
-			d.oidcVerifier = nil
+			d.oidcVerifier.Store(nil)
 		} else {
 			var err error
 
@@ -1024,15 +1296,24 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 				return util.HTTPClient("", d.proxy)
 			}
 
-			d.oidcVerifier, err = oidc.NewVerifier(oidcIssuer, oidcClientID, oidcAudience, s.ServerCert, d.identityCache, httpClientFunc, &oidc.Opts{GroupsClaim: oidcGroupsClaim})
+			expiryFunc := func() string {
+				d.globalConfigMu.Lock()
+				defer d.globalConfigMu.Unlock()
+				return d.globalConfig.OIDCSessionExpiry()
+			}
+
+			sessionHandler := dbOIDC.NewSessionHandler(d.db.Cluster, d.events, expiryFunc)
+			oidcVerifier, err := oidc.NewVerifier(s.ShutdownCtx, oidcIssuer, oidcClientID, oidcClientSecret, oidcScopes, oidcAudience, oidcGroupsClaim, oidcDeviceClientID, newClusterConfig.ClusterUUID(), d.endpoints.NetworkAddress(), s.CoreAuthSecrets, httpClientFunc, sessionHandler)
 			if err != nil {
 				return fmt.Errorf("Failed creating verifier: %w", err)
 			}
+
+			d.oidcVerifier.Store(oidcVerifier)
 		}
 	}
 
 	if syslogSocketChanged {
-		err := d.setupSyslogSocket(nodeConfig.SyslogSocket())
+		err := d.setupSyslogSocket(newNodeConfig.SyslogSocket())
 		if err != nil {
 			return err
 		}

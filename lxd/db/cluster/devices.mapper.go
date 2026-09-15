@@ -7,6 +7,7 @@ package cluster
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -24,12 +25,6 @@ const deviceCreate = `INSERT INTO %s_devices (%s_id, name, type)
   VALUES (?, ?, ?)`
 
 const deviceDelete = `DELETE FROM %s_devices WHERE %s_id = ?`
-
-// deviceColumns returns a string of column names to be used with a SELECT statement for the entity.
-// Use this function when building statements to retrieve database entries matching the Device entity.
-func deviceColumns() string {
-	return "%s_devices.id, %s_devices.%s_id, %s_devices.name, %s_devices.type, %s_devices.config"
-}
 
 // getDevices can be used to run handwritten sql.Stmts to return a slice of objects.
 func getDevices(ctx context.Context, stmt *sql.Stmt, parent string, args ...any) ([]Device, error) {
@@ -49,7 +44,7 @@ func getDevices(ctx context.Context, stmt *sql.Stmt, parent string, args ...any)
 
 	err := query.SelectObjects(ctx, stmt, dest, args...)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch from \"%s_devices\" table: %w", parent, err)
+		return nil, fmt.Errorf("Failed fetching from \"%s_devices\" table: %w", parent, err)
 	}
 
 	return objects, nil
@@ -73,7 +68,7 @@ func getDevicesRaw(ctx context.Context, tx *sql.Tx, sql string, parent string, a
 
 	err := query.Scan(ctx, tx, sql, dest, args...)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch from \"%s_devices\" table: %w", parent, err)
+		return nil, fmt.Errorf("Failed fetching from \"%s_devices\" table: %w", parent, err)
 	}
 
 	return objects, nil
@@ -85,12 +80,13 @@ func GetDevices(ctx context.Context, tx *sql.Tx, parent string, filters ...Devic
 	var err error
 
 	// Result slice.
-	objects := make([]Device, 0)
+	var objects []Device
 
-	deviceObjectsLocal := strings.Replace(deviceObjects, "%s_id", fmt.Sprintf("%s_id", parent), -1)
+	deviceObjectsLocal := strings.ReplaceAll(deviceObjects, "%s_id", parent+"_id")
 	fillParent := make([]any, strings.Count(deviceObjectsLocal, "%s"))
+	mangledParent := strings.ReplaceAll(parent, "_", "s_") + "s"
 	for i := range fillParent {
-		fillParent[i] = strings.Replace(parent, "_", "s_", -1) + "s"
+		fillParent[i] = mangledParent
 	}
 
 	queryStr := fmt.Sprintf(deviceObjectsLocal, fillParent...)
@@ -117,7 +113,7 @@ func GetDevices(ctx context.Context, tx *sql.Tx, parent string, filters ...Devic
 		}
 
 		if len(entries) == 0 {
-			return nil, fmt.Errorf("Cannot filter on empty DeviceFilter")
+			return nil, errors.New("Cannot filter on empty DeviceFilter")
 		}
 
 		queryParts[0] += fmt.Sprintf(cond, strings.Join(entries, " AND "))
@@ -127,7 +123,7 @@ func GetDevices(ctx context.Context, tx *sql.Tx, parent string, filters ...Devic
 	// Select.
 	objects, err = getDevicesRaw(ctx, tx, queryStr, parent, args...)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch from \"%s_devices\" table: %w", parent, err)
+		return nil, fmt.Errorf("Failed fetching from \"%s_devices\" table: %w", parent, err)
 	}
 
 	configFilters := []ConfigFilter{}
@@ -135,7 +131,7 @@ func GetDevices(ctx context.Context, tx *sql.Tx, parent string, filters ...Devic
 		filter := f.Config
 		if filter != nil {
 			if filter.Key == nil && filter.Value == nil {
-				return nil, fmt.Errorf("Cannot filter on empty ConfigFilter")
+				return nil, errors.New("Cannot filter on empty ConfigFilter")
 			}
 
 			configFilters = append(configFilters, *filter)
@@ -172,10 +168,10 @@ func GetDevices(ctx context.Context, tx *sql.Tx, parent string, filters ...Devic
 // CreateDevices adds a new device to the database.
 // generator: device Create
 func CreateDevices(ctx context.Context, tx *sql.Tx, parent string, objects map[string]Device) error {
-	deviceCreateLocal := strings.Replace(deviceCreate, "%s_id", fmt.Sprintf("%s_id", parent), -1)
+	deviceCreateLocal := strings.ReplaceAll(deviceCreate, "%s_id", parent+"_id")
 	fillParent := make([]any, strings.Count(deviceCreateLocal, "%s"))
 	for i := range fillParent {
-		fillParent[i] = strings.Replace(parent, "_", "s_", -1) + "s"
+		fillParent[i] = strings.ReplaceAll(parent, "_", "s_") + "s"
 	}
 
 	queryStr := fmt.Sprintf(deviceCreateLocal, fillParent...)
@@ -187,7 +183,7 @@ func CreateDevices(ctx context.Context, tx *sql.Tx, parent string, objects map[s
 
 		id, err := result.LastInsertId()
 		if err != nil {
-			return fmt.Errorf("Failed to fetch ID: %w", err)
+			return fmt.Errorf("Failed fetching ID: %w", err)
 		}
 
 		referenceID := int(id)
@@ -234,10 +230,10 @@ func UpdateDevices(ctx context.Context, tx *sql.Tx, parent string, referenceID i
 // DeleteDevices deletes the device matching the given key parameters.
 // generator: device DeleteMany
 func DeleteDevices(ctx context.Context, tx *sql.Tx, parent string, referenceID int) error {
-	deviceDeleteLocal := strings.Replace(deviceDelete, "%s_id", fmt.Sprintf("%s_id", parent), -1)
+	deviceDeleteLocal := strings.ReplaceAll(deviceDelete, "%s_id", parent+"_id")
 	fillParent := make([]any, strings.Count(deviceDeleteLocal, "%s"))
 	for i := range fillParent {
-		fillParent[i] = strings.Replace(parent, "_", "s_", -1) + "s"
+		fillParent[i] = strings.ReplaceAll(parent, "_", "s_") + "s"
 	}
 
 	queryStr := fmt.Sprintf(deviceDeleteLocal, fillParent...)

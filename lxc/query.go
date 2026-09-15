@@ -8,14 +8,14 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
 
-	"github.com/canonical/lxd/shared"
+	"github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/shared/api"
 	cli "github.com/canonical/lxd/shared/cmd"
-	"github.com/canonical/lxd/shared/i18n"
 )
 
 type cmdQuery struct {
@@ -29,19 +29,17 @@ type cmdQuery struct {
 
 func (c *cmdQuery) command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("query", i18n.G("[<remote>:]<API path>"))
-	cmd.Short = i18n.G("Send a raw query to LXD")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Send a raw query to LXD`))
-	cmd.Example = cli.FormatSection("", i18n.G(
-		`lxc query -X DELETE --wait /1.0/instances/c1
-    Delete local instance "c1".`))
+	cmd.Use = usage("query", "[<remote>:]<API path>")
+	cmd.Short = "Send a raw query to LXD"
+	cmd.Long = cli.FormatSection("Description", cmd.Short)
+	cmd.Example = cli.FormatSection("", `lxc query -X DELETE --wait /1.0/instances/c1
+    Delete local instance "c1".`)
 
 	cmd.RunE = c.run
-	cmd.Flags().BoolVar(&c.flagRespWait, "wait", false, i18n.G("Wait for the operation to complete"))
-	cmd.Flags().BoolVar(&c.flagRespRaw, "raw", false, i18n.G("Print the raw response"))
-	cmd.Flags().StringVarP(&c.flagAction, "request", "X", "GET", i18n.G("Action (defaults to GET)")+"``")
-	cmd.Flags().StringVarP(&c.flagData, "data", "d", "", i18n.G("Input data")+"``")
+	cmd.Flags().BoolVar(&c.flagRespWait, "wait", false, "Wait for the operation to complete")
+	cmd.Flags().BoolVar(&c.flagRespRaw, "raw", false, "Print the raw response")
+	cmd.Flags().StringVarP(&c.flagAction, "request", "X", "GET", cli.FormatStringFlagLabel("Action"))
+	cmd.Flags().StringVarP(&c.flagData, "data", "d", "", cli.FormatStringFlagLabel("Input data"))
 
 	return cmd
 }
@@ -53,7 +51,7 @@ func (c *cmdQuery) pretty(input any) string {
 	enc.SetIndent("", "\t")
 	err := enc.Encode(input)
 	if err != nil {
-		return fmt.Sprintf("%v", input)
+		return fmt.Sprint(input)
 	}
 
 	return pretty.String()
@@ -69,11 +67,11 @@ func (c *cmdQuery) run(cmd *cobra.Command, args []string) error {
 	}
 
 	if c.global.flagProject != "" {
-		return errors.New(i18n.G("--project cannot be used with the query command"))
+		return errors.New("--project cannot be used with the query command")
 	}
 
-	if !shared.ValueInSlice(c.flagAction, []string{"GET", "PUT", "POST", "PATCH", "DELETE"}) {
-		return fmt.Errorf(i18n.G("Action %q isn't supported by this tool"), c.flagAction)
+	if !slices.Contains([]string{"GET", "PUT", "POST", "PATCH", "DELETE"}, c.flagAction) {
+		return fmt.Errorf("Action %q is not supported by this tool", c.flagAction)
 	}
 
 	// Parse the remote
@@ -84,20 +82,24 @@ func (c *cmdQuery) run(cmd *cobra.Command, args []string) error {
 
 	// Validate path
 	if !strings.HasPrefix(path, "/") {
-		return errors.New(i18n.G("Query path must start with /"))
+		return errors.New("Query path must start with /")
 	}
 
-	// Attempt to connect
-	d, err := conf.GetInstanceServer(remote)
+	// Setup client
+	d, err := conf.GetInstanceServerWithConnectionArgs(remote, &lxd.ConnectionArgs{
+		SkipGetServer: true,
+	})
 	if err != nil {
 		return err
 	}
 
 	// Guess the encoding of the input
 	var data any
-	err = json.Unmarshal([]byte(c.flagData), &data)
-	if err != nil {
-		data = c.flagData
+	if c.flagData != "" {
+		err = json.Unmarshal([]byte(c.flagData), &data)
+		if err != nil {
+			data = c.flagData
+		}
 	}
 
 	// Perform the query
@@ -127,13 +129,15 @@ func (c *cmdQuery) run(cmd *cobra.Command, args []string) error {
 		}
 
 		// Setup the request
-		req, err := http.NewRequest(c.flagAction, fmt.Sprintf("%s%s", httpInfo.URL, path), rs)
+		req, err := http.NewRequest(c.flagAction, httpInfo.URL+path, rs)
 		if err != nil {
 			return err
 		}
 
 		// Set the encoding accordingly
-		req.Header.Set("Content-Type", "plain/text")
+		if c.flagData != "" {
+			req.Header.Set("Content-Type", "plain/text")
+		}
 
 		resp, err := d.DoHTTP(req)
 		if err != nil {
@@ -160,7 +164,7 @@ func (c *cmdQuery) run(cmd *cobra.Command, args []string) error {
 			return err
 		}
 
-		resp, _, err = d.RawQuery("GET", fmt.Sprintf("%s/wait?%s", uri.Path, uri.RawQuery), "", "")
+		resp, _, err = d.RawQuery(http.MethodGet, uri.Path+"/wait?"+uri.RawQuery, "", "")
 		if err != nil {
 			return err
 		}

@@ -4,17 +4,19 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/canonical/lxd/lxd/apparmor"
+	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/lxd/subprocess"
-	"github.com/canonical/lxd/lxd/sys"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/ioprogress"
 	"github.com/canonical/lxd/shared/logger"
@@ -32,7 +34,7 @@ func (nwc *nullWriteCloser) Close() error {
 // ExtractWithFds runs extractor process under specifc AppArmor profile.
 // The allowedCmds argument specify commands which are allowed to run by apparmor.
 // The cmd argument is automatically added to allowedCmds slice.
-func ExtractWithFds(cmd string, args []string, allowedCmds []string, stdin io.ReadCloser, sysOS *sys.OS, output *os.File) error {
+func ExtractWithFds(s *state.State, cmd string, args []string, allowedCmds []string, stdin io.ReadCloser, output *os.File) error {
 	outputPath := output.Name()
 
 	allowedCmds = append(allowedCmds, cmd)
@@ -40,19 +42,19 @@ func ExtractWithFds(cmd string, args []string, allowedCmds []string, stdin io.Re
 	for _, c := range allowedCmds {
 		cmdPath, err := exec.LookPath(c)
 		if err != nil {
-			return fmt.Errorf("Failed to start extract: Failed to find executable: %w", err)
+			return fmt.Errorf("Failed starting extract: Failed finding executable: %w", err)
 		}
 
 		allowedCmdPaths = append(allowedCmdPaths, cmdPath)
 	}
 
-	err := apparmor.ArchiveLoad(sysOS, outputPath, allowedCmdPaths)
+	err := apparmor.ArchiveLoad(s, outputPath, allowedCmdPaths)
 	if err != nil {
-		return fmt.Errorf("Failed to start extract: Failed to load profile: %w", err)
+		return fmt.Errorf("Failed starting extract: Failed loading profile: %w", err)
 	}
 
-	defer func() { _ = apparmor.ArchiveDelete(sysOS, outputPath) }()
-	defer func() { _ = apparmor.ArchiveUnload(sysOS, outputPath) }()
+	defer func() { _ = apparmor.ArchiveDelete(s.OS, outputPath) }()
+	defer func() { _ = apparmor.ArchiveUnload(s.OS, outputPath) }()
 
 	var buffer bytes.Buffer
 	p := subprocess.NewProcessWithFds(cmd, args, stdin, output, &nullWriteCloser{&buffer})
@@ -60,7 +62,7 @@ func ExtractWithFds(cmd string, args []string, allowedCmds []string, stdin io.Re
 
 	err = p.Start(context.TODO())
 	if err != nil {
-		return fmt.Errorf("Failed to start extract: Failed running: tar: %w", err)
+		return fmt.Errorf("Failed starting extract: Failed running: tar: %w", err)
 	}
 
 	_, err = p.Wait(context.Background())
@@ -75,7 +77,7 @@ func ExtractWithFds(cmd string, args []string, allowedCmds []string, stdin io.Re
 // The unpacker arguments are those returned by DetectCompressionFile().
 // The returned cancelFunc should be called when finished with reader to clean up any resources used.
 // This can be done before reading to the end of the tarball if desired.
-func CompressedTarReader(ctx context.Context, r io.ReadSeeker, unpacker []string, sysOS *sys.OS, outputPath string) (*tar.Reader, context.CancelFunc, error) {
+func CompressedTarReader(s *state.State, ctx context.Context, r io.ReadSeeker, unpacker []string, outputPath string) (*tar.Reader, context.CancelFunc, error) {
 	ctx, cancelFunc := context.WithCancel(ctx)
 
 	_, err := r.Seek(0, io.SeekStart)
@@ -88,12 +90,12 @@ func CompressedTarReader(ctx context.Context, r io.ReadSeeker, unpacker []string
 	if len(unpacker) > 0 {
 		cmdPath, err := exec.LookPath(unpacker[0])
 		if err != nil {
-			return nil, cancelFunc, fmt.Errorf("Failed to start unpack: Failed to find executable: %w", err)
+			return nil, cancelFunc, fmt.Errorf("Failed starting unpack: Failed finding executable: %w", err)
 		}
 
-		err = apparmor.ArchiveLoad(sysOS, outputPath, []string{cmdPath})
+		err = apparmor.ArchiveLoad(s, outputPath, []string{cmdPath})
 		if err != nil {
-			return nil, cancelFunc, fmt.Errorf("Failed to start unpack: Failed to load profile: %w", err)
+			return nil, cancelFunc, fmt.Errorf("Failed starting unpack: Failed loading profile: %w", err)
 		}
 
 		pipeReader, pipeWriter := io.Pipe()
@@ -101,7 +103,7 @@ func CompressedTarReader(ctx context.Context, r io.ReadSeeker, unpacker []string
 		p.SetApparmor(apparmor.ArchiveProfileName(outputPath))
 		err = p.Start(ctx)
 		if err != nil {
-			return nil, cancelFunc, fmt.Errorf("Failed to start unpack: Failed running: %s: %w", unpacker[0], err)
+			return nil, cancelFunc, fmt.Errorf("Failed starting unpack: Failed running: %s: %w", unpacker[0], err)
 		}
 
 		ctxCancelFunc := cancelFunc
@@ -112,8 +114,8 @@ func CompressedTarReader(ctx context.Context, r io.ReadSeeker, unpacker []string
 			ctxCancelFunc()
 			_ = pipeWriter.Close()
 			_, _ = p.Wait(ctx)
-			_ = apparmor.ArchiveUnload(sysOS, outputPath)
-			_ = apparmor.ArchiveDelete(sysOS, outputPath)
+			_ = apparmor.ArchiveUnload(s.OS, outputPath)
+			_ = apparmor.ArchiveDelete(s.OS, outputPath)
 		}
 
 		tr = tar.NewReader(pipeReader)
@@ -124,8 +126,9 @@ func CompressedTarReader(ctx context.Context, r io.ReadSeeker, unpacker []string
 	return tr, cancelFunc, nil
 }
 
-// Unpack extracts image from archive.
-func Unpack(file string, path string, blockBackend bool, sysOS *sys.OS, tracker *ioprogress.ProgressTracker) error {
+// doUnpack unpacks the specified file to the given path.
+// When protected is set to true, devices will be excluded and instance specific metadata files will be checked to ensure they are not symlinks.
+func doUnpack(s *state.State, file string, path string, blockBackend bool, protected bool, progressHandler ioprogress.ProgressHandler) error {
 	extractArgs, extension, unpacker, err := shared.DetectCompression(file)
 	if err != nil {
 		return err
@@ -134,10 +137,10 @@ func Unpack(file string, path string, blockBackend bool, sysOS *sys.OS, tracker 
 	command := ""
 	args := []string{}
 	var allowedCmds []string
-	var reader io.Reader
+	var reader io.ReadCloser
 	if strings.HasPrefix(extension, ".tar") {
 		command = "tar"
-		if sysOS.RunningInUserNS {
+		if protected && s.OS.RunningInUserNS {
 			// We can't create char/block devices so avoid extracting them.
 			args = append(args, "--anchored")
 			args = append(args, "--wildcards")
@@ -162,19 +165,13 @@ func Unpack(file string, path string, blockBackend bool, sysOS *sys.OS, tracker 
 		defer func() { _ = f.Close() }()
 
 		reader = f
-
-		// Attach the ProgressTracker if supplied.
-		if tracker != nil {
+		if progressHandler != nil {
 			fsinfo, err := f.Stat()
 			if err != nil {
 				return err
 			}
 
-			tracker.Length = fsinfo.Size()
-			reader = &ioprogress.ProgressReader{
-				ReadCloser: f,
-				Tracker:    tracker,
-			}
+			reader = ioprogress.NewProgressReader(f, ioprogress.WithLength(fsinfo.Size()), ioprogress.WithProgressHandler(progressHandler))
 		}
 
 		// Allow supplementary commands for the unpacker to use.
@@ -192,7 +189,8 @@ func Unpack(file string, path string, blockBackend bool, sysOS *sys.OS, tracker 
 		mem, err := shared.DeviceTotalMemory()
 		mem = mem / 1024 / 1024 / 10
 		if err == nil && mem < 256 {
-			args = append(args, "-da", fmt.Sprintf("%d", mem), "-fr", fmt.Sprintf("%d", mem), "-p", "1")
+			memString := strconv.FormatInt(mem, 10)
+			args = append(args, "-da", memString, "-fr", memString, "-p", "1")
 		}
 
 		args = append(args, file)
@@ -207,15 +205,10 @@ func Unpack(file string, path string, blockBackend bool, sysOS *sys.OS, tracker 
 
 	defer func() { _ = outputDir.Close() }()
 
-	var readCloser io.ReadCloser
-	if reader != nil {
-		readCloser = io.NopCloser(reader)
-	}
-
-	err = ExtractWithFds(command, args, allowedCmds, readCloser, sysOS, outputDir)
+	err = ExtractWithFds(s, command, args, allowedCmds, reader, outputDir)
 	if err != nil {
 		// We can't create char/block devices in unpriv containers so ignore related errors.
-		if sysOS.RunningInUserNS && command == "unsquashfs" {
+		if s.OS.RunningInUserNS && command == "unsquashfs" {
 			runError, ok := err.(shared.RunError)
 			if !ok {
 				return err
@@ -228,17 +221,17 @@ func Unpack(file string, path string, blockBackend bool, sysOS *sys.OS, tracker 
 
 			// Confirm that all errors are related to character or block devices.
 			found := false
-			for _, line := range strings.Split(stdErr, "\n") {
+			for line := range strings.SplitSeq(stdErr, "\n") {
 				line = strings.TrimSpace(line)
 				if line == "" {
 					continue
 				}
 
-				if !strings.Contains(line, "failed to create block device") {
+				if !strings.Contains(line, "failed creating block device") {
 					continue
 				}
 
-				if !strings.Contains(line, "failed to create character device") {
+				if !strings.Contains(line, "failed creating character device") {
 					continue
 				}
 
@@ -263,14 +256,63 @@ func Unpack(file string, path string, blockBackend bool, sysOS *sys.OS, tracker 
 		// Check if we're running out of space
 		if int64(fs.Bfree) < 10 {
 			if blockBackend {
-				return fmt.Errorf("Unable to unpack image, run out of disk space (consider increasing your pool's volume.size)")
+				return errors.New("Cannot unpack image, run out of disk space (consider increasing your pool's volume.size)")
 			}
 
-			return fmt.Errorf("Unable to unpack image, run out of disk space")
+			return errors.New("Cannot unpack image, run out of disk space")
 		}
 
 		logger.Warn("Unpack failed", logger.Ctx{"file": file, "allowedCmds": allowedCmds, "extension": extension, "path": path, "err": err})
 		return fmt.Errorf("Unpack failed: %w", err)
+	}
+
+	// Check if none of the metadata files are symlinks.
+	// This blocks using images which reference external files.
+	if protected {
+		err := CheckMetadataFilesAreRegular(path)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// UnpackImage extracts image from archive.
+func UnpackImage(s *state.State, file string, path string, blockBackend bool, progressHandler ioprogress.ProgressHandler) error {
+	return doUnpack(s, file, path, blockBackend, true, progressHandler)
+}
+
+// UnpackRaw extracts all content from archive.
+func UnpackRaw(s *state.State, file string, path string, blockBackend bool, progressHandler ioprogress.ProgressHandler) error {
+	return doUnpack(s, file, path, blockBackend, false, progressHandler)
+}
+
+// CheckMetadataFilesAreRegular verifies that the metadata files inside root are regular files and not symlinks.
+// Missing files are allowed.
+func CheckMetadataFilesAreRegular(root string) error {
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return fmt.Errorf("Failed opening directory %q: %w", root, err)
+	}
+
+	defer func() { _ = r.Close() }()
+
+	// Some metadata files (e.g. backup.yaml) are not present right after unpack.
+	// Therefore accept if they are missing.
+	for _, name := range []string{"metadata.yaml", "backup.yaml"} {
+		info, err := r.Lstat(name)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+
+			return err
+		}
+
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("Metadata file %q is not a regular file", name)
+		}
 	}
 
 	return nil

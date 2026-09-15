@@ -1,8 +1,10 @@
 package drivers
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/canonical/lxd/lxd/db"
@@ -14,10 +16,10 @@ import (
 	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/project"
 	"github.com/canonical/lxd/lxd/state"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/revert"
+	"github.com/canonical/lxd/shared/version"
 )
 
 // Instance driver definitions.
@@ -29,6 +31,7 @@ var instanceDrivers = map[string]func() instance.Instance{
 // DriverStatus definition.
 type DriverStatus struct {
 	Info      instance.Info
+	Version   *version.DottedVersion
 	Warning   *cluster.Warning
 	Supported bool
 }
@@ -57,12 +60,13 @@ func load(s *state.State, args db.InstanceArgs, p api.Project) (instance.Instanc
 	var inst instance.Instance
 	var err error
 
-	if args.Type == instancetype.Container {
+	switch args.Type {
+	case instancetype.Container:
 		inst, err = lxcLoad(s, args, p)
-	} else if args.Type == instancetype.VM {
+	case instancetype.VM:
 		inst, err = qemuLoad(s, args, p)
-	} else {
-		return nil, fmt.Errorf("Invalid instance type for instance %s", args.Name)
+	default:
+		return nil, fmt.Errorf("Invalid type for instance %q", args.Name)
 	}
 
 	if err != nil {
@@ -86,7 +90,7 @@ func validDevices(state *state.State, p api.Project, instanceType instancetype.T
 	checkDevices := func(devices deviceConfig.Devices, expanded bool) error {
 		// Check each device individually using the device package.
 		for deviceName, deviceConfig := range devices {
-			if expanded && shared.ValueInSlice(deviceName, checkedDevices) {
+			if expanded && slices.Contains(checkedDevices, deviceName) {
 				continue // Don't check the device twice if present in both local and expanded.
 			}
 
@@ -117,7 +121,7 @@ func validDevices(state *state.State, p api.Project, instanceType instancetype.T
 
 	if len(expandedDevices) > 0 {
 		// Check we have a root disk if in expanded validation mode.
-		_, _, err := instancetype.GetRootDiskDevice(expandedDevices.CloneNative())
+		_, _, err := api.GetRootDiskDevice(expandedDevices.CloneNative())
 		if err != nil {
 			return fmt.Errorf("Failed detecting root disk device: %w", err)
 		}
@@ -133,14 +137,15 @@ func validDevices(state *state.State, p api.Project, instanceType instancetype.T
 	return nil
 }
 
-func create(s *state.State, args db.InstanceArgs, p api.Project) (instance.Instance, revert.Hook, error) {
-	if args.Type == instancetype.Container {
-		return lxcCreate(s, args, p)
-	} else if args.Type == instancetype.VM {
-		return qemuCreate(s, args, p)
+func create(ctx context.Context, s *state.State, args db.InstanceArgs, p api.Project) (instance.Instance, revert.Hook, error) {
+	switch args.Type {
+	case instancetype.Container:
+		return lxcCreate(ctx, s, args, p)
+	case instancetype.VM:
+		return qemuCreate(ctx, s, args, p)
 	}
 
-	return nil, nil, fmt.Errorf("Instance type invalid")
+	return nil, nil, errors.New("Instance type invalid")
 }
 
 // DriverStatuses returns a map of DriverStatus structs for all instance type drivers.
@@ -163,13 +168,39 @@ func DriverStatuses() map[instancetype.Type]*DriverStatus {
 		driverStatus.Info = driverInfo
 		driverStatus.Supported = true
 
+		// Parse the version string, ignoring any extra suffixes
+		// like "(external)" that may be appended by external driver wrappers.
+		if driverInfo.Version != "" {
+			dottedVersion, err := version.Parse(driverInfo.Version)
+			if err == nil {
+				driverStatus.Version = dottedVersion
+			}
+		}
+
+		// Check that we have a sufficiently recent version of liblxc.
+		if driverInfo.Name == "lxc" && driverStatus.Version != nil {
+			minLXCVersion, _ := version.NewDottedVersion("5.0.0")
+
+			if driverStatus.Version.Compare(minLXCVersion) < 0 {
+				driverInfo.Error = errors.New("LXC 5.0.0 or newer is required")
+				driverStatus.Info.Error = driverInfo.Error
+			}
+		}
+
 		if driverInfo.Error != nil || driverInfo.Version == "" {
 			logger.Warn("Instance type not operational", logger.Ctx{"type": driverInfo.Type, "driver": driverInfo.Name, "err": driverInfo.Error})
+
+			var lastMessage string
+			if driverInfo.Error != nil {
+				lastMessage = driverInfo.Error.Error()
+			} else if driverInfo.Version == "" {
+				lastMessage = "Driver version not available"
+			}
 
 			driverStatus.Supported = false
 			driverStatus.Warning = &cluster.Warning{
 				TypeCode:    warningtype.InstanceTypeNotOperational,
-				LastMessage: fmt.Sprintf("%v", driverInfo.Error),
+				LastMessage: lastMessage,
 			}
 		} else {
 			logger.Info("Instance type operational", logger.Ctx{"type": driverInfo.Type, "driver": driverInfo.Name, "features": driverInfo.Features})

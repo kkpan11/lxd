@@ -50,7 +50,9 @@ type CertificatesPost struct {
 
 	// Server trust password (used to add an untrusted client, deprecated, use trust_token)
 	// Example: blah
-	Password string `json:"password" yaml:"password"` // Deprecated, use TrustToken.
+	//
+	// Deprecated: Use TrustToken.
+	Password string `json:"password" yaml:"password"`
 
 	// Trust token (used to add an untrusted client)
 	// Example: blah
@@ -102,6 +104,8 @@ type CertificatePut struct {
 //
 // swagger:model
 type Certificate struct {
+	WithEntitlements `yaml:",inline"`
+
 	// Name associated with the certificate
 	// Example: castiana
 	Name string `json:"name" yaml:"name"`
@@ -184,6 +188,12 @@ type CertificateAddToken struct {
 	// The token's expiry date.
 	// Example: 2021-03-23T17:38:37.753398689-04:00
 	ExpiresAt time.Time `json:"expires_at" yaml:"expires_at"`
+
+	// Type is an indicator for which API (certificates or identities) to send the token.
+	// Example: Client certificate
+	//
+	// API extension: access_management_tls
+	Type string `json:"type" yaml:"type"`
 }
 
 // String encodes the certificate add token as JSON and then base64.

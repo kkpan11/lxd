@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"net/http"
 	"sync"
@@ -18,7 +19,6 @@ import (
 	"github.com/canonical/lxd/lxd/instance"
 	"github.com/canonical/lxd/lxd/migration"
 	"github.com/canonical/lxd/lxd/operations"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 )
 
@@ -137,6 +137,7 @@ type migrationSourceWs struct {
 	migrationFields
 
 	clusterMoveSourceName string
+	diskVolumesMode       string
 
 	pushCertificate  string
 	pushOperationURL string
@@ -145,8 +146,8 @@ type migrationSourceWs struct {
 
 // Metadata returns a map where each key is a connection name and each value is
 // the secret of the corresponding websocket connection.
-func (s *migrationSourceWs) Metadata() any {
-	secrets := make(shared.Jmap, len(s.conns))
+func (s *migrationSourceWs) Metadata() map[string]any {
+	secrets := make(map[string]any, len(s.conns))
 	for connName, conn := range s.conns {
 		secrets[connName] = conn.Secret()
 	}
@@ -163,8 +164,11 @@ func (s *migrationSourceWs) Connect(op *operations.Operation, r *http.Request, w
 		return api.StatusErrorf(http.StatusBadRequest, "Missing migration source secret")
 	}
 
+	incomingSecretBytes := []byte(incomingSecret)
+
 	for connName, conn := range s.conns {
-		if incomingSecret != conn.Secret() {
+		connSecret := conn.Secret()
+		if subtle.ConstantTimeCompare(incomingSecretBytes, []byte(connSecret)) != 1 {
 			continue
 		}
 
@@ -188,6 +192,8 @@ type migrationSink struct {
 	push                  bool
 	clusterMoveSourceName string
 	refresh               bool
+	attachedVolumes       map[string]struct{}
+	deferredVolumes       map[string]struct{}
 }
 
 // migrationSinkArgs arguments to configure migration sink.
@@ -205,6 +211,8 @@ type migrationSinkArgs struct {
 	refresh               bool
 	clusterMoveSourceName string
 	snapshots             []*migration.Snapshot
+	attachedVolumes       map[string]struct{}
+	deferredVolumes       map[string]struct{}
 
 	// Storage specific fields
 	volumeOnly bool
@@ -214,8 +222,8 @@ type migrationSinkArgs struct {
 }
 
 // Metadata returns metadata for the migration sink.
-func (s *migrationSink) Metadata() any {
-	secrets := make(shared.Jmap, len(s.conns))
+func (s *migrationSink) Metadata() map[string]any {
+	secrets := make(map[string]any, len(s.conns))
 	for connName, conn := range s.conns {
 		secrets[connName] = conn.Secret()
 	}
@@ -230,8 +238,11 @@ func (s *migrationSink) Connect(op *operations.Operation, r *http.Request, w htt
 		return api.StatusErrorf(http.StatusBadRequest, "Missing migration sink secret")
 	}
 
+	incomingSecretBytes := []byte(incomingSecret)
+
 	for connName, conn := range s.conns {
-		if incomingSecret != conn.Secret() {
+		connSecret := conn.Secret()
+		if subtle.ConstantTimeCompare(incomingSecretBytes, []byte(connSecret)) != 1 {
 			continue
 		}
 

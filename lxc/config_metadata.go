@@ -7,12 +7,11 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	cli "github.com/canonical/lxd/shared/cmd"
-	"github.com/canonical/lxd/shared/i18n"
 	"github.com/canonical/lxd/shared/termios"
 )
 
@@ -24,9 +23,8 @@ type cmdConfigMetadata struct {
 func (c *cmdConfigMetadata) command() *cobra.Command {
 	cmd := &cobra.Command{}
 	cmd.Use = usage("metadata")
-	cmd.Short = i18n.G("Manage instance metadata files")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Manage instance metadata files`))
+	cmd.Short = "Manage instance metadata files"
+	cmd.Long = cli.FormatSection("Description", cmd.Short)
 
 	// Edit
 	configMetadataEditCmd := cmdConfigMetadataEdit{global: c.global, config: c.config, configMetadata: c}
@@ -51,16 +49,15 @@ type cmdConfigMetadataEdit struct {
 
 func (c *cmdConfigMetadataEdit) command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("edit", i18n.G("[<remote>:]<instance>"))
-	cmd.Short = i18n.G("Edit instance metadata files")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Edit instance metadata files`))
+	cmd.Use = usage("edit", "[<remote>:]<instance>")
+	cmd.Short = "Edit instance metadata files"
+	cmd.Long = cli.FormatSection("Description", cmd.Short)
 
 	cmd.RunE = c.run
 
 	cmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		if len(args) == 0 {
-			return c.global.cmpInstances(toComplete)
+			return c.global.cmpTopLevelResource("instance", toComplete)
 		}
 
 		return nil, cobra.ShellCompDirectiveNoFileComp
@@ -70,9 +67,8 @@ func (c *cmdConfigMetadataEdit) command() *cobra.Command {
 }
 
 func (c *cmdConfigMetadataEdit) helpTemplate() string {
-	return i18n.G(
-		`### This is a YAML representation of the instance metadata.
-### Any line starting with a '# will be ignored.
+	return `### This is a YAML representation of the instance metadata.
+### Any line starting with a '#' will be ignored.
 ###
 ### A sample configuration looks like:
 ###
@@ -90,7 +86,7 @@ func (c *cmdConfigMetadataEdit) helpTemplate() string {
 ###     - ""
 ###     create_only: false
 ###     template: template.tpl
-###     properties: {}`)
+###     properties: {}`
 }
 
 func (c *cmdConfigMetadataEdit) run(cmd *cobra.Command, args []string) error {
@@ -109,7 +105,7 @@ func (c *cmdConfigMetadataEdit) run(cmd *cobra.Command, args []string) error {
 	resource := resources[0]
 
 	if resource.name == "" {
-		return errors.New(i18n.G("Missing instance name"))
+		return errors.New("Missing instance name")
 	}
 
 	// Edit the metadata
@@ -153,8 +149,8 @@ func (c *cmdConfigMetadataEdit) run(cmd *cobra.Command, args []string) error {
 
 		// Respawn the editor
 		if err != nil {
-			fmt.Fprintf(os.Stderr, i18n.G("Config parsing error: %s")+"\n", err)
-			fmt.Println(i18n.G("Press enter to open the editor again or ctrl+c to abort change"))
+			fmt.Fprintf(os.Stderr, "Config parsing error: %s\n", err)
+			fmt.Println("Press enter to open the editor again or ctrl+c to abort change")
 
 			_, err := os.Stdin.Read(make([]byte, 1))
 			if err != nil {
@@ -184,16 +180,15 @@ type cmdConfigMetadataShow struct {
 
 func (c *cmdConfigMetadataShow) command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("show", i18n.G("[<remote>:]<instance>"))
-	cmd.Short = i18n.G("Show instance metadata files")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Show instance metadata files`))
+	cmd.Use = usage("show", "[<remote>:]<instance>")
+	cmd.Short = "Show instance metadata files"
+	cmd.Long = cli.FormatSection("Description", cmd.Short)
 
 	cmd.RunE = c.run
 
 	cmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		if len(args) == 0 {
-			return c.global.cmpInstances(toComplete)
+			return c.global.cmpTopLevelResource("instance", toComplete)
 		}
 
 		return nil, cobra.ShellCompDirectiveNoFileComp
@@ -218,7 +213,7 @@ func (c *cmdConfigMetadataShow) run(cmd *cobra.Command, args []string) error {
 	resource := resources[0]
 
 	if resource.name == "" {
-		return errors.New(i18n.G("Missing instance name"))
+		return errors.New("Missing instance name")
 	}
 
 	// Show the instance metadata

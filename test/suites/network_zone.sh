@@ -1,8 +1,8 @@
 test_network_zone() {
   ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
 
-  poolName=$(lxc profile device get default root pool)
+  local poolName
+  poolName="lxdtest-$(basename "${LXD_DIR}")"
 
   lxc config unset core.https_address
 
@@ -10,7 +10,8 @@ test_network_zone() {
   netName=lxdt$$
   lxc network create "${netName}" \
         ipv4.address=192.0.2.1/24 \
-        ipv6.address=fd42:4242:4242:1010::1/64
+        ipv6.address=fd42:4242:4242:1010::1/64 \
+        ipv6.dhcp.stateful=true
 
   # Create the zones
   ! lxc network zone create /lxd.example.net || false
@@ -27,8 +28,8 @@ test_network_zone() {
     -c restricted.networks.zones=example.net
 
   # Put an instance on the network in each project.
-  lxc init testimage c1 --network "${netName}" -d eth0,ipv4.address=192.0.2.42
-  lxc init testimage c2 --network "${netName}" --storage "${poolName}" -d eth0,ipv4.address=192.0.2.43 --project foo
+  lxc init testimage c1 --network "${netName}" -d eth0,ipv4.address=192.0.2.42 -d eth0,ipv6.address=fd42:4242:4242:1010::42
+  lxc init testimage c2 --network "${netName}" --storage "${poolName}" -d eth0,ipv4.address=192.0.2.43 -d eth0,ipv6.address=fd42:4242:4242:1010::43 --project foo
 
   # Check features.networks.zones can be enabled if false in a non-empty project, but cannot be disabled again.
   lxc project set foo features.networks.zones=true
@@ -39,6 +40,10 @@ test_network_zone() {
 
   # Create zone in project.
   lxc network zone create lxdfoo.example.net --project foo
+
+  # Check listing zones from all projects.
+  lxc network zone list --all-projects -f csv | grep -F 'default,lxd.example.net'
+  lxc network zone list --all-projects -f csv | grep -F 'foo,lxdfoo.example.net'
 
   # Check associating a network to a missing zone isn't allowed.
   ! lxc network set "${netName}" dns.zone.forward missing || false
@@ -63,13 +68,6 @@ test_network_zone() {
   lxc start c1
   lxc start c2 --project foo
 
-  # Wait for IPv4 and IPv6 addresses
-  while :; do
-    sleep 1
-    [ -n "$(lxc list -c6 --format=csv c1)" ] || continue
-    break
-  done
-
   # Setup DNS peers
   lxc network zone set lxd.example.net peers.test.address=192.0.2.1
   lxc network zone set lxdfoo.example.net peers.test.address=192.0.2.1 --project=foo
@@ -77,11 +75,11 @@ test_network_zone() {
   lxc network zone set 0.1.0.1.2.4.2.4.2.4.2.4.2.4.d.f.ip6.arpa peers.test.address=192.0.2.1
 
   # Enable the DNS listener on the bridge itself
-  lxc config set core.dns_address 192.0.2.1:8853
+  DNS_ADDR="192.0.2.1"
+  DNS_PORT="8853"
+  lxc config set core.dns_address "${DNS_ADDR}:${DNS_PORT}"
 
   # Check the zones
-  DNS_ADDR="$(lxc config get core.dns_address | cut -d: -f1)"
-  DNS_PORT="$(lxc config get core.dns_address | cut -d: -f2)"
   dig "@${DNS_ADDR}" -p "${DNS_PORT}" axfr lxd.example.net
   dig "@${DNS_ADDR}" -p "${DNS_PORT}" axfr lxd.example.net | grep "${netName}.gw.lxd.example.net.\s\+300\s\+IN\s\+A\s\+"
   dig "@${DNS_ADDR}" -p "${DNS_PORT}" axfr lxd.example.net | grep "c1.lxd.example.net.\s\+300\s\+IN\s\+A\s\+"
@@ -126,7 +124,7 @@ test_network_zone() {
   [ "$(dig "@${DNS_ADDR}" -p "${DNS_PORT}" axfr lxd.example.net | grep -Fc demo.lxd.example.net)" = "6" ]
   lxc network zone record entry remove lxd.example.net demo A 1.1.1.1
 
-  lxd sql global 'select * from networks_zones_records'
+  lxd sql global 'SELECT * FROM networks_zones_records'
   lxc network zone record create lxdfoo.example.net demo user.foo=bar --project foo
   ! lxc network zone record create lxdfoo.example.net demo user.foo=bar --project foo || false
   lxc network zone record entry add lxdfoo.example.net demo A 1.1.1.1 --ttl 900 --project foo
@@ -138,6 +136,26 @@ test_network_zone() {
   lxc network zone record list lxdfoo.example.net --project foo
   [ "$(dig "@${DNS_ADDR}" -p "${DNS_PORT}" axfr lxdfoo.example.net | grep -Fc demo.lxdfoo.example.net)" = "6" ]
   lxc network zone record entry remove lxdfoo.example.net demo A 1.1.1.1 --project foo
+
+  # Test patching of network zone record.
+  lxc network zone record create lxd.example.net patchtest user.key1=val1 user.key2=val2
+  lxc network zone record entry add lxd.example.net patchtest A 3.3.3.3 --ttl 600
+
+  # Patch config. Description, entries, and other config keys must be preserved.
+  lxc query --wait -X PATCH /1.0/network-zones/lxd.example.net/records/patchtest -d '{"config": {"user.key1": "updated"}}'
+  record_output="$(lxc query /1.0/network-zones/lxd.example.net/records/patchtest)"
+  echo "${record_output}" | jq --exit-status '.config["user.key1"] == "updated"'
+  echo "${record_output}" | jq --exit-status '.config["user.key2"] == "val2"'
+  echo "${record_output}" | jq --exit-status '.entries | length == 1'
+
+  # Patch entries. Description and config must be preserved.
+  lxc query --wait -X PATCH /1.0/network-zones/lxd.example.net/records/patchtest -d '{"entries": [{"type": "A", "value": "4.4.4.4", "ttl": 300}]}'
+  record_output="$(lxc query /1.0/network-zones/lxd.example.net/records/patchtest)"
+  echo "${record_output}" | jq --exit-status '.config["user.key1"] == "updated"'
+  echo "${record_output}" | jq --exit-status '.config["user.key2"] == "val2"'
+  echo "${record_output}" | jq --exit-status '.entries[0].value == "4.4.4.4"'
+
+  lxc network zone record delete lxd.example.net patchtest
 
   # Check that the listener survives a restart of LXD
   shutdown_lxd "${LXD_DIR}"

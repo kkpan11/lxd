@@ -3,10 +3,10 @@ test_remote_url() {
   # shellcheck disable=2153
   for url in "${LXD_ADDR}" "https://${LXD_ADDR}"; do
     token="$(lxc config trust add --name foo -q)"
-    lxc_remote remote add test "${url}" --accept-certificate --token "${token}"
+    lxc_remote remote add test "${url}" --token "${token}"
     lxc_remote info test:
-    lxc_remote config trust list | awk '/@/ {print $8}' | while read -r line ; do
-      lxc_remote config trust remove "\"${line}\""
+    for fingerprint in $(lxc_remote config trust list -f csv | awk -F, '{print $4}'); do
+      lxc_remote config trust remove "${fingerprint}"
     done
     lxc_remote remote remove test
   done
@@ -19,7 +19,8 @@ test_remote_url() {
   urls="${LXD_DIR}/unix.socket unix:${LXD_DIR}/unix.socket unix://${LXD_DIR}/unix.socket"
 
   # an invalid protocol returns an error
-  ! lxc_remote remote add test "${url}" --accept-certificate --token foo --protocol foo || false
+  ! lxc_remote remote add test "${url}" --protocol foo || false
+  [ "$(CLIENT_DEBUG="" SHELL_TRACING="" lxc_remote remote add test "${url}" --protocol foo 2>&1)" = "Error: Invalid protocol: foo" ]
 
   for url in ${urls}; do
     lxc_remote remote add test "${url}"
@@ -27,7 +28,7 @@ test_remote_url() {
   done
 
   # Check that we can add simplestream remotes with valid certs without confirmation
-  if [ -z "${LXD_OFFLINE:-}" ]; then
+  if curl --head --silent https://cloud-images.ubuntu.com/releases/ > /dev/null; then
     lxc_remote remote add ubuntu1 https://cloud-images.ubuntu.com/releases/ --protocol=simplestreams
     lxc_remote remote add ubuntu2 https://cloud-images.ubuntu.com:443/releases/ --protocol=simplestreams
     lxc_remote remote remove ubuntu1
@@ -44,16 +45,16 @@ test_remote_url_with_token() {
   echo foo | lxc config trust add -q
 
   # Listing all tokens should show only a single one
-  [ "$(lxc config trust list-tokens -f json | jq '[.[] | select(.ClientName == "foo")] |  length')" -eq 1 ]
+  lxc config trust list-tokens -f json | jq --exit-status '[.[] | select(.ClientName == "foo")] | length == 1'
 
   # Extract token
-  token="$(lxc config trust list-tokens -f json | jq '.[].Token')"
+  token="$(lxc config trust list-tokens -f json | jq --raw-output --exit-status '.[].Token')"
 
   # Invalidate token so that it cannot be used again
   lxc config trust revoke-token foo
 
   # Ensure the token is invalidated
-  [ "$(lxc config trust list-tokens -f json | jq 'length')" -eq 0 ]
+  lxc config trust list-tokens -f json | jq --exit-status 'length == 0'
 
   # Try adding the remote using the invalidated token
   ! lxc_remote remote add test "${token}" || false
@@ -63,81 +64,93 @@ test_remote_url_with_token() {
   echo foo | lxc config trust add -q --projects foo --restricted
 
   # Extract the token
-  token="$(lxc config trust list-tokens -f json | jq -r '.[].Token')"
+  token="$(lxc config trust list-tokens -f json | jq --raw-output --exit-status '.[].Token')"
 
   # Add the valid token
   lxc_remote remote add test "${token}"
 
   # Ensure the token is invalidated
-  [ "$(lxc config trust list-tokens -f json | jq 'length')" -eq 0 ]
+  lxc config trust list-tokens -f json | jq --exit-status 'length == 0'
 
   # List instances as the remote has been added
   lxc_remote ls test:
 
   # Clean up
   lxc_remote remote remove test
-  lxc config trust rm "$(lxc config trust list -f json | jq -r '.[].fingerprint')"
+  lxc config trust rm "$(lxc config trust list -f json | jq --raw-output --exit-status '.[].fingerprint')"
 
   # Generate new token
   echo foo | lxc config trust add -q
 
   # Extract token
-  token="$(lxc config trust list-tokens -f json | jq '.[].Token')"
+  token="$(lxc config trust list-tokens -f json | jq --raw-output --exit-status '.[].Token')"
 
   # create new certificate
   gen_cert_and_key "token-client"
 
   # Try accessing instances (this should fail)
-  [ "$(CERTNAME="token-client" my_curl "https://${LXD_ADDR}/1.0/instances" | jq '.error_code')" -eq 403 ]
+  CERTNAME="token-client" my_curl "https://${LXD_ADDR}/1.0/instances" | jq --exit-status '.error_code == 403'
 
   # Add valid token
-  CERTNAME="token-client" my_curl -X POST -d "{\"trust_token\": ${token}}" "https://${LXD_ADDR}/1.0/certificates"
+  CERTNAME="token-client" my_curl -X POST --fail-with-body -H 'Content-Type: application/json' -d '{"trust_token": "'"${token}"'"}' "https://${LXD_ADDR}/1.0/certificates"
 
   # Check if we can see instances
-  [ "$(CERTNAME="token-client" my_curl "https://${LXD_ADDR}/1.0/instances" | jq '.status_code')" -eq 200 ]
+  CERTNAME="token-client" my_curl "https://${LXD_ADDR}/1.0/instances" | jq --exit-status '.status_code == 200'
 
-  lxc config trust rm "$(lxc config trust list -f json | jq -r '.[].fingerprint')"
+  lxc config trust rm "$(lxc config trust list -f json | jq --raw-output --exit-status '.[].fingerprint')"
 
   # Generate new token
   echo foo | lxc config trust add -q --projects foo --restricted
 
   # Extract token
-  token="$(lxc config trust list-tokens -f json | jq '.[].Token')"
+  token="$(lxc config trust list-tokens -f json | jq --raw-output --exit-status '.[].Token')"
+
+  # Ensure there is a default expiry set (expressed in UTC)
+  expiresAt="$(lxc config trust list-tokens -f json | jq --raw-output --exit-status '.[].ExpiresAt')"
+  [[ "${expiresAt}" =~ UTC$ ]]
 
   # Add valid token but override projects
-  CERTNAME="token-client" my_curl -X POST -d "{\"trust_token\":${token},\"projects\":[\"default\",\"foo\"],\"restricted\":false}" "https://${LXD_ADDR}/1.0/certificates"
+  CERTNAME="token-client" my_curl -X POST --fail-with-body -H 'Content-Type: application/json' -d '{"trust_token": "'"${token}"'","projects":["default","foo"],"restricted":true}' "https://${LXD_ADDR}/1.0/certificates"
 
   # Check if we can see instances in the foo project
-  [ "$(CERTNAME="token-client" my_curl "https://${LXD_ADDR}/1.0/instances?project=foo" | jq '.status_code')" -eq 200 ]
+  CERTNAME="token-client" my_curl "https://${LXD_ADDR}/1.0/instances?project=foo" | jq --exit-status '.status_code == 200'
 
   # Check if we can see instances in the default project (this should fail)
-  [ "$(CERTNAME="token-client" my_curl "https://${LXD_ADDR}/1.0/instances" | jq '.error_code')" -eq 403 ]
+  CERTNAME="token-client" my_curl "https://${LXD_ADDR}/1.0/instances" | jq --exit-status '.error_code == 403'
 
-  lxc config trust rm "$(lxc config trust list -f json | jq -r '.[].fingerprint')"
+  lxc config trust rm "$(lxc config trust list -f json | jq --raw-output --exit-status '.[].fingerprint')"
 
   # Set token expiry to 1 seconds
   lxc config set core.remote_token_expiry 1S
 
   # Generate new token
-  token="$(lxc config trust add --name foo | tail -n1)"
+  token="$(lxc config trust add --name foo --quiet)"
 
   # Try adding remote. This should succeed.
   lxc_remote remote add test "${token}"
 
   # Remove all trusted clients
-  lxc config trust rm "$(lxc config trust list -f json | jq -r '.[].fingerprint')"
+  lxc config trust rm "$(lxc config trust list -f json | jq --raw-output --exit-status '.[].fingerprint')"
 
   # Remove remote
   lxc_remote remote rm test
 
   # Generate new token
-  token="$(lxc config trust add --name foo | tail -n1)"
+  token="$(lxc config trust add --name foo --quiet)"
 
   # This will cause the token to expire
-  sleep 2
+  sleep 1.1
 
   # Try adding remote. This should fail.
   ! lxc_remote remote add test "${token}" || false
+
+  # Check token prune task
+  lxc config trust add --name foo --quiet # Create a token
+  [ "$(lxc operation list --format csv | grep -cF 'TOKEN,Certificate add token,RUNNING')" -eq 1 ] # Expect only one token operation to be running
+  running_token_operation_uuid="$(lxc operation list --format csv | grep -F 'TOKEN,Certificate add token,RUNNING' | cut -d, -f1)" # Get the operation UUID
+  sleep 1.1 # Wait for token to expire (expiry still set to short expiry)
+  lxc query --request POST /internal/testing/prune-tokens # Prune tokens
+  lxc query "/1.0/operations/${running_token_operation_uuid}" | jq --exit-status '.status == "Cancelled"' # Expect the operation to be cancelled
 
   # Unset token expiry
   lxc config unset core.remote_token_expiry
@@ -147,19 +160,34 @@ test_remote_url_with_token() {
 }
 
 test_remote_admin() {
-  ! lxc_remote remote add badpass "${LXD_ADDR}" --accept-certificate --token badtoken || false
-  ! lxc_remote list badpass: || false
+  echo "Verify error due to bad token and inspect error message"
+  OUTPUT="$(! lxc_remote remote add badtoken "${LXD_ADDR}" --token badtoken 2>&1 || false)"
+  echo "${OUTPUT}" | grep -F "Error: Failed decoding trust token:"
+
+  echo "Verify that a bad token does not succeed in adding remote"
+  ! lxc_remote remote add badtoken "${LXD_ADDR}" --token badtoken || false
+  if lxc_remote remote list | grep -wF badtoken; then
+    echo "Remote added with bad token"
+    false
+  fi
 
   token="$(lxc config trust add --name foo -q)"
-  lxc_remote remote add foo "${LXD_ADDR}" --accept-certificate --token "${token}"
-  lxc_remote remote list | grep 'foo'
+
+  # Ensure trust token cannot be used with --accept-certificate.
+  ! lxc_remote remote add foo "${LXD_ADDR}" --accept-certificate --token "${token}" || false
+
+  lxc_remote remote add foo "${LXD_ADDR}" --token "${token}"
+  lxc_remote remote list | grep -wF 'foo'
 
   lxc_remote remote set-default foo
   [ "$(lxc_remote remote get-default)" = "foo" ]
 
   lxc_remote remote rename foo bar
-  lxc_remote remote list | grep 'bar'
-  lxc_remote remote list | grep -v 'foo'
+  lxc_remote remote list -f csv | grep '^bar'
+  if lxc_remote remote list -f csv | grep '^foo'; then
+    echo "Remote rename failed, old name still exists"
+    false
+  fi
   [ "$(lxc_remote remote get-default)" = "bar" ]
 
   ! lxc_remote remote remove bar || false
@@ -173,11 +201,11 @@ test_remote_admin() {
 
   # we just re-add our cert under a different name to test the cert
   # manipulation mechanism.
-  gen_cert client2
+  gen_cert_and_key client2
 
   # Test for #623
   token="$(lxc config trust add --name foo -q)"
-  lxc_remote remote add test-623 "${LXD_ADDR}" --accept-certificate --token "${token}"
+  lxc_remote remote add test-623 "${LXD_ADDR}" --token "${token}"
   lxc_remote remote remove test-623
 
   # now re-add under a different alias
@@ -189,67 +217,71 @@ test_remote_admin() {
 }
 
 test_remote_usage() {
+  # Remove any leftover localhost remote from prior tests
+  lxc remote remove localhost || true
+
   local LXD2_DIR LXD2_ADDR
   LXD2_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
-  chmod +x "${LXD2_DIR}"
   spawn_lxd "${LXD2_DIR}" true
-  LXD2_ADDR=$(cat "${LXD2_DIR}/lxd.addr")
+  LXD2_ADDR=$(< "${LXD2_DIR}/lxd.addr")
 
   ensure_import_testimage
   ensure_has_localhost_remote "${LXD_ADDR}"
 
   token="$(LXD_DIR=${LXD2_DIR} lxc config trust add --name foo -q)"
-  lxc_remote remote add lxd2 "${LXD2_ADDR}" --accept-certificate --token "${token}"
+  lxc_remote remote add lxd2 "${LXD2_ADDR}" --token "${token}"
 
   # we need a public image on localhost
 
   lxc_remote image export localhost:testimage "${LXD_DIR}/foo"
   lxc_remote image delete localhost:testimage
-  sum=$(sha256sum "${LXD_DIR}/foo.tar.xz" | cut -d' ' -f1)
-  lxc_remote image import "${LXD_DIR}/foo.tar.xz" localhost: --public
+  sum=$(sha256sum "${LXD_DIR}/foo.tar"* | cut -d' ' -f1)
+  lxc_remote image import "${LXD_DIR}/foo.tar"* localhost: --public
   lxc_remote image alias create localhost:testimage "${sum}"
 
   lxc_remote image delete "lxd2:${sum}" || true
 
-  lxc_remote image copy localhost:testimage lxd2: --copy-aliases --public
+  lxc_remote image copy --quiet localhost:testimage lxd2: --copy-aliases --public
   lxc_remote image delete "localhost:${sum}"
-  lxc_remote image copy "lxd2:${sum}" local: --copy-aliases --public
+  lxc_remote image copy --quiet "lxd2:${sum}" local: --copy-aliases --public
   lxc_remote image info localhost:testimage
   lxc_remote image delete "lxd2:${sum}"
 
-  lxc_remote image copy "localhost:${sum}" lxd2:
+  lxc_remote image copy --quiet "localhost:${sum}" lxd2:
   lxc_remote image delete "lxd2:${sum}"
 
-  lxc_remote image copy "localhost:$(echo "${sum}" | colrm 3)" lxd2:
+  lxc_remote image copy --quiet "localhost:${sum:0:12}" lxd2:
   lxc_remote image delete "lxd2:${sum}"
 
   # test a private image
-  lxc_remote image copy "localhost:${sum}" lxd2:
+  lxc_remote image copy --quiet "localhost:${sum}" lxd2:
   lxc_remote image delete "localhost:${sum}"
-  lxc_remote init "lxd2:${sum}" localhost:c1
+  lxc_remote init --quiet "lxd2:${sum}" localhost:c1
   lxc_remote delete localhost:c1
 
   lxc_remote image alias create localhost:testimage "${sum}"
 
   # test remote publish
-  lxc_remote init testimage pub
-  lxc_remote publish pub lxd2: --alias bar --public a=b
-  lxc_remote image show lxd2:bar | grep -q "a: b"
-  lxc_remote image show lxd2:bar | grep -q "public: true"
+  lxc_remote init --quiet testimage pub
+  lxc_remote publish --quiet pub lxd2: --alias bar --public a=b
+  lxc_remote image show lxd2:bar | grep -F "a: b"
+  lxc_remote image show lxd2:bar | grep -xF "public: true"
+  fingerprint="$(lxc image list -f csv -c F lxd2:bar)"
   ! lxc_remote image show bar || false
   lxc_remote delete pub
 
   # test spawn from public server
   lxc_remote remote add lxd2-public "${LXD2_ADDR}" --public --accept-certificate
-  lxc_remote init lxd2-public:bar pub
+  lxc_remote init --quiet lxd2-public:bar pub
   lxc_remote image delete lxd2:bar
   lxc_remote delete pub
+  lxc_remote image delete "${fingerprint}"
 
   # Double launch to test if the image downloads only once.
-  lxc_remote init localhost:testimage lxd2:c1 &
+  lxc_remote init --quiet localhost:testimage lxd2:c1 &
   C1PID=$!
 
-  lxc_remote init localhost:testimage lxd2:c2
+  lxc_remote init --quiet localhost:testimage lxd2:c2
   lxc_remote delete lxd2:c2
 
   wait "${C1PID}"
@@ -269,15 +301,7 @@ test_remote_usage() {
   mv "${LXD_CONF}/client.key" "${LXD_CONF}/client.key.bak"
 
   # testimage should still exist on the local server.
-  lxc_remote image list local: | grep -q testimage
-
-  # Skip the truly remote servers in offline mode.
-  # There should always be Ubuntu images in the results from cloud-images.ubuntu.com remote.
-  # And test for alpine in the images.lxd.canonical.com remote.
-  if [ -z "${LXD_OFFLINE:-}" ]; then
-    lxc_remote image list images: | grep -i -c alpine
-    lxc_remote image list ubuntu: | grep -i -c ubuntu
-  fi
+  lxc_remote image list local: | grep -wF testimage
 
   mv "${LXD_CONF}/client.crt.bak" "${LXD_CONF}/client.crt"
   mv "${LXD_CONF}/client.key.bak" "${LXD_CONF}/client.key"
@@ -286,37 +310,37 @@ test_remote_usage() {
 
   lxc_remote image alias create localhost:foo "${sum}"
 
-  lxc_remote image copy "localhost:${sum}" lxd2: --mode=push
+  lxc_remote image copy --quiet "localhost:${sum}" lxd2: --mode=push
   lxc_remote image show lxd2:"${sum}"
-  lxc_remote image show lxd2:"${sum}" | grep -q 'public: false'
+  lxc_remote image show lxd2:"${sum}" | grep -xF 'public: false'
   ! lxc_remote image show lxd2:foo || false
   lxc_remote image delete "lxd2:${sum}"
 
-  lxc_remote image copy "localhost:${sum}" lxd2: --mode=push --copy-aliases --public
+  lxc_remote image copy --quiet "localhost:${sum}" lxd2: --mode=push --copy-aliases --public
   lxc_remote image show lxd2:"${sum}"
-  lxc_remote image show lxd2:"${sum}" | grep -q 'public: true'
+  lxc_remote image show lxd2:"${sum}" | grep -xF 'public: true'
   lxc_remote image show lxd2:foo
   lxc_remote image delete "lxd2:${sum}"
 
-  lxc_remote image copy "localhost:${sum}" lxd2: --mode=push --copy-aliases --alias=bar
+  lxc_remote image copy --quiet "localhost:${sum}" lxd2: --mode=push --copy-aliases --alias=bar
   lxc_remote image show lxd2:"${sum}"
   lxc_remote image show lxd2:foo
   lxc_remote image show lxd2:bar
   lxc_remote image delete "lxd2:${sum}"
 
-  lxc_remote image copy "localhost:${sum}" lxd2: --mode=relay
+  lxc_remote image copy --quiet "localhost:${sum}" lxd2: --mode=relay
   lxc_remote image show lxd2:"${sum}"
-  lxc_remote image show lxd2:"${sum}" | grep -q 'public: false'
+  lxc_remote image show lxd2:"${sum}" | grep -xF 'public: false'
   ! lxc_remote image show lxd2:foo || false
   lxc_remote image delete "lxd2:${sum}"
 
-  lxc_remote image copy "localhost:${sum}" lxd2: --mode=relay --copy-aliases --public
+  lxc_remote image copy --quiet "localhost:${sum}" lxd2: --mode=relay --copy-aliases --public
   lxc_remote image show lxd2:"${sum}"
-  lxc_remote image show lxd2:"${sum}" | grep -q 'public: true'
+  lxc_remote image show lxd2:"${sum}" | grep -xF 'public: true'
   lxc_remote image show lxd2:foo
   lxc_remote image delete "lxd2:${sum}"
 
-  lxc_remote image copy "localhost:${sum}" lxd2: --mode=relay --copy-aliases --alias=bar
+  lxc_remote image copy --quiet "localhost:${sum}" lxd2: --mode=relay --copy-aliases --alias=bar
   lxc_remote image show lxd2:"${sum}"
   lxc_remote image show lxd2:foo
   lxc_remote image show lxd2:bar
@@ -324,36 +348,36 @@ test_remote_usage() {
 
   # Test image copy between projects
   lxc_remote project create lxd2:foo
-  lxc_remote image copy "localhost:${sum}" lxd2: --target-project foo
+  lxc_remote image copy --quiet "localhost:${sum}" lxd2: --target-project foo
   lxc_remote image show lxd2:"${sum}" --project foo
   lxc_remote image delete "lxd2:${sum}" --project foo
-  lxc_remote image copy "localhost:${sum}" lxd2: --target-project foo --mode=push
+  lxc_remote image copy --quiet "localhost:${sum}" lxd2: --target-project foo --mode=push
   lxc_remote image show lxd2:"${sum}" --project foo
   lxc_remote image delete "lxd2:${sum}" --project foo
-  lxc_remote image copy "localhost:${sum}" lxd2: --target-project foo --mode=relay
+  lxc_remote image copy --quiet "localhost:${sum}" lxd2: --target-project foo --mode=relay
   lxc_remote image show lxd2:"${sum}" --project foo
   lxc_remote image delete "lxd2:${sum}" --project foo
   lxc_remote project delete lxd2:foo
 
   # Test image copy with --profile option
   lxc_remote profile create lxd2:foo
-  lxc_remote image copy "localhost:${sum}" lxd2: --profile foo
-  lxc_remote image show lxd2:"${sum}" | grep -q '\- foo'
+  lxc_remote image copy --quiet "localhost:${sum}" lxd2: --profile foo
+  lxc_remote image show lxd2:"${sum}" | grep -xF -- '- foo'
   lxc_remote image delete "lxd2:${sum}"
 
-  lxc_remote image copy "localhost:${sum}" lxd2: --profile foo --mode=push
-  lxc_remote image show lxd2:"${sum}" | grep -q '\- foo'
+  lxc_remote image copy --quiet "localhost:${sum}" lxd2: --profile foo --mode=push
+  lxc_remote image show lxd2:"${sum}" | grep -xF -- '- foo'
   lxc_remote image delete "lxd2:${sum}"
 
-  lxc_remote image copy "localhost:${sum}" lxd2: --profile foo --mode=relay
-  lxc_remote image show lxd2:"${sum}" | grep -q '\- foo'
+  lxc_remote image copy --quiet "localhost:${sum}" lxd2: --profile foo --mode=relay
+  lxc_remote image show lxd2:"${sum}" | grep -xF -- '- foo'
   lxc_remote image delete "lxd2:${sum}"
   lxc_remote profile delete lxd2:foo
 
-  lxc_remote image copy localhost:testimage lxd2: --alias bar
+  lxc_remote image copy --quiet localhost:testimage lxd2: --alias bar
   # Get the `cached` and `aliases` fields for the image `bar` in lxd2
-  cached=$(lxc_remote image info lxd2:bar | awk '/Cached/ { print $2 }')
-  alias=$(lxc_remote image info lxd2:bar | grep -A 1 "Aliases:" | tail -n1 | awk '{print $2}')
+  cached=$(lxc_remote image info lxd2:bar | awk '/^Cached/ { print $2 }')
+  alias=$(lxc_remote image info lxd2:bar | grep -xF -A 1 "Aliases:" | tail -n1 | awk '{print $2}')
 
   # Check that image is not cached
   [ "${cached}" = "no" ]
@@ -362,26 +386,65 @@ test_remote_usage() {
 
   # Now, lets delete the image and observe that when its downloaded implicitly as part of an instance create,
   # the image becomes `cached` and has no alias.
-  fingerprint=$(lxc_remote image info lxd2:bar | awk '/Fingerprint/ { print $2 }')
+  fingerprint=$(lxc_remote image info lxd2:bar | awk '/^Fingerprint/ { print $2 }')
   lxc_remote image delete lxd2:bar
-  lxc_remote init localhost:testimage lxd2:c1
-  cached=$(lxc_remote image info "lxd2:${fingerprint}" | awk '/Cached/ { print $2 }')
+  lxc_remote init --quiet localhost:testimage lxd2:c1
+  cached=$(lxc_remote image info "lxd2:${fingerprint}" | awk '/^Cached/ { print $2 }')
   # The `cached` field should be set to `yes` since the image was implicitly downloaded by the instance create operation
   [ "${cached}" = "yes" ]
   # There should be no alias for the image
-  ! lxc_remote image info "lxd2:${fingerprint}" | grep -q "Aliases:"
+  [ "$(lxc_remote image list "lxd2:${fingerprint}" -f csv -c l || echo fail)" = "" ]
 
   # Finally, lets copy the remote image explicitly to the local server with an alias like we did before
-  lxc_remote image copy localhost:testimage lxd2: --alias bar
-  cached=$(lxc_remote image info lxd2:bar | awk '/Cached/ { print $2 }')
-  alias=$(lxc_remote image info lxd2:bar | grep -A 1 "Aliases:" | tail -n1 | awk '{print $2}')
+  lxc_remote image copy --quiet localhost:testimage lxd2: --alias bar
+  cached=$(lxc_remote image info lxd2:bar | awk '/^Cached/ { print $2 }')
+  alias=$(lxc_remote image info lxd2:bar | grep -xF -A 1 "Aliases:" | tail -n1 | awk '{print $2}')
   # The `cached` field should be set to `no` since the image was explicitly copied.
   [ "${cached}" = "no" ]
   # The alias should be set to `bar`.
   [ "${alias}" = "bar" ]
 
-  lxc_remote image alias delete localhost:foo
+  echo "==> Ensure that the copied image properties are set from source image."
 
+  # Check that the copied image has the same filename as the source image.
+  filename=$(lxc_remote query localhost:"/1.0/images/${fingerprint}" | jq --exit-status '.filename')
+  lxc_remote query lxd2:"/1.0/images/${fingerprint}" | jq --exit-status --raw-output ".filename == ${filename}"
+
+  # Now, change the description property for the downloaded image in the default project.
+  lxc_remote image set-property lxd2:bar description "TEST"
+
+  # Create another project to download the image into.
+  lxc_remote project create lxd2:foo
+
+  # Copy the same image from source into newly created project.
+  lxc_remote image copy --quiet localhost:testimage lxd2: --alias bar --target-project foo
+
+  # Check that the downloaded image in the new project has the description property from source.
+  [ "$(lxc_remote image get-property lxd2:bar description --project foo)" = "$(lxc_remote image get-property localhost:testimage description)" ]
+
+  # Check that the downloaded image in the default project still has custom description.
+  [ "$(lxc_remote image get-property lxd2:bar description --project default)" = "TEST" ]
+
+  # Clean up.
+  lxc_remote image alias delete localhost:foo
+  lxc_remote image delete lxd2:bar --project default
+  lxc_remote image delete lxd2:bar --project foo
+  lxc_remote project delete lxd2:foo
+
+  echo "==> Test copying image on the same remote into a different project."
+  lxc_remote project create localhost:p1
+  lxc_remote image copy --quiet localhost:testimage localhost: --project default --target-project p1 --copy-aliases
+  lxc_remote image delete localhost:testimage --project default
+
+  echo "==> Test copying image from one remote's non-default project into another remote's non-default project."
+  lxc_remote project create lxd2:foo
+  lxc_remote image copy --quiet localhost:testimage lxd2: --project p1 --target-project foo --copy-aliases
+
+  echo "==> Clean up."
+  lxc_remote image delete localhost:testimage --project p1
+  lxc_remote image delete lxd2:testimage --project foo
+  lxc_remote project delete localhost:p1
+  lxc_remote project delete lxd2:foo
   lxc_remote remote remove lxd2
   lxc_remote remote remove lxd2-public
 

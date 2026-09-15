@@ -114,7 +114,7 @@ restart:
 			continue;
 
 		if (close(fd)) {
-			return log_error(-errno, "%s - Failed to close file descriptor %d", strerror(errno), fd);
+			return log_error(-errno, "%s - Failed closing file descriptor %d", strerror(errno), fd);
 		} else {
 			char fdpath[PATH_MAX], realpath[PATH_MAX];
 
@@ -154,7 +154,6 @@ __attribute__ ((noinline)) static int __forkexec(void)
 	call_cleaner(lxc_container_put) struct lxc_container *c = NULL;
 	const char *config_path = NULL, *lxcpath = NULL, *name = NULL;
 	char *cwd = NULL;
-	pid_t init_pid;
 	lxc_attach_options_t attach_options = LXC_ATTACH_OPTIONS_DEFAULT;
 	lxc_attach_command_t command = {
 		.program = NULL,
@@ -164,7 +163,6 @@ __attribute__ ((noinline)) static int __forkexec(void)
 	pid_t attached_pid;
 	uid_t uid;
 	gid_t gid;
-	int coresched;
 
 	if (geteuid() != 0)
 		return log_error(EXIT_FAILURE, "Error: forkexec requires root privileges");
@@ -184,9 +182,6 @@ __attribute__ ((noinline)) static int __forkexec(void)
 	gid = atoi(advance_arg(true));
 	if (gid < 0)
 		gid = (gid_t) - 1;
-	coresched = atoi(advance_arg(true));
-	if (coresched != 0 && coresched != 1)
-		_exit(EXIT_FAILURE);
 
 	for (char *arg = NULL, *section = NULL; (arg = advance_arg(false)); ) {
 		if (!strcmp(arg, "--") && (!section || strcmp(section, "cmd"))) {
@@ -204,11 +199,11 @@ __attribute__ ((noinline)) static int __forkexec(void)
 				attach_options.initial_cwd = arg + STRLITERALLEN("HOME=");
 			ret = push_vargs(&envvp, arg);
 			if (ret < 0)
-				return log_error(ret, "Failed to add %s to env array", arg);
+				return log_error(ret, "Failed adding %s to env array", arg);
 		} else if (!strcmp(section, "cmd")) {
 			ret = push_vargs(&argvp, arg);
 			if (ret < 0)
-				return log_error(ret, "Failed to add %s to arg array", arg);
+				return log_error(ret, "Failed adding %s to arg array", arg);
 		} else {
 			return log_error(EXIT_FAILURE, "Invalid exec section %s", section);
 		}
@@ -233,16 +228,16 @@ __attribute__ ((noinline)) static int __forkexec(void)
 
 	ret = fd_cloexec(status_pipe, true);
 	if (ret)
-		return log_errno(EXIT_FAILURE, "Failed to make pipe close-on-exec");
+		return log_errno(EXIT_FAILURE, "Failed making pipe close-on-exec");
 
 	c = lxc_container_new(name, lxcpath);
 	if (!c)
-		return log_error(EXIT_FAILURE, "Failed to load new container %s/%s", lxcpath, name);
+		return log_error(EXIT_FAILURE, "Failed loading new container %s/%s", lxcpath, name);
 
 	c->clear_config(c);
 
 	if (!c->load_config(c, config_path))
-		return log_error(EXIT_FAILURE, "Failed to load config file %s for %s/%s", config_path, lxcpath, name);
+		return log_error(EXIT_FAILURE, "Failed loading config file %s for %s/%s", config_path, lxcpath, name);
 
 	if (strcmp(cwd, ""))
 		attach_options.initial_cwd = cwd;
@@ -263,53 +258,13 @@ __attribute__ ((noinline)) static int __forkexec(void)
 	ret = write_nointr(status_pipe, &attached_pid, sizeof(attached_pid));
 	if (ret < 0) {
 		// Kill the child just to be safe.
-		fprintf(stderr, "Failed to send pid %d of executing child to LXD. Killing child\n", attached_pid);
+		fprintf(stderr, "Failed sending pid %d of executing child to LXD. Killing child\n", attached_pid);
 		kill(attached_pid, SIGKILL);
-		goto out_reap;
 	}
 
-	if (coresched == 1) {
-		pid_t pid;
-
-		init_pid = c->init_pid(c);
-		if (init_pid < 0) {
-			kill(attached_pid, SIGKILL);
-			goto out_reap;
-		}
-
-		pid = vfork();
-		if (pid < 0) {
-			kill(attached_pid, SIGKILL);
-			goto out_reap;
-		}
-
-		if (pid == 0) {
-			__u64 cookie;
-
-			ret = core_scheduling_cookie_share_with(init_pid);
-			if (ret)
-				_exit(EXIT_FAILURE);
-
-			ret = core_scheduling_cookie_share_to(attached_pid);
-			if (ret)
-				_exit(EXIT_FAILURE);
-
-			cookie = core_scheduling_cookie_get(attached_pid);
-			if (!core_scheduling_cookie_valid(cookie))
-				_exit(EXIT_FAILURE);
-
-			_exit(EXIT_SUCCESS);
-		}
-
-		ret = wait_for_pid(pid);
-		if (ret)
-			kill(attached_pid, SIGKILL);
-	}
-
-out_reap:
 	ret = wait_for_pid_status_nointr(attached_pid);
 	if (ret < 0)
-		return log_error(EXIT_FAILURE, "Failed to wait for child process %d", attached_pid);
+		return log_error(EXIT_FAILURE, "Failed waiting for child process %d", attached_pid);
 
 	if (WIFEXITED(ret))
 		return WEXITSTATUS(ret);
@@ -328,11 +283,11 @@ void forkexec(void)
 import "C"
 
 import (
-	"fmt"
+	"errors"
 
 	"github.com/spf13/cobra"
 
-	// Used by cgo
+	// Used by cgo.
 	_ "github.com/canonical/lxd/lxd/include"
 )
 
@@ -340,10 +295,10 @@ type cmdForkexec struct {
 	global *cmdGlobal
 }
 
-func (c *cmdForkexec) Command() *cobra.Command {
+func (c *cmdForkexec) command() *cobra.Command {
 	// Main subcommand
 	cmd := &cobra.Command{}
-	cmd.Use = "forkexec <container name> <containers path> <config> <cwd> <uid> <gid> <coresched> -- env [key=value...] -- cmd <args...>"
+	cmd.Use = "forkexec <container name> <containers path> <config> <cwd> <uid> <gid> -- env [key=value...] -- cmd <args...>"
 	cmd.Short = "Execute a task inside the container"
 	cmd.Long = `Description:
   Execute a task inside the container
@@ -351,12 +306,12 @@ func (c *cmdForkexec) Command() *cobra.Command {
   This internal command is used to spawn a task inside the container and
   allow LXD to interact with it.
 `
-	cmd.RunE = c.Run
+	cmd.RunE = c.run
 	cmd.Hidden = true
 
 	return cmd
 }
 
-func (c *cmdForkexec) Run(cmd *cobra.Command, args []string) error {
-	return fmt.Errorf("This command should have been intercepted in cgo")
+func (c *cmdForkexec) run(cmd *cobra.Command, args []string) error {
+	return errors.New("This command should have been intercepted in cgo")
 }

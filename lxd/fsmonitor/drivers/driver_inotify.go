@@ -11,7 +11,6 @@ import (
 	in "k8s.io/utils/inotify"
 
 	"github.com/canonical/lxd/lxd/fsmonitor"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/logger"
 )
 
@@ -83,13 +82,13 @@ func (d *inotify) load(ctx context.Context) error {
 
 	d.watcher, err = in.NewWatcher()
 	if err != nil {
-		return fmt.Errorf("Failed to initialize: %w", err)
+		return fmt.Errorf("Failed initializing: %w", err)
 	}
 
 	err = d.watchFSTree(d.prefixPath)
 	if err != nil {
 		_ = d.watcher.Close()
-		return fmt.Errorf("Failed to watch directory %q: %w", d.prefixPath, err)
+		return fmt.Errorf("Failed watching directory %q: %w", d.prefixPath, err)
 	}
 
 	go d.getEvents(ctx)
@@ -109,7 +108,7 @@ func (d *inotify) getEvents(ctx context.Context) {
 			action, err := d.toFSMonitorEvent(event.Mask)
 			if err != nil {
 				if !errors.Is(err, errIgnoreEvent) {
-					logger.Warn("Failed to match inotify event, skipping", logger.Ctx{"err": err})
+					logger.Warn("Failed matching inotify event, skipping", logger.Ctx{"err": err})
 				}
 
 				continue
@@ -177,10 +176,6 @@ func (d *inotify) getEvents(ctx context.Context) {
 }
 
 func (d *inotify) watchFSTree(path string) error {
-	if !shared.PathExists(path) {
-		return errors.New("Path doesn't exist")
-	}
-
 	err := filepath.Walk(path, func(path string, info os.FileInfo, err error) error {
 		// Check for errors here as we only care about directories. Files and symlinks aren't of interest for this.
 		if err != nil {
@@ -199,19 +194,19 @@ func (d *inotify) watchFSTree(path string) error {
 
 		mask, err := d.eventMask()
 		if err != nil {
-			return fmt.Errorf("Failed to get an inotify event mask: %w", err)
+			return fmt.Errorf("Failed getting an inotify event mask: %w", err)
 		}
 
 		err = d.watcher.AddWatch(path, mask)
 		if err != nil {
-			d.logger.Warn("Failed to watch path", logger.Ctx{"path": path, "err": err})
+			d.logger.Warn("Failed watching path", logger.Ctx{"path": path, "err": err})
 			return nil
 		}
 
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to watch directory tree: %w", err)
+		return fmt.Errorf("Failed watching directory tree: %w", err)
 	}
 
 	return nil

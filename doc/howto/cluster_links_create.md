@@ -1,0 +1,219 @@
+---
+myst:
+  html_meta:
+    description: Create bidirectional and unidirectional cluster links between LXD clusters.
+---
+
+(howto-cluster-links-create)=
+# How to create cluster links
+
+{ref}`Cluster links <exp-cluster-links>` connect separate LXD clusters.
+There are three link types (bidirectional, unidirectional, and public), each with a different creation flow.
+
+## Network addresses
+
+Cluster links use LXD's existing HTTPS listeners. On a clustered server, link trust tokens
+and bidirectional activation requests advertise the local member's `cluster.https_address`,
+including its port. Address refresh subsequently discovers the remote cluster's member addresses.
+These addresses must be reachable from the linked cluster.
+
+On a standalone server, bootstrap addresses come from `core.https_address`. A wildcard
+listener includes the host's global unicast addresses, which can include internal networks.
+Configure a specific `core.https_address` to restrict these advertised addresses. This also
+restricts the core HTTPS listener; cluster links do not create a separate listener or select
+an outbound source interface.
+
+(howto-cluster-links-auth)=
+## Prepare authentication
+
+Before creating bidirectional or unidirectional cluster links, set up proper authentication groups and {ref}`manage permissions <manage-permissions>`:
+
+```bash
+lxc auth group create <group-name>
+lxc auth group permission add <group-name> <entity-type> <entitlement>
+```
+
+The example below shows how to create an authentication group for each cluster called `link` with the `admin` entitlement on the `server` entity type:
+
+```{code-block} bash
+:caption: Example: Cluster A
+lxc auth group create link
+lxc auth group permission add link server admin
+```
+
+```{code-block} bash
+:caption: Example: Cluster B
+lxc auth group create link
+lxc auth group permission add link server admin
+```
+
+Adjust the permissions according to your security requirements. {ref}`Fine-grained permissions <fine-grained-authorization>` can be applied to control what operations each cluster can perform on the other.
+
+For example, you can create a more restricted group for backup operations only:
+
+```bash
+lxc auth group create backup
+lxc auth group permission add backup instance my-instance can_manage_backups
+```
+
+(howto-cluster-links-create-bidirectional)=
+## Create a bidirectional cluster link
+
+To create a bidirectional cluster link between two clusters (Cluster A and Cluster B), you must create the link on both sides. Follow these steps:
+
+1. On Cluster A, create a new cluster link to Cluster B and receive a trust token:
+
+   `````{tabs}
+   ````{group-tab} CLI
+   ```bash
+   lxc cluster link create <name-of-link-to-cluster-b> --auth-group <auth-group-name>
+   ```
+
+   This command:
+   - Creates a pending identity for Cluster B under the link name you provided.
+   - Assigns this identity to the specified authentication group.
+   - Returns a trust token.
+
+   Copy the trust token. You'll need it for the next step.
+
+   Example:
+
+   ```bash
+   lxc cluster link create cluster_b --auth-group clusters
+   ```
+   ````
+   ````{group-tab} UI
+   Click {guilabel}`Clustering` in the navigation sidebar, then select {guilabel}`Links` from the expanded drop-down list.
+
+   Click on the {guilabel}`+ Create cluster link` button to open the side panel.
+
+   Enter a name and optionally a description for the new cluster link.
+   Leave {guilabel}`Generate token` checked, select relevant authentication group(s), and click {guilabel}`Create link`.
+
+   In the modal, click the copy button {{copy_button}} to copy the token.
+   ````
+   `````
+
+2. On Cluster B, create the corresponding cluster link using the trust token from Cluster A:
+
+   `````{tabs}
+   ````{group-tab} CLI
+   ```bash
+   lxc cluster link create <name-of-link-to-cluster-a> --token <token-from-A> --auth-group <auth-group-name>
+   ```
+
+   This command:
+   - Verifies the token's fingerprint against Cluster A's certificate.
+   - Creates an identity for Cluster A under the name you provided and assigns it to the specified authentication group.
+   - Activates the pending link with Cluster A by sending Cluster B's certificate.
+   - Establishes bidirectional trust between the clusters.
+
+   Example:
+
+   ```bash
+   lxc cluster link create cluster_a --token <token-from-A> --auth-group clusters
+   ```
+   ````
+   ````{group-tab} UI
+   Click {guilabel}`Clustering` in the navigation sidebar, then select {guilabel}`Links` from the expanded drop-down list.
+
+   Click on the {guilabel}`+ Create cluster link` button to open the side panel.
+
+   Enter a name and optionally a description for the new cluster link.
+   Select {guilabel}`I have a token`, and paste the trust token you generated in the previous step.
+   Select relevant authentication group(s), then click {guilabel}`Create link`.
+   ````
+   `````
+
+(howto-cluster-links-create-unidirectional)=
+## Create a unidirectional cluster link
+
+A unidirectional link lets Cluster A access Cluster B's resources, but Cluster B cannot initiate requests to Cluster A. Cluster B creates an identity for Cluster A, but Cluster A does not create an identity for Cluster B.
+
+Follow these steps:
+
+1. On Cluster B (the target), issue a pending identity token:
+
+   ```bash
+   lxc auth identity create cluster-link/<name-for-cluster-a> --group <auth-group-name>
+   ```
+
+   This command creates a pending `Cluster link certificate` identity on Cluster B and returns a trust token.
+
+   Example:
+
+   ```bash
+   lxc auth identity create cluster-link/cluster_a --group clusters
+   ```
+
+1. On Cluster A (the initiator), create the cluster link using the token from Cluster B:
+
+   ```bash
+   lxc cluster link create <name-for-cluster-b> --token <token-from-B> --unidirectional
+   ```
+
+   This command:
+   - Pins Cluster B's certificate on Cluster A.
+   - Calls back to Cluster B to activate Cluster B's pending identity for Cluster A.
+   - Stores Cluster B's addresses in {config:option}`cluster-link-volatile-conf:volatile.addresses` so Cluster A can reach B.
+
+   Example:
+
+   ```bash
+   lxc cluster link create cluster_b --token <token-from-B> --unidirectional
+   ```
+
+After these steps, Cluster A has a link with `type: unidirectional` and no associated identity. Cluster B has an active `Cluster link certificate` identity for Cluster A but no cluster link record.
+
+(howto-cluster-links-create-public)=
+## Create a public cluster link
+
+A public link lets Cluster A connect to Cluster B without any token exchange. Cluster A fetches and pins Cluster B's TLS certificate, but Cluster B has no record of the connection. Neither cluster creates an identity for the other. Use this type when Cluster B exposes resources publicly or when you want anonymous read access.
+
+No authentication groups are required for public links.
+
+On Cluster A (the initiator), create the cluster link:
+
+```bash
+lxc cluster link create <name-for-cluster-b> --public --remote-address <cluster-b-address>
+```
+
+This command:
+- Fetches Cluster B's TLS certificate through the LXD server and displays its fingerprint.
+- Prompts you to confirm the fingerprint.
+- If confirmed, pins the certificate and activates the link on Cluster A. If declined, the pending link is removed.
+
+Until you confirm the fingerprint, the link exists but is inert: no certificate is pinned and no address is set, so it cannot be used to reach Cluster B.
+If the command is interrupted at the prompt, the pending link is left behind — re-running the same command refreshes it, or you can remove it with [`lxc cluster link delete`](lxc_cluster_link_delete.md).
+
+Example:
+
+```bash
+lxc cluster link create cluster_b --public --remote-address 10.0.0.2:8443
+```
+
+After these steps, Cluster A has a link with `type: public` and no associated identity. Cluster B has no link or identity for Cluster A.
+
+(howto-cluster-links-identities)=
+## View the underlying identities
+
+LXD creates `Cluster link certificate` identities differently depending on the link type:
+
+- **Bidirectional links:** each cluster creates an identity for the other. On either cluster, view the identity for the remote cluster with:
+
+  ```bash
+  lxc auth identity show tls/<cluster-link-name>
+  ```
+
+- **Unidirectional links:** only the target cluster (B) has an identity for the initiator cluster (A). The initiator cluster has no associated identity. To view the identity, run the following on Cluster B:
+
+  ```bash
+  lxc auth identity show tls/<name-for-cluster-a>
+  ```
+
+The output shows the identity with the type `Cluster link certificate`.
+
+## Next steps
+
+- {ref}`howto-replicators-setup` — set up replicators to sync instances across this link for active-passive disaster recovery.
+- {ref}`howto-cluster-links-manage` — view, configure, and delete existing cluster links.

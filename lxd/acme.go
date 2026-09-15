@@ -3,9 +3,6 @@ package main
 import (
 	"context"
 	"net/http"
-	"net/url"
-
-	"github.com/gorilla/mux"
 
 	"github.com/canonical/lxd/lxd/acme"
 	"github.com/canonical/lxd/lxd/cluster"
@@ -19,45 +16,30 @@ import (
 	"github.com/canonical/lxd/shared/logger"
 )
 
-var apiACME = []APIEndpoint{
-	acmeChallengeCmd,
-}
-
-var acmeChallengeCmd = APIEndpoint{
-	Path: ".well-known/acme-challenge/{token}",
-
-	Get: APIEndpointAction{Handler: acmeProvideChallenge, AllowUntrusted: true},
-}
-
 func acmeProvideChallenge(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	token, err := url.PathUnescape(mux.Vars(r)["token"])
+	leaderInfo, err := s.LeaderInfo()
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	if s.ServerClustered {
-		leader, err := d.gateway.LeaderAddress()
+	if !leaderInfo.Leader {
+		// Forward the request to the leader
+		client, err := cluster.Connect(r.Context(), leaderInfo.Address, s.Endpoints.NetworkCert(), s.ServerCert(), true)
 		if err != nil {
 			return response.SmartError(err)
 		}
 
-		// This gives me the correct value
-		clusterAddress := s.LocalConfig.ClusterAddress()
-
-		if clusterAddress != "" && clusterAddress != leader {
-			// Forward the request to the leader
-			client, err := cluster.Connect(leader, s.Endpoints.NetworkCert(), s.ServerCert(), r, true)
-			if err != nil {
-				return response.SmartError(err)
-			}
-
-			return response.ForwardedResponse(client, r)
-		}
+		return response.ForwardedResponse(client)
 	}
 
-	if d.http01Provider == nil || d.http01Provider.Token() != token {
+	if d.http01Provider == nil {
+		return response.NotFound(nil)
+	}
+
+	token := r.PathValue("token")
+	if d.http01Provider.Token() != token {
 		return response.NotFound(nil)
 	}
 
@@ -83,21 +65,16 @@ func autoRenewCertificate(ctx context.Context, d *Daemon, force bool) error {
 	}
 
 	// If we are clustered, let the leader handle the certificate renewal.
-	if s.ServerClustered {
-		leader, err := d.gateway.LeaderAddress()
-		if err != nil {
-			return err
-		}
-
-		// Figure out our own cluster address.
-		clusterAddress := s.LocalConfig.ClusterAddress()
-
-		if clusterAddress != leader {
-			return nil
-		}
+	leaderInfo, err := s.LeaderInfo()
+	if err != nil {
+		return err
 	}
 
-	opRun := func(op *operations.Operation) error {
+	if !leaderInfo.Leader {
+		return nil
+	}
+
+	opRun := func(ctx context.Context, op *operations.Operation) error {
 		newCert, err := acme.UpdateCertificate(s, d.http01Provider, s.ServerClustered, domain, email, caURL, force)
 		if err != nil {
 			return err
@@ -114,7 +91,7 @@ func autoRenewCertificate(ctx context.Context, d *Daemon, force bool) error {
 				ClusterCertificateKey: string(newCert.PrivateKey),
 			}
 
-			err = updateClusterCertificate(s.ShutdownCtx, s, d.gateway, nil, req)
+			err = updateClusterCertificate(ctx, s, d.gateway, nil, false, req)
 			if err != nil {
 				return err
 			}
@@ -137,17 +114,16 @@ func autoRenewCertificate(ctx context.Context, d *Daemon, force bool) error {
 		return nil
 	}
 
-	op, err := operations.OperationCreate(s, "", operations.OperationClassTask, operationtype.RenewServerCertificate, nil, nil, opRun, nil, nil, nil)
-	if err != nil {
-		logger.Error("Failed creating renew server certificate operation", logger.Ctx{"err": err})
-		return err
+	args := operations.OperationArgs{
+		Type:    operationtype.RenewServerCertificate,
+		Class:   operationtype.OperationClassTask,
+		RunHook: opRun,
 	}
 
 	logger.Info("Starting automatic server certificate renewal check")
-
-	err = op.Start()
+	op, err := operations.ScheduleServerOperation(s, args)
 	if err != nil {
-		logger.Error("Failed starting renew server certificate operation", logger.Ctx{"err": err})
+		logger.Error("Failed creating renew server certificate operation", logger.Ctx{"err": err})
 		return err
 	}
 

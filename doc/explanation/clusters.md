@@ -1,0 +1,324 @@
+---
+discourse: lxc:[Scriptlet&#32;based&#32;instance&#32;placement&#32;scheduler](15728)
+---
+
+(exp-clusters)=
+# Clusters
+
+```{youtube} https://www.youtube.com/watch?v=nrOR6yaO_MY
+:title: Deep dive into LXD clustering
+```
+
+To spread the total workload over several servers, LXD can be run in clustering mode.
+In this scenario, any number of LXD servers share the same distributed database that holds the configuration for the cluster members and their instances.
+The LXD cluster can be managed uniformly using the [`lxc`](lxc.md) client or the REST API.
+
+This feature was introduced as part of the [`clustering`](../api-extensions.md#clustering) API extension and is available since LXD 3.0.
+
+```{tip}
+If you want to quickly set up a basic LXD cluster, check out [MicroCloud](https://canonical.com/microcloud).
+```
+
+(clustering-members)=
+## Cluster members
+
+A LXD cluster consists of one bootstrap server and at least two further cluster members.
+It stores its state in a [distributed database](../database.md), which is a [Dqlite](https://canonical.com/dqlite) database replicated using the Raft algorithm.
+
+While you could create a cluster with only two members, it is strongly recommended that the number of cluster members be at least three.
+With this setup, the cluster can survive the loss of at least one member and still be able to establish quorum for its distributed state.
+
+When you create the cluster, the Dqlite database runs on only the bootstrap server until a third member joins the cluster.
+Then both the second and the third server receive a replica of the database.
+
+See {ref}`cluster-form` for more information.
+
+(clustering-member-roles)=
+### Member roles
+
+In a cluster with three members, all members replicate the distributed database that stores the state of the cluster.
+If the cluster has more members, only some of them replicate the database.
+The remaining members have access to the database, but don't replicate it.
+
+At each time, there is an elected cluster leader that monitors the health of the other members.
+
+Each member that replicates the database has either the role of a *voter* or of a *stand-by*.
+If the cluster leader goes offline, one of the voters is elected as the new leader.
+If a voter member goes offline, a stand-by member is automatically promoted to voter.
+The database (and hence the cluster) remains available as long as a majority of voters is online.
+
+The following roles can be assigned to LXD cluster members.
+Automatic roles are assigned by LXD itself and cannot be modified by the user.
+
+| Role                  | Automatic     | Description |
+| :---                  | :--------     | :---------- |
+| `database-voter`      | yes           | Voting member of the distributed database |
+| `database-leader`     | yes           | Current leader of the distributed database |
+| `database-standby`    | yes           | Stand-by (non-voting) member of the distributed database |
+| `control-plane`       | no            | Eligible to participate in Raft as voter, standby, or leader; when control plane mode is active, members without this role are assigned as spares and excluded from automatic promotion |
+| `ovn-chassis`         | no            | Uplink gateway candidate for OVN networks |
+
+The default number of voter members ({config:option}`server-cluster:cluster.max_voters`) is three.
+The default number of stand-by members ({config:option}`server-cluster:cluster.max_standby`) is two.
+With this configuration, your cluster will remain operational as long as you switch off at most one voting member at a time.
+
+(clustering-control-plane)=
+#### Control plane mode
+The `control-plane` role is optional and is not assigned by default.
+
+It designates which members are eligible for database roles (voter, standby, leader), enabling safe auto-scaling with fixed database members and dynamic worker members.
+
+Control plane mode activates when at least 3 members have the role assigned.
+Once active, only members with the `control-plane` role can participate in Raft and be assigned as voters, standbys, or the leader.
+Members without the `control-plane` role are automatically assigned the `RAFT_SPARE` role and are excluded from automatic promotion to database roles.
+Spare members can still run instances and act as "worker" members for hosting workloads.
+
+You can assign the `control-plane` role to more members than {config:option}`server-cluster:cluster.max_voters` to create a pool of eligible candidates.
+
+For example, if you assign `control-plane` to 5 members when `cluster.max_voters` is 3, all 5 members are eligible for database roles, but only 3 will be promoted to voters based on the configuration.
+
+If no cluster members have the `control-plane` role assigned (the default), or if fewer than 3 members have the role, all members are eligible for automatic promotion to database roles.
+
+When control plane mode is active, members with the `control-plane` role also act as event hubs for internal LXD events.
+If control plane mode is inactive, the cluster uses full-mesh event connectivity.
+
+See {ref}`cluster-manage-control-plane` for instructions on using the `control-plane` role.
+
+(clustering-offline-members)=
+#### Offline members and fault tolerance
+
+If a cluster member is down for more than the configured offline threshold, its status is marked as offline.
+In this case, no operations are possible on this member, and neither are operations that require a state change across all members.
+
+As soon as the offline member comes back online, operations are available again.
+
+If the member that goes offline is the leader itself, the other members will elect a new leader.
+
+If you can't or don't want to bring the server back online, you can [delete it from the cluster](cluster-manage-delete-members).
+
+You can tweak the amount of seconds after which a non-responding member is considered offline by setting the {config:option}`server-cluster:cluster.offline_threshold` configuration.
+The default value is 20 seconds.
+The minimum value is 10 seconds.
+
+To automatically {ref}`evacuate <cluster-evacuate>` instances from an offline member, set the {config:option}`server-cluster:cluster.healing_threshold` configuration to a non-zero value.
+
+See {ref}`cluster-recover` for more information.
+
+(clustering-failure-domains)=
+#### Failure domains
+
+You can use failure domains to indicate which cluster members should be given preference when assigning roles to a cluster member that has gone offline.
+For example, if a cluster member that currently has the `database-voter` role is shut down and control plane mode is active, LXD tries to promote another `control-plane` cluster member in the same failure domain to voter, if one is available. If no members have the `control-plane` role assigned (the default), any suitable member in the same failure domain can be promoted instead.
+
+See {ref}`cluster-manage-failure-domains` for more information.
+
+(clustering-member-config)=
+### Member configuration
+
+LXD cluster members are generally assumed to be identical systems.
+This means that all LXD servers joining a cluster must have an identical configuration to the bootstrap server, in terms of storage pools and networks.
+
+To accommodate things like slightly different disk ordering or network interface naming, there is an exception for some configuration options related to storage and networks, which are member-specific.
+
+When such settings are present in a cluster, any server that is being added must provide a value for them.
+Most often, this is done through the interactive `lxd init` command, which asks the user for the value for a number of configuration keys related to storage or networks.
+
+Those settings typically include:
+
+- The source device and size (quota) for a storage pool
+- The name for a ZFS zpool, LVM thin pool or LVM volume group
+- External interfaces and BGP next-hop for a bridged network
+- The name of the parent network device for managed `physical` or `macvlan` networks
+
+See {ref}`howto-cluster-storage` and {ref}`cluster-config-networks` for more information.
+
+If you want to look up the questions ahead of time (which can be useful for scripting), query the `/1.0/cluster` API endpoint.
+This can be done through `lxc query /1.0/cluster` or through other API clients.
+
+## Images
+
+By default, LXD replicates images on as many cluster members as there are database members.
+This typically means up to three copies within the cluster.
+
+You can increase that number to improve fault tolerance and the likelihood of the image being locally available.
+To do so, set the {config:option}`server-cluster:cluster.images_minimal_replica` configuration.
+The special value of `-1` can be used to have the image copied to all cluster members.
+
+(cluster-groups)=
+## Cluster groups
+
+In a LXD cluster, you can add members to cluster groups.
+You can use these cluster groups to launch instances on a cluster member that belongs to a subset of all available members.
+For example, you could create a cluster group for all members that have a GPU and then launch all instances that require a GPU on this cluster group.
+
+By default, all cluster members belong to the `default` group.
+
+See {ref}`howto-cluster-groups` and {ref}`cluster-target-instance` for more information.
+
+(exp-cluster-links)=
+## Cluster links
+
+Cluster links enable communication between separate LXD clusters by pinning the remote cluster's TLS certificate and optionally establishing mutual trust.
+
+Cluster links are the foundation for {ref}`replicators <exp-replicators>`, which use bidirectional links to sync instances across clusters for active-passive disaster recovery. Unidirectional links are suited to scenarios where one cluster needs to access another cluster without granting reciprocal access.
+
+### Link types
+
+There are three link types, each suited to different trust and access requirements:
+
+`bidirectional`
+: Either cluster can initiate requests to the other cluster. The clusters authenticate each other using mutual TLS, and both clusters create an identity for the other side. This is the default type.
+
+`unidirectional`
+: Requests can only be sent in one direction: from Cluster A to Cluster B. Cluster A pins Cluster B's certificate and uses a token to activate a pending identity that Cluster B created for Cluster A. Cluster B stores only a TLS identity for Cluster A (no cluster link record) and can authenticate incoming requests from Cluster A, but holds no address for Cluster A and cannot initiate requests to it.
+
+`public`
+: An initiating cluster (Cluster A) stores a link to a public cluster (Cluster B). Cluster A connects to Cluster B without presenting a client certificate, relying solely on certificate pinning for server authentication. Cluster B has no record of the connection, and neither cluster creates an identity for the other. Use this type when Cluster B exposes resources publicly or when you want read-only, anonymous access to Cluster B.
+
+### Connection process
+
+All link types rely on TLS certificate pinning: Cluster A fetches and pins Cluster B's certificate before making any connection. The link type determines the level (and direction) of trust that is established between Cluster A and Cluster B.
+
+#### Bidirectional connection process
+
+1. A user initiates the process to {ref}`create a bidirectional cluster link <howto-cluster-links-create-bidirectional>` on Cluster A, generating a trust token.
+1. A user uses this token to create the corresponding link on Cluster B, establishing the connection and sending Cluster B's certificate back.
+1. Both clusters validate certificates and activate their cluster links.
+1. The trust relationship is established and both clusters can communicate.
+
+#### Unidirectional connection process
+
+1. A user initiates the process to {ref}`create a unidirectional cluster link <howto-cluster-links-create-unidirectional>` by issuing a pending identity token on Cluster B.
+1. A user uses that token to create the link on Cluster A. This pins Cluster B's certificate on Cluster A and calls back to Cluster B to activate the pending identity.
+1. Cluster A has an active cluster link to Cluster B with no associated identity. Cluster B has an active TLS identity for Cluster A but no cluster link record.
+
+#### Public connection process
+
+1. A user initiates the process to {ref}`create a public cluster link <howto-cluster-links-create-public>` on Cluster A that points to Cluster B.
+1. Cluster A's LXD server fetches Cluster B's certificate, confirms Cluster B is serving the LXD API, and creates a pending link holding that certificate and the verified address. Neither is pinned yet, so the link is inert. The fingerprint is displayed for the user to confirm.
+1. If the user confirms, a request echoing back the fingerprint is sent to Cluster A's LXD server to acknowledge the certificate the user verified. Cluster A checks the returned fingerprint against the certificate it already fetched, then pins that certificate and activates the link using the address it verified. If the user rejects it, the pending link is deleted. Cluster B is not contacted beyond the initial certificate fetch and has no record of the link.
+
+For more information, see: {ref}`howto-cluster-links-create`.
+
+(exp-clusters-links-identity)=
+### Identity management
+
+The identities created depend on the link type:
+
+- **Bidirectional**: LXD creates a `Cluster link certificate` identity on each side. The identity can be in one of two states:
+  - **Pending**: A trust token has been generated but the link has not been activated yet.
+  - **Active**: Both clusters have exchanged certificates and the link is operational.
+- **Unidirectional**: Cluster B creates a TLS identity for Cluster A (no cluster link record). Cluster A stores Cluster B's certificate directly without an associated identity.
+
+Identities are managed using {ref}`fine-grained authorization <fine-grained-authorization>`.
+
+### Security considerations
+
+- **Certificate validation**: All connections verify certificate fingerprints.
+- **Fine-grained permissions**: Linked clusters can be granted specific entitlements (for example, only backup operations).
+- **Identity isolation**: Each cluster link gets its own identity that can be managed independently.
+- **Group membership**: Cluster link identities can be assigned to authentication groups for bulk permission management.
+
+Together, these controls limit the potential impact of a compromised link by enforcing certificate-based trust and least-privilege access. They also make it possible to revoke a single link's access without impacting other cluster-to-cluster trust relationships.
+
+### Removal
+
+Deleting a cluster link revokes the security trust it established. The scope depends on the link type:
+
+- **Bidirectional**: Run [`lxc cluster link delete`](lxc_cluster_link_delete.md) on both clusters to fully remove the trust relationship.
+- **Unidirectional**: Deleting on Cluster A removes only Cluster A's link. Cluster B's identity remains until Cluster B explicitly revokes it with [`lxc auth identity delete`](lxc_auth_identity_delete.md) `cluster-link/<name-for-cluster-a>`.
+
+### Member status
+
+A cluster link member can have one of the following statuses. Run [`lxc cluster link info`](lxc_cluster_link_info.md) to check member status. (Refer to {ref}`howto-cluster-links-view` for additional details.)
+
+- `ACTIVE`: Reachable and authenticated. The link is usable for requests according to the {ref}`entitlements <fine-grained-authorization>` you granted.
+- `UNAUTHENTICATED`: Reachable but not authenticated. The remote cluster cannot use the link yet. Resolve the trust exchange before relying on it.
+- `UNREACHABLE`: Not reachable. Requests that depend on the link will fail until connectivity is restored or the remote cluster is online.
+
+Member status reflects connectivity, while [`lxc cluster link list`](lxc_cluster_link_list.md) shows the link identity status and link type, which determine the permissions available to the linked cluster.
+
+(clustering-instance-placement)=
+## Automatic placement of instances
+
+In a cluster setup, each instance lives on one of the cluster members.
+When you launch an instance, you can target it to a specific cluster member, to a cluster group or have LXD automatically assign it to a cluster member.
+
+By default, the automatic assignment picks the cluster member that has the lowest number of instances.
+If several members have the same amount of instances, one of the members is chosen at random.
+
+However, you can control this behavior with the {config:option}`cluster-cluster:scheduler.instance` configuration option:
+
+- If `scheduler.instance` is set to `all` for a cluster member, this cluster member is selected for an instance if:
+
+   - The instance is created without `--target` and the cluster member has the lowest number of instances.
+   - The instance is targeted to live on this cluster member.
+   - The instance is targeted to live on a member of a cluster group that the cluster member is a part of, and the cluster member has the lowest number of instances compared to the other members of the cluster group.
+
+- If `scheduler.instance` is set to `manual` for a cluster member, this cluster member is selected for an instance if:
+
+   - The instance is targeted to live on this cluster member.
+
+- If `scheduler.instance` is set to `group` for a cluster member, this cluster member is selected for an instance if:
+
+   - The instance is targeted to live on this cluster member.
+   - The instance is targeted to live on a member of a cluster group that the cluster member is a part of, and the cluster member has the lowest number of instances compared to the other members of the cluster group.
+
+(exp-clusters-placement)=
+### Placement groups
+
+Placement groups provide declarative control over how instances are distributed across cluster members.
+They define both a **policy** (how instances should be distributed) and a **rigor** (how strictly the policy is enforced).
+
+Placement groups are project-scoped resources, which means different projects can have placement groups with the same name without conflict.
+
+See {ref}`cluster-placement-groups` for usage instructions and {ref}`ref-placement-groups` for reference documentation.
+
+(clusters-high-availability)=
+## High availability
+
+Clusters provide two types of high availability (HA):
+
+- Control plane HA (ensuring that clients can always access the cluster)
+- Data plane HA (ensuring that workloads continue to run)
+
+(clusters-high-availability-control)=
+### High availability of the control plane (client access)
+
+Each cluster member can {ref}`expose an API endpoint <server-expose>` through its {config:option}`server-core:core.https_address`. Through this access point, a remote client can communicate with any cluster member in multiple ways:
+
+- Through the API (see {ref}`authentication` and {ref}`rest-api`)
+- Through the {ref}`LXD web UI client <access-ui>`
+- By setting up {ref}`remote servers <remotes>` for CLI access
+
+Because the cluster database is distributed, access to any member gives you access to the entire control plane. If one server goes down, you can still manage the cluster through the other members. This provides the basis for control plane HA.
+
+The limitation is that on the client side, you must either manually switch to another member's access point if your chosen server is unavailable, or implement your own client-side logic to cycle through a list of access points.
+
+For a single, highly available access point to the control plane, you can add on a routing service that configures a virtual IP. See our how-to guide: {ref}`howto-cluster-vip`.
+
+(clusters-high-availability-data)=
+### High availability of the data plane (workloads)
+
+LXD clusters enable HA of workloads (instances) in multiple ways:
+
+Cluster evacuation
+: Instances can be manually evacuated from one cluster member to another, providing planned high availability during maintenance. This includes live migration for virtual machines. See: {ref}`cluster-evacuate`.
+
+Cluster healing
+: If a cluster member fails and {config:option}`server-cluster:cluster.healing_threshold` is set, it automatically restarts instances on that member on a healthy member of the cluster. See: {ref}`cluster-healing`.
+
+Virtual networking
+: On clusters using {ref}`OVN networking <network-ovn>`, logical switches/routers are distributed across the cluster. This means that instance NICs remain reachable even if the server hosting one OVN chassis goes offline.
+
+Storage redundancy
+: On clusters using Ceph for storage, if a disk or cluster member fails, the data is still available elsewhere in the Ceph cluster.
+
+Shared storage
+: Volumes using the {ref}`Ceph RBD <storage-ceph>` and {ref}`CephFS <storage-cephfs>` storage drivers are accessible from all cluster members. If the member hosting an instance fails, its volumes can be reattached to another member.
+
+## Related topics
+
+{{clustering_how}}
+
+{{clustering_ref}}

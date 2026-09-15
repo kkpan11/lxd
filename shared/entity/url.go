@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"net/url"
 	"runtime"
+	"slices"
 	"strings"
 
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/version"
@@ -23,25 +23,6 @@ func nRequiredPathArguments(t typeInfo) int {
 	}
 
 	return nRequiredPathArguments
-}
-
-// EndpointEntityType derives the main entity type an endpoint is opertaing on from its URL.
-// This is used to label endpoints for the API rates metrics.
-func EndpointEntityType(url url.URL) Type {
-	// Extract the url prefix without slashes and the API version if present.
-	urlPrefix := strings.Split(strings.TrimPrefix(strings.TrimPrefix(url.Path, "/"+version.APIVersion), "/"), "/")[0]
-
-	// Match the extracted prefix with recognized entity types' prefixes.
-	for entityType, typeInfo := range entityTypes {
-		if shared.ValueInSlice(urlPrefix, typeInfo.apiMetricsURLPrefixes()) {
-			return entityType
-		}
-	}
-
-	// Use TypeServer as the default, is used for undefined URLs.
-	// This also applies to endpoints /, /{version}, /{version}/metrics, /{version}/events, /{version}/metadata and
-	// /{version}/resources.
-	return TypeServer
 }
 
 // URL returns a string URL for the Type.
@@ -78,15 +59,50 @@ func (t Type) URL(projectName string, location string, pathArguments ...string) 
 
 	u := api.NewURL().Path(path...)
 
-	// Set project parameter if provided and the entity type is not TypeProject (operations and warnings may be project
-	// specific but it is not a requirement).
-	if projectName != "" && t != TypeProject {
+	// Set project parameter if provided and the entity type requires a project.
+	if projectName != "" && info.requiresProject() {
 		u = u.WithQuery("project", projectName)
 	}
 
-	// Always set location if provided (empty or "none" locations are ignored).
-	u = u.Target(location)
+	// Only set location if required to uniquely identify the entity.
+	if info.requiresLocation() {
+		u = u.Target(location)
+	}
+
 	return u, nil
+}
+
+// URLFromNamedArgs returns a string URL for the Type.
+//
+// If the Type is project specific and no project name is given, the project name will be set to api.ProjectDefaultName.
+//
+// Warning: All arguments to this function will be URL encoded. They must not be URL encoded before calling this method.
+func (t Type) URLFromNamedArgs(projectName string, location string, pathArguments map[string]string) (*api.URL, error) {
+	info, ok := entityTypes[t]
+	if !ok {
+		return nil, fmt.Errorf("Invalid entity type %q", t)
+	}
+
+	// Ensure only known path arguments are provided.
+	argNames := info.pathArgNames()
+	for name := range pathArguments {
+		if !slices.Contains(argNames, name) {
+			return nil, fmt.Errorf("Unknown path argument %q for entity type %q", name, t)
+		}
+	}
+
+	// Convert the map of named path arguments to a slice of path arguments.
+	args := make([]string, len(argNames))
+	for i, name := range argNames {
+		_, ok := pathArguments[name]
+		if !ok {
+			return nil, fmt.Errorf("Entity type %q requires path argument %q", t, name)
+		}
+
+		args[i] = pathArguments[name]
+	}
+
+	return t.URL(projectName, location, args...)
 }
 
 // ParseURL parses a raw URL string and returns the Type, project, location, and path arguments (mux vars).
@@ -95,20 +111,21 @@ func (t Type) URL(projectName string, location string, pathArguments ...string) 
 // Type requires a project, then api.ProjectDefaultName is returned as the project name. The returned location is the
 // value of the "target" query parameter. All returned values are unescaped.
 func ParseURL(u url.URL) (entityType Type, projectName string, location string, pathArguments []string, err error) {
-	if u.Path == "/"+version.APIVersion {
-		return TypeServer, "", "", nil, nil
-	}
-
 	path := u.Path
 	if u.RawPath != "" {
 		path = u.RawPath
 	}
 
-	if !strings.HasPrefix(path, "/"+version.APIVersion+"/") {
+	pathSuffix, found := strings.CutPrefix(path, "/"+version.APIVersion+"/")
+	if !found {
+		if path == "/"+version.APIVersion {
+			return TypeServer, "", "", nil, nil
+		}
+
 		return "", "", "", nil, fmt.Errorf("URL %q does not contain LXD API version", u.String())
 	}
 
-	pathParts := strings.Split(strings.TrimPrefix(path, "/"+version.APIVersion+"/"), "/")
+	pathParts := strings.Split(pathSuffix, "/")
 	var entityTypeImpl typeInfo
 entityTypeLoop:
 	for t, info := range entityTypes {
@@ -124,7 +141,7 @@ entityTypeLoop:
 			if entityPathPart == pathPlaceholder {
 				pathArgument, err := url.PathUnescape(pathParts[i])
 				if err != nil {
-					return "", "", "", nil, fmt.Errorf("Failed to unescape path element %q from url %q: %w", pathParts[i], u.String(), err)
+					return "", "", "", nil, fmt.Errorf("Failed unescaping path element %q from url %q: %w", pathParts[i], u.String(), err)
 				}
 
 				pathArgs = append(pathArgs, pathArgument)
@@ -143,14 +160,16 @@ entityTypeLoop:
 	}
 
 	if entityType == "" {
-		return "", "", "", nil, fmt.Errorf("Failed to match entity URL %q", u.String())
+		return "", "", "", nil, fmt.Errorf("Failed matching entity URL %q", u.String())
 	}
 
+	// Handle the project query parameter. If the entity type requires a project we set it to
+	// [api.ProjectDefaultName] if it does not exist.
 	requiresProject := entityTypeImpl.requiresProject()
 	projectName = ""
 	if requiresProject {
 		projectName = u.Query().Get("project")
-		if projectName == "" {
+		if projectName == "" && requiresProject {
 			projectName = api.ProjectDefaultName
 		}
 	}
@@ -161,6 +180,33 @@ entityTypeLoop:
 	}
 
 	return entityType, projectName, u.Query().Get("target"), pathArguments, nil
+}
+
+// ParseURLWithNamedArgs parses a raw URL string and returns the Type and a map of named arguments,
+// where each entry maps an argument name to its corresponding value parsed from the URL.
+func ParseURLWithNamedArgs(u url.URL) (entityType Type, projectName string, location string, args map[string]string, err error) {
+	entityType, projectName, location, pathArgs, err := ParseURL(u)
+	if err != nil {
+		return "", "", "", nil, err
+	}
+
+	entityInfo, ok := entityTypes[entityType]
+	if !ok {
+		return "", "", "", nil, fmt.Errorf("Unknown entity type %q", entityType)
+	}
+
+	pathArgNames := entityInfo.pathArgNames()
+
+	if len(pathArgs) != len(pathArgNames) {
+		return "", "", "", nil, fmt.Errorf("Argument count mismatch for entity type %q: expected %d, got %d", entityType, len(pathArgNames), len(pathArgs))
+	}
+
+	args = make(map[string]string, len(pathArgs))
+	for i, argName := range pathArgNames {
+		args[argName] = pathArgs[i]
+	}
+
+	return entityType, projectName, location, args, nil
 }
 
 // urlMust is used internally when we know that creation of an *api.URL ought to succeed. If an error does occur an
@@ -177,7 +223,7 @@ func (t Type) urlMust(projectName string, location string, pathArguments ...stri
 			logCtx["caller"] = fmt.Sprintf("%s#%d", file, line)
 		}
 
-		logger.Error("Failed to create entity URL", logCtx)
+		logger.Error("Failed creating entity URL", logCtx)
 		return api.NewURL()
 	}
 
@@ -192,6 +238,16 @@ func ProjectURL(projectName string) *api.URL {
 // InstanceURL returns an *api.URL to an instance.
 func InstanceURL(projectName string, instanceName string) *api.URL {
 	return TypeInstance.urlMust(projectName, "", instanceName)
+}
+
+// InstanceBackupURL returns an *api.URL to an instance backup.
+func InstanceBackupURL(projectName string, instanceName string, backupName string) *api.URL {
+	return TypeInstanceBackup.urlMust(projectName, "", instanceName, backupName)
+}
+
+// InstanceSnapshotURL returns an *api.URL to an instance snapshot.
+func InstanceSnapshotURL(projectName string, instanceName string, snapshotName string) *api.URL {
+	return TypeInstanceSnapshot.urlMust(projectName, "", instanceName, snapshotName)
 }
 
 // ServerURL returns an *api.URL to the server.
@@ -244,6 +300,16 @@ func StorageVolumeURL(projectName string, location string, storagePoolName strin
 	return TypeStorageVolume.urlMust(projectName, location, storagePoolName, storageVolumeType, storageVolumeName)
 }
 
+// StorageVolumeBackupURL returns an *api.URL to a storage volume backup.
+func StorageVolumeBackupURL(projectName string, location string, poolName string, volumeTypeName string, volumeName, backupName string) *api.URL {
+	return TypeStorageVolumeBackup.urlMust(projectName, location, poolName, volumeTypeName, volumeName, backupName)
+}
+
+// StorageVolumeSnapshotURL returns an *api.URL to a storage volume snapshot.
+func StorageVolumeSnapshotURL(projectName string, location string, poolName string, volumeTypeName string, volumeName, backupName string) *api.URL {
+	return TypeStorageVolumeSnapshot.urlMust(projectName, location, poolName, volumeTypeName, volumeName, backupName)
+}
+
 // StorageBucketURL returns an *api.URL to a storage bucket.
 func StorageBucketURL(projectName string, location string, storagePoolName string, storageBucketName string) *api.URL {
 	return TypeStorageBucket.urlMust(projectName, location, storagePoolName, storageBucketName)
@@ -262,4 +328,19 @@ func AuthGroupURL(groupName string) *api.URL {
 // IdentityProviderGroupURL returns an *api.URL to an identity provider group.
 func IdentityProviderGroupURL(identityProviderGroupName string) *api.URL {
 	return TypeIdentityProviderGroup.urlMust("", "", identityProviderGroupName)
+}
+
+// PlacementGroupURL returns an [*api.URL] to a placement group.
+func PlacementGroupURL(projectName string, placementGroupName string) *api.URL {
+	return TypePlacementGroup.urlMust(projectName, "", placementGroupName)
+}
+
+// ClusterLinkURL returns an [*api.URL] to a cluster link.
+func ClusterLinkURL(clusterLinkName string) *api.URL {
+	return TypeClusterLink.urlMust("", "", clusterLinkName)
+}
+
+// ReplicatorURL returns an [*api.URL] to a replicator.
+func ReplicatorURL(projectName string, replicatorName string) *api.URL {
+	return TypeReplicator.urlMust(projectName, "", replicatorName)
 }

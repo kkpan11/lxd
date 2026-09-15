@@ -3,22 +3,19 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
+	"maps"
 	"net/http"
-	"net/url"
 
 	"github.com/google/uuid"
-	"github.com/gorilla/mux"
 
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/db/operationtype"
 	deviceConfig "github.com/canonical/lxd/lxd/device/config"
 	"github.com/canonical/lxd/lxd/instance"
-	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/project/limits"
-	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/lxd/util"
@@ -66,29 +63,7 @@ func instancePut(d *Daemon, r *http.Request) response.Response {
 
 	s := d.State()
 
-	instanceType, err := urlInstanceTypeDetect(r)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	projectName := request.ProjectParam(r)
-
-	// Get the container
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	if shared.IsSnapshot(name) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
-	}
-
-	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(s, r, projectName, name, instanceType)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	projectName, name, resp := forwardedInstanceResponse(s, r)
 	if resp != nil {
 		return resp
 	}
@@ -128,7 +103,7 @@ func instancePut(d *Daemon, r *http.Request) response.Response {
 		architecture = 0
 	}
 
-	var do func(*operations.Operation) error
+	var do func(context.Context, *operations.Operation) error
 	var opType operationtype.Type
 	if configRaw.Restore == "" {
 		// Check project limits.
@@ -139,8 +114,18 @@ func instancePut(d *Daemon, r *http.Request) response.Response {
 				return err
 			}
 
+			profileConfigs, err := cluster.GetConfig(ctx, tx.Tx(), "profile")
+			if err != nil {
+				return err
+			}
+
+			profileDevices, err := cluster.GetDevices(ctx, tx.Tx(), "profile")
+			if err != nil {
+				return err
+			}
+
 			for _, profile := range profiles {
-				apiProfile, err := profile.ToAPI(ctx, tx.Tx())
+				apiProfile, err := profile.ToAPI(ctx, tx.Tx(), profileConfigs, profileDevices)
 				if err != nil {
 					return err
 				}
@@ -148,14 +133,14 @@ func instancePut(d *Daemon, r *http.Request) response.Response {
 				apiProfiles = append(apiProfiles, *apiProfile)
 			}
 
-			return limits.AllowInstanceUpdate(s.GlobalConfig, tx, projectName, name, configRaw, inst.LocalConfig())
+			return limits.AllowInstanceUpdate(ctx, s.GlobalConfig, tx, projectName, name, configRaw, inst.LocalConfig())
 		})
 		if err != nil {
 			return response.SmartError(err)
 		}
 
 		// Update container configuration
-		do = func(op *operations.Operation) error {
+		do = func(ctx context.Context, _ *operations.Operation) error {
 			defer unlock()
 
 			args := db.InstanceArgs{
@@ -168,7 +153,7 @@ func instancePut(d *Daemon, r *http.Request) response.Response {
 				Project:      projectName,
 			}
 
-			err = inst.Update(args, true)
+			err = inst.Update(ctx, args, instance.UpdateActionUser)
 			if err != nil {
 				return err
 			}
@@ -179,33 +164,35 @@ func instancePut(d *Daemon, r *http.Request) response.Response {
 		opType = operationtype.InstanceUpdate
 	} else {
 		// Snapshot Restore
-		do = func(op *operations.Operation) error {
+		do = func(ctx context.Context, op *operations.Operation) error {
 			defer unlock()
 
-			return instanceSnapRestore(s, projectName, name, configRaw.Restore, configRaw.Stateful)
+			return instanceSnapRestore(ctx, s, projectName, name, configRaw, op)
 		}
 
 		opType = operationtype.SnapshotRestore
 	}
 
-	resources := map[string][]api.URL{}
-	resources["instances"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", name)}
-
-	if inst.Type() == instancetype.Container {
-		resources["containers"] = resources["instances"]
+	args := operations.OperationArgs{
+		ProjectName: projectName,
+		EntityURL:   api.NewURL().Path(version.APIVersion, "instances", name).Project(projectName),
+		Type:        opType,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     do,
 	}
 
-	op, err := operations.OperationCreate(s, projectName, operations.OperationClassTask, opType, resources, nil, do, nil, nil, r)
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		return response.InternalError(err)
 	}
 
 	revert.Success()
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
-func instanceSnapRestore(s *state.State, projectName string, name string, snap string, stateful bool) error {
+func instanceSnapRestore(ctx context.Context, s *state.State, projectName string, name string, req api.InstancePut, op *operations.Operation) error {
 	// normalize snapshot name
+	snap := req.Restore
 	if !shared.IsSnapshot(snap) {
 		snap = name + shared.SnapshotDelimiter + snap
 	}
@@ -219,16 +206,67 @@ func instanceSnapRestore(s *state.State, projectName string, name string, snap s
 	if err != nil {
 		switch {
 		case response.IsNotFoundError(err):
-			return fmt.Errorf("Snapshot %s does not exist", snap)
+			return api.NewStatusError(http.StatusBadRequest, "Snapshot "+snap+" does not exist")
 		default:
 			return err
 		}
 	}
 
+	// Build the instance config that restoring the snapshot would apply, so it can be
+	// validated against the project's restrictions and limits below.
+	snapProfileNames := make([]string, 0, len(source.Profiles()))
+	for _, profile := range source.Profiles() {
+		snapProfileNames = append(snapProfileNames, profile.Name)
+	}
+
+	// Copy the snapshot's config rather than using it directly, and strip
+	// "volatile.attached_volumes": it's set by LXD on the snapshot itself for
+	// multi-volume restores and is never present on the live instance, so comparing
+	// it as-is would always be rejected as an unexpected volatile key change.
+	snapConfigMap := maps.Clone(source.LocalConfig())
+	delete(snapConfigMap, "volatile.attached_volumes")
+
+	snapConfig := api.InstancePut{
+		Config:   snapConfigMap,
+		Devices:  source.LocalDevices().CloneNative(),
+		Profiles: snapProfileNames,
+	}
+
+	// Load the project to validate features.
+	var p *api.Project
+	err = s.DB.Cluster.Transaction(s.ShutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+		project, err := cluster.GetProject(ctx, tx.Tx(), projectName)
+		if err != nil {
+			return err
+		}
+
+		p, err = project.ToAPI(ctx, tx.Tx())
+		if err != nil {
+			return err
+		}
+
+		// Check that restoring the snapshot does not violate the project's restrictions
+		// or limits. A snapshot can carry config that was permitted when it was taken but
+		// is forbidden in the instance's current project (for example low-level keys such
+		// as raw.lxc or raw.qemu after the instance was moved into a restricted project).
+		// Restoring re-applies the snapshot's config to the instance, so it must be
+		// validated the same way a direct instance update is.
+		return limits.AllowInstanceUpdate(ctx, s.GlobalConfig, tx, projectName, name, snapConfig, inst.LocalConfig())
+	})
+	if err != nil {
+		return err
+	}
+
+	// A project that does not own its custom volumes has none to restore, so only allow the root disk.
+	// This is the rule the storage layer applies, so an unset key counts as inheriting.
+	if shared.IsFalseOrEmpty(p.Config["features.storage.volumes"]) && req.RestoreDiskVolumesMode == api.DiskVolumesModeAllExclusive {
+		return errors.New("Project does not have features.storage.volumes enabled")
+	}
+
 	// Generate a new `volatile.uuid.generation` to differentiate this instance restored from a snapshot from the original instance.
 	source.LocalConfig()["volatile.uuid.generation"] = uuid.New().String()
 
-	err = inst.Restore(source, stateful)
+	err = inst.Restore(ctx, source, req.Stateful, req.RestoreDiskVolumesMode, op)
 	if err != nil {
 		return err
 	}

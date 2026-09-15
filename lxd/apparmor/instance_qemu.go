@@ -30,9 +30,13 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   /dev/vfio/**                              rw,
   /dev/vhost-net                            rw,
   /dev/vhost-vsock                          rw,
-  /etc/ceph/**                              r,
   /etc/machine-id                           r,
   /run/udev/data/*                          r,
+  @{PROC}/sys/vm/max_map_count              r,
+  @{PROC}/@{pid}/cpuset                     r,
+  @{PROC}/@{pid}/gid_map                    r,
+  @{PROC}/@{pid}/uid_map                    r,
+  @{PROC}/@{pid}/task/*/comm                rw,
   /sys/bus/                                 r,
   /sys/bus/nd/devices/                      r,
   /sys/bus/usb/devices/                     r,
@@ -44,12 +48,16 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   /{,usr/}bin/qemu-system-*                 mrix,
   /usr/share/qemu/**                        kr,
   /usr/share/seabios/**                     kr,
-  @{PROC}/@{pid}/cpuset                     r,
-  @{PROC}/@{pid}/task/@{tid}/comm           rw,
   {{ .rootPath }}/etc/nsswitch.conf         r,
   {{ .rootPath }}/etc/passwd                r,
   {{ .rootPath }}/etc/group                 r,
+  {{ .rootPath }}/etc/ssl/openssl.cnf       r,
   @{PROC}/version                           r,
+
+  # Extra config paths
+{{- range $index, $element := .extra_config }}
+  {{ $element }}/** kr,
+{{- end }}
 
   # Used by qemu for live migration NBD server and client or when in a container
   unix (bind, listen, accept, send, receive, connect) type=stream,
@@ -73,6 +81,7 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   # The binary itself (for nesting)
   /var/snap/lxd/common/lxd.debug            mr,
   /snap/lxd/*/bin/lxd                       mr,
+  /snap/lxd/*/sbin/lxd                      mr,
   /snap/lxd/*/bin/qemu-system-*             mrix,
   /snap/lxd/*/share/qemu/**                 kr,
 

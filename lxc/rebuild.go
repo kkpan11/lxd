@@ -3,34 +3,57 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/spf13/cobra"
 
+	"github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/lxc/config"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	cli "github.com/canonical/lxd/shared/cmd"
-	"github.com/canonical/lxd/shared/i18n"
 )
 
 // Rebuild.
 type cmdRebuild struct {
-	global    *cmdGlobal
-	flagEmpty bool
-	flagForce bool
+	global            *cmdGlobal
+	flagEmpty         bool
+	flagForce         bool
+	flagTargetProject string
 }
 
 func (c *cmdRebuild) command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("rebuild", i18n.G("[<remote>:]<image> [<remote>:]<instance>"))
-	cmd.Short = i18n.G("Rebuild instances")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Wipe the instance root disk and re-initialize. The original image is used to re-initialize the instance if a different image or --empty is not specified.`))
+	cmd.Use = usage("rebuild", "[<registry|remote>:]<image> [<remote>:]<instance>")
+	cmd.Short = "Rebuild instance"
+	cmd.Long = cli.FormatSection("Description", `Wipe the instance root disk and re-initialize.
+The original image is used to re-initialize the instance if a different image or --empty is not specified.
+
+Note: The --project flag sets the project for both the image remote and the instance remote.
+If the image remote is a public remote (e.g. simplestreams) then this project is ignored by the image remote.
+If the image remote is another LXD server, specify the source project for the image remote 
+with --project and the instance remote with --target-project (if different from --project).
+
+If the destination LXD remote supports image registries, the source image
+must be from an image registry or available locally on the destination remote.`)
 
 	cmd.RunE = c.run
-	cmd.Flags().BoolVar(&c.flagEmpty, "empty", false, i18n.G("Rebuild as an empty instance"))
-	cmd.Flags().BoolVarP(&c.flagForce, "force", "f", false, i18n.G("If an instance is running, stop it and then rebuild it"))
+	cmd.Flags().BoolVar(&c.flagEmpty, "empty", false, "Rebuild as an empty instance")
+	cmd.Flags().BoolVarP(&c.flagForce, "force", "f", false, "If an instance is running, stop it and then rebuild it")
+	cmd.Flags().StringVar(&c.flagTargetProject, "target-project", "", cli.FormatStringFlagLabel("Project containing the instance (if different from --project)"))
+
+	cmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]cobra.Completion, cobra.ShellCompDirective) {
+		if len(args) > 1 {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+
+		if len(args) == 0 {
+			return c.global.cmpImages(toComplete, false)
+		}
+
+		return c.global.cmpTopLevelResource("instance", toComplete)
+	}
 
 	return cmd
 }
@@ -47,10 +70,7 @@ func (c *cmdRebuild) rebuild(conf *config.Config, args []string) error {
 		}
 
 	case 2:
-		iremote, image, err = conf.ParseRemote(args[0])
-		if err != nil {
-			return err
-		}
+		iremote, image = conf.ParseRemoteUnchecked(args[0])
 
 		remote, name, err = conf.ParseRemote(args[1])
 		if err != nil {
@@ -58,11 +78,11 @@ func (c *cmdRebuild) rebuild(conf *config.Config, args []string) error {
 		}
 
 	default:
-		return errors.New(i18n.G("Missing instance name"))
+		return errors.New("Missing instance name")
 	}
 
 	if c.flagEmpty && len(args) > 1 {
-		return errors.New(i18n.G("--empty cannot be combined with an image name"))
+		return errors.New("--empty cannot be combined with an image name")
 	}
 
 	d, err := conf.GetInstanceServer(remote)
@@ -70,9 +90,14 @@ func (c *cmdRebuild) rebuild(conf *config.Config, args []string) error {
 		return err
 	}
 
+	// Set the target project if provided.
+	if c.flagTargetProject != "" {
+		d = d.UseProject(c.flagTargetProject)
+	}
+
 	// We are not rebuilding just a snapshot but an instance
 	if strings.Contains(name, shared.SnapshotDelimiter) {
-		return fmt.Errorf(i18n.G("Instance snapshots cannot be rebuilt: %s"), name)
+		return fmt.Errorf("Instance snapshots cannot be rebuilt: %s", name)
 	}
 
 	current, _, err := d.GetInstance(name)
@@ -117,22 +142,76 @@ func (c *cmdRebuild) rebuild(conf *config.Config, args []string) error {
 
 	if !c.flagEmpty {
 		if image == "" && iremote == "" {
-			return errors.New(i18n.G("You need to specify an image name or use --empty"))
+			return errors.New("You need to specify an image name or use --empty")
 		}
 
 		iremote, image := guessImage(conf, d, remote, iremote, image)
-		imgRemote, imgInfo, err := getImgInfo(d, conf, iremote, remote, image, &req.Source)
-		if err != nil {
-			return err
-		}
 
-		if conf.Remotes[iremote].Protocol != "simplestreams" {
-			if imgInfo.Type != "virtual-machine" && current.Type == "virtual-machine" {
-				return errors.New(i18n.G("Asked for a VM but image is of type container"))
+		var imgRemoteServer lxd.ImageServer
+		var imgInfo *api.Image
+		var legacyRemote string
+		var err error
+
+		// If the server supports image registries, we can use server-side image resolution and download.
+		// This avoids resolving the image on the client side, and passes the registry name or source project
+		// to the server so it can handle the resolution directly.
+		if d.HasExtension("image_registries") {
+			var registryName string
+			imgInfo, registryName = resolveRegistryImageSource(conf.Remotes, iremote, image, remote, c.global.flagProject)
+
+			if registryName != "" {
+				// Remote image registry.
+				// Check if the server has an image registry with this name.
+				_, _, err := d.GetImageRegistry(registryName)
+				if err != nil {
+					// Only fall back for 404 (registry not found).
+					if !api.StatusErrorCheck(err, http.StatusNotFound) {
+						return fmt.Errorf("Failed checking image registry %q: %w", registryName, err)
+					}
+
+					// Registry not found. If the local remote is a public remote,
+					// fall back to sending the deprecated Server and Protocol fields
+					// so the server can validate the URL and auto-create the registry if supported.
+					remoteConfig := conf.Remotes[iremote]
+					if !remoteConfig.Public {
+						return fmt.Errorf("Image registry %q not found", registryName)
+					}
+
+					req.Source.Server = remoteConfig.Addr                        //nolint:staticcheck
+					req.Source.Protocol = api.ImageRegistryProtocolSimpleStreams //nolint:staticcheck
+				} else {
+					// Registry exists on the server, use it directly.
+					req.Source.ImageRegistry = registryName
+				}
+			}
+		} else {
+			// Fetch image info from the given remote (legacy client-side resolution path).
+			// Normalize empty remote to the default remote, since ParseRemoteUnchecked
+			// does not fill in the default.
+			legacyRemote = iremote
+			if legacyRemote == "" {
+				legacyRemote = conf.DefaultRemote
+			}
+
+			imgRemoteServer, imgInfo, err = getImgInfo(conf, legacyRemote, image, c.global.flagProject, &req.Source)
+			if err != nil {
+				return err
 			}
 		}
 
-		op, err := d.RebuildInstanceFromImage(imgRemote, *imgInfo, name, req)
+		// Update the source project if it was determined by getImgInfo.
+		if imgRemoteServer == nil && imgInfo.Project != "" {
+			req.Source.Project = imgInfo.Project
+		}
+
+		// Only perform legacy type and protocol checks if we are NOT using an image registry.
+		if imgRemoteServer != nil && conf.Remotes[legacyRemote].Protocol != api.ImageRegistryProtocolSimpleStreams {
+			if imgInfo.Type != "virtual-machine" && current.Type == "virtual-machine" {
+				return errors.New("Asked for a VM but image is of type container")
+			}
+		}
+
+		op, err := d.RebuildInstanceFromImage(imgRemoteServer, *imgInfo, name, req)
 		if err != nil {
 			return err
 		}
@@ -158,10 +237,10 @@ func (c *cmdRebuild) rebuild(conf *config.Config, args []string) error {
 	} else {
 		// This is a rebuild as an empty instance
 		if image != "" || iremote != "" {
-			return errors.New(i18n.G("Can't use an image with --empty"))
+			return errors.New("Cannot use an image with --empty")
 		}
 
-		req.Source.Type = "none"
+		req.Source.Type = api.SourceTypeNone
 		op, err := d.RebuildInstance(name, req)
 		if err != nil {
 			return err

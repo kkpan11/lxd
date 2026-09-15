@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -14,12 +15,13 @@ import (
 	"strings"
 	"time"
 
-	dqlite "github.com/canonical/go-dqlite"
-	"github.com/canonical/go-dqlite/client"
-	"gopkg.in/yaml.v2"
+	dqlite "github.com/canonical/go-dqlite/v3"
+	"github.com/canonical/go-dqlite/v3/client"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/node"
+	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/revert"
 )
@@ -40,7 +42,7 @@ func ListDatabaseNodes(database *db.Node) ([]string, error) {
 		return err
 	})
 	if err != nil {
-		return nil, fmt.Errorf("Failed to list database nodes: %w", err)
+		return nil, fmt.Errorf("Failed listing database nodes: %w", err)
 	}
 
 	addresses := make([]string, 0)
@@ -67,12 +69,12 @@ func localRaftNode(database *db.Node) (*db.RaftNode, error) {
 		return err
 	})
 	if err != nil {
-		return nil, fmt.Errorf("Failed to determine cluster member raft role: %w", err)
+		return nil, fmt.Errorf("Failed determining cluster member raft role: %w", err)
 	}
 
 	// If we're not a database node, return an error.
 	if info == nil {
-		return nil, fmt.Errorf("This cluster member has no raft role")
+		return nil, errors.New("This cluster member has no raft role")
 	}
 
 	return info, nil
@@ -95,10 +97,10 @@ func Recover(database *db.Node) error {
 	// If this is a standalone node not exposed to the network, return an
 	// error.
 	if info.Address == "" {
-		return fmt.Errorf("This LXD instance is not clustered")
+		return errors.New("This LXD instance is not clustered")
 	}
 
-	dir := filepath.Join(database.Dir(), "global")
+	dir := database.DqliteDir()
 
 	cluster := []dqlite.NodeInfo{
 		{
@@ -110,7 +112,7 @@ func Recover(database *db.Node) error {
 
 	err = dqlite.ReconfigureMembershipExt(dir, cluster)
 	if err != nil {
-		return fmt.Errorf("Failed to recover database state: %w", err)
+		return fmt.Errorf("Failed recovering database state: %w", err)
 	}
 
 	// Update the list of raft nodes.
@@ -128,7 +130,7 @@ func Recover(database *db.Node) error {
 		return tx.ReplaceRaftNodes(nodes)
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to update database nodes: %w", err)
+		return fmt.Errorf("Failed updating database nodes: %w", err)
 	}
 
 	return nil
@@ -143,7 +145,7 @@ func updateLocalAddress(database *db.Node, address string) error {
 			return err
 		}
 
-		newConfig := map[string]any{"cluster.https_address": address}
+		newConfig := map[string]string{"cluster.https_address": address}
 		_, err = config.Patch(newConfig)
 		if err != nil {
 			return err
@@ -152,7 +154,7 @@ func updateLocalAddress(database *db.Node, address string) error {
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to update node configuration: %w", err)
+		return fmt.Errorf("Failed updating local configuration: %w", err)
 	}
 
 	return nil
@@ -177,7 +179,7 @@ func writeGlobalNodesPatch(database *db.Node, nodes []db.RaftNode) error {
 		return fmt.Errorf("Found %s: %s", filePath, errPatchExists)
 	}
 
-	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY, 0644)
+	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
@@ -237,11 +239,11 @@ func Reconfigure(database *db.Node, raftNodes []db.RaftNode) (string, error) {
 		}
 	}
 
-	dir := filepath.Join(database.Dir(), "global")
+	dir := database.DqliteDir()
 	// Replace cluster configuration in dqlite.
 	err = dqlite.ReconfigureMembershipExt(dir, nodes)
 	if err != nil {
-		return "", fmt.Errorf("Failed to recover database state: %w", err)
+		return "", fmt.Errorf("Failed recovering database state: %w", err)
 	}
 
 	// Replace cluster configuration in local raft_nodes database.
@@ -254,12 +256,12 @@ func Reconfigure(database *db.Node, raftNodes []db.RaftNode) (string, error) {
 
 	tarballPath, err := writeRecoveryTarball(database.Dir(), raftNodes)
 	if err != nil {
-		return "", fmt.Errorf("Failed to create recovery tarball: copy db manually; %w", err)
+		return "", fmt.Errorf("Failed creating recovery tarball: copy db manually; %w", err)
 	}
 
 	err = writeGlobalNodesPatch(database, raftNodes)
 	if err != nil {
-		return "", fmt.Errorf("Failed to create global db patch for cluster recover: %w", err)
+		return "", fmt.Errorf("Failed creating global db patch for cluster recover: %w", err)
 	}
 
 	return tarballPath, nil
@@ -310,7 +312,7 @@ func writeRecoveryTarball(databaseDir string, raftNodes []db.RaftNode) (string, 
 // and writes a global patch file to update the global database with any changed
 // addresses.
 func DatabaseReplaceFromTarball(tarballPath string, database *db.Node) error {
-	globalDBDir := path.Join(database.Dir(), "global")
+	globalDBDir := database.DqliteDir()
 	unpackDir := filepath.Join(database.Dir(), "global.recover")
 
 	logger.Warn("Recovery tarball located; attempting DB recovery", logger.Ctx{"tarball": tarballPath})
@@ -326,15 +328,17 @@ func DatabaseReplaceFromTarball(tarballPath string, database *db.Node) error {
 	}
 
 	raftNodesYamlPath := path.Join(unpackDir, raftNodesFilename)
-	raftNodesYaml, err := os.ReadFile(raftNodesYamlPath)
+	raftNodesFile, err := os.Open(raftNodesYamlPath)
 	if err != nil {
 		return err
 	}
 
+	defer func() { _ = raftNodesFile.Close() }()
+
 	var incomingRaftNodes []db.RaftNode
-	err = yaml.Unmarshal(raftNodesYaml, &incomingRaftNodes)
+	err = yaml.NewDecoder(util.MaxBytesReader(raftNodesFile, util.MaxYAMLFileBytes)).Decode(&incomingRaftNodes)
 	if err != nil {
-		return fmt.Errorf("Invalid %q", raftNodesYamlPath)
+		return fmt.Errorf("Invalid %q: %w", raftNodesYamlPath, err)
 	}
 
 	var localRaftNodes []db.RaftNode
@@ -394,7 +398,7 @@ func DatabaseReplaceFromTarball(tarballPath string, database *db.Node) error {
 
 	err = writeGlobalNodesPatch(database, incomingRaftNodes)
 	if err != nil {
-		return fmt.Errorf("Failed to create global db patch for cluster recover: %w", err)
+		return fmt.Errorf("Failed creating global db patch for cluster recover: %w", err)
 	}
 
 	// Now that we're as sure as we can be that the recovery DB is valid, we can
@@ -422,7 +426,7 @@ func DatabaseReplaceFromTarball(tarballPath string, database *db.Node) error {
 func RemoveRaftNode(gateway *Gateway, address string) error {
 	nodes, err := gateway.currentRaftNodes()
 	if err != nil {
-		return fmt.Errorf("Failed to get current raft nodes: %w", err)
+		return fmt.Errorf("Failed getting current raft nodes: %w", err)
 	}
 
 	var id uint64
@@ -444,13 +448,13 @@ func RemoveRaftNode(gateway *Gateway, address string) error {
 		client.WithLogFunc(DqliteLog),
 	)
 	if err != nil {
-		return fmt.Errorf("Failed to connect to cluster leader: %w", err)
+		return fmt.Errorf("Failed connecting to cluster leader: %w", err)
 	}
 
 	defer func() { _ = client.Close() }()
 	err = client.Remove(ctx, id)
 	if err != nil {
-		return fmt.Errorf("Failed to remove node: %w", err)
+		return fmt.Errorf("Failed removing node: %w", err)
 	}
 
 	return nil

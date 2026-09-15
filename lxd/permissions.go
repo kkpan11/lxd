@@ -1,21 +1,24 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"net/http"
+	"slices"
 
 	"github.com/canonical/lxd/lxd/auth"
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/db/cluster"
+	"github.com/canonical/lxd/lxd/db/query"
 	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/entity"
 )
 
 var permissionsCmd = APIEndpoint{
-	Name: "permissions",
-	Path: "auth/permissions",
+	Path:        "auth/permissions",
+	MetricsType: entity.TypeIdentity,
 	Get: APIEndpointAction{
 		Handler:       getPermissions,
 		AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanViewPermissions),
@@ -135,7 +138,7 @@ func getPermissions(d *Daemon, r *http.Request) response.Response {
 	}
 
 	var entityURLs map[entity.Type]map[int]*api.URL
-	var groups []cluster.AuthGroup
+	var groups []cluster.AuthGroupsRow
 	var authGroupPermissions []cluster.Permission
 	err := d.State().DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
 		var err error
@@ -148,18 +151,18 @@ func getPermissions(d *Daemon, r *http.Request) response.Response {
 		}
 
 		if recursion == "1" {
-			groups, err = cluster.GetAuthGroups(ctx, tx.Tx())
+			groups, err = query.Select[cluster.AuthGroupsRow](ctx, tx.Tx(), "")
 			if err != nil {
-				return fmt.Errorf("Failed to get groups: %w", err)
+				return err
 			}
 
 			authGroupPermissions, err = cluster.GetPermissions(ctx, tx.Tx())
 			if err != nil {
-				return fmt.Errorf("Failed to get currently assigned permissions: %w", err)
+				return fmt.Errorf("Failed getting currently assigned permissions: %w", err)
 			}
 		}
 
-		entityURLs, err = cluster.GetEntityURLs(ctx, tx.Tx(), projectNameFilter, entityTypes...)
+		entityURLs, err = cluster.GetEntityURLsByProjectAndType(ctx, tx.Tx(), projectNameFilter, entityTypes...)
 		if err != nil {
 			return err
 		}
@@ -172,7 +175,7 @@ func getPermissions(d *Daemon, r *http.Request) response.Response {
 
 	assignedPermissions := make(map[cluster.Permission][]string, len(authGroupPermissions))
 	if recursion == "1" {
-		groupNames := make(map[int]string, len(groups))
+		groupNames := make(map[int64]string, len(groups))
 		for _, group := range groups {
 			groupNames[group.ID] = group.Name
 		}
@@ -221,8 +224,38 @@ func getPermissions(d *Daemon, r *http.Request) response.Response {
 	}
 
 	if recursion == "1" {
+		slices.SortFunc(apiPermissionInfos, comparePermissionInfo)
 		return response.SyncResponse(true, apiPermissionInfos)
 	}
 
+	slices.SortFunc(apiPermissions, comparePermission)
 	return response.SyncResponse(true, apiPermissions)
+}
+
+func comparePermission(a, b api.Permission) int {
+	result := cmp.Compare(a.EntityType, b.EntityType)
+	if result != 0 {
+		return result
+	}
+
+	result = cmp.Compare(a.EntityReference, b.EntityReference)
+	if result != 0 {
+		return result
+	}
+
+	return cmp.Compare(a.Entitlement, b.Entitlement)
+}
+
+func comparePermissionInfo(a, b api.PermissionInfo) int {
+	result := cmp.Compare(a.EntityType, b.EntityType)
+	if result != 0 {
+		return result
+	}
+
+	result = cmp.Compare(a.EntityReference, b.EntityReference)
+	if result != 0 {
+		return result
+	}
+
+	return cmp.Compare(a.Entitlement, b.Entitlement)
 }

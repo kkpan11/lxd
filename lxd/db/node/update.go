@@ -1,5 +1,7 @@
 package node
 
+//go:generate go run ../freshschema/main.go node
+
 import (
 	"context"
 	"database/sql"
@@ -23,15 +25,10 @@ func Schema() *schema.Schema {
 	return schema
 }
 
-// FreshSchema returns the fresh schema definition of the local database.
-func FreshSchema() string {
-	return freshSchema
-}
-
 // SchemaDotGo refreshes the schema.go file in this package, using the updates
 // defined here.
 func SchemaDotGo() error {
-	return schema.DotGo(updates, "schema")
+	return schema.DotGo(updates, "node", "schema.go")
 }
 
 /* Database updates are one-time actions that are needed to move an
@@ -101,10 +98,6 @@ var updates = map[int]schema.Update{
 	43: updateFromV42,
 }
 
-// UpdateFromPreClustering is the last schema version where clustering support
-// was not available, and hence no cluster dqlite database is used.
-const UpdateFromPreClustering = 36
-
 // Schema updates begin here
 
 // updateFromV42 ensures key and value fields in config table are TEXT NOT NULL.
@@ -170,7 +163,7 @@ func updateFromV39(ctx context.Context, tx *sql.Tx) error {
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to fetch raft nodes: %w", err)
+		return fmt.Errorf("Failed fetching raft nodes: %w", err)
 	}
 
 	if len(nodes) != 1 {

@@ -1,299 +1,385 @@
 # LXD-related test helpers.
 
+spawn_lxd_snap() {
+    { set +x; } 2>/dev/null
+    # Install the snap and sideload the binaries
+    if ! [ -e /var/snap/lxd/common/lxd.debug ]; then
+      sideload_lxd_snap
+    fi
+
+    # Ensure LXD_DIR always points to the snap common dir
+    LXD_DIR_NON_SNAP="${LXD_DIR}"
+    LXD_DIR="/var/snap/lxd/common/lxd"
+
+    # For snap based tests, the lxc and lxc_remote functions MUST NOT be used
+    unset -f lxc lxc_remote
+
+    # shellcheck disable=SC2153
+    local lxd_backend="${LXD_BACKEND}"
+    if [ "$LXD_BACKEND" = "random" ]; then
+        lxd_backend="$(random_storage_backend)"
+    fi
+
+    # Pass GOCOVERDIR to snap
+    gocoverage_lxd_snap
+
+    # setup storage (add "-snap" suffix to pool name to avoid conflicts with the regular test pool)
+    local poolName="lxdtest-${LXD_DIR##*/}-snap"
+    "$lxd_backend"_setup "${LXD_DIR}" "${poolName}"
+    echo "$lxd_backend" > "${LXD_DIR}/lxd.backend"
+
+    echo "==> Starting lxd snap"
+
+    systemctl start snap.lxd.daemon.service
+    echo "==> Started lxd snap"
+
+    echo "==> Confirming lxd snap is responsive"
+    lxd waitready --timeout=300
+
+    # XXX: the lxd snap needs some time to spawn lxd and have a valid PID file
+    #      so wait till after `lxd waitready` to read the PID file and register
+    #      the daemon.
+    local LXD_PID
+    LXD_PID="$(< "${LXD_DIR}/../lxd.pid")"
+    # XXX: the lxd snap stores lxd PID in a different location so create a symlink
+    #      to the expected location.
+    ln -sf "${LXD_DIR}/../lxd.pid" "${LXD_DIR}/lxd.pid"
+    # XXX: the lxd snap stores lxd logs in a different location so create a symlink
+    #      to the expected location.
+    ln -sf "${LXD_DIR}/logs/lxd.log" "${LXD_DIR}/lxd.log"
+    # shellcheck disable=SC2153
+    echo "${LXD_DIR}" >> "${TEST_DIR}/daemons"
+    echo "==> Started lxd snap (PID is ${LXD_PID})"
+
+    echo "==> Binding to network"
+    lxc config set core.https_address "127.0.0.1:8443"
+
+    if [ -n "${SHELL_TRACING:-}" ]; then
+        set -x
+    fi
+
+    echo "==> Setting up networking"
+    lxc profile device add default eth0 nic nictype=p2p name=eth0
+
+    echo "==> Configuring storage backend"
+    "$lxd_backend"_configure "${LXD_DIR}" "${poolName}" "${SMALLEST_VM_ROOT_DISK}"
+}
+
 spawn_lxd() {
-    set +x
+    { set +x; } 2>/dev/null
     # LXD_DIR is local here because since $(lxc) is actually a function, it
     # overwrites the environment and we would lose LXD_DIR's value otherwise.
-
-    local LXD_DIR lxddir lxd_backend
-
-    lxddir=${1}
+    local LXD_DIR="${1}"
     shift
+    chmod +x "${LXD_DIR}"
 
-    storage=${1}
+    local storage="${1}"
     shift
 
     # shellcheck disable=SC2153
+    local lxd_backend="${LXD_BACKEND}"
     if [ "$LXD_BACKEND" = "random" ]; then
         lxd_backend="$(random_storage_backend)"
-    else
-        lxd_backend="$LXD_BACKEND"
-    fi
-
-    if [ "${LXD_BACKEND}" = "ceph" ] && [ -z "${LXD_CEPH_CLUSTER:-}" ]; then
-        echo "A cluster name must be specified when using the CEPH driver." >&2
-        exit 1
     fi
 
     # setup storage
-    "$lxd_backend"_setup "${lxddir}"
-    echo "$lxd_backend" > "${lxddir}/lxd.backend"
+    "$lxd_backend"_setup "${LXD_DIR}"
+    echo "$lxd_backend" > "${LXD_DIR}/lxd.backend"
 
-    echo "==> Spawning lxd in ${lxddir}"
-    # shellcheck disable=SC2086
+    echo "==> Spawning lxd in ${LXD_DIR}"
 
     if [ "${LXD_NETNS}" = "" ]; then
-        LXD_DIR="${lxddir}" lxd --logfile "${lxddir}/lxd.log" "${DEBUG-}" "$@" 2>&1 &
+        lxd --logfile "${LXD_DIR}/lxd.log" "${SERVER_DEBUG-}" "$@" 2>&1 &
     else
-        # shellcheck disable=SC2153
-        read -r pid < "${TEST_DIR}/ns/${LXD_NETNS}/PID"
-        LXD_DIR="${lxddir}" nsenter -n -m -t "${pid}" lxd --logfile "${lxddir}/lxd.log" "${DEBUG-}" "$@" 2>&1 &
+        nsenter -n -m -t "$(< "${TEST_DIR}/ns/${LXD_NETNS}/PID")" lxd --logfile "${LXD_DIR}/lxd.log" "${SERVER_DEBUG-}" "$@" 2>&1 &
     fi
-    LXD_PID=$!
-    echo "${LXD_PID}" > "${lxddir}/lxd.pid"
+    local LXD_PID=$!
+    echo "${LXD_PID}" > "${LXD_DIR}/lxd.pid"
     # shellcheck disable=SC2153
-    echo "${lxddir}" >> "${TEST_DIR}/daemons"
+    echo "${LXD_DIR}" >> "${TEST_DIR}/daemons"
     echo "==> Spawned LXD (PID is ${LXD_PID})"
 
     echo "==> Confirming lxd is responsive (PID is ${LXD_PID})"
-    LXD_DIR="${lxddir}" lxd waitready --timeout=300 || (echo "Killing PID ${LXD_PID}" ; kill -9 "${LXD_PID}" ; false)
+    lxd waitready --timeout=300 || (echo "Killing PID ${LXD_PID}" ; kill -9 "${LXD_PID}" ; false)
 
     if [ "${LXD_NETNS}" = "" ]; then
         echo "==> Binding to network"
         for _ in $(seq 10); do
             addr="127.0.0.1:$(local_tcp_port)"
-            LXD_DIR="${lxddir}" lxc config set core.https_address "${addr}" || continue
-            echo "${addr}" > "${lxddir}/lxd.addr"
+            lxc config set core.https_address "${addr}" || continue
+            echo "${addr}" > "${LXD_DIR}/lxd.addr"
             echo "==> Bound to ${addr}"
             break
         done
     fi
 
-    if [ -n "${DEBUG:-}" ]; then
+    if [ -n "${SHELL_TRACING:-}" ]; then
         set -x
     fi
 
     if [ "${LXD_NETNS}" = "" ]; then
         echo "==> Setting up networking"
-        LXD_DIR="${lxddir}" lxc profile device add default eth0 nic nictype=p2p name=eth0
+        lxc profile device add default eth0 nic nictype=p2p name=eth0
     fi
 
     if [ "${storage}" = true ]; then
         echo "==> Configuring storage backend"
-        "$lxd_backend"_configure "${lxddir}"
+        "$lxd_backend"_configure "${LXD_DIR}"
     fi
 }
 
 respawn_lxd() {
-    set +x
+    { set +x; } 2>/dev/null
     # LXD_DIR is local here because since $(lxc) is actually a function, it
     # overwrites the environment and we would lose LXD_DIR's value otherwise.
-
-    local LXD_DIR
-
-    lxddir=${1}
+    local LXD_DIR="${1}"
+    shift
+    local wait="${1}"
     shift
 
-    wait=${1}
-    shift
-
-    echo "==> Spawning lxd in ${lxddir}"
-    # shellcheck disable=SC2086
+    echo "==> Spawning lxd in ${LXD_DIR}"
     if [ "${LXD_NETNS}" = "" ]; then
-        LXD_DIR="${lxddir}" lxd --logfile "${lxddir}/lxd.log" "${DEBUG-}" "$@" 2>&1 &
+        lxd --logfile "${LXD_DIR}/lxd.log" "${SERVER_DEBUG-}" "$@" 2>&1 &
     else
         read -r pid < "${TEST_DIR}/ns/${LXD_NETNS}/PID"
-        LXD_DIR="${lxddir}" nsenter -n -m -t "${pid}" lxd --logfile "${lxddir}/lxd.log" "${DEBUG-}" "$@" 2>&1 &
+        nsenter -n -m -t "${pid}" lxd --logfile "${LXD_DIR}/lxd.log" "${SERVER_DEBUG-}" "$@" 2>&1 &
     fi
     LXD_PID=$!
-    echo "${LXD_PID}" > "${lxddir}/lxd.pid"
+    echo "${LXD_PID}" > "${LXD_DIR}/lxd.pid"
     echo "==> Spawned LXD (PID is ${LXD_PID})"
 
     if [ "${wait}" = true ]; then
         echo "==> Confirming lxd is responsive (PID is ${LXD_PID})"
-        LXD_DIR="${lxddir}" lxd waitready --timeout=300 || (echo "Killing PID ${LXD_PID}" ; kill -9 "${LXD_PID}" ; false)
+        lxd waitready --timeout=300 || (echo "Killing PID ${LXD_PID}" ; kill -9 "${LXD_PID}" ; false)
     fi
 
-    if [ -n "${DEBUG:-}" ]; then
+    if [ -n "${SHELL_TRACING:-}" ]; then
         set -x
     fi
+}
+
+kill_lxd_snap() {
+    # Ensure no LXD snap gets in the way
+    snap remove --purge lxd
+
+    # Restore LXD_DIR to its previous value
+    if [ "${LXD_DIR_NON_SNAP:-}" != "" ]; then
+        LXD_DIR="${LXD_DIR_NON_SNAP}"
+    fi
+
+    # Reinstate the lxc and lxc_remote functions
+    # shellcheck source=test/includes/lxc.sh
+    . "${MAIN_DIR}/includes/lxc.sh"
 }
 
 kill_lxd() {
     # LXD_DIR is local here because since $(lxc) is actually a function, it
     # overwrites the environment and we would lose LXD_DIR's value otherwise.
-
-    local LXD_DIR daemon_dir daemon_pid check_leftovers lxd_backend
-
-    daemon_dir=${1}
-    LXD_DIR=${daemon_dir}
+    local LXD_DIR="${1}"
 
     # Check if already killed
-    if [ ! -f "${daemon_dir}/lxd.pid" ]; then
-      return
-    fi
+    [ -f "${LXD_DIR}/lxd.pid" ] || return 0
 
-    daemon_pid=$(cat "${daemon_dir}/lxd.pid")
+    local LXD_PID lxd_backend check_leftovers
+    LXD_PID=$(< "${LXD_DIR}/lxd.pid")
     check_leftovers="false"
-    lxd_backend=$(storage_backend "$daemon_dir")
-    echo "==> Killing LXD at ${daemon_dir} (${daemon_pid})"
+    lxd_backend="$(storage_backend "${LXD_DIR}")"
+    echo "==> Killing LXD at ${LXD_DIR} (${LXD_PID})"
 
-    if [ -e "${daemon_dir}/unix.socket" ]; then
+    if [ -e "${LXD_DIR}/unix.socket" ]; then
         # Delete all containers
-        echo "==> Deleting all containers"
-        for container in $(timeout -k 2 2 lxc list --force-local --format csv --columns n); do
-            timeout -k 10 10 lxc delete "${container}" --force-local -f || true
-        done
+        echo "==> Deleting all instances from all projects"
+        while IFS=, read -r instance project; do
+            echo "   ⛔ instance ${instance} from project ${project}"
+            timeout -k 10 10 lxc delete "${instance}" --project "${project}" --force-local -f || true
+        done < <(timeout -k 2 2 lxc list --force-local --all-projects --format csv --columns ne)
 
         # Delete all images
-        echo "==> Deleting all images"
-        for image in $(timeout -k 2 2 lxc image list --force-local --format csv --columns f); do
-            timeout -k 10 10 lxc image delete "${image}" --force-local || true
-        done
+        echo "==> Deleting all images from all projects"
+        while IFS=, read -r image project; do
+            echo "   ⛔ image ${image} from project ${project}"
+            timeout -k 10 10 lxc image delete "${image}" --project "${project}" --force-local || true
+        done < <(timeout -k 2 2 lxc image list --force-local --all-projects --format csv --columns Fe)
 
         # Delete all profiles
-        echo "==> Deleting all profiles"
-        for profile in $(timeout -k 2 2 lxc profile list --force-local --format csv | cut -d, -f1); do
-            timeout -k 10 10 lxc profile delete "${profile}" --force-local || true
-        done
+        echo "==> Deleting all profiles from all projects"
+        while IFS=, read -r profile project; do
+            # default cannot be deleted.
+            [ "${profile}" = "default" ] && continue
+            echo "   ⛔ Deleting profile ${profile} from project ${project}"
+            timeout -k 10 10 lxc profile delete "${profile}" --project "${project}" --force-local || true
+        done < <(timeout -k 2 2 lxc profile list --force-local --all-projects --format csv --columns ne)
 
         # Delete all networks
-        echo "==> Deleting all managed networks"
-        for network in $(timeout -k 2 2 lxc network list --force-local --format csv | awk -F, '{if ($3 == "YES") {print $1}}'); do
-            timeout -k 10 10 lxc network delete "${network}" --force-local || true
-        done
+        echo "==> Deleting all managed networks from all projects"
+        while IFS=, read -r project network _ managed _; do
+            # Only delete managed networks.
+            [ "${managed}" != "YES" ] && continue
+            echo "   ⛔ Deleting network ${network} from project ${project}"
+            timeout -k 10 10 lxc network delete "${network}" --project "${project}" --force-local || true
+        done < <(timeout -k 2 2 lxc network list --all-projects --force-local --format csv)
 
         # Clear config of the default profile since the profile itself cannot
         # be deleted.
         echo "==> Clearing config of default profile"
-        printf 'config: {}\ndevices: {}' | timeout -k 5 5 lxc profile edit default
+        echo -ne 'config: {}\ndevices: {}' | timeout -k 5 5 lxc profile edit default
 
         echo "==> Deleting all storage pools"
-        for storage_pool in $(lxc query "/1.0/storage-pools?recursion=1" | jq .[].name -r); do
+        while read -r storage_pool; do
             # Delete the storage volumes.
-            for volume in $(lxc query "/1.0/storage-pools/${storage_pool}/volumes/custom?recursion=1" | jq .[].name -r); do
-                echo "==> Deleting storage volume ${volume} on ${storage_pool}"
+            path="/1.0/storage-pools/${storage_pool}/volumes/custom"
+            while read -r volume; do
+                echo "   ⛔ Deleting storage volume ${volume} on ${storage_pool}"
                 timeout -k 20 20 lxc storage volume delete "${storage_pool}" "${volume}" --force-local || true
-            done
+            done < <(lxc query "${path}" | jq --exit-status --raw-output ".[] | ltrimstr(\"${path}/\")")
 
-            # Delete the storage buckets.
-            for bucket in $(lxc query "/1.0/storage-pools/${storage_pool}/buckets?recursion=1" | jq .[].name -r); do
-                echo "==> Deleting storage bucket ${bucket} on ${storage_pool}"
-                timeout -k 20 20 lxc storage bucket delete "${storage_pool}" "${bucket}" --force-local || true
-            done
+            # Delete the storage buckets (only object storage pools support buckets).
+            if lxc query "/1.0/storage-pools/${storage_pool}" | jq --exit-status '.driver == "cephobject"' > /dev/null; then
+                path="/1.0/storage-pools/${storage_pool}/buckets"
+                while read -r bucket; do
+                    echo "   ⛔ Deleting storage bucket ${bucket} on ${storage_pool}"
+                    timeout -k 20 20 lxc storage bucket delete "${storage_pool}" "${bucket}" --force-local || true
+                done < <(lxc query "${path}" | jq --exit-status --raw-output ".[] | ltrimstr(\"${path}/\")")
+            fi
 
             ## Delete the storage pool.
+            echo "   ⛔ Deleting storage pool ${storage_pool}"
             timeout -k 20 20 lxc storage delete "${storage_pool}" --force-local || true
-        done
+        done < <(lxc query /1.0/storage-pools | jq --exit-status --raw-output ".[] | ltrimstr(\"/1.0/storage-pools/\")")
 
         echo "==> Checking for locked DB tables"
-        for table in $(echo .tables | sqlite3 "${daemon_dir}/local.db"); do
-            echo "SELECT * FROM ${table};" | sqlite3 "${daemon_dir}/local.db" >/dev/null
-        done
+        while read -r table; do
+            echo "SELECT 1 FROM ${table} LIMIT 1;" | sqlite3 "${LXD_DIR}/local.db" >/dev/null
+        done < <(echo .tables | sqlite3 "${LXD_DIR}/local.db")
 
         # Kill the daemon
-        timeout -k 30 30 lxd shutdown || kill -9 "${daemon_pid}" 2>/dev/null || true
-
-        sleep 2
-
-        # Cleanup shmounts (needed due to the forceful kill)
-        find "${daemon_dir}" -name shmounts -exec "umount" "-l" "{}" \; >/dev/null 2>&1 || true
-        find "${daemon_dir}" -name devlxd -exec "umount" "-l" "{}" \; >/dev/null 2>&1 || true
+        timeout -k 30 30 lxd shutdown || kill_go_proc "${LXD_PID}" 2>/dev/null || true
 
         check_leftovers="true"
     fi
 
+    # If SERVER_DEBUG is set, check for panics in the daemon logs
+    if [ -n "${SERVER_DEBUG:-}" ]; then
+      "${MAIN_DIR}/deps/panic-checker" "${LXD_DIR}/lxd.log"
+    fi
+
     if [ -n "${LXD_LOGS:-}" ]; then
         echo "==> Copying the logs"
-        mkdir -p "${LXD_LOGS}/${daemon_pid}"
-        cp -R "${daemon_dir}/logs/" "${LXD_LOGS}/${daemon_pid}/"
-        cp "${daemon_dir}/lxd.log" "${LXD_LOGS}/${daemon_pid}/"
+        mkdir -p "${LXD_LOGS}/${LXD_PID}"
+        cp -R "${LXD_DIR}/logs/" "${LXD_LOGS}/${LXD_PID}/"
+        cp "${LXD_DIR}/lxd.log" "${LXD_LOGS}/${LXD_PID}/"
     fi
 
     if [ "${check_leftovers}" = "true" ]; then
+        echo "==> Checking for leftover DB entries"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "images"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "images_aliases"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "images_nodes"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "images_properties"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "images_source"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "instances"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "instances_config"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "instances_devices"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "instances_devices_config"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "instances_profiles"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "networks"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "networks_config"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "profiles"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "profiles_config"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "profiles_devices"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "profiles_devices_config"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "storage_pools"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "storage_pools_config"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "storage_pools_nodes"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "storage_volumes"
+        check_empty_table "${LXD_DIR}/database/global/db.bin" "storage_volumes_config"
+
+        # Cleanup devlxd and shmounts (needed due to the forceful kill)
+        # Only try to unmount things on the same filesystem as LXD_DIR and only if they are directories.
+        # This is to avoid stepping on the snap symlink that appears to be dangling from the host's point of view.
+        find "${LXD_DIR}" -type d -xdev \( -name devlxd -o -name shmounts \) -exec "umount" "-q" "-l" "{}" + || true
+
         echo "==> Checking for leftover files"
-        rm -f "${daemon_dir}/containers/lxc-monitord.log"
+        rm -f "${LXD_DIR}/containers/lxc-monitord.log"
 
         # Support AppArmor policy cache directory
-        apparmor_cache_dir="$(apparmor_parser -L "${daemon_dir}"/security/apparmor/cache --print-cache-dir)"
+        apparmor_cache_dir="$(apparmor_parser --cache-loc "${LXD_DIR}"/security/apparmor/cache --print-cache-dir)"
         rm -f "${apparmor_cache_dir}/.features"
-        check_empty "${daemon_dir}/containers/"
-        check_empty "${daemon_dir}/devices/"
-        check_empty "${daemon_dir}/images/"
+        check_empty "${LXD_DIR}/containers/"
+        check_empty "${LXD_DIR}/devices/"
+        check_empty "${LXD_DIR}/images/"
         # FIXME: Once container logging rework is done, uncomment
-        # check_empty "${daemon_dir}/logs/"
+        # check_empty "${LXD_DIR}/logs/"
         check_empty "${apparmor_cache_dir}"
-        check_empty "${daemon_dir}/security/apparmor/profiles/"
-        check_empty "${daemon_dir}/security/seccomp/"
-        check_empty "${daemon_dir}/shmounts/"
-        check_empty "${daemon_dir}/snapshots/"
-
-        echo "==> Checking for leftover DB entries"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "instances"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "instances_config"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "instances_devices"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "instances_devices_config"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "instances_profiles"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "images"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "images_aliases"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "images_properties"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "images_source"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "images_nodes"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "networks"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "networks_config"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "profiles"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "profiles_config"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "profiles_devices"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "profiles_devices_config"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "storage_pools"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "storage_pools_nodes"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "storage_pools_config"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "storage_volumes"
-        check_empty_table "${daemon_dir}/database/global/db.bin" "storage_volumes_config"
+        check_empty "${LXD_DIR}/security/apparmor/profiles/"
+        check_empty "${LXD_DIR}/security/seccomp/"
+        check_empty "${LXD_DIR}/shmounts/"
+        check_empty "${LXD_DIR}/snapshots/"
     fi
 
     # teardown storage
-    "$lxd_backend"_teardown "${daemon_dir}"
+    "$lxd_backend"_teardown "${LXD_DIR}"
 
     # Wipe the daemon directory
-    wipe "${daemon_dir}"
+    wipe "${LXD_DIR}"
 
     # Remove the daemon from the list
-    sed "\\|^${daemon_dir}|d" -i "${TEST_DIR}/daemons"
+    sed "\\|^${LXD_DIR}|d" -i "${TEST_DIR}/daemons"
+
+    # If this is the snap, extra steps are needed
+    if [ "${LXD_DIR}" = "/var/snap/lxd/common/lxd" ]; then
+      kill_lxd_snap
+    fi
 }
 
 shutdown_lxd() {
     # LXD_DIR is local here because since $(lxc) is actually a function, it
     # overwrites the environment and we would lose LXD_DIR's value otherwise.
+    local LXD_DIR="${1}"
+    shift
 
-    local LXD_DIR
-
-    daemon_dir=${1}
-    # shellcheck disable=2034
-    LXD_DIR=${daemon_dir}
-    daemon_pid=$(cat "${daemon_dir}/lxd.pid")
-    echo "==> Shutting down LXD at ${daemon_dir} (${daemon_pid})"
+    local LXD_PID
+    LXD_PID=$(< "${LXD_DIR}/lxd.pid")
+    echo "==> Shutting down LXD at ${LXD_DIR} (${LXD_PID})"
 
     # Shutting down the daemon
-    lxd shutdown || kill -9 "${daemon_pid}" 2>/dev/null || true
+    lxd shutdown || kill_go_proc "${LXD_PID}" 2>/dev/null || true
 
     # Wait for any cleanup activity that might be happening right
     # after the websocket is closed.
-    sleep 0.5
+    sleep 0.1
 }
 
 wait_for() {
     local addr op
-
-    addr=${1}
+    addr="${1}"
     shift
-    op=$("$@" | jq -r .operation)
+    op="$("$@" | jq --exit-status --raw-output '.operation')"
     my_curl "https://${addr}${op}/wait"
 }
 
-wipe() {
-    if command -v btrfs >/dev/null 2>&1; then
-        rm -Rf "${1}" 2>/dev/null || true
-        if [ -d "${1}" ]; then
-            find "${1}" | tac | xargs btrfs subvolume delete >/dev/null 2>&1 || true
-        fi
-    fi
+# waitInstanceReady: waits for the instance to be ready (processes count > 0).
+waitInstanceReady() {
+    local instName="${1}"
+    local instProj="${2:-}"
+    local i
 
-    local pid
-    # shellcheck disable=SC2009
-    ps aux | grep lxc-monitord | grep "${1}" | awk '{print $2}' | while read -r pid; do
-        kill -9 "${pid}" || true
+    for i in $(seq "${MAX_WAIT_SECONDS:-120}"); do
+        if lxc query "/1.0/instances/${instName}/state?project=${instProj}" | jq --exit-status '.processes | select(. > 0)'; then
+            return 0
+        fi
+        sleep 1
     done
+
+    echo "Instance ${instName} (${instProj:-current}) not ready after ${i}s"
+    return 1
+}
+
+wipe() {
+    rm -Rf "${1}" 2>/dev/null || true
+    if [ -d "${1}" ] && command -v btrfs >/dev/null 2>&1; then
+        find "${1}" -type d | tac | xargs btrfs subvolume delete >/dev/null 2>&1 || true
+    fi
 
     if mountpoint -q "${1}"; then
         umount -l "${1}"
@@ -302,21 +388,38 @@ wipe() {
     rm -Rf "${1}"
 }
 
+panic_checker() {
+  # Only run if SERVER_DEBUG is set (e.g. LXD_VERBOSE or LXD_DEBUG is set)
+  # Panics are logged at info level, which won't be outputted unless this is set.
+  if [ -z "${SERVER_DEBUG:-}" ]; then
+    return 0
+  fi
+
+  local test_dir daemon_dir
+  test_dir="${1}"
+
+  [ -s "${test_dir}/daemons" ] || return
+
+  while read -r daemon_dir; do
+    [ -s "${daemon_dir}/lxd.log" ] || continue
+    "${MAIN_DIR}/deps/panic-checker" "${daemon_dir}/lxd.log"
+  done < "${test_dir}/daemons"
+}
+
 # Kill and cleanup LXD instances and related resources
 cleanup_lxds() {
     local test_dir daemon_dir
     test_dir="$1"
 
     # Kill all LXD instances
-    while read -r daemon_dir; do
-        kill_lxd "${daemon_dir}"
-    done < "${test_dir}/daemons"
+    if [ -s "${test_dir}/daemons" ]; then
+      while read -r daemon_dir; do
+          kill_lxd "${daemon_dir}"
+      done < "${test_dir}/daemons"
+    fi
 
     # Cleanup leftover networks
-    # shellcheck disable=SC2009
-    ps aux | grep "interface=lxdt$$ " | grep -v grep | awk '{print $2}' | while read -r line; do
-        kill -9 "${line}"
-    done
+    pkill -9 -f " --interface=lxdt$$ "  # dnsmasq process
     if [ -e "/sys/class/net/lxdt$$" ]; then
         ip link del lxdt$$
     fi
@@ -329,4 +432,185 @@ cleanup_lxds() {
     wipe "$test_dir"
 
     umount_loops "$test_dir"
+}
+
+lxc_monitor_start() {
+    local output="${1}"; shift
+    local ready="${TEST_DIR}/monitor.$$.${RANDOM}.ready"
+
+    lxc monitor --verbose "$@" > "${output}" 2> "${ready}" &
+    LXC_MONITOR_PID=$!
+    for i in $(seq 200); do
+        if grep -qF "Monitoring events" "${ready}"; then
+            rm -f "${ready}"
+            return 0
+        fi
+
+        sleep 0.1
+    done
+    echo "lxc monitor $* (${LXC_MONITOR_PID}) failed liveness check"
+    cat "${ready}"
+    rm -f "${ready}"
+    kill_go_proc "${LXC_MONITOR_PID}"
+    return 1
+}
+
+lxd_shutdown_restart() {
+    local scenario="${1}"
+    local LXD_PID
+
+    LXD_PID=$(< "${LXD_DIR}/lxd.pid")
+    echo "==> Shutting down LXD at ${LXD_DIR} (${LXD_PID})"
+
+    local logfile="${scenario}.log"
+    echo "Starting LXD log capture in $logfile using lxc monitor..."
+    lxc_monitor_start "$logfile" --pretty
+    local monitor_pid="${LXC_MONITOR_PID}"
+    echo "Monitor PID: $monitor_pid"
+    echo "LXD daemon PID: $LXD_PID"
+    echo "Starting LXD shutdown sequence..."
+    if ! kill -SIGPWR "$LXD_PID" 2>/dev/null; then
+        echo "Failed to signal LXD to shutdown" | tee -a "$logfile"
+        return 1
+    fi
+
+    echo "Waiting for LXD to shutdown gracefully..." | tee -a "$logfile"
+    for _ in $(seq 540); do
+        if [ -d "/proc/${LXD_PID}" ]; then
+            sleep 0.5
+        else
+            # Once LXD has shutdown, wait for the monitor to capture all logs
+            # and terminate on its own. Ignore any errors from wait in case the
+            # monitor has already exited.
+            wait "${monitor_pid}" || true
+            break
+        fi
+    done
+
+    echo "LXD shutdown sequence completed."
+    respawn_lxd "${LXD_DIR}" true
+}
+
+# create_instances creates a specified number of instances in the background.
+# The instance are called i1, i2, i3, etc.
+create_instances() {
+  local n="${1}"  # Number of instances to create.
+
+  for i in $(seq "${n}"); do
+    echo "Creating instance i${i}..."
+    lxc launch --quiet testimage "i${i}" -d "${SMALL_ROOT_DISK}"
+  done
+
+  echo "All instances created successfully."
+}
+
+# Returns true if Go coverage collection is enabled (GOCOVERDIR is set).
+coverage_enabled() {
+  [ -n "${GOCOVERDIR:-}" ]
+}
+
+# Kills a Go process, using start-stop-daemon if coverage is enabled or kill -9 otherwise.
+# When coverage is enabled, use start-stop-daemon to allow it to write out coverage data.
+# https://go.dev/doc/build-cover#panicprof:
+# > Programs built with go build -cover will only write out complete profile data
+# > at the end of execution if the program invokes os.Exit() or returns normally
+# > from main.main. If a program terminates in an unrecovered panic, or if the
+# > program hits a fatal exception (such as a segmentation violation, divide by
+# > zero, etc), profile data from statements executed during the run will be lost.
+kill_go_proc() {
+  local pid="${1}"
+  if coverage_enabled; then
+    # Send TERM, wait 1 second, then KILL.
+    start-stop-daemon --stop --retry=TERM/1/KILL --pid "${pid}"
+  else
+    kill -9 "${pid}"
+  fi
+}
+
+
+# If Go coverage is enabled, prepare the lxd-agent inside the instance for hard stop.
+# This is a no-op if coverage is not enabled.
+prepare_vm_for_hard_stop() {
+  coverage_enabled || return 0
+
+  local instance="${1}"
+  local project="${2:-}"
+
+  # The lxd-agent is only relevant for VMs.
+  if [ "$(lxc list --project "${project}" -f csv -c t name="${instance}")" != "VIRTUAL-MACHINE" ]; then
+    return 0
+  fi
+
+  lxc exec "${instance}" --project "${project}" -- systemctl stop --no-block lxd-agent.service || true
+}
+
+# Setup instance to collect coverage data from running Go binaries from inside the instance.
+# If coverage is not enabled, this is a no-op.
+# If the instance is a VM, the lxd-agent will be instrumented too.
+# Note: incompatible with `migration.stateful=true` instances due to relying on host shared directory for coverage data.
+setup_instance_gocoverage() {
+  coverage_enabled || return 0
+
+  local instance="${1}"
+  local project="${2:-}"
+
+  echo "==> Setting up Go coverage gathering inside the ${instance} (${project:-"-"}) instance"
+
+  # Mount the host's GOCOVERDIR into the instance.
+  lxc config device add "${instance}" gocoverdir disk source="${GOCOVERDIR}" path="${GOCOVERDIR}" --project "${project}"
+
+  # The GOCOVERDIR variable is set for use by test binaries.
+  lxc config set "${instance}" environment.GOCOVERDIR="${GOCOVERDIR}" --project "${project}"
+
+  # The lxd-agent is only relevant for VMs.
+  if [ "$(lxc list --project "${project}" -f csv -c t name="${instance}")" != "VIRTUAL-MACHINE" ]; then
+    return 0
+  fi
+
+  # The GOCOVERDIR variable is passed to lxd-agent via a systemd drop-in.
+  lxc file push --quiet --create-dirs --project "${project}" - "${instance}"/etc/systemd/system/lxd-agent.service.d/env.conf << EOF
+[Service]
+Environment="GOCOVERDIR=${GOCOVERDIR}"
+EOF
+  lxc exec "${instance}" --project "${project}" -- systemctl daemon-reload
+
+  # Restarting lxd-agent is expected to abruptly terminate the lxc exec session,
+  # so a failure is possible and harmless.
+  lxc exec "${instance}" --project "${project}" -- systemctl restart --no-block lxd-agent.service || true
+
+  # Restarting the lxd-agent isn't instantaneous, so wait for it to be ready again.
+  waitInstanceReady "${instance}" "${project}"
+
+  # Give lxd-agent a moment to start up properly.
+  sleep 1
+}
+
+# Teardown instance Go coverage gathering.
+# If coverage is not enabled, this is a no-op.
+teardown_instance_gocoverage() {
+  coverage_enabled || return 0
+
+  local instance="${1}"
+  local project="${2:-}"
+
+  echo "==> Tearing down Go coverage gathering inside the ${instance} (${project:-"-"}) instance"
+
+  # The lxd-agent is only relevant for VMs.
+  if [ "$(lxc list --project "${project}" -f csv -c t name="${instance}")" = "VIRTUAL-MACHINE" ]; then
+    lxc file delete "${instance}"/etc/systemd/system/lxd-agent.service.d/env.conf --project "${project}"
+    lxc exec "${instance}" --project "${project}" -- systemctl daemon-reload
+
+    # Restarting lxd-agent is expected to abruptly terminate the lxc exec session,
+    # so expect failure.
+    ! lxc exec "${instance}" --project "${project}" -- systemctl restart lxd-agent.service || false
+
+    # Restarting the lxd-agent isn't instantaneous, so wait for it to be ready again.
+    waitInstanceReady "${instance}" "${project}"
+  fi
+
+  # Unset the GOCOVERDIR environment variable.
+  lxc config unset "${instance}" environment.GOCOVERDIR --project "${project}"
+
+  # Remove the shared dir.
+  lxc config device remove "${instance}" gocoverdir --project "${project}"
 }

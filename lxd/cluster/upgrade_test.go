@@ -10,8 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/canonical/go-dqlite/client"
-	"github.com/canonical/go-dqlite/driver"
+	"github.com/canonical/go-dqlite/v3/client"
+	"github.com/canonical/go-dqlite/v3/driver"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -33,12 +34,10 @@ func TestNotifyUpgradeCompleted(t *testing.T) {
 	gateway1 := f.Grow()
 
 	wg := sync.WaitGroup{}
-	wg.Add(1)
 
-	go func() {
-		gateway1.WaitUpgradeNotification()
-		wg.Done()
-	}()
+	wg.Go(func() {
+		gateway1.WaitUpgradeNotification(context.Background())
+	})
 
 	state0 := f.State(gateway0)
 
@@ -71,7 +70,7 @@ func TestMaybeUpdate_Upgrade(t *testing.T) {
 	// Create a stub upgrade script that just touches a stamp file.
 	stamp := filepath.Join(dir, "stamp")
 	script := filepath.Join(dir, "cluster-upgrade")
-	data := []byte(fmt.Sprintf("#!/bin/sh\ntouch %s\n", stamp))
+	data := fmt.Appendf(nil, "#!/bin/sh\ntouch %s\n", stamp)
 	err = os.WriteFile(script, data, 0755)
 	require.NoError(t, err)
 
@@ -124,7 +123,7 @@ func TestMaybeUpdate_NothingToDo(t *testing.T) {
 	// Create a stub upgrade script that just touches a stamp file.
 	stamp := filepath.Join(dir, "stamp")
 	script := filepath.Join(dir, "cluster-upgrade")
-	data := []byte(fmt.Sprintf("#!/bin/sh\ntouch %s\n", stamp))
+	data := fmt.Appendf(nil, "#!/bin/sh\ntouch %s\n", stamp)
 	err = os.WriteFile(script, data, 0755)
 	require.NoError(t, err)
 
@@ -161,11 +160,13 @@ func TestUpgradeMembersWithoutRole(t *testing.T) {
 		mux.HandleFunc(path, handler)
 	}
 
-	var err error
 	require.NoError(t, state.DB.Cluster.Close())
+
+	serverUUID, err := uuid.NewV7()
+	require.NoError(t, err)
 	store := gateway.NodeStore()
 	dial := gateway.DialFunc()
-	state.DB.Cluster, err = db.OpenCluster(context.Background(), "db.bin", store, address, "/unused/db/dir", 5*time.Second, nil, driver.WithDialFunc(dial))
+	state.DB.Cluster, err = db.OpenCluster(context.Background(), "db.bin", store, address, "/unused/db/dir", 5*time.Second, serverUUID.String(), driver.WithDialFunc(dial))
 	require.NoError(t, err)
 	gateway.Cluster = state.DB.Cluster
 

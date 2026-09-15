@@ -8,33 +8,24 @@ import (
 	"github.com/canonical/lxd/shared"
 )
 
-// HasClientCertificate will return true if a client certificate has already been generated.
-func (c *Config) HasClientCertificate() bool {
-	certf := c.ConfigPath("client.crt")
-	keyf := c.ConfigPath("client.key")
-	if !shared.PathExists(certf) || !shared.PathExists(keyf) {
-		return false
-	}
-
-	return true
-}
-
 // GenerateClientCertificate will generate the needed client.crt and client.key if needed.
 func (c *Config) GenerateClientCertificate() error {
-	if c.HasClientCertificate() {
+	certf := c.ConfigPath("client.crt")
+	keyf := c.ConfigPath("client.key")
+
+	if shared.PathExists(certf) && shared.PathExists(keyf) {
 		return nil
 	}
 
-	certf := c.ConfigPath("client.crt")
-	keyf := c.ConfigPath("client.key")
+	fmt.Fprint(os.Stderr, "Generating a client certificate. This may take a moment...\n")
 
 	return shared.FindOrGenCert(certf, keyf, true, shared.CertOptions{})
 }
 
 // CopyGlobalCert will copy global (system-wide) certificate to the user config path.
 func (c *Config) CopyGlobalCert(src string, dst string) error {
-	oldPath := c.GlobalConfigPath("servercerts", fmt.Sprintf("%s.crt", src))
-	newPath := c.ConfigPath("servercerts", fmt.Sprintf("%s.crt", dst))
+	oldPath := c.GlobalConfigPath("servercerts", src+".crt")
+	newPath := c.ConfigPath("servercerts", dst+".crt")
 	sourceFile, err := os.Open(oldPath)
 	if err != nil {
 		return err

@@ -29,6 +29,8 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   capability fsetid,
   capability mknod,
   capability setfcap,
+  # CAP_SYS_ADMIN is needed to set 'trusted.*' and 'security.*' extended attributes
+  capability sys_admin,
 
   unix (connect, send, receive) type=stream,
 
@@ -43,11 +45,13 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
 
 {{- if .sourcePath }}
   {{ .sourcePath }}/** r,
+  {{ .sourcePath }} r,
   {{ .sourcePath }}/ r,
 {{- end }}
 
 {{- if .dstPath }}
   {{ .dstPath }}/** rwkl,
+  {{ .dstPath }} rwkl,
   {{ .dstPath }}/ rwkl,
 {{- end }}
 
@@ -102,7 +106,7 @@ func RsyncWrapper(sysOS *sys.OS, cmd *exec.Cmd, sourcePath string, dstPath strin
 	// Load the profile.
 	profileName, err := rsyncProfileLoad(sysOS, sourcePath, dstPath)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to load rsync profile: %w", err)
+		return nil, fmt.Errorf("Failed loading rsync profile: %w", err)
 	}
 
 	revert.Add(func() { _ = deleteProfile(sysOS, profileName, profileName) })
@@ -114,7 +118,8 @@ func RsyncWrapper(sysOS *sys.OS, cmd *exec.Cmd, sourcePath string, dstPath strin
 	}
 
 	// Override the command.
-	newArgs := []string{"aa-exec", "-p", profileName}
+	newArgs := make([]string, 0, 3+len(cmd.Args))
+	newArgs = append(newArgs, "aa-exec", "-p", profileName)
 	newArgs = append(newArgs, cmd.Args...)
 	cmd.Args = newArgs
 	cmd.Path = execPath

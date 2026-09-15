@@ -4,14 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"testing"
 
-	"github.com/canonical/go-dqlite/driver"
+	"github.com/canonical/go-dqlite/v3/driver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -61,7 +59,7 @@ func TestGateway_Single(t *testing.T) {
 	require.NoError(t, netConn.Close())
 
 	leader, err := gateway.LeaderAddress()
-	assert.Equal(t, "", leader)
+	assert.Empty(t, leader)
 	assert.EqualError(t, err, cluster.ErrNodeIsNotClustered.Error())
 
 	driver, err := driver.New(
@@ -150,7 +148,7 @@ func TestGateway_NetworkAuth(t *testing.T) {
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: config}}
 
 	for path := range gateway.HandlerFuncs(nil, &identity.Cache{}) {
-		url := fmt.Sprintf("https://%s%s", address, path)
+		url := "https://" + address + path
 		response, err := client.Head(url)
 		require.NoError(t, err)
 		assert.Equal(t, http.StatusForbidden, response.StatusCode)
@@ -181,13 +179,13 @@ func TestGateway_RaftNodesNotLeader(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Len(t, nodes, 1)
-	assert.Equal(t, nodes[0].ID, uint64(1))
+	assert.Equal(t, uint64(1), nodes[0].ID)
 	assert.Equal(t, nodes[0].Address, address)
 }
 
 // Create a new test Gateway with the given parameters, and ensure no error happens.
 func newGateway(t *testing.T, node *db.Node, networkCert *shared.CertInfo, s *state.State) *cluster.Gateway {
-	require.NoError(t, os.Mkdir(filepath.Join(node.Dir(), "global"), 0755))
+	require.NoError(t, os.Mkdir(node.DqliteDir(), 0755))
 	stateFunc := func() *state.State { return s }
 	gateway, err := cluster.NewGateway(context.Background(), node, networkCert, stateFunc, cluster.Latency(0.2), cluster.LogLevel("TRACE"))
 	require.NoError(t, err)

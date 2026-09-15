@@ -3,6 +3,10 @@ package shared
 import (
 	"fmt"
 	"net"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func Example_parseIPRange() {
@@ -134,4 +138,135 @@ func Example_ipRangesOverlap() {
 	// Range1: 10.1.1.4, Range2: 10.1.1.4, overlapped: true
 	// Range1: 10.1.1.4, Range2: 10.1.1.8-10.1.1.9, overlapped: false
 	// Range1: 10.1.1.8-10.1.1.9, Range2: 10.1.1.4, overlapped: false
+}
+
+func TestGetIPScope(t *testing.T) {
+	tests := []struct {
+		ip       string
+		expected string
+	}{
+		{
+			ip:       "169.254.183.5",
+			expected: "link",
+		},
+		{
+			ip:       "fe80::1",
+			expected: "link",
+		},
+		{
+			ip:       "192.0.2.1",
+			expected: "global",
+		},
+		{
+			ip:       "::1",
+			expected: "local",
+		},
+		{
+			ip:       "127.0.0.1",
+			expected: "local",
+		},
+		{
+			ip:       "127::db8::1",
+			expected: "global",
+		},
+		{
+			ip:       "2001:db8::1",
+			expected: "global",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.ip, func(t *testing.T) {
+			scope := GetIPScope(test.ip)
+			assert.Equal(t, test.expected, scope, "Expected scope to match")
+		})
+	}
+}
+
+func TestParseNetworks(t *testing.T) {
+	testCases := []struct {
+		name       string
+		networks   string
+		expectNets []string
+		expectErr  bool
+	}{
+		{
+			name:       "Single network",
+			networks:   "10.0.0.0/24",
+			expectNets: []string{"10.0.0.0/24"},
+			expectErr:  false,
+		},
+		{
+			name:       "Multiple networks",
+			networks:   "10.0.0.0/24,192.168.0.1/32,127.0.0.0/8",
+			expectNets: []string{"10.0.0.0/24", "192.168.0.1/32", "127.0.0.0/8"},
+			expectErr:  false,
+		},
+		{
+			name:       "Multiple networks with whitespace (tabs)",
+			networks:   "10.0.0.0/24,  192.168.0.1/32,   127.0.0.0/8",
+			expectNets: []string{"10.0.0.0/24", "192.168.0.1/32", "127.0.0.0/8"},
+			expectErr:  false,
+		},
+		{
+			name:       "Multiple networks with whitespace (newlines)",
+			networks:   "10.0.0.0/24,\n192.168.0.1/32\n,\n127.0.0.0/8",
+			expectNets: []string{"10.0.0.0/24", "192.168.0.1/32", "127.0.0.0/8"},
+			expectErr:  false,
+		},
+		{
+			name:       "Invalid network",
+			networks:   "abcd.abcd/8",
+			expectNets: nil,
+			expectErr:  true,
+		},
+		{
+			name:       "Multiple invalid networks",
+			networks:   "600.600.600.600/24,abcd.abcd/8,abcd.abcd/8",
+			expectNets: nil,
+			expectErr:  true,
+		},
+		{
+			name:       "Single invalid network in a list",
+			networks:   "10.0.0.0/24,192.168.0.1/32,600.600.600.600/24,127.0.0.0/8",
+			expectNets: nil,
+			expectErr:  true,
+		},
+		{
+			name:       "Single IPv6 network",
+			networks:   "2001:db8:abcd:1::/64",
+			expectNets: []string{"2001:db8:abcd:1::/64"},
+			expectErr:  false,
+		},
+		{
+			name:       "Multiple IPv6 networks",
+			networks:   "2001:db8:abcd:1::/64,2001:db8:1234:1a00::/56",
+			expectNets: []string{"2001:db8:abcd:1::/64", "2001:db8:1234:1a00::/56"},
+			expectErr:  false,
+		},
+		{
+			name:       "Mixed IPv4 and IPv6 networks",
+			networks:   "2001:db8:abcd:1::/64,10.0.0.0/24,2001:db8:1234:1a00::/56",
+			expectNets: []string{"2001:db8:abcd:1::/64", "10.0.0.0/24", "2001:db8:1234:1a00::/56"},
+			expectErr:  false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			nets, err := ParseNetworks(tc.networks)
+
+			if tc.expectErr {
+				assert.Error(t, err, "Expected ParseNetworks to return an error.")
+			} else {
+				assert.NoError(t, err, "Expected ParseNetworks to succeed.")
+			}
+
+			require.Len(t, tc.expectNets, len(nets), "Expected number of networks in/out to match.")
+
+			for i, net := range nets {
+				assert.Equal(t, net.String(), tc.expectNets[i], "Expected networks to match.")
+			}
+		})
+	}
 }

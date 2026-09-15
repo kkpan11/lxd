@@ -2,6 +2,7 @@ package cgroup
 
 import (
 	"bufio"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,17 +17,17 @@ var cgControllers = map[string]Backend{}
 var cgNamespace bool
 
 // Layout determines the cgroup layout on this system.
-type Layout int
+type Layout string
 
 const (
 	// CgroupsDisabled indicates that cgroups are not supported.
-	CgroupsDisabled Layout = iota
+	CgroupsDisabled Layout = "disabled"
 	// CgroupsUnified indicates that this is a pure cgroup2 layout.
-	CgroupsUnified
+	CgroupsUnified Layout = "cgroup2"
 	// CgroupsHybrid indicates that this is a mixed cgroup1 and cgroup2 layout.
-	CgroupsHybrid
+	CgroupsHybrid Layout = "hybrid"
 	// CgroupsLegacy indicates that this is a pure cgroup1 layout.
-	CgroupsLegacy
+	CgroupsLegacy Layout = "legacy"
 )
 
 var cgLayout Layout
@@ -47,22 +48,6 @@ func GetInfo() Info {
 	info.Layout = cgLayout
 
 	return info
-}
-
-// Mode returns the cgroup layout name.
-func (info *Info) Mode() string {
-	switch info.Layout {
-	case CgroupsDisabled:
-		return "disabled"
-	case CgroupsUnified:
-		return "cgroup2"
-	case CgroupsHybrid:
-		return "hybrid"
-	case CgroupsLegacy:
-		return "legacy"
-	}
-
-	return "unknown"
 }
 
 // Resource is a generic type used to abstract resource control features
@@ -119,123 +104,14 @@ const (
 	Pids
 )
 
-// SupportsVersion indicates whether or not a given cgroup resource is
-// controllable and in which type of cgroup filesystem.
-func (info *Info) SupportsVersion(resource Resource) (Backend, bool) {
-	switch resource {
-	case Blkio:
-		val, ok := cgControllers["blkio"]
-		if ok {
-			return val, ok
-		}
-
-		val, ok = cgControllers["io"]
-		if ok {
-			return val, ok
-		}
-
-		return Unavailable, false
-	case BlkioWeight:
-		val, ok := cgControllers["blkio.weight"]
-		if ok {
-			return val, ok
-		}
-
-		val, ok = cgControllers["io"]
-		if ok {
-			return val, ok
-		}
-
-		return Unavailable, false
-	case CPU:
-		val, ok := cgControllers["cpu"]
-		return val, ok
-	case CPUAcct:
-		val, ok := cgControllers["cpuacct"]
-		if ok {
-			return val, ok
-		}
-
-		val, ok = cgControllers["cpu"]
-		if ok {
-			return val, ok
-		}
-
-		return Unavailable, false
-	case CPUSet:
-		val, ok := cgControllers["cpuset"]
-		return val, ok
-	case Devices:
-		val, ok := cgControllers["devices"]
-		return val, ok
-	case Freezer:
-		val, ok := cgControllers["freezer"]
-		return val, ok
-	case Hugetlb:
-		val, ok := cgControllers["hugetlb"]
-		return val, ok
-	case Memory:
-		val, ok := cgControllers["memory"]
-		return val, ok
-	case MemoryMaxUsage:
-		val, ok := cgControllers["memory.max_usage_in_bytes"]
-		return val, ok
-	case MemorySwap:
-		val, ok := cgControllers["memory.memsw.limit_in_bytes"]
-		if ok {
-			return val, ok
-		}
-
-		val, ok = cgControllers["memory.swap.max"]
-		if ok {
-			return val, ok
-		}
-
-		return Unavailable, false
-	case MemorySwapMaxUsage:
-		val, ok := cgControllers["memory.memsw.max_usage_in_bytes"]
-		if ok {
-			return val, ok
-		}
-
-		return Unavailable, false
-	case MemorySwapUsage:
-		val, ok := cgControllers["memory.memsw.usage_in_bytes"]
-		if ok {
-			return val, ok
-		}
-
-		val, ok = cgControllers["memory.swap.current"]
-		if ok {
-			return val, ok
-		}
-
-		return Unavailable, false
-	case MemorySwappiness:
-		val, ok := cgControllers["memory.swappiness"]
-		if ok {
-			return val, ok
-		}
-
-		return Unavailable, false
-	case NetPrio:
-		val, ok := cgControllers["net_prio"]
-		return val, ok
-	case Pids:
-		val, ok := cgControllers["pids"]
-		if ok {
-			return val, ok
-		}
-
-		return Unavailable, false
-	}
-
-	return Unavailable, false
-}
-
 // Supports indicates whether or not a given resource is controllable.
 func (info *Info) Supports(resource Resource, cgroup *CGroup) bool {
-	val, ok := info.SupportsVersion(resource)
+	keys, ok := resourceMap[resource]
+	if !ok {
+		return false
+	}
+
+	val, ok := supportsVersion(keys)
 	if val == V2 && cgroup != nil && !cgroup.UnifiedCapable {
 		ok = false
 	}
@@ -285,14 +161,14 @@ func (info *Info) Warnings() []cluster.Warning {
 	if !info.Supports(Devices, nil) {
 		warnings = append(warnings, cluster.Warning{
 			TypeCode:    warningtype.MissingCGroupDevicesController,
-			LastMessage: "device access control won't work",
+			LastMessage: "device access control will not work",
 		})
 	}
 
 	if !info.Supports(Freezer, nil) {
 		warnings = append(warnings, cluster.Warning{
 			TypeCode:    warningtype.MissingCGroupFreezerController,
-			LastMessage: "pausing/resuming containers won't work",
+			LastMessage: "pausing/resuming containers will not work",
 		})
 	}
 
@@ -310,7 +186,10 @@ func (info *Info) Warnings() []cluster.Warning {
 		})
 	}
 
-	if !info.Supports(NetPrio, nil) {
+	// Only warn about missing net_prio on cgroup v1 systems.
+	// The net_prio controller doesn't exist in cgroup v2 and LXD uses
+	// per-device limits.priority as the modern alternative.
+	if info.Layout != CgroupsUnified && !info.Supports(NetPrio, nil) {
 		warnings = append(warnings, cluster.Warning{
 			TypeCode:    warningtype.MissingCGroupNetworkPriorityController,
 			LastMessage: "per-instance network priority will be ignored. Please use per-device limits.priority instead",
@@ -345,9 +224,9 @@ func Init() {
 	selfCg, err := os.Open("/proc/self/cgroup")
 	if err != nil {
 		if os.IsNotExist(err) {
-			logger.Warnf("System doesn't appear to support CGroups")
+			logger.Warn("System does not appear to support CGroups")
 		} else {
-			logger.Errorf("Unable to load list of cgroups: %v", err)
+			logger.Errorf("Cannot load list of cgroups: %v", err)
 		}
 
 		cgLayout = CgroupsDisabled
@@ -368,8 +247,8 @@ func Init() {
 
 		// Deal with the V1 controllers.
 		if fields[1] != "" {
-			controllers := strings.Split(fields[1], ",")
-			for _, controller := range controllers {
+			controllers := strings.SplitSeq(fields[1], ",")
+			for controller := range controllers {
 				cgControllers[controller] = V1
 			}
 
@@ -385,14 +264,14 @@ func Init() {
 		controllers, err := os.Open(hybridPath)
 		if err != nil {
 			if !os.IsNotExist(err) {
-				logger.Errorf("Unable to load cgroup.controllers")
+				logger.Error("Cannot load cgroup.controllers")
 				return
 			}
 
 			dedicatedPath = filepath.Join(cgPath, path, "cgroup.controllers")
 			controllers, err = os.Open(dedicatedPath)
 			if err != nil && !os.IsNotExist(err) {
-				logger.Errorf("Unable to load cgroup.controllers")
+				logger.Error("Cannot load cgroup.controllers")
 				return
 			}
 		}
@@ -406,7 +285,7 @@ func Init() {
 			scanControllers := bufio.NewScanner(controllers)
 			for scanControllers.Scan() {
 				line := strings.TrimSpace(scanControllers.Text())
-				for _, entry := range strings.Split(line, " ") {
+				for entry := range strings.SplitSeq(line, " ") {
 					unifiedControllers[entry] = V2
 				}
 			}
@@ -417,9 +296,7 @@ func Init() {
 				hasV2Root = true
 				break
 			} else {
-				for k, v := range unifiedControllers {
-					cgControllers[k] = v
-				}
+				maps.Copy(cgControllers, unifiedControllers)
 			}
 		}
 
@@ -434,11 +311,10 @@ func Init() {
 
 	// Check for additional legacy cgroup features
 	val, ok := cgControllers["blkio"]
-	if ok && val == V1 && shared.PathExists("/sys/fs/cgroup/blkio/blkio.weight") {
-		cgControllers["blkio.weight"] = V1
-	} else {
-		val, ok := cgControllers["blkio"]
-		if ok && val == V1 && shared.PathExists("/sys/fs/cgroup/blkio/blkio.bfq.weight") {
+	if ok && val == V1 {
+		if shared.PathExists("/sys/fs/cgroup/blkio/blkio.weight") {
+			cgControllers["blkio.weight"] = V1
+		} else if shared.PathExists("/sys/fs/cgroup/blkio/blkio.bfq.weight") {
 			cgControllers["blkio.weight"] = V1
 		}
 	}

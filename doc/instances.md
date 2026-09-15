@@ -1,95 +1,77 @@
 ---
-relatedlinks: '[How&#32;to&#32;install&#32;a&#32;Windows&#32;11&#32;VM&#32;using&#32;LXD](https://ubuntu.com/tutorials/how-to-install-a-windows-11-vm-using-lxd)'
+relatedlinks: "[How&#32;to&#32;install&#32;a&#32;Windows&#32;11&#32;VM&#32;using&#32;LXD](https://ubuntu.com/tutorials/how-to-install-a-windows-11-vm-using-lxd)"
+myst:
+  html_meta:
+    description: An index of how-to guides for LXD instances, including creating, configuring, and managing instances, backup, migration, and GPU passthrough.
 ---
 
 (instances)=
 # Instances
 
-```{only} diataxis
-The following how-to guides cover common operations related to instances.
+These how-to guides cover common operations related to LXD instances.
 
-How to create and manage instances:
-```
+## Create and manage instances
 
-```{filtered-toctree}
+LXD supports both system containers and virtual machines, configured using direct settings or reusable profiles.
+
+```{toctree}
 :titlesonly:
 
-:diataxis:Create instances </howto/instances_create.md>
-:diataxis:Configure instances </howto/instances_configure.md>
-:diataxis:Manage instances </howto/instances_manage.md>
-:diataxis:Use profiles </profiles.md>
-:diataxis:Troubleshoot errors </howto/instances_troubleshoot.md>
+Create instances </howto/instances_create.md>
+Configure instances </howto/instances_configure.md>
+Manage instances </howto/instances_manage.md>
+Use profiles </profiles.md>
+Troubleshoot errors </howto/instances_troubleshoot.md>
 ```
 
-```{only} diataxis
-How to work with instances:
-```
+## Attach instances to Ubuntu Pro
 
-```{filtered-toctree}
+A LXD server can automatically attach guest instances to its Ubuntu Pro subscription.
+
+```{toctree}
 :titlesonly:
 
-:diataxis:Access files </howto/instances_access_files.md>
-:diataxis:Access the console </howto/instances_console.md>
-:diataxis:Run commands </instance-exec.md>
-:diataxis:Use cloud-init </cloud-init>
-:diataxis:Add a routed NIC to a VM </howto/instances_routed_nic_vm.md>
+Auto attach Ubuntu Pro </howto/instances_ubuntu_pro_attach.md>
 ```
 
-```{only} diataxis
-How to export and move instances:
-```
+## Work with instances
 
-```{filtered-toctree}
+Instance files can be accessed from the host, and the instance console can be attached to for log output and debugging. Commands can also be run inside instances through the `lxc` CLI or by opening a shell.
+
+```{toctree}
 :titlesonly:
 
-:diataxis:Back up instances </howto/instances_backup.md>
-:diataxis:Move instances </howto/move_instances>
+Access files </howto/instances_access_files.md>
+Access the console </howto/instances_console.md>
+Run commands </instance-exec.md>
+Use cloud-init </cloud-init>
+Add a routed NIC to a VM </howto/instances_routed_nic_vm.md>
 ```
 
-```{only} diataxis
-How to import instances:
-```
+## Back up, import, and migrate instances
 
-```{filtered-toctree}
+Instances can be backed up using snapshots, export files, or copies. Physical machines, as well as virtual machines and containers created using a different technology, can be imported as LXD instances. Instances can also be migrated between LXD servers, including live migration for VMs.
+
+```{toctree}
 :titlesonly:
 
-:diataxis:Import existing machines </howto/import_machines_to_instances>
-:diataxis:Migrate from LXC </howto/migrate_from_lxc>
+Back up instances </howto/instances_backup.md>
+Import existing machines </howto/import_machines_to_instances>
+Migrate instances </howto/instances_migrate>
 ```
 
-```{only} diataxis
-How to pass an NVIDIA GPU to a container with a Docker workload:
-```
+## Pass through an NVIDIA GPU
 
-```{filtered-toctree}
+An NVIDIA GPU can be passed through to a container running a Docker workload.
+
+```{toctree}
 :titlesonly:
 
-:diataxis:Pass NVIDIA GPUs </howto/container_gpu_passthrough_with_docker>
+Pass NVIDIA GPUs </howto/container_gpu_passthrough_with_docker>
 ```
 
 ## Related topics
 
-```{only} diataxis
 {{instances_exp}}
 
 {{instances_ref}}
-```
-
-```{filtered-toctree}
-:titlesonly:
-
-:topical:/explanation/instances.md
-:topical:Create instances </howto/instances_create.md>
-:topical:Manage instances </howto/instances_manage.md>
-:topical:Configure instances </howto/instances_configure.md>
-:topical:Back up instances </howto/instances_backup.md>
-:topical:Use profiles </profiles.md>
-:topical:Use cloud-init </cloud-init>
-:topical:Run commands </instance-exec.md>
-:topical:Access the console </howto/instances_console.md>
-:topical:Access files </howto/instances_access_files.md>
-:topical:Add a routed NIC to a VM </howto/instances_routed_nic_vm.md>
-:topical:Troubleshoot errors </howto/instances_troubleshoot.md>
-:topical:/explanation/instance_config.md
-:topical:Container environment </container-environment>
-```

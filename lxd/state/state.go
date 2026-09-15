@@ -12,17 +12,19 @@ import (
 	"github.com/canonical/lxd/lxd/bgp"
 	clusterConfig "github.com/canonical/lxd/lxd/cluster/config"
 	"github.com/canonical/lxd/lxd/db"
+	"github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/dns"
 	"github.com/canonical/lxd/lxd/endpoints"
 	"github.com/canonical/lxd/lxd/events"
 	"github.com/canonical/lxd/lxd/firewall"
 	"github.com/canonical/lxd/lxd/fsmonitor"
+	"github.com/canonical/lxd/lxd/identity"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
-	"github.com/canonical/lxd/lxd/maas"
 	"github.com/canonical/lxd/lxd/node"
 	"github.com/canonical/lxd/lxd/sys"
 	"github.com/canonical/lxd/lxd/ubuntupro"
 	"github.com/canonical/lxd/shared"
+	"github.com/canonical/lxd/shared/cancel"
 )
 
 // State is a gateway to the two main stateful components of LXD, the database
@@ -34,9 +36,6 @@ type State struct {
 
 	// Databases
 	DB *db.DB
-
-	// MAAS server
-	MAAS *maas.Controller
 
 	// BGP server
 	BGP *bgp.Server
@@ -61,6 +60,9 @@ type State struct {
 	// Server certificate
 	ServerCert func() *shared.CertInfo
 
+	// Identity cache
+	IdentityCache *identity.Cache
+
 	// UpdateIdentityCache refreshes the local cache of identities.
 	// This should be called whenever an identity is added, modified, or removed.
 	// The cache is also refreshed on dqlite heartbeat to synchronise with other members.
@@ -84,8 +86,14 @@ type State struct {
 	// Whether the server is clustered.
 	ServerClustered bool
 
-	// Local server UUID.
-	ServerUUID string
+	// Whether we are the leader and the leader address if not.
+	LeaderInfo func() (*LeaderInfo, error)
+
+	// Storage path used by this daemon
+	ImagesStoragePath func(string) string
+
+	// Storage path used by this daemon
+	BackupsStoragePath func(string) string
 
 	// Local server start time.
 	StartTime time.Time
@@ -95,4 +103,25 @@ type State struct {
 
 	// Ubuntu pro settings.
 	UbuntuPro *ubuntupro.Client
+
+	// NetworkReady can be used to track whether all networks are successfully started.
+	NetworkReady cancel.Canceller
+
+	// StorageReady can be used to track whether all storage pools are successfully started.
+	StorageReady cancel.Canceller
+
+	// CoreAuthSecrets returns the current secrets.
+	CoreAuthSecrets func(ctx context.Context) (cluster.AuthSecrets, error)
+}
+
+// LeaderInfo represents information regarding cluster member leadership.
+type LeaderInfo struct {
+	// Clustered is true if the server is clustered and false otherwise.
+	Clustered bool
+
+	// Leader is true if the server is the raft leader or if the server is not clustered, and false otherwise.
+	Leader bool
+
+	// Address is the address of the leader. It is not set if the server is not clustered.
+	Address string
 }

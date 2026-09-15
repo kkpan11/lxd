@@ -2,14 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
-	"google.golang.org/protobuf/proto"
-
+	"github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/migration"
 	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/state"
@@ -71,7 +72,7 @@ func newStorageMigrationSource(volumeOnly bool, pushTarget *api.StorageVolumePos
 func (s *migrationSourceWs) DoStorage(state *state.State, projectName string, poolName string, volName string, migrateOp *operations.Operation) error {
 	l := logger.AddContext(logger.Ctx{"project": projectName, "pool": poolName, "volume": volName, "push": s.pushOperationURL != ""})
 
-	ctx, cancel := context.WithTimeout(context.TODO(), time.Second*10)
+	ctx, cancel := context.WithTimeout(state.ShutdownCtx, time.Second*10)
 	defer cancel()
 
 	l.Info("Waiting for migration connections on source")
@@ -97,16 +98,21 @@ func (s *migrationSourceWs) DoStorage(state *state.State, projectName string, po
 
 	srcConfig, err := pool.GenerateCustomVolumeBackupConfig(projectName, volName, !s.volumeOnly, migrateOp)
 	if err != nil {
-		return fmt.Errorf("Failed generating volume migration config: %w", err)
+		return fmt.Errorf("Failed generating migration config of volume %q in pool %q and project %q: %w", volName, poolName, projectName, err)
+	}
+
+	customVol, err := srcConfig.CustomVolume()
+	if err != nil {
+		return fmt.Errorf("Failed getting the custom volume: %w", err)
 	}
 
 	// The refresh argument passed to MigrationTypes() is always set
 	// to false here. The migration source/sender doesn't need to care whether
 	// or not it's doing a refresh as the migration sink/receiver will know
 	// this, and adjust the migration types accordingly.
-	poolMigrationTypes = pool.MigrationTypes(storageDrivers.ContentType(srcConfig.Volume.ContentType), false, !s.volumeOnly)
+	poolMigrationTypes = pool.MigrationTypes(storageDrivers.ContentType(customVol.ContentType), false, !s.volumeOnly)
 	if len(poolMigrationTypes) == 0 {
-		return fmt.Errorf("No source migration types available")
+		return errors.New("No source migration types available")
 	}
 
 	// Convert the pool's migration type options to an offer header to target.
@@ -118,19 +124,19 @@ func (s *migrationSourceWs) DoStorage(state *state.State, projectName string, po
 
 	// Only send snapshots when requested.
 	if !s.volumeOnly {
-		offerHeader.Snapshots = make([]*migration.Snapshot, 0, len(srcConfig.VolumeSnapshots))
-		offerHeader.SnapshotNames = make([]string, 0, len(srcConfig.VolumeSnapshots))
+		offerHeader.Snapshots = make([]*migration.Snapshot, 0, len(customVol.Snapshots))
+		offerHeader.SnapshotNames = make([]string, 0, len(customVol.Snapshots))
 
-		for i := range srcConfig.VolumeSnapshots {
-			offerHeader.SnapshotNames = append(offerHeader.SnapshotNames, srcConfig.VolumeSnapshots[i].Name)
-			offerHeader.Snapshots = append(offerHeader.Snapshots, volumeSnapshotToProtobuf(srcConfig.VolumeSnapshots[i]))
+		for i := range customVol.Snapshots {
+			offerHeader.SnapshotNames = append(offerHeader.SnapshotNames, customVol.Snapshots[i].Name)
+			offerHeader.Snapshots = append(offerHeader.Snapshots, migration.VolumeSnapshotToProtobuf(customVol.Snapshots[i]))
 		}
 	}
 
 	// Send offer to target.
 	err = s.send(offerHeader)
 	if err != nil {
-		logger.Errorf("Failed to send storage volume migration header")
+		logger.Error("Failed sending storage volume migration header")
 		s.sendControl(err)
 		return err
 	}
@@ -139,25 +145,25 @@ func (s *migrationSourceWs) DoStorage(state *state.State, projectName string, po
 	respHeader := &migration.MigrationHeader{}
 	err = s.recv(respHeader)
 	if err != nil {
-		logger.Errorf("Failed to receive storage volume migration header")
+		logger.Error("Failed receiving storage volume migration header")
 		s.sendControl(err)
 		return err
 	}
 
-	migrationTypes, err := migration.MatchTypes(respHeader, storagePools.FallbackMigrationType(storageDrivers.ContentType(srcConfig.Volume.ContentType)), poolMigrationTypes)
+	migrationTypes, err := migration.MatchTypes(respHeader, storagePools.FallbackMigrationType(storageDrivers.ContentType(customVol.ContentType)), poolMigrationTypes)
 	if err != nil {
-		logger.Errorf("Failed to negotiate migration type: %v", err)
+		logger.Errorf("Failed negotiating migration type: %v", err)
 		s.sendControl(err)
 		return err
 	}
 
 	volSourceArgs := &migration.VolumeSourceArgs{
 		IndexHeaderVersion: respHeader.GetIndexHeaderVersion(), // Enable index header frame if supported.
-		Name:               srcConfig.Volume.Name,
+		Name:               customVol.Name,
 		MigrationType:      migrationTypes[0],
 		Snapshots:          offerHeader.SnapshotNames,
 		TrackProgress:      true,
-		ContentType:        srcConfig.Volume.ContentType,
+		ContentType:        customVol.ContentType,
 		Info:               &migration.Info{Config: srcConfig},
 		VolumeOnly:         s.volumeOnly,
 	}
@@ -166,18 +172,18 @@ func (s *migrationSourceWs) DoStorage(state *state.State, projectName string, po
 	if respHeader.GetRefresh() {
 		volSourceArgs.Refresh = true
 		volSourceArgs.Snapshots = respHeader.GetSnapshotNames()
-		allSnapshots := volSourceArgs.Info.Config.VolumeSnapshots
+		allSnapshots := customVol.Snapshots
 
 		// Ensure that only the requested snapshots are included in the migration index header.
-		volSourceArgs.Info.Config.VolumeSnapshots = make([]*api.StorageVolumeSnapshot, 0, len(volSourceArgs.Snapshots))
+		customVol.Snapshots = make([]*api.StorageVolumeSnapshot, 0, len(volSourceArgs.Snapshots))
 		for i := range allSnapshots {
-			if shared.ValueInSlice(allSnapshots[i].Name, volSourceArgs.Snapshots) {
-				volSourceArgs.Info.Config.VolumeSnapshots = append(volSourceArgs.Info.Config.VolumeSnapshots, allSnapshots[i])
+			if slices.Contains(volSourceArgs.Snapshots, allSnapshots[i].Name) {
+				customVol.Snapshots = append(customVol.Snapshots, allSnapshots[i])
 			}
 		}
 	}
 
-	fsConn, err := s.conns[api.SecretNameFilesystem].WebsocketIO(context.TODO())
+	fsConn, err := s.conns[api.SecretNameFilesystem].WebsocketIO(state.ShutdownCtx)
 	if err != nil {
 		return err
 	}
@@ -191,16 +197,16 @@ func (s *migrationSourceWs) DoStorage(state *state.State, projectName string, po
 	msg := migration.MigrationControl{}
 	err = s.recv(&msg)
 	if err != nil {
-		logger.Errorf("Failed to receive storage volume migration control message")
+		logger.Error("Failed receiving storage volume migration control message")
 		return err
 	}
 
 	if !msg.GetSuccess() {
-		logger.Errorf("Failed to send storage volume")
-		return fmt.Errorf(msg.GetMessage())
+		logger.Error("Failed sending storage volume")
+		return errors.New(msg.GetMessage())
 	}
 
-	logger.Debugf("Migration source finished transferring storage volume")
+	logger.Debug("Migration source finished transferring storage volume")
 	return nil
 }
 
@@ -243,10 +249,10 @@ func newStorageMigrationSink(args *migrationSinkArgs) (*migrationSink, error) {
 
 // DoStorage handles the storage volume migration on the target side. It waits for
 // migration connections, negotiates migration types, and initiates the volume reception.
-func (c *migrationSink) DoStorage(state *state.State, projectName string, poolName string, req *api.StorageVolumesPost, op *operations.Operation) error {
+func (c *migrationSink) DoStorage(ctx context.Context, state *state.State, projectName string, poolName string, req *api.StorageVolumesPost, op *operations.Operation) error {
 	l := logger.AddContext(logger.Ctx{"project": projectName, "pool": poolName, "volume": req.Name, "push": c.push})
 
-	ctx, cancel := context.WithTimeout(context.TODO(), time.Second*10)
+	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
 	defer cancel()
 
 	l.Info("Waiting for migration connections on target")
@@ -269,7 +275,7 @@ func (c *migrationSink) DoStorage(state *state.State, projectName string, poolNa
 	offerHeader := &migration.MigrationHeader{}
 	err := c.recv(offerHeader)
 	if err != nil {
-		logger.Errorf("Failed to receive storage volume migration header")
+		logger.Error("Failed receiving storage volume migration header")
 		c.sendControl(err)
 		return err
 	}
@@ -282,15 +288,12 @@ func (c *migrationSink) DoStorage(state *state.State, projectName string, poolNa
 		return err
 	}
 
-	dbContentType, err := storagePools.VolumeContentTypeNameToContentType(req.ContentType)
+	dbContentType, err := cluster.StoragePoolVolumeContentTypeFromName(req.ContentType)
 	if err != nil {
 		return err
 	}
 
-	contentType, err := storagePools.VolumeDBContentTypeToContentType(dbContentType)
-	if err != nil {
-		return err
-	}
+	contentType := storagePools.VolumeDBContentTypeToContentType(dbContentType)
 
 	// The source/sender will never set Refresh. However, to determine the correct migration type
 	// Refresh needs to be set.
@@ -310,10 +313,7 @@ func (c *migrationSink) DoStorage(state *state.State, projectName string, poolNa
 
 	// Respond with our maximum supported header version if the requested version is higher than ours.
 	// Otherwise just return the requested header version to the source.
-	indexHeaderVersion := offerHeader.GetIndexHeaderVersion()
-	if indexHeaderVersion > migration.IndexHeaderVersion {
-		indexHeaderVersion = migration.IndexHeaderVersion
-	}
+	indexHeaderVersion := min(offerHeader.GetIndexHeaderVersion(), migration.IndexHeaderVersion)
 
 	respHeader.IndexHeaderVersion = &indexHeaderVersion
 	respHeader.SnapshotNames = offerHeader.SnapshotNames
@@ -344,61 +344,16 @@ func (c *migrationSink) DoStorage(state *state.State, projectName string, poolNa
 			}
 		}
 
-		return pool.CreateCustomVolumeFromMigration(projectName, conn, volTargetArgs, op)
+		return pool.CreateCustomVolumeFromMigration(ctx, projectName, conn, volTargetArgs, op)
 	}
 
 	if c.refresh {
-		// Get the remote snapshots on the source.
-		sourceSnapshots := offerHeader.GetSnapshots()
-		sourceSnapshotComparable := make([]storagePools.ComparableSnapshot, 0, len(sourceSnapshots))
-		for _, sourceSnap := range sourceSnapshots {
-			sourceSnapshotComparable = append(sourceSnapshotComparable, storagePools.ComparableSnapshot{
-				Name:         sourceSnap.GetName(),
-				CreationDate: time.Unix(sourceSnap.GetCreationDate(), 0),
-			})
-		}
-
-		// Get existing snapshots on the local target.
-		targetSnapshots, err := storagePools.VolumeDBSnapshotsGet(pool, projectName, req.Name, storageDrivers.VolumeTypeCustom)
+		// Drop the target snapshots the source no longer has and only request the ones it still needs to
+		// send, the same comparison the instance sink runs for the custom volumes travelling with it.
+		syncSnapshots, syncSnapshotNames, err := storagePools.CustomVolumeSnapshotsToSync(ctx, pool, projectName, req.Name, offerHeader.GetSnapshots(), op)
 		if err != nil {
 			c.sendControl(err)
 			return err
-		}
-
-		targetSnapshotsComparable := make([]storagePools.ComparableSnapshot, 0, len(targetSnapshots))
-		for _, targetSnap := range targetSnapshots {
-			_, targetSnapName, _ := api.GetParentAndSnapshotName(targetSnap.Name)
-
-			targetSnapshotsComparable = append(targetSnapshotsComparable, storagePools.ComparableSnapshot{
-				Name: targetSnapName,
-
-				// The list of source snapshots from the offer header
-				// contains the creation timestamps in seconds granularity.
-				// Also use second based granularity for the target snapshots to be able to compare them.
-				// They are stored with nanoseconds in the database.
-				// Retrieve the timestamp using second based granularity the same way as it's done on the source.
-				CreationDate: time.Unix(targetSnap.CreationDate.Unix(), 0),
-			})
-		}
-
-		// Compare the two sets.
-		syncSourceSnapshotIndexes, deleteTargetSnapshotIndexes := storagePools.CompareSnapshots(sourceSnapshotComparable, targetSnapshotsComparable)
-
-		// Delete the extra local snapshots first.
-		for _, deleteTargetSnapshotIndex := range deleteTargetSnapshotIndexes {
-			err := pool.DeleteCustomVolumeSnapshot(projectName, targetSnapshots[deleteTargetSnapshotIndex].Name, op)
-			if err != nil {
-				c.sendControl(err)
-				return err
-			}
-		}
-
-		// Only request to send the snapshots that need updating.
-		syncSnapshotNames := make([]string, 0, len(syncSourceSnapshotIndexes))
-		syncSnapshots := make([]*migration.Snapshot, 0, len(syncSourceSnapshotIndexes))
-		for _, syncSourceSnapshotIndex := range syncSourceSnapshotIndexes {
-			syncSnapshotNames = append(syncSnapshotNames, sourceSnapshots[syncSourceSnapshotIndex].GetName())
-			syncSnapshots = append(syncSnapshots, sourceSnapshots[syncSourceSnapshotIndex])
 		}
 
 		respHeader.Snapshots = syncSnapshots
@@ -409,7 +364,7 @@ func (c *migrationSink) DoStorage(state *state.State, projectName string, poolNa
 
 	err = c.send(respHeader)
 	if err != nil {
-		logger.Errorf("Failed to send storage volume migration header")
+		logger.Error("Failed sending storage volume migration header")
 		c.sendControl(err)
 		return err
 	}
@@ -434,7 +389,7 @@ func (c *migrationSink) DoStorage(state *state.State, projectName string, poolNa
 				refresh:       c.refresh,
 			}
 
-			fsConn, err := c.conns[api.SecretNameFilesystem].WebsocketIO(context.TODO())
+			fsConn, err := c.conns[api.SecretNameFilesystem].WebsocketIO(state.ShutdownCtx)
 			if err != nil {
 				fsTransfer <- err
 				return
@@ -480,7 +435,7 @@ func (c *migrationSink) DoStorage(state *state.State, projectName string, poolNa
 			if !msg.GetSuccess() {
 				c.disconnect()
 
-				return fmt.Errorf(msg.GetMessage())
+				return errors.New(msg.GetMessage())
 			}
 
 			// The source can only tell us it failed (e.g. if
@@ -488,27 +443,5 @@ func (c *migrationSink) DoStorage(state *state.State, projectName string, poolNa
 			// whether or not the restore was successful.
 			logger.Warn("Unknown message from migration source", logger.Ctx{"message": msg.GetMessage()})
 		}
-	}
-}
-
-func volumeSnapshotToProtobuf(vol *api.StorageVolumeSnapshot) *migration.Snapshot {
-	config := []*migration.Config{}
-	for k, v := range vol.Config {
-		kCopy := string(k)
-		vCopy := string(v)
-		config = append(config, &migration.Config{Key: &kCopy, Value: &vCopy})
-	}
-
-	return &migration.Snapshot{
-		Name:         &vol.Name,
-		LocalConfig:  config,
-		Profiles:     []string{},
-		Ephemeral:    proto.Bool(false),
-		LocalDevices: []*migration.Device{},
-		Architecture: proto.Int32(0),
-		Stateful:     proto.Bool(false),
-		CreationDate: proto.Int64(vol.CreatedAt.Unix()),
-		LastUsedDate: proto.Int64(0),
-		ExpiryDate:   proto.Int64(0),
 	}
 }

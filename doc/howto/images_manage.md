@@ -190,7 +190,7 @@ To delete a local copy of an image, send a DELETE request:
 See [`DELETE /1.0/images/{fingerprint}`](swagger:/images/image_delete) for more information.
 ```
 ```{group-tab} UI
-In the images list, click the {guilabel}`Delete` button ({{delete_button}}) next to an image to delete it.
+In the images list, click the delete button {{delete_button}} next to an image to delete it.
 
 You can also select several images and click the {guilabel}`Delete images` button at the top to delete all selected images.
 ```
@@ -293,7 +293,7 @@ To export a virtual machine image to a set of files, add the `--vm` flag:
 Send a query to the `export` endpoint of the image to retrieve it:
 
     curl -X GET --unix-socket /var/snap/lxd/common/lxd/unix.socket lxd/1.0/images/<fingerprint>/export \
-    -H "Content-Type: multipart/form-data" -o <output-file>
+    --output <output-file>
 
 If the image is a {ref}`split image <image-format-split>`, the output file contains two separate tarballs in multipart format.
 

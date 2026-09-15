@@ -23,8 +23,6 @@ package main
 void forkcoresched(void)
 {
 	char *cur = NULL;
-	char *pidstr;
-	int hook;
 	int ret;
 	__u64 cookie;
 
@@ -47,25 +45,7 @@ void forkcoresched(void)
 	if (!core_scheduling_cookie_valid(cookie))
 		_exit(EXIT_FAILURE);
 
-	hook = atoi(cur);
-	switch (hook) {
-	case 0:
-		for (pidstr = cur; pidstr; pidstr = advance_arg(false)) {
-			ret = core_scheduling_cookie_share_to(atoi(pidstr));
-			if (ret)
-				_exit(EXIT_FAILURE);
-
-			cookie = core_scheduling_cookie_get(0);
-			if (!core_scheduling_cookie_valid(cookie))
-				_exit(EXIT_FAILURE);
-		}
-
-		break;
-	case 1:
-		pidstr = getenv("LXC_PID");
-		if (!pidstr)
-			_exit(EXIT_FAILURE);
-
+	for (const char *pidstr = cur; pidstr; pidstr = advance_arg(false)) {
 		ret = core_scheduling_cookie_share_to(atoi(pidstr));
 		if (ret)
 			_exit(EXIT_FAILURE);
@@ -73,9 +53,6 @@ void forkcoresched(void)
 		cookie = core_scheduling_cookie_get(0);
 		if (!core_scheduling_cookie_valid(cookie))
 			_exit(EXIT_FAILURE);
-		break;
-	default:
-		_exit(EXIT_FAILURE);
 	}
 
 	_exit(EXIT_SUCCESS);
@@ -84,11 +61,11 @@ void forkcoresched(void)
 import "C"
 
 import (
-	"fmt"
+	"errors"
 
 	"github.com/spf13/cobra"
 
-	// Used by cgo
+	// Used by cgo.
 	_ "github.com/canonical/lxd/lxd/include"
 )
 
@@ -96,10 +73,10 @@ type cmdForkcoresched struct {
 	global *cmdGlobal
 }
 
-func (c *cmdForkcoresched) Command() *cobra.Command {
+func (c *cmdForkcoresched) command() *cobra.Command {
 	// Main subcommand
 	cmd := &cobra.Command{}
-	cmd.Use = "forkcoresched <hook> <PID> [...]"
+	cmd.Use = "forkcoresched <PID> [...]"
 	cmd.Short = "Create new core scheduling domain"
 	cmd.Long = `Description:
   Create new core scheduling domain
@@ -107,12 +84,12 @@ func (c *cmdForkcoresched) Command() *cobra.Command {
   This command is used to move a set of processes into a new core scheduling
   domain.
 `
-	cmd.RunE = c.Run
+	cmd.RunE = c.run
 	cmd.Hidden = true
 
 	return cmd
 }
 
-func (c *cmdForkcoresched) Run(cmd *cobra.Command, args []string) error {
-	return fmt.Errorf("This command should have been intercepted in cgo")
+func (c *cmdForkcoresched) run(cmd *cobra.Command, args []string) error {
+	return errors.New("This command should have been intercepted in cgo")
 }

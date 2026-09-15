@@ -1,8 +1,10 @@
 package device
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"strconv"
 
 	deviceConfig "github.com/canonical/lxd/lxd/device/config"
 	"github.com/canonical/lxd/lxd/instance"
@@ -54,7 +56,7 @@ func (d *nicP2P) validateConfig(instConf instance.ConfigReader) error {
 // validateEnvironment checks the runtime environment for correctness.
 func (d *nicP2P) validateEnvironment() error {
 	if d.inst.Type() == instancetype.Container && d.config["name"] == "" {
-		return fmt.Errorf("Requires name property to start")
+		return errors.New("Requires name property to start")
 	}
 
 	return nil
@@ -88,7 +90,9 @@ func (d *nicP2P) Start() (*deviceConfig.RunConfig, error) {
 	var mtu uint32
 
 	// Create veth pair and configure the peer end with custom hwaddr and mtu if supplied.
-	if d.inst.Type() == instancetype.Container {
+	instType := d.inst.Type()
+	switch instType {
+	case instancetype.Container:
 		if saveData["host_name"] == "" {
 			saveData["host_name"], err = d.generateHostName("veth", d.config["hwaddr"])
 			if err != nil {
@@ -97,7 +101,7 @@ func (d *nicP2P) Start() (*deviceConfig.RunConfig, error) {
 		}
 
 		peerName, mtu, err = networkCreateVethPair(saveData["host_name"], d.config)
-	} else if d.inst.Type() == instancetype.VM {
+	case instancetype.VM:
 		if saveData["host_name"] == "" {
 			saveData["host_name"], err = d.generateHostName("tap", d.config["hwaddr"])
 			if err != nil {
@@ -150,11 +154,11 @@ func (d *nicP2P) Start() (*deviceConfig.RunConfig, error) {
 		{Key: "hwaddr", Value: d.config["hwaddr"]},
 	}
 
-	if d.inst.Type() == instancetype.VM {
+	if instType == instancetype.VM {
 		runConf.NetworkInterface = append(runConf.NetworkInterface,
 			[]deviceConfig.RunConfigItem{
 				{Key: "devName", Value: d.name},
-				{Key: "mtu", Value: fmt.Sprintf("%d", mtu)},
+				{Key: "mtu", Value: strconv.FormatUint(uint64(mtu), 10)},
 			}...)
 	}
 
@@ -162,7 +166,7 @@ func (d *nicP2P) Start() (*deviceConfig.RunConfig, error) {
 	return &runConf, nil
 }
 
-// Update applies configuration changes to a started device.
+// Update applies configuration changes to a device.
 func (d *nicP2P) Update(oldDevices deviceConfig.Devices, isRunning bool) error {
 	if !isRunning {
 		return nil
@@ -231,7 +235,7 @@ func (d *nicP2P) postStop() error {
 		// Removing host-side end of veth pair will delete the peer end too.
 		err := network.InterfaceRemove(d.config["host_name"])
 		if err != nil {
-			return fmt.Errorf("Failed to remove interface %s: %w", d.config["host_name"], err)
+			return fmt.Errorf("Failed removing interface %s: %w", d.config["host_name"], err)
 		}
 	}
 

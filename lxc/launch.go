@@ -7,7 +7,6 @@ import (
 
 	"github.com/canonical/lxd/shared/api"
 	cli "github.com/canonical/lxd/shared/cmd"
-	"github.com/canonical/lxd/shared/i18n"
 )
 
 type cmdLaunch struct {
@@ -19,11 +18,13 @@ type cmdLaunch struct {
 
 func (c *cmdLaunch) command() *cobra.Command {
 	cmd := c.init.command()
-	cmd.Use = usage("launch", i18n.G("[<remote>:]<image> [<remote>:][<name>]"))
-	cmd.Short = i18n.G("Create and start instances from images")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Create and start instances from images`))
-	cmd.Example = cli.FormatSection("", i18n.G(`lxc launch ubuntu:24.04 u1
+	cmd.Use = usage("launch", "[<registry|remote>:]<image> [<remote>:][<name>]")
+	cmd.Short = "Create and start instances from images"
+	cmd.Long = cli.FormatSection("Description", cmd.Short+`
+
+If the destination LXD remote supports image registries, the source image
+must be from an image registry or available locally on the destination remote.`)
+	cmd.Example = cli.FormatSection("", `lxc launch ubuntu:24.04 u1
     Create and start a container
 
 lxc launch ubuntu:24.04 u1 < config.yaml
@@ -36,21 +37,23 @@ lxc launch ubuntu:24.04 v1 --vm -c limits.cpu=4 -c limits.memory=4GiB
     Create and start a virtual machine with 4 vCPUs and 4GiB of RAM
 
 lxc launch ubuntu:24.04 v1 --vm -c limits.cpu=2 -c limits.memory=8GiB -d root,size=32GiB
-    Create and start a virtual machine with 2 vCPUs, 8GiB of RAM and a root disk of 32GiB`))
-
-	cmd.Hidden = false
+    Create and start a virtual machine with 2 vCPUs, 8GiB of RAM and a root disk of 32GiB`)
 
 	cmd.RunE = c.run
 
-	cmd.Flags().StringVar(&c.flagConsole, "console", "", i18n.G("Immediately attach to the console")+"``")
+	cmd.Flags().StringVar(&c.flagConsole, "console", "", cli.FormatStringFlagLabel("Immediately attach to the console"))
 	cmd.Flags().Lookup("console").NoOptDefVal = "console"
 
 	cmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		if len(args) != 0 {
+		if len(args) > 1 {
 			return nil, cobra.ShellCompDirectiveNoFileComp
 		}
 
-		return c.global.cmpImages(toComplete)
+		if len(args) == 0 {
+			return c.global.cmpImages(toComplete, false)
+		}
+
+		return c.global.cmpRemotes(toComplete, ":", true, instanceServerRemoteCompletionFilters(*c.global.conf)...)
 	}
 
 	return cmd
@@ -71,63 +74,61 @@ func (c *cmdLaunch) run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Check if the instance was started by the server.
-	if d.HasExtension("instance_create_start") {
-		return nil
-	}
+	// Start the instance if it wasn't started by the server
+	if !d.HasExtension("instance_create_start") {
+		// Get the remote
+		var remote string
+		if len(args) == 2 {
+			remote, _, err = conf.ParseRemote(args[1])
+			if err != nil {
+				return err
+			}
+		} else {
+			remote, _, err = conf.ParseRemote("")
+			if err != nil {
+				return err
+			}
+		}
 
-	// Get the remote
-	var remote string
-	if len(args) == 2 {
-		remote, _, err = conf.ParseRemote(args[1])
+		// Start the instance
+		if !c.global.flagQuiet {
+			fmt.Printf("Starting %s\n", name)
+		}
+
+		req := api.InstanceStatePut{
+			Action:  "start",
+			Timeout: -1,
+		}
+
+		op, err := d.UpdateInstanceState(name, req, "")
 		if err != nil {
 			return err
 		}
-	} else {
-		remote, _, err = conf.ParseRemote("")
+
+		progress := cli.ProgressRenderer{
+			Quiet: c.global.flagQuiet,
+		}
+
+		_, err = op.AddHandler(progress.UpdateOp)
 		if err != nil {
+			progress.Done("")
 			return err
 		}
-	}
 
-	// Start the instance
-	if !c.global.flagQuiet {
-		fmt.Printf(i18n.G("Starting %s")+"\n", name)
-	}
+		// Wait for operation to finish
+		err = cli.CancelableWait(op, &progress)
+		if err != nil {
+			progress.Done("")
+			prettyName := name
+			if remote != "" {
+				prettyName = remote + ":" + name
+			}
 
-	req := api.InstanceStatePut{
-		Action:  "start",
-		Timeout: -1,
-	}
-
-	op, err := d.UpdateInstanceState(name, req, "")
-	if err != nil {
-		return err
-	}
-
-	progress := cli.ProgressRenderer{
-		Quiet: c.global.flagQuiet,
-	}
-
-	_, err = op.AddHandler(progress.UpdateOp)
-	if err != nil {
-		progress.Done("")
-		return err
-	}
-
-	// Wait for operation to finish
-	err = cli.CancelableWait(op, &progress)
-	if err != nil {
-		progress.Done("")
-		prettyName := name
-		if remote != "" {
-			prettyName = fmt.Sprintf("%s:%s", remote, name)
+			return fmt.Errorf("%w\nTry `lxc info --show-log %s` for more info", err, prettyName)
 		}
 
-		return fmt.Errorf("%s\n"+i18n.G("Try `lxc info --show-log %s` for more info"), err, prettyName)
+		progress.Done("")
 	}
-
-	progress.Done("")
 
 	// Handle console attach
 	if c.flagConsole != "" {

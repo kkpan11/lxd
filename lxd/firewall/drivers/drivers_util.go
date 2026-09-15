@@ -2,8 +2,10 @@ package drivers
 
 import (
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
+	"strconv"
 )
 
 // portRangesFromSlice checks if adjacent indices in the given slice contain consecutive
@@ -35,10 +37,10 @@ func portRangeStr(portRange [2]uint64, delimiter string) string {
 	if portRange[1] < 1 {
 		return ""
 	} else if portRange[1] == 1 {
-		return fmt.Sprintf("%d", portRange[0])
+		return strconv.FormatUint(portRange[0], 10)
 	}
 
-	return fmt.Sprintf("%d%s%d", portRange[0], delimiter, portRange[0]+portRange[1]-1)
+	return fmt.Sprint(portRange[0], delimiter, portRange[0]+portRange[1]-1)
 }
 
 // getOptimisedDNATRanges returns a map of listen port ranges to target port ranges that can be
@@ -114,10 +116,10 @@ func getOptimisedDNATRanges(forward *AddressForward) map[[2]uint64][2]uint64 {
 // subnetMask returns the subnet mask of the given network as a string. Both IPv4 and IPv6 are handled.
 func subnetMask(ipNet *net.IPNet) string {
 	if ipNet.IP.To4() != nil {
-		return fmt.Sprintf("%d.%d.%d.%d", ipNet.Mask[0], ipNet.Mask[1], ipNet.Mask[2], ipNet.Mask[3])
+		return fmt.Sprint(ipNet.Mask[0], ".", ipNet.Mask[1], ".", ipNet.Mask[2], ".", ipNet.Mask[3])
 	}
 
-	var hexMask []rune
+	hexMask := make([]rune, 0, len(ipNet.Mask)*2)
 	for i, r := range ipNet.Mask.String() {
 		if i%4 == 0 && i != 0 {
 			hexMask = append(hexMask, ':')
@@ -134,13 +136,13 @@ func subnetMask(ipNet *net.IPNet) string {
 // is "fd25c7e35dece4dd"). Only for use with IPv6 networks.
 func subnetPrefixHex(ipNet *net.IPNet) (string, error) {
 	if ipNet == nil || ipNet.IP.To4() != nil {
-		return "", fmt.Errorf("Cannot create a hex prefix for empty or IPv4 subnets")
+		return "", errors.New("Cannot create a hex prefix for empty or IPv4 subnets")
 	}
 
 	hexStr := hex.EncodeToString(ipNet.IP)
 	ones, _ := ipNet.Mask.Size()
 	if ones%8 != 0 {
-		return "", fmt.Errorf("Cannot create a hex prefix for an IPv6 subnet whose CIDR range is not divisible by 8")
+		return "", errors.New("Cannot create a hex prefix for an IPv6 subnet whose CIDR range is not divisible by 8")
 	}
 
 	return hexStr[:ones/4], nil

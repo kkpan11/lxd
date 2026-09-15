@@ -7,7 +7,9 @@ import (
 	"io"
 	"os"
 
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
+
+	"github.com/canonical/lxd/lxd/util"
 )
 
 // NewProcess is a constructor for a process object. Represents a process with argument config.
@@ -19,7 +21,7 @@ func NewProcess(name string, args []string, stdoutPath string, stderrPath string
 	if stdoutPath != "" {
 		stdout, err = os.Create(stdoutPath)
 		if err != nil {
-			return nil, fmt.Errorf("Unable to open stdout file %q: %w", stdoutPath, err)
+			return nil, fmt.Errorf("Cannot open stdout file %q: %w", stdoutPath, err)
 		}
 	}
 	if stderrPath == stdoutPath {
@@ -27,7 +29,7 @@ func NewProcess(name string, args []string, stdoutPath string, stderrPath string
 	} else if stderrPath != "" {
 		stderr, err = os.Create(stderrPath)
 		if err != nil {
-			return nil, fmt.Errorf("Unable to open stderr file %q: %w", stderrPath, err)
+			return nil, fmt.Errorf("Cannot open stderr file %q: %w", stderrPath, err)
 		}
 	}
 
@@ -42,9 +44,9 @@ func NewProcessWithFds(name string, args []string, stdin io.ReadCloser, stdout i
 	proc := Process{
 		Name:   name,
 		Args:   args,
-		Stdin:  stdin,
-		Stdout: stdout,
-		Stderr: stderr,
+		stdin:  stdin,
+		stdout: stdout,
+		stderr: stderr,
 	}
 
 	return &proc
@@ -52,15 +54,44 @@ func NewProcessWithFds(name string, args []string, stdin io.ReadCloser, stdout i
 
 // ImportProcess imports a saved process into a subprocess object.
 func ImportProcess(path string) (*Process, error) {
-	dat, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("Unable to read PID file %q: %w", path, err)
+		return nil, fmt.Errorf("Cannot read PID file %q: %w", path, err)
 	}
 
+	defer func() { _ = file.Close() }()
+
 	proc := Process{}
-	err = yaml.Unmarshal(dat, &proc)
+	err = yaml.NewDecoder(util.MaxBytesReader(file, util.MaxYAMLFileBytes)).Decode(&proc)
 	if err != nil {
-		return nil, fmt.Errorf("Unable to parse YAML in PID file %q: %w", path, err)
+		return nil, fmt.Errorf("Cannot parse YAML in PID file %q: %w", path, err)
+	}
+
+	if proc.PID <= 0 {
+		return nil, fmt.Errorf("%w %d in PID file %q", ErrBadPID, proc.PID, path)
+	}
+
+	if proc.BootID != "" {
+		bootID, err := currentBootID()
+		if err == nil {
+			if bootID != proc.BootID {
+				return &proc, nil
+			}
+		}
+	}
+
+	// On unix, FindProcess always returns successfully (with a 'done' process if pidfd_open
+	// returned with ESRCH).
+	proc.proc, _ = os.FindProcess(proc.PID)
+	if proc.StartTime != 0 {
+		starttime, err := processStartTime(proc.PID)
+		if err == nil {
+			if proc.StartTime != starttime {
+				_ = proc.proc.Release()
+				proc.proc = nil
+				return &proc, nil
+			}
+		}
 	}
 
 	return &proc, nil

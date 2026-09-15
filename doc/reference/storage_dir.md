@@ -2,6 +2,7 @@
 # Directory - `dir`
 
 ```{youtube} https://www.youtube.com/watch?v=imWkPM9GjCY
+:title: Directory storage and LXD
 ```
 
 The directory storage driver is a basic backend that stores its data in a standard file and directory structure.
@@ -43,10 +44,3 @@ The following configuration options are available for storage pools that use the
     :start-after: <!-- config group storage-dir-volume-conf start -->
     :end-before: <!-- config group storage-dir-volume-conf end -->
 ```
-
-### Storage bucket configuration
-
-To enable storage buckets for local storage pool drivers and allow applications to access the buckets via the S3 protocol, you must configure the {config:option}`server-core:core.storage_buckets_address` server setting.
-
-Storage buckets do not have any configuration for `dir` pools.
-Unlike the other storage pool drivers, the `dir` driver does not support bucket quotas via the `size` setting.

@@ -2,33 +2,31 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
-	"time"
 
-	"github.com/gorilla/mux"
-
-	"github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/lxd/auth"
-	"github.com/canonical/lxd/lxd/cluster"
 	"github.com/canonical/lxd/lxd/db"
 	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
+	"github.com/canonical/lxd/lxd/db/query"
 	"github.com/canonical/lxd/lxd/lifecycle"
 	"github.com/canonical/lxd/lxd/request"
+	"github.com/canonical/lxd/lxd/request/security"
 	"github.com/canonical/lxd/lxd/response"
+	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/lxd/util"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/entity"
 )
 
 var authGroupsCmd = APIEndpoint{
-	Name: "auth_groups",
-	Path: "auth/groups",
+	Path:        "auth/groups",
+	MetricsType: entity.TypeIdentity,
 	Get: APIEndpointAction{
 		Handler:       getAuthGroups,
 		AccessHandler: allowAuthenticated,
@@ -40,8 +38,8 @@ var authGroupsCmd = APIEndpoint{
 }
 
 var authGroupCmd = APIEndpoint{
-	Name: "auth_group",
-	Path: "auth/groups/{groupName}",
+	Path:        "auth/groups/{groupName}",
+	MetricsType: entity.TypeIdentity,
 	Get: APIEndpointAction{
 		Handler:       getAuthGroup,
 		AccessHandler: allowPermission(entity.TypeAuthGroup, auth.EntitlementCanView, "groupName"),
@@ -62,6 +60,27 @@ var authGroupCmd = APIEndpoint{
 		Handler:       patchAuthGroup,
 		AccessHandler: allowPermission(entity.TypeAuthGroup, auth.EntitlementCanEdit, "groupName"),
 	},
+}
+
+// isServerAdminPermission returns true if p grants the "admin" entitlement on the server entity.
+func isServerAdminPermission(p api.Permission) bool {
+	return p.EntityType == string(entity.TypeServer) && p.Entitlement == string(auth.EntitlementAdmin)
+}
+
+// hasServerAdminPermission returns true if permissions contains the server admin permission.
+func hasServerAdminPermission(permissions []api.Permission) bool {
+	return slices.ContainsFunc(permissions, isServerAdminPermission)
+}
+
+// validateAdminsGroupPermissions ensures that the desired permissions for the admins group consist of
+// exactly the server admin permission (and nothing else). This is used when creating the admins group or
+// when granting the server admin permission to an admins group that does not yet have it.
+func validateAdminsGroupPermissions(permissions []api.Permission) error {
+	if len(permissions) != 1 || !isServerAdminPermission(permissions[0]) {
+		return api.StatusErrorf(http.StatusBadRequest, "The admins group can only be granted the server admin permission")
+	}
+
+	return nil
 }
 
 func validateGroupName(name string) error {
@@ -161,69 +180,68 @@ func validateGroupName(name string) error {
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func getAuthGroups(d *Daemon, r *http.Request) response.Response {
-	recursion := request.QueryParam(r, "recursion")
+	recursion, _ := util.IsRecursionRequest(r)
 	s := d.State()
 
 	canViewGroup, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeAuthGroup)
 	if err != nil {
-		return response.SmartError(fmt.Errorf("Failed to get a permission checker: %w", err))
+		return response.SmartError(fmt.Errorf("Failed getting a permission checker: %w", err))
 	}
 
 	canViewIdentity, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeIdentity)
 	if err != nil {
-		return response.SmartError(fmt.Errorf("Failed to get a permission checker: %w", err))
+		return response.SmartError(fmt.Errorf("Failed getting a permission checker: %w", err))
 	}
 
 	canViewIDPGroup, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeIdentityProviderGroup)
 	if err != nil {
-		return response.SmartError(fmt.Errorf("Failed to get a permission checker: %w", err))
+		return response.SmartError(fmt.Errorf("Failed getting a permission checker: %w", err))
 	}
 
-	var groups []dbCluster.AuthGroup
+	withEntitlements, err := extractEntitlementsFromQuery(r, entity.TypeAuthGroup, true)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	var groups []dbCluster.AuthGroupsRow
+	var groupURLs []string
 	var authGroupPermissions []dbCluster.Permission
-	groupsIdentities := make(map[int][]dbCluster.Identity)
-	groupsIdentityProviderGroups := make(map[int][]dbCluster.IdentityProviderGroup)
+	groupsIdentities := make(map[int64][]dbCluster.IdentitiesRow)
+	groupsIdentityProviderGroups := make(map[int64][]dbCluster.IdentityProviderGroupsRow)
 	entityURLs := make(map[entity.Type]map[int]*api.URL)
 	err = d.db.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
-		allGroups, err := dbCluster.GetAuthGroups(ctx, tx.Tx())
+		groups, groupURLs, err = dbCluster.GetAuthGroupsAndURLs(ctx, tx.Tx(), func(group dbCluster.AuthGroupsRow) bool {
+			return canViewGroup(entity.AuthGroupURL(group.Name))
+		})
 		if err != nil {
 			return err
 		}
 
-		groups = make([]dbCluster.AuthGroup, 0, len(groups))
-		for _, group := range allGroups {
-			if canViewGroup(entity.AuthGroupURL(group.Name)) {
-				groups = append(groups, group)
-			}
-		}
-
-		if len(groups) == 0 {
+		if recursion == 0 || len(groups) == 0 {
 			return nil
 		}
 
-		if recursion == "1" {
-			// If recursing, we need all identities for all groups, all IDP groups for all groups,
-			// all permissions for all groups, and finally the URLs that those permissions apply to.
-			groupsIdentities, err = dbCluster.GetAllIdentitiesByAuthGroupIDs(ctx, tx.Tx())
-			if err != nil {
-				return err
-			}
+		// If recursing, we need all identities for all groups, all IDP groups for all groups,
+		// all permissions for all groups, and finally the URLs that those permissions apply to.
+		groupsIdentities, err = dbCluster.GetAllIdentitiesByAuthGroupIDs(ctx, tx.Tx())
+		if err != nil {
+			return err
+		}
 
-			groupsIdentityProviderGroups, err = dbCluster.GetAllIdentityProviderGroupsByGroupIDs(ctx, tx.Tx())
-			if err != nil {
-				return err
-			}
+		groupsIdentityProviderGroups, err = dbCluster.GetAllIdentityProviderGroupsByGroupIDs(ctx, tx.Tx())
+		if err != nil {
+			return err
+		}
 
-			authGroupPermissions, err = dbCluster.GetPermissions(ctx, tx.Tx())
-			if err != nil {
-				return err
-			}
+		authGroupPermissions, err = dbCluster.GetPermissions(ctx, tx.Tx())
+		if err != nil {
+			return err
+		}
 
-			// Get the EntityURLs for the permissions.
-			authGroupPermissions, entityURLs, err = dbCluster.GetPermissionEntityURLs(ctx, tx.Tx(), authGroupPermissions)
-			if err != nil {
-				return err
-			}
+		// Get the EntityURLs for the permissions.
+		authGroupPermissions, entityURLs, err = dbCluster.GetPermissionEntityURLs(ctx, tx.Tx(), authGroupPermissions)
+		if err != nil {
+			return err
 		}
 
 		return nil
@@ -232,62 +250,70 @@ func getAuthGroups(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	if recursion == "1" {
-		authGroupPermissionsByGroupID := make(map[int][]dbCluster.Permission, len(groups))
-		for _, permission := range authGroupPermissions {
-			authGroupPermissionsByGroupID[permission.GroupID] = append(authGroupPermissionsByGroupID[permission.GroupID], permission)
-		}
-
-		apiGroups := make([]api.AuthGroup, 0, len(groups))
-		for _, group := range groups {
-			var apiPermissions []api.Permission
-
-			// The group may not have any permissions.
-			permissions, ok := authGroupPermissionsByGroupID[group.ID]
-			if ok {
-				apiPermissions = make([]api.Permission, 0, len(permissions))
-				for _, permission := range permissions {
-					apiPermissions = append(apiPermissions, api.Permission{
-						EntityType:      string(permission.EntityType),
-						EntityReference: entityURLs[entity.Type(permission.EntityType)][permission.EntityID].String(),
-						Entitlement:     string(permission.Entitlement),
-					})
-				}
-			}
-
-			apiIdentities := make(map[string][]string)
-			for _, identity := range groupsIdentities[group.ID] {
-				authenticationMethod := string(identity.AuthMethod)
-				if canViewIdentity(entity.IdentityURL(authenticationMethod, identity.Identifier)) {
-					apiIdentities[authenticationMethod] = append(apiIdentities[authenticationMethod], identity.Identifier)
-				}
-			}
-
-			idpGroups := make([]string, 0, len(groupsIdentityProviderGroups[group.ID]))
-			for _, idpGroup := range groupsIdentityProviderGroups[group.ID] {
-				if canViewIDPGroup(entity.IdentityProviderGroupURL(idpGroup.Name)) {
-					idpGroups = append(idpGroups, idpGroup.Name)
-				}
-			}
-
-			apiGroups = append(apiGroups, api.AuthGroup{
-				Name:                   group.Name,
-				Description:            group.Description,
-				Permissions:            apiPermissions,
-				Identities:             apiIdentities,
-				IdentityProviderGroups: idpGroups,
-			})
-		}
-
-		return response.SyncResponse(true, apiGroups)
+	if recursion == 0 {
+		return response.SyncResponse(true, groupURLs)
 	}
 
-	groupURLs := make([]string, 0, len(groups))
+	authGroupPermissionsByGroupID := make(map[int64][]dbCluster.Permission, len(groups))
+	for _, permission := range authGroupPermissions {
+		authGroupPermissionsByGroupID[permission.GroupID] = append(authGroupPermissionsByGroupID[permission.GroupID], permission)
+	}
+	// We need to allocate a slice of pointer to api.AuthGroup because
+	// these records will be modified in place by the reportEntitlements function.
+	// We'll then return a slice of api.AuthGroup as an API response.
+	apiGroups := make([]*api.AuthGroup, 0, len(groups))
+	urlToGroup := make(map[*api.URL]auth.EntitlementReporter, len(groups))
 	for _, group := range groups {
-		groupURLs = append(groupURLs, entity.AuthGroupURL(group.Name).String())
+		var apiPermissions []api.Permission
+
+		// The group may not have any permissions.
+		permissions, ok := authGroupPermissionsByGroupID[group.ID]
+		if ok {
+			apiPermissions = make([]api.Permission, 0, len(permissions))
+			for _, permission := range permissions {
+				apiPermissions = append(apiPermissions, api.Permission{
+					EntityType:      string(permission.EntityType),
+					EntityReference: entityURLs[entity.Type(permission.EntityType)][permission.EntityID].String(),
+					Entitlement:     string(permission.Entitlement),
+				})
+			}
+		}
+
+		apiIdentities := make(map[string][]string)
+		for _, identity := range groupsIdentities[group.ID] {
+			authenticationMethod := string(identity.AuthMethod)
+			if canViewIdentity(entity.IdentityURL(authenticationMethod, identity.Identifier)) {
+				apiIdentities[authenticationMethod] = append(apiIdentities[authenticationMethod], identity.Identifier)
+			}
+		}
+
+		idpGroups := make([]string, 0, len(groupsIdentityProviderGroups[group.ID]))
+		for _, idpGroup := range groupsIdentityProviderGroups[group.ID] {
+			if canViewIDPGroup(entity.IdentityProviderGroupURL(idpGroup.Name)) {
+				idpGroups = append(idpGroups, idpGroup.Name)
+			}
+		}
+
+		group := &api.AuthGroup{
+			Name:                   group.Name,
+			Description:            group.Description,
+			Permissions:            apiPermissions,
+			Identities:             apiIdentities,
+			IdentityProviderGroups: idpGroups,
+		}
+
+		apiGroups = append(apiGroups, group)
+		urlToGroup[entity.AuthGroupURL(group.Name)] = group
 	}
 
-	return response.SyncResponse(true, groupURLs)
+	if len(withEntitlements) > 0 {
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeAuthGroup, withEntitlements, urlToGroup)
+		if err != nil {
+			return response.SmartError(err)
+		}
+	}
+
+	return response.SyncResponse(true, apiGroups)
 }
 
 // swagger:operation POST /1.0/auth/groups auth_groups auth_groups_post
@@ -329,17 +355,24 @@ func createAuthGroup(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	err = validatePermissions(group.Permissions)
+	// The admins group is a built-in group. It may be created without permissions (e.g. by users
+	// upgrading from a version of LXD that predates the built-in admins group), but if permissions
+	// are provided at creation time they must consist of exactly the server admin permission.
+	if group.Name == api.AuthGroupAdminsName && len(group.Permissions) > 0 {
+		err = validateAdminsGroupPermissions(group.Permissions)
+		if err != nil {
+			return response.SmartError(err)
+		}
+	}
+
+	s := d.State()
+	validatedPermissions, err := validatePermissions(r.Context(), s, group.Permissions)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-
-	s := d.State()
-	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
-		groupID, err := dbCluster.CreateAuthGroup(ctx, tx.Tx(), dbCluster.AuthGroup{
+	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+		groupID, err := query.Create(ctx, tx.Tx(), dbCluster.AuthGroupsRow{
 			Name:        group.Name,
 			Description: group.Description,
 		})
@@ -347,7 +380,7 @@ func createAuthGroup(d *Daemon, r *http.Request) response.Response {
 			return err
 		}
 
-		err = upsertPermissions(ctx, tx.Tx(), int(groupID), group.Permissions)
+		err = dbCluster.SetAuthGroupPermissions(ctx, tx.Tx(), groupID, validatedPermissions)
 		if err != nil {
 			return err
 		}
@@ -359,8 +392,11 @@ func createAuthGroup(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Send a lifecycle event for the group creation
-	lc := lifecycle.AuthGroupCreated.Event(group.Name, request.CreateRequestor(r), nil)
-	s.Events.SendLifecycle(api.ProjectDefaultName, lc)
+	lc := lifecycle.AuthGroupCreated.Event(group.Name, request.CreateRequestor(r.Context()), nil)
+	s.Events.SendLifecycle("", lc)
+
+	secEvt := security.AuthzAdmin.WithSuffix("group_create", group.Name).UserEvent(r.Context(), security.LevelInfo, "Authorization group created")
+	s.Events.SendSecurity(secEvt)
 
 	return response.SyncResponseLocation(true, nil, entity.AuthGroupURL(group.Name).String())
 }
@@ -399,27 +435,25 @@ func createAuthGroup(d *Daemon, r *http.Request) response.Response {
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func getAuthGroup(d *Daemon, r *http.Request) response.Response {
-	groupName, err := url.PathUnescape(mux.Vars(r)["groupName"])
+	groupName := r.PathValue("groupName")
+	withEntitlements, err := extractEntitlementsFromQuery(r, entity.TypeAuthGroup, false)
 	if err != nil {
 		return response.SmartError(err)
 	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
 
 	var apiGroup *api.AuthGroup
 	s := d.State()
 	canViewIdentity, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeIdentity)
 	if err != nil {
-		return response.SmartError(fmt.Errorf("Failed to get a permission checker: %w", err))
+		return response.SmartError(fmt.Errorf("Failed getting a permission checker: %w", err))
 	}
 
 	canViewIDPGroup, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeIdentityProviderGroup)
 	if err != nil {
-		return response.SmartError(fmt.Errorf("Failed to get a permission checker: %w", err))
+		return response.SmartError(fmt.Errorf("Failed getting a permission checker: %w", err))
 	}
 
-	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
 		group, err := dbCluster.GetAuthGroup(ctx, tx.Tx(), groupName)
 		if err != nil {
 			return err
@@ -434,6 +468,13 @@ func getAuthGroup(d *Daemon, r *http.Request) response.Response {
 	})
 	if err != nil {
 		return response.SmartError(err)
+	}
+
+	if len(withEntitlements) > 0 {
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeAuthGroup, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.AuthGroupURL(groupName): apiGroup})
+		if err != nil {
+			return response.SmartError(err)
+		}
 	}
 
 	return response.SyncResponseETag(true, *apiGroup, *apiGroup)
@@ -466,10 +507,8 @@ func getAuthGroup(d *Daemon, r *http.Request) response.Response {
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func updateAuthGroup(d *Daemon, r *http.Request) response.Response {
-	groupName, err := url.PathUnescape(mux.Vars(r)["groupName"])
-	if err != nil {
-		return response.SmartError(err)
-	}
+	groupName := r.PathValue("groupName")
+	var err error
 
 	var groupPut api.AuthGroupPut
 	err = json.NewDecoder(r.Body).Decode(&groupPut)
@@ -477,26 +516,23 @@ func updateAuthGroup(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(fmt.Errorf("Invalid request body: %w", err))
 	}
 
-	err = validatePermissions(groupPut.Permissions)
+	s := d.State()
+	validatedPermissions, err := validatePermissions(r.Context(), s, groupPut.Permissions)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-
-	s := d.State()
 	canViewIdentity, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeIdentity)
 	if err != nil {
-		return response.SmartError(fmt.Errorf("Failed to get a permission checker: %w", err))
+		return response.SmartError(fmt.Errorf("Failed getting a permission checker: %w", err))
 	}
 
 	canViewIDPGroup, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeIdentityProviderGroup)
 	if err != nil {
-		return response.SmartError(fmt.Errorf("Failed to get a permission checker: %w", err))
+		return response.SmartError(fmt.Errorf("Failed getting a permission checker: %w", err))
 	}
 
-	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
 		group, err := dbCluster.GetAuthGroup(ctx, tx.Tx(), groupName)
 		if err != nil {
 			return err
@@ -512,15 +548,30 @@ func updateAuthGroup(d *Daemon, r *http.Request) response.Response {
 			return err
 		}
 
-		err = dbCluster.UpdateAuthGroup(ctx, tx.Tx(), groupName, dbCluster.AuthGroup{
-			Name:        groupName,
-			Description: groupPut.Description,
-		})
+		// The admins group is a built-in group with special semantics. Once it has been granted the
+		// server admin permission it becomes immutable. It may still be updated to grant the server
+		// admin permission if it does not yet have it (for example when the group has been created
+		// manually on an installation that was upgraded from a version of LXD that did not seed the
+		// admins group automatically).
+		if groupName == api.AuthGroupAdminsName {
+			if hasServerAdminPermission(apiGroup.Permissions) {
+				return api.StatusErrorf(http.StatusBadRequest, "The admins group cannot be modified")
+			}
+
+			err = validateAdminsGroupPermissions(groupPut.Permissions)
+			if err != nil {
+				return err
+			}
+		}
+
+		group.Description = groupPut.Description
+
+		err = query.UpdateByPrimaryKey(ctx, tx.Tx(), group)
 		if err != nil {
 			return err
 		}
 
-		err = upsertPermissions(ctx, tx.Tx(), group.ID, groupPut.Permissions)
+		err = dbCluster.SetAuthGroupPermissions(ctx, tx.Tx(), group.ID, validatedPermissions)
 		if err != nil {
 			return err
 		}
@@ -532,8 +583,11 @@ func updateAuthGroup(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Send a lifecycle event for the group update
-	lc := lifecycle.AuthGroupUpdated.Event(groupName, request.CreateRequestor(r), nil)
-	s.Events.SendLifecycle(api.ProjectDefaultName, lc)
+	lc := lifecycle.AuthGroupUpdated.Event(groupName, request.CreateRequestor(r.Context()), nil)
+	s.Events.SendLifecycle("", lc)
+
+	secEvt := security.AuthzAdmin.WithSuffix("group_edit", groupName).UserEvent(r.Context(), security.LevelInfo, "Authorization group updated")
+	s.Events.SendSecurity(secEvt)
 
 	return response.EmptySyncResponse
 }
@@ -565,10 +619,8 @@ func updateAuthGroup(d *Daemon, r *http.Request) response.Response {
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func patchAuthGroup(d *Daemon, r *http.Request) response.Response {
-	groupName, err := url.PathUnescape(mux.Vars(r)["groupName"])
-	if err != nil {
-		return response.SmartError(err)
-	}
+	groupName := r.PathValue("groupName")
+	var err error
 
 	var groupPut api.AuthGroupPut
 	err = json.NewDecoder(r.Body).Decode(&groupPut)
@@ -576,27 +628,21 @@ func patchAuthGroup(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(fmt.Errorf("Invalid request body: %w", err))
 	}
 
-	err = validatePermissions(groupPut.Permissions)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-
 	s := d.State()
 	canViewIdentity, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeIdentity)
 	if err != nil {
-		return response.SmartError(fmt.Errorf("Failed to get a permission checker: %w", err))
+		return response.SmartError(fmt.Errorf("Failed getting a permission checker: %w", err))
 	}
 
 	canViewIDPGroup, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeIdentityProviderGroup)
 	if err != nil {
-		return response.SmartError(fmt.Errorf("Failed to get a permission checker: %w", err))
+		return response.SmartError(fmt.Errorf("Failed getting a permission checker: %w", err))
 	}
 
-	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
-		group, err := dbCluster.GetAuthGroup(ctx, tx.Tx(), groupName)
+	newPermissions := make([]api.Permission, 0, len(groupPut.Permissions))
+	var group *dbCluster.AuthGroupsRow
+	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+		group, err = dbCluster.GetAuthGroup(ctx, tx.Tx(), groupName)
 		if err != nil {
 			return err
 		}
@@ -611,26 +657,26 @@ func patchAuthGroup(d *Daemon, r *http.Request) response.Response {
 			return err
 		}
 
-		if groupPut.Description != "" {
-			err = dbCluster.UpdateAuthGroup(ctx, tx.Tx(), groupName, dbCluster.AuthGroup{
-				Name:        groupName,
-				Description: groupPut.Description,
-			})
+		// The admins group is a built-in group with special semantics. Once it has been granted the
+		// server admin permission it becomes immutable. It may still be patched to grant the server
+		// admin permission if it does not yet have it (for example when the group has been created
+		// manually on an installation that was upgraded from a version of LXD that did not seed the
+		// admins group automatically).
+		if groupName == api.AuthGroupAdminsName {
+			if hasServerAdminPermission(apiGroup.Permissions) {
+				return api.StatusErrorf(http.StatusBadRequest, "The admins group cannot be modified")
+			}
+
+			err = validateAdminsGroupPermissions(groupPut.Permissions)
 			if err != nil {
 				return err
 			}
 		}
 
-		newPermissions := make([]api.Permission, 0, len(groupPut.Permissions))
 		for _, permission := range groupPut.Permissions {
-			if !shared.ValueInSlice(permission, apiGroup.Permissions) {
+			if !slices.Contains(apiGroup.Permissions, permission) {
 				newPermissions = append(newPermissions, permission)
 			}
-		}
-
-		err = upsertPermissions(ctx, tx.Tx(), group.ID, newPermissions)
-		if err != nil {
-			return err
 		}
 
 		return nil
@@ -639,9 +685,32 @@ func patchAuthGroup(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
+	newDBPermissions, err := validatePermissions(r.Context(), s, newPermissions)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+		if groupPut.Description != "" {
+			group.Description = groupPut.Description
+			err = query.UpdateByPrimaryKey(ctx, tx.Tx(), group)
+			if err != nil {
+				return err
+			}
+		}
+
+		return dbCluster.SetAuthGroupPermissions(ctx, tx.Tx(), group.ID, newDBPermissions)
+	})
+	if err != nil {
+		return response.SmartError(err)
+	}
+
 	// Send a lifecycle event for the group update
-	lc := lifecycle.AuthGroupUpdated.Event(groupName, request.CreateRequestor(r), nil)
-	s.Events.SendLifecycle(api.ProjectDefaultName, lc)
+	lc := lifecycle.AuthGroupUpdated.Event(groupName, request.CreateRequestor(r.Context()), nil)
+	s.Events.SendLifecycle("", lc)
+
+	secEvt := security.AuthzAdmin.WithSuffix("group_edit", groupName).UserEvent(r.Context(), security.LevelInfo, "Authorization group updated")
+	s.Events.SendSecurity(secEvt)
 
 	return response.EmptySyncResponse
 }
@@ -673,9 +742,10 @@ func patchAuthGroup(d *Daemon, r *http.Request) response.Response {
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func renameAuthGroup(d *Daemon, r *http.Request) response.Response {
-	groupName, err := url.PathUnescape(mux.Vars(r)["groupName"])
-	if err != nil {
-		return response.SmartError(err)
+	groupName := r.PathValue("groupName")
+	var err error
+	if groupName == api.AuthGroupAdminsName {
+		return response.BadRequest(errors.New("The admins group cannot be renamed"))
 	}
 
 	var groupPost api.AuthGroupPost
@@ -689,44 +759,27 @@ func renameAuthGroup(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-
 	s := d.State()
-	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
-		err = dbCluster.RenameAuthGroup(ctx, tx.Tx(), groupName, groupPost.Name)
+	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+		group, err := dbCluster.GetAuthGroup(ctx, tx.Tx(), groupName)
 		if err != nil {
 			return err
 		}
 
-		return nil
+		group.Name = groupPost.Name
+		return query.UpdateByPrimaryKey(ctx, tx.Tx(), group)
 	})
 	if err != nil {
 		return response.SmartError(err)
 	}
-
-	// Notify other cluster members to update their identity cache.
-	notifier, err := cluster.NewNotifier(s, s.Endpoints.NetworkCert(), s.ServerCert(), cluster.NotifyAlive)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	err = notifier(func(client lxd.InstanceServer) error {
-		_, _, err := client.RawQuery(http.MethodPost, "/internal/identity-cache-refresh", nil, "")
-		return err
-	})
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	// When a group is renamed we need to update the list of group names associated with each identity in the cache.
-	// When a group is otherwise modified, the name is unchanged, so the cache doesn't need to be updated.
-	// When a group is created, no identities are a member of it yet, so the cache doesn't need to be updated.
-	s.UpdateIdentityCache()
 
 	// Send a lifecycle event for the group rename
-	lc := lifecycle.AuthGroupRenamed.Event(groupPost.Name, request.CreateRequestor(r), map[string]any{"old_name": groupName})
-	s.Events.SendLifecycle(api.ProjectDefaultName, lc)
+	lc := lifecycle.AuthGroupRenamed.Event(groupPost.Name, request.CreateRequestor(r.Context()), map[string]any{"old_name": groupName})
+	s.Events.SendLifecycle("", lc)
+
+	// Rename is treated as an edit per spec; no separate group_rename action.
+	secEvt := security.AuthzAdmin.WithSuffix("group_edit", groupPost.Name).UserEvent(r.Context(), security.LevelInfo, "Authorization group renamed from "+groupName)
+	s.Events.SendSecurity(secEvt)
 
 	return response.SyncResponseLocation(true, nil, entity.AuthGroupURL(groupPost.Name).String())
 }
@@ -750,89 +803,65 @@ func renameAuthGroup(d *Daemon, r *http.Request) response.Response {
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func deleteAuthGroup(d *Daemon, r *http.Request) response.Response {
-	groupName, err := url.PathUnescape(mux.Vars(r)["groupName"])
-	if err != nil {
-		return response.SmartError(err)
+	groupName := r.PathValue("groupName")
+	var err error
+	if groupName == api.AuthGroupAdminsName {
+		return response.BadRequest(errors.New("The admins group cannot be deleted"))
 	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
 
 	s := d.State()
-	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
-		return dbCluster.DeleteAuthGroup(ctx, tx.Tx(), groupName)
+	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+		return query.DeleteOne[dbCluster.AuthGroupsRow](ctx, tx.Tx(), "WHERE name = ?", groupName)
 	})
 	if err != nil {
 		return response.SmartError(err)
 	}
-
-	// Notify other cluster members to update their identity cache.
-	notifier, err := cluster.NewNotifier(s, s.Endpoints.NetworkCert(), s.ServerCert(), cluster.NotifyAlive)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	err = notifier(func(client lxd.InstanceServer) error {
-		_, _, err := client.RawQuery(http.MethodPost, "/internal/identity-cache-refresh", nil, "")
-		return err
-	})
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	// When a group is deleted we need to remove it from the list of groups names associated with each identity in the cache.
-	// (When a group is created, nobody is a member of it yet, so the cache doesn't need to be updated).
-	s.UpdateIdentityCache()
 
 	// Send a lifecycle event for the group deletion
-	lc := lifecycle.AuthGroupDeleted.Event(groupName, request.CreateRequestor(r), nil)
-	s.Events.SendLifecycle(api.ProjectDefaultName, lc)
+	lc := lifecycle.AuthGroupDeleted.Event(groupName, request.CreateRequestor(r.Context()), nil)
+	s.Events.SendLifecycle("", lc)
+
+	secEvt := security.AuthzAdmin.WithSuffix("group_delete", groupName).UserEvent(r.Context(), security.LevelInfo, "Authorization group deleted")
+	s.Events.SendSecurity(secEvt)
 
 	return response.EmptySyncResponse
 }
 
 // validatePermissions checks that a) the entity type exists, b) the entitlement exists, c) then entity type matches the
 // entity reference (URL), and d) that the entitlement is valid for the entity type.
-func validatePermissions(permissions []api.Permission) error {
+func validatePermissions(ctx context.Context, s *state.State, permissions []api.Permission) ([]dbCluster.Permission, error) {
+	projectsWithViewPermissionRequired := make(map[string][]api.Permission, len(permissions))
+	entityReferences := make(map[*api.URL]*dbCluster.EntityRef, len(permissions))
+	permissionToURL := make(map[api.Permission]*api.URL, len(permissions))
 	for _, permission := range permissions {
 		entityType := entity.Type(permission.EntityType)
 		err := entityType.Validate()
 		if err != nil {
-			return api.StatusErrorf(http.StatusBadRequest, "Failed to validate entity type for permission with entity reference %q and entitlement %q: %w", permission.EntityReference, permission.Entitlement, err)
+			return nil, api.StatusErrorf(http.StatusBadRequest, "Failed validating entity type for permission with entity reference %q and entitlement %q: %w", permission.EntityReference, permission.Entitlement, err)
 		}
 
 		u, err := url.Parse(permission.EntityReference)
 		if err != nil {
-			return api.StatusErrorf(http.StatusBadRequest, "Failed to parse permission with entity reference %q and entitlement %q: %w", permission.EntityReference, permission.Entitlement, err)
+			return nil, api.StatusErrorf(http.StatusBadRequest, "Failed parsing permission with entity reference %q and entitlement %q: %w", permission.EntityReference, permission.Entitlement, err)
 		}
 
-		referenceEntityType, _, _, _, err := entity.ParseURL(*u)
+		referenceEntityType, projectName, _, _, err := entity.ParseURL(*u)
 		if err != nil {
-			return api.StatusErrorf(http.StatusBadRequest, "Failed to parse permission with entity reference %q and entitlement %q: %w", permission.EntityReference, permission.Entitlement, err)
+			return nil, api.StatusErrorf(http.StatusBadRequest, "Failed parsing permission with entity reference %q and entitlement %q: %w", permission.EntityReference, permission.Entitlement, err)
 		}
 
 		if entityType != referenceEntityType {
-			return api.StatusErrorf(http.StatusBadRequest, "Failed to parse permission with entity reference %q and entitlement %q: Entity type does not correspond to entity reference", permission.EntityReference, permission.Entitlement)
+			return nil, api.StatusErrorf(http.StatusBadRequest, "Failed parsing permission with entity reference %q and entitlement %q: Entity type does not correspond to entity reference", permission.EntityReference, permission.Entitlement)
 		}
 
 		err = auth.ValidateEntitlement(entityType, auth.Entitlement(permission.Entitlement))
 		if err != nil {
-			return api.StatusErrorf(http.StatusBadRequest, "Failed to validate group permission with entity reference %q and entitlement %q: %w", permission.EntityReference, permission.Entitlement, err)
+			return nil, api.StatusErrorf(http.StatusBadRequest, "Failed validating group permission with entity reference %q and entitlement %q: %w", permission.EntityReference, permission.Entitlement, err)
 		}
-	}
 
-	return nil
-}
-
-// upsertPermissions converts the given slice of api.Permission into a slice of cluster.Permission by resolving
-// the URLs of each permission to an entity ID. Then sets those permissions against the group with the given ID.
-func upsertPermissions(ctx context.Context, tx *sql.Tx, groupID int, permissions []api.Permission) error {
-	entityReferences := make(map[*api.URL]*dbCluster.EntityRef, len(permissions))
-	permissionToURL := make(map[api.Permission]*api.URL, len(permissions))
-	for _, permission := range permissions {
-		u, err := url.Parse(permission.EntityReference)
-		if err != nil {
-			return fmt.Errorf("Failed to parse permission entity reference: %w", err)
+		requiresProject, _ := entityType.RequiresProject()
+		if requiresProject || entityType == entity.TypeProject {
+			projectsWithViewPermissionRequired[projectName] = append(projectsWithViewPermissionRequired[projectName], permission)
 		}
 
 		apiURL := &api.URL{URL: *u}
@@ -840,9 +869,29 @@ func upsertPermissions(ctx context.Context, tx *sql.Tx, groupID int, permissions
 		permissionToURL[permission] = apiURL
 	}
 
-	err := dbCluster.PopulateEntityReferencesFromURLs(ctx, tx, entityReferences)
+	if len(projectsWithViewPermissionRequired) > 0 {
+		viewableProjects, err := s.Authorizer.GetViewableProjects(ctx, permissions)
+		if err != nil {
+			return nil, fmt.Errorf("Failed verifying that projects are viewable: %w", err)
+		}
+
+		for project, perms := range projectsWithViewPermissionRequired {
+			if !slices.Contains(viewableProjects, project) {
+				if len(perms) == 1 {
+					// Return an informative error message if possible.
+					return nil, api.StatusErrorf(http.StatusBadRequest, "Entitlement %q on entity type %q references project %q, but the project cannot be viewed by the group", perms[0].Entitlement, perms[0].EntityType, project)
+				}
+
+				return nil, api.StatusErrorf(http.StatusBadRequest, "Members of the group cannot view project %q, but %d permissions reference this project", project, len(perms))
+			}
+		}
+	}
+
+	err := s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		return dbCluster.PopulateEntityReferencesFromURLs(ctx, tx.Tx(), entityReferences)
+	})
 	if err != nil {
-		return err
+		return nil, api.StatusErrorf(http.StatusBadRequest, "Could not resolve permission URLs: %w", err)
 	}
 
 	authGroupPermissions := make([]dbCluster.Permission, 0, len(permissions))
@@ -851,7 +900,7 @@ func upsertPermissions(ctx context.Context, tx *sql.Tx, groupID int, permissions
 		entityType := dbCluster.EntityType(permission.EntityType)
 		entityRef, ok := entityReferences[apiURL]
 		if !ok {
-			return api.StatusErrorf(http.StatusBadRequest, "Missing entity ID for permission with URL %q", permission.EntityReference)
+			return nil, api.StatusErrorf(http.StatusBadRequest, "Missing entity ID for permission with URL %q", permission.EntityReference)
 		}
 
 		authGroupPermissions = append(authGroupPermissions, dbCluster.Permission{
@@ -861,10 +910,5 @@ func upsertPermissions(ctx context.Context, tx *sql.Tx, groupID int, permissions
 		})
 	}
 
-	err = dbCluster.SetAuthGroupPermissions(ctx, tx, groupID, authGroupPermissions)
-	if err != nil {
-		return fmt.Errorf("Failed to set group permissions: %w", err)
-	}
-
-	return nil
+	return authGroupPermissions, nil
 }

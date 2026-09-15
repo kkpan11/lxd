@@ -3,25 +3,28 @@ package resources
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
-	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 
-	"github.com/canonical/lxd/shared"
+	"github.com/canonical/lxd/lxd/storage/block"
 	"github.com/canonical/lxd/shared/api"
 )
 
 var devDiskByPath = "/dev/disk/by-path"
-var devDiskByID = "/dev/disk/by-id"
 var runUdevData = "/run/udev/data"
 var sysClassBlock = "/sys/class/block"
 var procSelfMountInfo = "/proc/self/mountinfo"
+
+// Most CD-ROM drives report this size when no media is present.
+const cdromNoMediaReportedSize = 0x1fffff * 512
 
 func storageAddDriveInfo(devicePath string, disk *api.ResourcesStorageDisk) error {
 	// Attempt to open the device path
@@ -43,20 +46,20 @@ func storageAddDriveInfo(devicePath string, disk *api.ResourcesStorageDisk) erro
 	}
 
 	// Retrieve udev information
-	udevInfo := filepath.Join(runUdevData, fmt.Sprintf("b%s", disk.Device))
-	if sysfsExists(udevInfo) {
+	udevInfo := filepath.Join(runUdevData, "b"+disk.Device)
+	if pathExists(udevInfo) {
 		// Get the udev information
 		f, err := os.Open(udevInfo)
 		if err != nil {
-			return fmt.Errorf("Failed to open %q: %w", udevInfo, err)
+			return fmt.Errorf("Failed opening %q: %w", udevInfo, err)
 		}
 
 		defer func() { _ = f.Close() }()
 
 		udevProperties := map[string]string{}
-		udevInfo := bufio.NewScanner(f)
-		for udevInfo.Scan() {
-			line := strings.TrimSpace(udevInfo.Text())
+		udevInfoScanner := bufio.NewScanner(f)
+		for udevInfoScanner.Scan() {
+			line := strings.TrimSpace(udevInfoScanner.Text())
 
 			if !strings.HasPrefix(line, "E:") {
 				continue
@@ -70,6 +73,10 @@ func storageAddDriveInfo(devicePath string, disk *api.ResourcesStorageDisk) erro
 			key := strings.TrimSpace(fields[0])
 			value := strings.TrimSpace(fields[1])
 			udevProperties[key] = value
+		}
+
+		if udevInfoScanner.Err() != nil {
+			return fmt.Errorf("Failed scanning udev info for disk: %w", udevInfoScanner.Err())
 		}
 
 		// Finer grained disk type
@@ -119,7 +126,7 @@ func storageAddDriveInfo(devicePath string, disk *api.ResourcesStorageDisk) erro
 		if udevProperties["E:ID_ATA_ROTATION_RATE_RPM"] != "" && disk.RPM == 0 {
 			valueUint, err := strconv.ParseUint(udevProperties["E:ID_ATA_ROTATION_RATE_RPM"], 10, 64)
 			if err != nil {
-				return fmt.Errorf("Failed to parse RPM value: %w", err)
+				return fmt.Errorf("Failed parsing RPM value: %w", err)
 			}
 
 			disk.RPM = valueUint
@@ -135,16 +142,16 @@ func GetStorage() (*api.ResourcesStorage, error) {
 	storage.Disks = []api.ResourcesStorageDisk{}
 
 	// Detect all block devices
-	if sysfsExists(sysClassBlock) {
+	if pathExists(sysClassBlock) {
 		entries, err := os.ReadDir(sysClassBlock)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to list %q: %w", sysClassBlock, err)
+			return nil, fmt.Errorf("Failed listing %q: %w", sysClassBlock, err)
 		}
 
 		// Get information about what's mounted.
 		mountInfo, err := os.ReadFile(procSelfMountInfo)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to read %q: %w", procSelfMountInfo, err)
+			return nil, fmt.Errorf("Failed reading %q: %w", procSelfMountInfo, err)
 		}
 
 		mountedIDs := map[string]bool{}
@@ -166,34 +173,65 @@ func GetStorage() (*api.ResourcesStorage, error) {
 			entryPath := filepath.Join(sysClassBlock, entryName)
 			devicePath := filepath.Join(entryPath, "device")
 
-			// Only keep the main entries not partitions
-			if !sysfsExists(devicePath) {
-				continue
-			}
-
 			// Setup the entry
 			disk := api.ResourcesStorageDisk{}
 			disk.ID = entryName
+			devPath := filepath.Join("/dev", entryName)
+
+			// Only keep the main entries not partitions.
+			if !pathExists(devicePath) {
+				// List of recognized virtual device types.
+				// Extending this list should be accommodated by setting the UsedBy field to the actual type.
+				virtualDevices := []string{"bcache"}
+				isVirtualDevicePath := func(deviceType string) bool {
+					// Skip partitions.
+					if pathExists(filepath.Join(entryPath, "partition")) {
+						return false
+					}
+
+					virtualDeviceTypePath := filepath.Join(entryPath, deviceType)
+					isVirtualDevice := pathExists(virtualDeviceTypePath)
+
+					// Identify if the disk is in use by any virtual device.
+					// In case of bcache the device's own ./bcache path is a link, not a directory.
+					// When adding more virtual types, check the behavior is identical to bcache.
+					if isVirtualDevice && pathIsDir(virtualDeviceTypePath) {
+						disk.UsedBy = deviceType
+					}
+
+					return isVirtualDevice
+				}
+
+				if !slices.ContainsFunc(virtualDevices, isVirtualDevicePath) {
+					continue
+				}
+
+				// For virtual block devices (for example bcache) there is no ./device directory.
+				// Use the entry path itself as the device source.
+				devicePath = entryPath
+			}
 
 			// Firmware revision
-			if sysfsExists(filepath.Join(devicePath, "firmware_rev")) {
-				firmwareRevision, err := os.ReadFile(filepath.Join(devicePath, "firmware_rev"))
+			firmwareRevPath := filepath.Join(devicePath, "firmware_rev")
+			if pathExists(firmwareRevPath) {
+				firmwareRevision, err := os.ReadFile(firmwareRevPath)
 				if err != nil {
-					return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(devicePath, "firmware_rev"), err)
+					return nil, fmt.Errorf("Failed reading %q: %w", firmwareRevPath, err)
 				}
 
 				disk.FirmwareVersion = strings.TrimSpace(string(firmwareRevision))
 			}
 
 			// Device node
-			diskDev, err := os.ReadFile(filepath.Join(entryPath, "dev"))
+			entryDevPath := filepath.Join(entryPath, "dev")
+			diskDev, err := os.ReadFile(entryDevPath)
 			if err != nil {
 				if os.IsNotExist(err) {
 					// This happens on multipath devices, just skip as we only care about the main node.
 					continue
 				}
 
-				return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(entryPath, "dev"), err)
+				return nil, fmt.Errorf("Failed reading %q: %w", entryDevPath, err)
 			}
 
 			disk.Device = strings.TrimSpace(string(diskDev))
@@ -201,7 +239,7 @@ func GetStorage() (*api.ResourcesStorage, error) {
 			// PCI address
 			pciAddr, err := pciAddress(devicePath)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to find PCI address for %q: %w", devicePath, err)
+				return nil, fmt.Errorf("Failed finding PCI address for %q: %w", devicePath, err)
 			}
 
 			if pciAddr != "" {
@@ -211,7 +249,7 @@ func GetStorage() (*api.ResourcesStorage, error) {
 			// USB address
 			usbAddr, err := usbAddress(devicePath)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to find USB address for %q: %w", devicePath, err)
+				return nil, fmt.Errorf("Failed finding USB address for %q: %w", devicePath, err)
 			}
 
 			if usbAddr != "" {
@@ -219,10 +257,11 @@ func GetStorage() (*api.ResourcesStorage, error) {
 			}
 
 			// NUMA node
-			if sysfsExists(filepath.Join(devicePath, "numa_node")) {
-				numaNode, err := readInt(filepath.Join(devicePath, "numa_node"))
+			numaNodePath := filepath.Join(devicePath, "numa_node")
+			if pathExists(numaNodePath) {
+				numaNode, err := readInt(numaNodePath)
 				if err != nil {
-					return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(devicePath, "numa_node"), err)
+					return nil, fmt.Errorf("Failed reading %q: %w", numaNodePath, err)
 				}
 
 				if numaNode > 0 {
@@ -231,20 +270,22 @@ func GetStorage() (*api.ResourcesStorage, error) {
 			}
 
 			// Disk model
-			if sysfsExists(filepath.Join(devicePath, "model")) {
-				diskModel, err := os.ReadFile(filepath.Join(devicePath, "model"))
+			modelPath := filepath.Join(devicePath, "model")
+			if pathExists(modelPath) {
+				diskModel, err := os.ReadFile(modelPath)
 				if err != nil {
-					return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(devicePath, "model"), err)
+					return nil, fmt.Errorf("Failed reading %q: %w", modelPath, err)
 				}
 
 				disk.Model = strings.TrimSpace(string(diskModel))
 			}
 
 			// Disk type
-			if sysfsExists(filepath.Join(devicePath, "subsystem")) {
-				diskSubsystem, err := filepath.EvalSymlinks(filepath.Join(devicePath, "subsystem"))
+			subsystemPath := filepath.Join(devicePath, "subsystem")
+			if pathExists(subsystemPath) {
+				diskSubsystem, err := filepath.EvalSymlinks(subsystemPath)
 				if err != nil {
-					return nil, fmt.Errorf("Failed to find %q: %w", filepath.Join(devicePath, "subsystem"), err)
+					return nil, fmt.Errorf("Failed finding %q: %w", subsystemPath, err)
 				}
 
 				disk.Type = filepath.Base(diskSubsystem)
@@ -256,34 +297,38 @@ func GetStorage() (*api.ResourcesStorage, error) {
 			}
 
 			// Read-only
-			diskRo, err := readUint(filepath.Join(entryPath, "ro"))
+			entryRoPath := filepath.Join(entryPath, "ro")
+			diskRo, err := readUint(entryRoPath)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(entryPath, "ro"), err)
+				return nil, fmt.Errorf("Failed reading %q: %w", entryRoPath, err)
 			}
 
 			disk.ReadOnly = diskRo == 1
 
 			// Size
-			diskSize, err := readUint(filepath.Join(entryPath, "size"))
+			entrySizePath := filepath.Join(entryPath, "size")
+			diskSize, err := readUint(entrySizePath)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(entryPath, "size"), err)
+				return nil, fmt.Errorf("Failed reading %q: %w", entrySizePath, err)
 			}
 
 			disk.Size = diskSize * 512
 
 			// Removable
-			diskRemovable, err := readUint(filepath.Join(entryPath, "removable"))
+			removablePath := filepath.Join(entryPath, "removable")
+			diskRemovable, err := readUint(removablePath)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(entryPath, "removable"), err)
+				return nil, fmt.Errorf("Failed reading %q: %w", removablePath, err)
 			}
 
 			disk.Removable = diskRemovable == 1
 
 			// WWN
-			if sysfsExists(filepath.Join(entryPath, "wwid")) {
-				diskWWN, err := os.ReadFile(filepath.Join(entryPath, "wwid"))
+			wwidPath := filepath.Join(entryPath, "wwid")
+			if pathExists(wwidPath) {
+				diskWWN, err := os.ReadFile(wwidPath)
 				if err != nil {
-					return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(entryPath, "wwid"), err)
+					return nil, fmt.Errorf("Failed reading %q: %w", wwidPath, err)
 				}
 
 				disk.WWN = strings.TrimSpace(string(diskWWN))
@@ -294,7 +339,7 @@ func GetStorage() (*api.ResourcesStorage, error) {
 				disk.Type = "cdrom"
 
 				// Most cdrom drives report this as size regardless of media
-				if disk.Size == 0x1fffff*512 {
+				if disk.Size == cdromNoMediaReportedSize {
 					disk.Size = 0
 				}
 			}
@@ -312,7 +357,7 @@ func GetStorage() (*api.ResourcesStorage, error) {
 					continue
 				}
 
-				if !sysfsExists(filepath.Join(subEntryPath, "partition")) {
+				if !pathExists(filepath.Join(subEntryPath, "partition")) {
 					continue
 				}
 
@@ -321,17 +366,19 @@ func GetStorage() (*api.ResourcesStorage, error) {
 				partition.ID = subEntryName
 
 				// Parse the partition number
-				partitionNumber, err := readUint(filepath.Join(subEntryPath, "partition"))
+				partitionPath := filepath.Join(subEntryPath, "partition")
+				partitionNumber, err := readUint(partitionPath)
 				if err != nil {
-					return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(subEntryPath, "partition"), err)
+					return nil, fmt.Errorf("Failed reading %q: %w", partitionPath, err)
 				}
 
 				partition.Partition = partitionNumber
 
 				// Device node
-				partitionDev, err := os.ReadFile(filepath.Join(subEntryPath, "dev"))
+				subEntryDevPath := filepath.Join(subEntryPath, "dev")
+				partitionDev, err := os.ReadFile(subEntryDevPath)
 				if err != nil {
-					return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(subEntryPath, "dev"), err)
+					return nil, fmt.Errorf("Failed reading %q: %w", subEntryDevPath, err)
 				}
 
 				partition.Device = strings.TrimSpace(string(partitionDev))
@@ -345,30 +392,44 @@ func GetStorage() (*api.ResourcesStorage, error) {
 				}
 
 				// Read-only
-				partitionRo, err := readUint(filepath.Join(subEntryPath, "ro"))
+				subEntryRoPath := filepath.Join(subEntryPath, "ro")
+				partitionRo, err := readUint(subEntryRoPath)
 				if err != nil {
-					return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(subEntryPath, "ro"), err)
+					return nil, fmt.Errorf("Failed reading %q: %w", subEntryRoPath, err)
 				}
 
 				partition.ReadOnly = partitionRo == 1
 
 				// Size
-				partitionSize, err := readUint(filepath.Join(subEntryPath, "size"))
+				subEntrySizePath := filepath.Join(subEntryPath, "size")
+				partitionSize, err := readUint(subEntrySizePath)
 				if err != nil {
-					return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(subEntryPath, "size"), err)
+					return nil, fmt.Errorf("Failed reading %q: %w", subEntrySizePath, err)
 				}
 
 				partition.Size = partitionSize * 512
+
+				// Pull device filesystem UUID information.
+				// Within LXD the block-devices interface is auto-connected, so blkid is
+				// always accessible. Permission errors can only surface when this code is
+				// reused outside LXD under tighter confinement (for example a snap that
+				// does not connect the block-devices interface). That is not an advertised
+				// use case, but we tolerate it by leaving DeviceFSUUID empty rather than
+				// failing the whole resources query.
+				partition.DeviceFSUUID, err = block.DiskFSUUID(filepath.Join("/dev", subEntryName))
+				if err != nil && !errors.Is(err, os.ErrPermission) {
+					return nil, err
+				}
 
 				// Add to list
 				disk.Partitions = append(disk.Partitions, partition)
 			}
 
 			// Try to find the udev device path
-			if sysfsExists(devDiskByPath) {
+			if pathExists(devDiskByPath) {
 				links, err := os.ReadDir(devDiskByPath)
 				if err != nil {
-					return nil, fmt.Errorf("Failed to list the links in %q: %w", devDiskByPath, err)
+					return nil, fmt.Errorf("Failed listing the links in %q: %w", devDiskByPath, err)
 				}
 
 				for _, link := range links {
@@ -377,50 +438,62 @@ func GetStorage() (*api.ResourcesStorage, error) {
 
 					linkTarget, err := filepath.EvalSymlinks(linkPath)
 					if err != nil {
-						return nil, fmt.Errorf("Failed to find %q: %w", linkPath, err)
+						return nil, fmt.Errorf("Failed finding %q: %w", linkPath, err)
 					}
 
-					if linkTarget == filepath.Join("/dev", entryName) {
+					if linkTarget == devPath {
 						disk.DevicePath = linkName
 					}
 				}
 			}
 
 			// Try to find the udev device id
-			if sysfsExists(devDiskByID) {
-				links, err := os.ReadDir(devDiskByID)
+			if pathExists(block.DevDiskByID) {
+				links, err := os.ReadDir(block.DevDiskByID)
 				if err != nil {
-					return nil, fmt.Errorf("Failed to list the links in %q: %w", devDiskByID, err)
+					return nil, fmt.Errorf("Failed listing the links in %q: %w", block.DevDiskByID, err)
 				}
 
 				for _, link := range links {
 					linkName := link.Name()
-					linkPath := filepath.Join(devDiskByID, linkName)
+					linkPath := filepath.Join(block.DevDiskByID, linkName)
 
 					linkTarget, err := filepath.EvalSymlinks(linkPath)
 					if err != nil {
-						return nil, fmt.Errorf("Failed to find %q: %w", linkPath, err)
+						return nil, fmt.Errorf("Failed finding %q: %w", linkPath, err)
 					}
 
-					if linkTarget == filepath.Join("/dev", entryName) {
+					if linkTarget == devPath {
 						disk.DeviceID = linkName
 					}
 				}
 			}
 
 			// Pull direct disk information
-			err = storageAddDriveInfo(filepath.Join("/dev", entryName), &disk)
+			err = storageAddDriveInfo(devPath, &disk)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to retrieve disk information from %q: %w", filepath.Join("/dev", entryName), err)
+				return nil, fmt.Errorf("Failed retrieving disk information from %q: %w", devPath, err)
 			}
 
 			// If no RPM set and drive is rotational, set to RPM to 1
-			diskRotationalPath := filepath.Join("/sys/class/block/", entryName, "queue/rotational")
-			if disk.RPM == 0 && sysfsExists(diskRotationalPath) {
+			diskRotationalPath := filepath.Join(sysClassBlock, entryName, "queue/rotational")
+			if disk.RPM == 0 && pathExists(diskRotationalPath) {
 				diskRotational, err := readUint(diskRotationalPath)
 				if err == nil {
 					disk.RPM = diskRotational
 				}
+			}
+
+			// Pull device filesystem UUID information.
+			// Within LXD the block-devices interface is auto-connected, so blkid is
+			// always accessible. Permission errors can only surface when this code is
+			// reused outside LXD under tighter confinement (for example a snap that
+			// does not connect the block-devices interface). That is not an advertised
+			// use case, but we tolerate it by leaving DeviceFSUUID empty rather than
+			// failing the whole resources query.
+			disk.DeviceFSUUID, err = block.DiskFSUUID(devPath)
+			if err != nil && !errors.Is(err, os.ErrPermission) {
+				return nil, err
 			}
 
 			// Add to list
@@ -430,32 +503,10 @@ func GetStorage() (*api.ResourcesStorage, error) {
 
 	storage.Total = 0
 	for _, card := range storage.Disks {
-		if storage.Disks != nil {
-			storage.Total += uint64(len(card.Partitions))
-		}
+		storage.Total += uint64(len(card.Partitions))
 
 		storage.Total++
 	}
 
 	return &storage, nil
-}
-
-// GetDisksByID returns all disks whose ID contains the filter prefix.
-func GetDisksByID(filterPrefix string) ([]string, error) {
-	disks, err := os.ReadDir(devDiskByID)
-	if err != nil {
-		return nil, fmt.Errorf("Failed getting disks by ID: %w", err)
-	}
-
-	var filteredDisks []string
-	for _, disk := range disks {
-		// Skip the disk if it does not have the prefix.
-		if !shared.StringHasPrefix(disk.Name(), filterPrefix) {
-			continue
-		}
-
-		filteredDisks = append(filteredDisks, path.Join(devDiskByID, disk.Name()))
-	}
-
-	return filteredDisks, nil
 }

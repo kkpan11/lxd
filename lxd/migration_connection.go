@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"crypto/x509"
-	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,8 +15,6 @@ import (
 
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
-	"github.com/canonical/lxd/shared/logger"
-	"github.com/canonical/lxd/shared/tcp"
 	"github.com/canonical/lxd/shared/ws"
 )
 
@@ -26,12 +24,7 @@ func setupWebsocketDialer(certificate string) (*websocket.Dialer, error) {
 	var cert *x509.Certificate
 
 	if certificate != "" {
-		certBlock, _ := pem.Decode([]byte(certificate))
-		if certBlock == nil {
-			return nil, fmt.Errorf("Failed PEM decoding certificate")
-		}
-
-		cert, err = x509.ParseCertificate(certBlock.Bytes)
+		cert, err = shared.ParseCert([]byte(certificate))
 		if err != nil {
 			return nil, fmt.Errorf("Failed parsing certificate: %w", err)
 		}
@@ -83,7 +76,7 @@ func (c *migrationConn) AcceptIncoming(r *http.Request, w http.ResponseWriter) e
 	defer c.mu.Unlock()
 
 	if c.disconnected {
-		return fmt.Errorf("Connection already disconnected")
+		return errors.New("Connection already disconnected")
 	}
 
 	if c.conn != nil {
@@ -96,14 +89,12 @@ func (c *migrationConn) AcceptIncoming(r *http.Request, w http.ResponseWriter) e
 		return fmt.Errorf("Failed upgrading incoming request to websocket: %w", err)
 	}
 
-	// Set TCP timeout options.
-	remoteTCP, _ := tcp.ExtractConn(c.conn.UnderlyingConn())
-	if remoteTCP != nil {
-		err = tcp.SetTimeouts(remoteTCP, 0)
-		if err != nil {
-			logger.Warn("Failed setting TCP timeouts on incoming websocket connection", logger.Ctx{"err": err})
-		}
-	}
+	// Enable TCP keepalive and periodic websocket pings so that a silently-dead
+	// connection (e.g. after a network partition) is detected within ~15 seconds
+	// rather than relying solely on TCP retransmission timeouts, which can take
+	// minutes. This ensures migration failures are surfaced quickly so cleanup
+	// can happen on both sides while LXD is still running.
+	ws.StartKeepAlive(c.conn)
 
 	close(c.connected)
 
@@ -119,7 +110,7 @@ func (c *migrationConn) WebSocket(ctx context.Context) (*websocket.Conn, error) 
 
 	if c.disconnected {
 		c.mu.Unlock()
-		return nil, fmt.Errorf("Connection already disconnected")
+		return nil, errors.New("Connection already disconnected")
 	}
 
 	if c.conn != nil {
@@ -138,6 +129,11 @@ func (c *migrationConn) WebSocket(ctx context.Context) (*websocket.Conn, error) 
 			return nil, err
 		}
 
+		// Enable keepalive so that a dead outgoing connection is detected quickly.
+		// Previously outgoing connections had no TCP timeouts at all,
+		// so the dialing side could block indefinitely on a network partition.
+		ws.StartKeepAlive(c.conn)
+
 		c.mu.Unlock()
 		return c.conn, nil
 	}
@@ -146,7 +142,19 @@ func (c *migrationConn) WebSocket(ctx context.Context) (*websocket.Conn, error) 
 
 	select {
 	case <-c.connected:
-		return c.conn, nil
+		c.mu.Lock()
+		conn := c.conn
+		disconnected := c.disconnected
+		c.mu.Unlock()
+		if disconnected {
+			return nil, errors.New("Connection already disconnected")
+		}
+
+		if conn == nil {
+			return nil, errors.New("Connection is no longer available")
+		}
+
+		return conn, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}

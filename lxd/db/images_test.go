@@ -25,7 +25,7 @@ func TestLocateImage(t *testing.T) {
 
 		address, err := tx.LocateImage(ctx, "abc")
 		require.NoError(t, err)
-		assert.Equal(t, "", address)
+		assert.Empty(t, address)
 
 		// Pretend that the function is being run on another node.
 		tx.NodeID(2)
@@ -39,7 +39,7 @@ func TestLocateImage(t *testing.T) {
 		require.NoError(t, err)
 
 		address, err = tx.LocateImage(ctx, "abc")
-		require.Equal(t, "", address)
+		require.Empty(t, address)
 		require.EqualError(t, err, "Image not available on any online member")
 
 		return nil
@@ -82,8 +82,8 @@ func TestGetImage(t *testing.T) {
 		// 'public' is ignored if 'false'
 		id, img, err := tx.GetImage(ctx, "a", cluster.ImageFilter{Project: &project})
 		require.NoError(t, err)
-		assert.Equal(t, img.Public, true)
-		assert.NotEqual(t, id, -1)
+		assert.True(t, img.Public)
+		assert.NotEqual(t, -1, id)
 
 		// non-public image with 'default' project
 		err = tx.CreateImage(ctx, project, "abcd2", "x.gz", 16, false, false, "amd64", time.Now(), time.Now(), map[string]string{}, "container", nil)
@@ -100,8 +100,8 @@ func TestGetImage(t *testing.T) {
 		public := true
 		id, img, err = tx.GetImage(ctx, "a", cluster.ImageFilter{Project: &project, Public: &public})
 		require.NoError(t, err)
-		assert.Equal(t, img.Public, true)
-		assert.NotEqual(t, id, -1)
+		assert.True(t, img.Public)
+		assert.NotEqual(t, -1, id)
 
 		return nil
 	})

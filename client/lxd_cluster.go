@@ -1,7 +1,7 @@
 package lxd
 
 import (
-	"fmt"
+	"net/http"
 
 	"github.com/canonical/lxd/shared/api"
 )
@@ -14,7 +14,8 @@ func (r *ProtocolLXD) GetCluster() (*api.Cluster, string, error) {
 	}
 
 	cluster := &api.Cluster{}
-	etag, err := r.queryStruct("GET", "/cluster", nil, "", &cluster)
+	u := api.NewURL().Path("cluster")
+	etag, err := r.queryStruct(http.MethodGet, u.String(), nil, "", &cluster)
 	if err != nil {
 		return nil, "", err
 	}
@@ -43,7 +44,8 @@ func (r *ProtocolLXD) UpdateCluster(cluster api.ClusterPut, ETag string) (Operat
 		}
 	}
 
-	op, _, err := r.queryOperation("PUT", "/cluster", cluster, "", true)
+	u := api.NewURL().Path("cluster")
+	op, _, err := r.queryOperation(http.MethodPut, u.String(), cluster, "", true)
 	if err != nil {
 		return nil, err
 	}
@@ -59,12 +61,12 @@ func (r *ProtocolLXD) DeleteClusterMember(name string, force bool) error {
 		return err
 	}
 
-	params := ""
+	u := api.NewURL().Path("cluster", "members", name)
 	if force {
-		params += "?force=1"
+		u = u.WithQuery("force", "1")
 	}
 
-	_, _, err = r.query("DELETE", fmt.Sprintf("/cluster/members/%s%s", name, params), nil, "")
+	_, _, err = r.query(http.MethodDelete, u.String(), nil, "")
 	if err != nil {
 		return err
 	}
@@ -81,14 +83,14 @@ func (r *ProtocolLXD) GetClusterMemberNames() ([]string, error) {
 
 	// Fetch the raw URL values.
 	urls := []string{}
-	baseURL := "/cluster/members"
-	_, err = r.queryStruct("GET", baseURL, nil, "", &urls)
+	u := api.NewURL().Path("cluster", "members")
+	_, err = r.queryStruct(http.MethodGet, u.String(), nil, "", &urls)
 	if err != nil {
 		return nil, err
 	}
 
 	// Parse it.
-	return urlsToResourceNames(baseURL, urls...)
+	return urlsToResourceNames(u.String(), urls...)
 }
 
 // GetClusterMembers returns the current members of the cluster.
@@ -99,7 +101,8 @@ func (r *ProtocolLXD) GetClusterMembers() ([]api.ClusterMember, error) {
 	}
 
 	members := []api.ClusterMember{}
-	_, err = r.queryStruct("GET", "/cluster/members?recursion=1", nil, "", &members)
+	u := api.NewURL().Path("cluster", "members").WithQuery("recursion", "1")
+	_, err = r.queryStruct(http.MethodGet, u.String(), nil, "", &members)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +118,8 @@ func (r *ProtocolLXD) GetClusterMember(name string) (*api.ClusterMember, string,
 	}
 
 	member := api.ClusterMember{}
-	etag, err := r.queryStruct("GET", fmt.Sprintf("/cluster/members/%s", name), nil, "", &member)
+	u := api.NewURL().Path("cluster", "members", name)
+	etag, err := r.queryStruct(http.MethodGet, u.String(), nil, "", &member)
 	if err != nil {
 		return nil, "", err
 	}
@@ -138,7 +142,8 @@ func (r *ProtocolLXD) UpdateClusterMember(name string, member api.ClusterMemberP
 	}
 
 	// Send the request
-	_, _, err = r.query("PUT", fmt.Sprintf("/cluster/members/%s", name), member, ETag)
+	u := api.NewURL().Path("cluster", "members", name)
+	_, _, err = r.query(http.MethodPut, u.String(), member, ETag)
 	if err != nil {
 		return err
 	}
@@ -153,7 +158,8 @@ func (r *ProtocolLXD) RenameClusterMember(name string, member api.ClusterMemberP
 		return err
 	}
 
-	_, _, err = r.query("POST", fmt.Sprintf("/cluster/members/%s", name), member, "")
+	u := api.NewURL().Path("cluster", "members", name)
+	_, _, err = r.query(http.MethodPost, u.String(), member, "")
 	if err != nil {
 		return err
 	}
@@ -168,7 +174,8 @@ func (r *ProtocolLXD) CreateClusterMember(member api.ClusterMembersPost) (Operat
 		return nil, err
 	}
 
-	op, _, err := r.queryOperation("POST", "/cluster/members", member, "", true)
+	u := api.NewURL().Path("cluster", "members")
+	op, _, err := r.queryOperation(http.MethodPost, u.String(), member, "", true)
 	if err != nil {
 		return nil, err
 	}
@@ -183,7 +190,8 @@ func (r *ProtocolLXD) UpdateClusterCertificate(certs api.ClusterCertificatePut, 
 		return err
 	}
 
-	_, _, err = r.query("PUT", "/cluster/certificate", certs, ETag)
+	u := api.NewURL().Path("cluster", "certificate")
+	_, _, err = r.query(http.MethodPut, u.String(), certs, ETag)
 	if err != nil {
 		return err
 	}
@@ -200,7 +208,7 @@ func (r *ProtocolLXD) GetClusterMemberState(name string) (*api.ClusterMemberStat
 
 	state := api.ClusterMemberState{}
 	u := api.NewURL().Path("cluster", "members", name, "state")
-	etag, err := r.queryStruct("GET", u.String(), nil, "", &state)
+	etag, err := r.queryStruct(http.MethodGet, u.String(), nil, "", &state)
 	if err != nil {
 		return nil, "", err
 	}
@@ -215,7 +223,22 @@ func (r *ProtocolLXD) UpdateClusterMemberState(name string, state api.ClusterMem
 		return nil, err
 	}
 
-	op, _, err := r.queryOperation("POST", fmt.Sprintf("/cluster/members/%s/state", name), state, "", true)
+	if state.Action == api.ClusterMemberActionRestore && state.Mode == api.ClusterRestoreModeSkip {
+		err = r.CheckExtension("clustering_restore_skip_mode")
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if state.Action == api.ClusterMemberActionEvacuate && state.Force {
+		err = r.CheckExtension("clustering_evacuation_force")
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	u := api.NewURL().Path("cluster", "members", name, "state")
+	op, _, err := r.queryOperation(http.MethodPost, u.String(), state, "", true)
 	if err != nil {
 		return nil, err
 	}
@@ -231,8 +254,8 @@ func (r *ProtocolLXD) GetClusterGroups() ([]api.ClusterGroup, error) {
 	}
 
 	groups := []api.ClusterGroup{}
-
-	_, err = r.queryStruct("GET", "/cluster/groups?recursion=1", nil, "", &groups)
+	u := api.NewURL().Path("cluster", "groups").WithQuery("recursion", "1")
+	_, err = r.queryStruct(http.MethodGet, u.String(), nil, "", &groups)
 	if err != nil {
 		return nil, err
 	}
@@ -248,8 +271,8 @@ func (r *ProtocolLXD) GetClusterGroupNames() ([]string, error) {
 	}
 
 	urls := []string{}
-
-	_, err = r.queryStruct("GET", "/cluster/groups", nil, "", &urls)
+	u := api.NewURL().Path("cluster", "groups")
+	_, err = r.queryStruct(http.MethodGet, u.String(), nil, "", &urls)
 	if err != nil {
 		return nil, err
 	}
@@ -265,7 +288,8 @@ func (r *ProtocolLXD) RenameClusterGroup(name string, group api.ClusterGroupPost
 		return err
 	}
 
-	_, _, err = r.query("POST", fmt.Sprintf("/cluster/groups/%s", name), group, "")
+	u := api.NewURL().Path("cluster", "groups", name)
+	_, _, err = r.query(http.MethodPost, u.String(), group, "")
 	if err != nil {
 		return err
 	}
@@ -280,7 +304,8 @@ func (r *ProtocolLXD) CreateClusterGroup(group api.ClusterGroupsPost) error {
 		return err
 	}
 
-	_, _, err = r.query("POST", "/cluster/groups", group, "")
+	u := api.NewURL().Path("cluster", "groups")
+	_, _, err = r.query(http.MethodPost, u.String(), group, "")
 	if err != nil {
 		return err
 	}
@@ -295,7 +320,8 @@ func (r *ProtocolLXD) DeleteClusterGroup(name string) error {
 		return err
 	}
 
-	_, _, err = r.query("DELETE", fmt.Sprintf("/cluster/groups/%s", name), nil, "")
+	u := api.NewURL().Path("cluster", "groups", name)
+	_, _, err = r.query(http.MethodDelete, u.String(), nil, "")
 	if err != nil {
 		return err
 	}
@@ -311,7 +337,8 @@ func (r *ProtocolLXD) UpdateClusterGroup(name string, group api.ClusterGroupPut,
 	}
 
 	// Send the request
-	_, _, err = r.query("PUT", fmt.Sprintf("/cluster/groups/%s", name), group, ETag)
+	u := api.NewURL().Path("cluster", "groups", name)
+	_, _, err = r.query(http.MethodPut, u.String(), group, ETag)
 	if err != nil {
 		return err
 	}
@@ -327,10 +354,180 @@ func (r *ProtocolLXD) GetClusterGroup(name string) (*api.ClusterGroup, string, e
 	}
 
 	group := api.ClusterGroup{}
-	etag, err := r.queryStruct("GET", fmt.Sprintf("/cluster/groups/%s", name), nil, "", &group)
+	u := api.NewURL().Path("cluster", "groups", name)
+	etag, err := r.queryStruct(http.MethodGet, u.String(), nil, "", &group)
 	if err != nil {
 		return nil, "", err
 	}
 
 	return &group, etag, nil
+}
+
+// GetClusterLinks returns all cluster links.
+func (r *ProtocolLXD) GetClusterLinks() ([]api.ClusterLink, error) {
+	err := r.CheckExtension("cluster_links")
+	if err != nil {
+		return nil, err
+	}
+
+	clusterLinks := []api.ClusterLink{}
+	_, err = r.queryStruct(http.MethodGet, api.NewURL().Path("cluster", "links").WithQuery("recursion", "1").String(), nil, "", &clusterLinks)
+	if err != nil {
+		return nil, err
+	}
+
+	return clusterLinks, nil
+}
+
+// GetClusterLink returns information about a cluster link.
+func (r *ProtocolLXD) GetClusterLink(name string) (*api.ClusterLink, string, error) {
+	err := r.CheckExtension("cluster_links")
+	if err != nil {
+		return nil, "", err
+	}
+
+	clusterLink := &api.ClusterLink{}
+	etag, err := r.queryStruct(http.MethodGet, api.NewURL().Path("cluster", "links", name).String(), nil, "", &clusterLink)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return clusterLink, etag, nil
+}
+
+// GetClusterLinkNames returns cluster link names.
+func (r *ProtocolLXD) GetClusterLinkNames() ([]string, error) {
+	err := r.CheckExtension("cluster_links")
+	if err != nil {
+		return nil, err
+	}
+
+	urls := []string{}
+	baseURL := api.NewURL().Path("cluster", "links").String()
+	_, err = r.queryStruct(http.MethodGet, baseURL, nil, "", &urls)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse it.
+	return urlsToResourceNames(baseURL, urls...)
+}
+
+// CreateClusterLink requests to create a new cluster link.
+func (r *ProtocolLXD) CreateClusterLink(clusterLink api.ClusterLinksPost) error {
+	err := r.CheckExtension("cluster_links")
+	if err != nil {
+		return err
+	}
+
+	if clusterLink.Type == api.ClusterLinkTypePublic {
+		err = r.CheckExtension("cluster_links_public")
+		if err != nil {
+			return err
+		}
+	}
+
+	_, _, err = r.query(http.MethodPost, api.NewURL().Path("cluster", "links").String(), clusterLink, "")
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// CreateIdentityClusterLinkToken creates a pending cluster link identity and returns a token that can be used by an untrusted client to set up authentication with LXD.
+func (r *ProtocolLXD) CreateIdentityClusterLinkToken(clusterLink api.ClusterLinksPost) (*api.CertificateAddToken, error) {
+	err := r.CheckExtension("cluster_links")
+	if err != nil {
+		return nil, err
+	}
+
+	var token api.CertificateAddToken
+	_, err = r.queryStruct(http.MethodPost, api.NewURL().Path("cluster", "links").String(), clusterLink, "", &token)
+	if err != nil {
+		return nil, err
+	}
+
+	return &token, nil
+}
+
+// CreateClusterLinkPendingPublic creates a pending public cluster link and returns the remote cluster's
+// certificate fingerprint for user verification. The fingerprint must be resubmitted via
+// CreateClusterLink to confirm and pin the certificate, activating the link.
+func (r *ProtocolLXD) CreateClusterLinkPendingPublic(clusterLink api.ClusterLinksPost) (*api.ClusterLinkCertificate, error) {
+	err := r.CheckExtension("cluster_links_public")
+	if err != nil {
+		return nil, err
+	}
+
+	var cert api.ClusterLinkCertificate
+	_, err = r.queryStruct(http.MethodPost, api.NewURL().Path("cluster", "links").String(), clusterLink, "", &cert)
+	if err != nil {
+		return nil, err
+	}
+
+	return &cert, nil
+}
+
+// UpdateClusterLink updates a cluster link.
+func (r *ProtocolLXD) UpdateClusterLink(name string, clusterLink api.ClusterLinkPut, ETag string) error {
+	err := r.CheckExtension("cluster_links")
+	if err != nil {
+		return err
+	}
+
+	_, _, err = r.query(http.MethodPut, api.NewURL().Path("cluster", "links", name).String(), clusterLink, ETag)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// DeleteClusterLink deletes a cluster link.
+func (r *ProtocolLXD) DeleteClusterLink(name string) error {
+	err := r.CheckExtension("cluster_links")
+	if err != nil {
+		return err
+	}
+
+	_, _, err = r.query(http.MethodDelete, api.NewURL().Path("cluster", "links", name).String(), nil, "")
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// GetClusterLinkState gets state information about a cluster link.
+func (r *ProtocolLXD) GetClusterLinkState(name string) (*api.ClusterLinkState, string, error) {
+	err := r.CheckExtension("cluster_links")
+	if err != nil {
+		return nil, "", err
+	}
+
+	state := api.ClusterLinkState{}
+	u := api.NewURL().Path("cluster", "links", name, "state")
+	etag, err := r.queryStruct(http.MethodGet, u.String(), nil, "", &state)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return &state, etag, nil
+}
+
+// RenameClusterLink changes the name of an existing cluster link.
+func (r *ProtocolLXD) RenameClusterLink(name string, clusterLink api.ClusterLinkPost) error {
+	err := r.CheckExtension("cluster_links")
+	if err != nil {
+		return err
+	}
+
+	u := api.NewURL().Path("cluster", "links", name)
+	_, _, err = r.query(http.MethodPost, u.String(), clusterLink, "")
+	if err != nil {
+		return err
+	}
+
+	return nil
 }

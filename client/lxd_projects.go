@@ -1,7 +1,7 @@
 package lxd
 
 import (
-	"fmt"
+	"net/http"
 	"net/url"
 
 	"github.com/canonical/lxd/shared/api"
@@ -19,7 +19,7 @@ func (r *ProtocolLXD) GetProjectNames() ([]string, error) {
 	// Fetch the raw URL values.
 	urls := []string{}
 	baseURL := "/projects"
-	_, err = r.queryStruct("GET", baseURL, nil, "", &urls)
+	_, err = r.queryStruct(http.MethodGet, baseURL, nil, "", &urls)
 	if err != nil {
 		return nil, err
 	}
@@ -38,7 +38,7 @@ func (r *ProtocolLXD) GetProjects() ([]api.Project, error) {
 	projects := []api.Project{}
 
 	// Fetch the raw value
-	_, err = r.queryStruct("GET", "/projects?recursion=1", nil, "", &projects)
+	_, err = r.queryStruct(http.MethodGet, "/projects?recursion=1", nil, "", &projects)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +56,7 @@ func (r *ProtocolLXD) GetProject(name string) (*api.Project, string, error) {
 	project := api.Project{}
 
 	// Fetch the raw value
-	etag, err := r.queryStruct("GET", fmt.Sprintf("/projects/%s", url.PathEscape(name)), nil, "", &project)
+	etag, err := r.queryStruct(http.MethodGet, "/projects/"+url.PathEscape(name), nil, "", &project)
 	if err != nil {
 		return nil, "", err
 	}
@@ -74,12 +74,32 @@ func (r *ProtocolLXD) GetProjectState(name string) (*api.ProjectState, error) {
 	projectState := api.ProjectState{}
 
 	// Fetch the raw value
-	_, err = r.queryStruct("GET", fmt.Sprintf("/projects/%s/state", url.PathEscape(name)), nil, "", &projectState)
+	_, err = r.queryStruct(http.MethodGet, "/projects/"+url.PathEscape(name)+"/state", nil, "", &projectState)
 	if err != nil {
 		return nil, err
 	}
 
 	return &projectState, nil
+}
+
+// UpdateProjectState updates the project replica state (promote or demote).
+func (r *ProtocolLXD) UpdateProjectState(name string, state api.ProjectStatePut, force bool) (Operation, error) {
+	err := r.CheckExtension("project_replica_mode")
+	if err != nil {
+		return nil, err
+	}
+
+	u := api.NewURL().Path("projects", name, "state")
+	if force {
+		u = u.WithQuery("force", "true")
+	}
+
+	op, _, err := r.queryOperation(http.MethodPut, u.String(), state, "", true)
+	if err != nil {
+		return nil, err
+	}
+
+	return op, nil
 }
 
 // CreateProject defines a new container project.
@@ -90,7 +110,7 @@ func (r *ProtocolLXD) CreateProject(project api.ProjectsPost) error {
 	}
 
 	// Send the request
-	_, _, err = r.query("POST", "/projects", project, "")
+	_, _, err = r.query(http.MethodPost, "/projects", project, "")
 	if err != nil {
 		return err
 	}
@@ -106,7 +126,7 @@ func (r *ProtocolLXD) UpdateProject(name string, project api.ProjectPut, ETag st
 	}
 
 	// Send the request
-	_, _, err = r.query("PUT", fmt.Sprintf("/projects/%s", url.PathEscape(name)), project, ETag)
+	_, _, err = r.query(http.MethodPut, "/projects/"+url.PathEscape(name), project, ETag)
 	if err != nil {
 		return err
 	}
@@ -122,7 +142,7 @@ func (r *ProtocolLXD) RenameProject(name string, project api.ProjectPost) (Opera
 	}
 
 	// Send the request
-	op, _, err := r.queryOperation("POST", fmt.Sprintf("/projects/%s", url.PathEscape(name)), project, "", true)
+	op, _, err := r.queryOperation(http.MethodPost, "/projects/"+url.PathEscape(name), project, "", true)
 	if err != nil {
 		return nil, err
 	}
@@ -130,18 +150,37 @@ func (r *ProtocolLXD) RenameProject(name string, project api.ProjectPost) (Opera
 	return op, nil
 }
 
-// DeleteProject deletes a project.
-func (r *ProtocolLXD) DeleteProject(name string) error {
+// DeleteProject deletes a project. If force is true, the project and its entities are deleted.
+func (r *ProtocolLXD) DeleteProject(name string, force bool) (Operation, error) {
 	err := r.CheckExtension("projects")
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// Send the request
-	_, _, err = r.query("DELETE", fmt.Sprintf("/projects/%s", url.PathEscape(name)), nil, "")
+	u := api.NewURL().Path("projects", name)
+
+	if force {
+		err = r.CheckExtension("projects_force_delete")
+		if err != nil {
+			return nil, err
+		}
+
+		u = u.WithQuery("force", "1")
+	}
+
+	var op Operation
+	err = r.CheckExtension("project_delete_operation")
 	if err != nil {
-		return err
+		// Fallback to older behavior without operations.
+		op = noopOperation{}
+		_, _, err = r.query(http.MethodDelete, u.String(), nil, "")
+	} else {
+		op, _, err = r.queryOperation(http.MethodDelete, u.String(), nil, "", true)
 	}
 
-	return nil
+	if err != nil {
+		return nil, err
+	}
+
+	return op, nil
 }

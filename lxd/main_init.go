@@ -1,16 +1,22 @@
 package main
 
 import (
+	"context"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/canonical/lxd/client"
+	"github.com/canonical/lxd/lxd/identity"
 	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
+	cli "github.com/canonical/lxd/shared/cmd"
 	"github.com/canonical/lxd/shared/revert"
 	"github.com/canonical/lxd/shared/version"
 )
@@ -23,12 +29,13 @@ type cmdInit struct {
 	flagPreseed bool
 	flagDump    bool
 
-	flagNetworkAddress  string
-	flagNetworkPort     int64
-	flagStorageBackend  string
-	flagStorageDevice   string
-	flagStorageLoopSize int
-	flagStoragePool     string
+	flagNetworkAddress      string
+	flagNetworkPort         int64
+	flagStorageBackend      string
+	flagStorageDevice       string
+	flagStorageLoopSize     int
+	flagStoragePool         string
+	flagUIInitialAccessLink bool
 
 	hostname string
 }
@@ -42,11 +49,16 @@ func (c *cmdInit) Command() *cobra.Command {
   Configure the LXD daemon
 `
 	cmd.Example = `  init --minimal
-  init --auto [--network-address=IP] [--network-port=8443] [--storage-backend=dir]
-              [--storage-create-device=DEVICE] [--storage-create-loop=SIZE]
+  init --auto [--network-address=IP]
+              [--network-port=8443]
+              [--storage-backend=dir]
+              [--storage-create-device=DEVICE]
+              [--storage-create-loop=SIZE]
               [--storage-pool=POOL]
+              [--ui-initial-access-link]
   init --preseed
   init --dump
+  init --ui-initial-access-link
 `
 	cmd.RunE = c.Run
 	cmd.Flags().BoolVar(&c.flagAuto, "auto", false, "Automatic (non-interactive) mode")
@@ -54,12 +66,13 @@ func (c *cmdInit) Command() *cobra.Command {
 	cmd.Flags().BoolVar(&c.flagPreseed, "preseed", false, "Pre-seed mode, expects YAML config from stdin")
 	cmd.Flags().BoolVar(&c.flagDump, "dump", false, "Dump YAML config to stdout")
 
-	cmd.Flags().StringVar(&c.flagNetworkAddress, "network-address", "", "Address to bind LXD to (default: none)"+"``")
-	cmd.Flags().Int64Var(&c.flagNetworkPort, "network-port", -1, fmt.Sprintf("Port to bind LXD to (default: %d)"+"``", shared.HTTPSDefaultPort))
-	cmd.Flags().StringVar(&c.flagStorageBackend, "storage-backend", "", "Storage backend to use (btrfs, dir, lvm or zfs, default: dir)"+"``")
-	cmd.Flags().StringVar(&c.flagStorageDevice, "storage-create-device", "", "Setup device based storage using DEVICE"+"``")
-	cmd.Flags().IntVar(&c.flagStorageLoopSize, "storage-create-loop", -1, "Setup loop based storage with SIZE in GiB"+"``")
-	cmd.Flags().StringVar(&c.flagStoragePool, "storage-pool", "", "Storage pool to use or create"+"``")
+	cmd.Flags().StringVar(&c.flagNetworkAddress, "network-address", "", cli.FormatStringFlagLabel("Address to bind LXD to (default: none)"))
+	cmd.Flags().Int64Var(&c.flagNetworkPort, "network-port", -1, fmt.Sprintf("Port to bind LXD to (default: %d)", shared.HTTPSDefaultPort))
+	cmd.Flags().StringVar(&c.flagStorageBackend, "storage-backend", "", cli.FormatStringFlagLabel("Storage backend to use (btrfs, dir, lvm or zfs, default: dir)"))
+	cmd.Flags().StringVar(&c.flagStorageDevice, "storage-create-device", "", cli.FormatStringFlagLabel("Setup device based storage using DEVICE"))
+	cmd.Flags().IntVar(&c.flagStorageLoopSize, "storage-create-loop", -1, "Setup loop based storage with SIZE in GiB")
+	cmd.Flags().StringVar(&c.flagStoragePool, "storage-pool", "", cli.FormatStringFlagLabel("Storage pool to use or create"))
+	cmd.Flags().BoolVar(&c.flagUIInitialAccessLink, "ui-initial-access-link", false, "Generate the URL for accessing LXD UI before remote API authentication is configured")
 
 	return cmd
 }
@@ -68,21 +81,25 @@ func (c *cmdInit) Command() *cobra.Command {
 func (c *cmdInit) Run(cmd *cobra.Command, args []string) error {
 	// Quick checks.
 	if c.flagAuto && c.flagPreseed {
-		return fmt.Errorf("Can't use --auto and --preseed together")
+		return errors.New("Cannot use --auto and --preseed together")
 	}
 
 	if c.flagMinimal && c.flagPreseed {
-		return fmt.Errorf("Can't use --minimal and --preseed together")
+		return errors.New("Cannot use --minimal and --preseed together")
 	}
 
 	if c.flagMinimal && c.flagAuto {
-		return fmt.Errorf("Can't use --minimal and --auto together")
+		return errors.New("Cannot use --minimal and --auto together")
+	}
+
+	if c.flagUIInitialAccessLink && (c.flagPreseed || c.flagDump || c.flagMinimal) {
+		return errors.New("Cannot use --ui-initial-access-link with --preseed, --dump, or --minimal")
 	}
 
 	if !c.flagAuto && (c.flagNetworkAddress != "" || c.flagNetworkPort != -1 ||
 		c.flagStorageBackend != "" || c.flagStorageDevice != "" ||
 		c.flagStorageLoopSize != -1 || c.flagStoragePool != "") {
-		return fmt.Errorf("Configuration flags require --auto")
+		return errors.New("Configuration flags require --auto")
 	}
 
 	if c.flagDump && (c.flagAuto || c.flagMinimal ||
@@ -90,18 +107,24 @@ func (c *cmdInit) Run(cmd *cobra.Command, args []string) error {
 		c.flagNetworkPort != -1 || c.flagStorageBackend != "" ||
 		c.flagStorageDevice != "" || c.flagStorageLoopSize != -1 ||
 		c.flagStoragePool != "") {
-		return fmt.Errorf("Can't use --dump with other flags")
+		return errors.New("Cannot use --dump with other flags")
 	}
 
 	// Connect to LXD
 	d, err := lxd.ConnectLXDUnix("", nil)
 	if err != nil {
-		return fmt.Errorf("Failed to connect to local LXD: %w", err)
+		return fmt.Errorf("Failed connecting to local LXD: %w", err)
 	}
 
 	server, _, err := d.GetServer()
 	if err != nil {
-		return fmt.Errorf("Failed to connect to get LXD server info: %w", err)
+		return fmt.Errorf("Failed connecting to get LXD server info: %w", err)
+	}
+
+	// If UI initial access link flag is set, but auto mode is not enabled,
+	// generate the link and exit.
+	if c.flagUIInitialAccessLink && !c.flagAuto {
+		return c.createUIInitialAccessLink(d)
 	}
 
 	// Dump mode
@@ -119,7 +142,7 @@ func (c *cmdInit) Run(cmd *cobra.Command, args []string) error {
 
 	// Preseed mode
 	if c.flagPreseed {
-		config, err = c.RunPreseed(cmd, args, d)
+		config, err = c.runPreseed()
 		if err != nil {
 			return err
 		}
@@ -127,7 +150,7 @@ func (c *cmdInit) Run(cmd *cobra.Command, args []string) error {
 
 	// Auto mode
 	if c.flagAuto || c.flagMinimal {
-		config, err = c.RunAuto(cmd, args, d, server)
+		config, err = c.RunAuto(args, d, server)
 		if err != nil {
 			return err
 		}
@@ -145,7 +168,7 @@ func (c *cmdInit) Run(cmd *cobra.Command, args []string) error {
 	// If yes then read cluster certificate from file
 	if config.Cluster != nil && config.Cluster.ClusterCertificatePath != "" {
 		if !shared.PathExists(config.Cluster.ClusterCertificatePath) {
-			return fmt.Errorf("Path %s doesn't exist", config.Cluster.ClusterCertificatePath)
+			return fmt.Errorf("Path %s does not exist", config.Cluster.ClusterCertificatePath)
 		}
 
 		content, err := os.ReadFile(config.Cluster.ClusterCertificatePath)
@@ -172,8 +195,8 @@ func (c *cmdInit) Run(cmd *cobra.Command, args []string) error {
 			// Cluster URL
 			config.Cluster.ClusterAddress = util.CanonicalNetworkAddress(clusterAddress, shared.HTTPSDefaultPort)
 
-			// Cluster certificate
-			cert, err := shared.GetRemoteCertificate(fmt.Sprintf("https://%s", config.Cluster.ClusterAddress), version.UserAgent)
+			// Get cluster certificate bypassing any configured HTTP proxy.
+			cert, err := shared.GetRemoteCertificateNoProxy(context.Background(), "https://"+config.Cluster.ClusterAddress, version.UserAgent)
 			if err != nil {
 				fmt.Printf("Error connecting to existing cluster member %q: %v\n", clusterAddress, err)
 				continue
@@ -190,7 +213,7 @@ func (c *cmdInit) Run(cmd *cobra.Command, args []string) error {
 		}
 
 		if config.Cluster.ClusterCertificate == "" {
-			return fmt.Errorf("Unable to connect to any of the cluster members specified in join token")
+			return errors.New("Cannot connect to any of the cluster members specified in join token")
 		}
 	}
 
@@ -211,12 +234,12 @@ func (c *cmdInit) Run(cmd *cobra.Command, args []string) error {
 
 		op, err := d.UpdateCluster(config.Cluster.ClusterPut, "")
 		if err != nil {
-			return fmt.Errorf("Failed to join cluster: %w", err)
+			return fmt.Errorf("Failed joining cluster: %w", err)
 		}
 
 		err = op.Wait()
 		if err != nil {
-			return fmt.Errorf("Failed to join cluster: %w", err)
+			return fmt.Errorf("Failed joining cluster: %w", err)
 		}
 
 		return nil
@@ -237,6 +260,13 @@ func (c *cmdInit) Run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	if c.flagUIInitialAccessLink {
+		err = c.createUIInitialAccessLink(d)
+		if err != nil {
+			return err
+		}
+	}
+
 	revert.Success()
 	return nil
 }
@@ -254,4 +284,56 @@ func (c *cmdInit) defaultHostname() string {
 
 	c.hostname = hostName
 	return hostName
+}
+
+func (c *cmdInit) createUIInitialAccessLink(d lxd.InstanceServer) error {
+	// Refresh server info.
+	server, _, err := d.GetServer()
+	if err != nil {
+		return fmt.Errorf("Failed refreshing LXD server info: %w", err)
+	}
+
+	var serverAddress string
+	if len(server.Environment.Addresses) > 0 {
+		serverAddress = server.Environment.Addresses[0]
+	}
+
+	if serverAddress == "" {
+		return errors.New("LXD server address is not set, cannot create UI initial access link")
+	}
+
+	uiAdminIdentityName := "ui-admin-initial"
+
+	// Check if identity already exists.
+	uiAdminIdentity, _, err := d.GetIdentity(api.AuthenticationMethodBearer, uiAdminIdentityName)
+	if err != nil && !api.StatusErrorCheck(err, http.StatusNotFound) {
+		return fmt.Errorf("Failed checking for existing initial UI identity: %w", err)
+	}
+
+	if uiAdminIdentity == nil {
+		// Create identity if it doesn't exist.
+		uiAdminIdentityReq := api.IdentitiesBearerPost{
+			Name: uiAdminIdentityName,
+			Type: api.IdentityTypeBearerTokenInitialUI,
+		}
+
+		err := d.CreateIdentityBearer(uiAdminIdentityReq)
+		if err != nil {
+			return fmt.Errorf("Failed creating initial UI identity: %w", err)
+		}
+	} else if !identity.IsInitialUIBearer(uiAdminIdentity.Type) {
+		return fmt.Errorf("A bearer identity with name %q already exists but is not of type %q", uiAdminIdentityName, api.IdentityTypeBearerTokenInitialUI)
+	}
+
+	token, err := d.IssueBearerIdentityToken(uiAdminIdentityName, api.IdentityBearerTokenPost{})
+	if err != nil {
+		return fmt.Errorf("Failed issuing bearer token for initial UI access link: %w", err)
+	}
+
+	tokenExpiry := time.Now().Add(24 * time.Hour).Format("2006-01-02 15:04")
+	uiAccessLink := api.NewURL().Scheme("https").Host(serverAddress).WithQuery("token", token.Token)
+	fmt.Println("UI initial identity (type: " + api.IdentityTypeBearerTokenInitialUI + "): " + uiAdminIdentityName)
+	fmt.Println("UI initial access link (expires: " + tokenExpiry + "): " + uiAccessLink.String())
+
+	return nil
 }

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -21,7 +22,7 @@ import (
 // GetStoragePoolVolumesWithType return a list of all volumes of the given type.
 // If memberSpecific is true, then the search is restricted to volumes that belong to this member or belong to
 // all members.
-func (c *ClusterTx) GetStoragePoolVolumesWithType(ctx context.Context, volumeType int, memberSpecific bool) ([]StorageVolumeArgs, error) {
+func (c *ClusterTx) GetStoragePoolVolumesWithType(ctx context.Context, volumeType cluster.StoragePoolVolumeType, memberSpecific bool) ([]StorageVolumeArgs, error) {
 	var q strings.Builder
 	q.WriteString(`
 SELECT
@@ -74,6 +75,7 @@ WHERE storage_volumes.type = ?
 // GetStoragePoolVolumeWithID returns the volume with the given ID.
 func (c *ClusterTx) GetStoragePoolVolumeWithID(ctx context.Context, volumeID int) (StorageVolumeArgs, error) {
 	var response StorageVolumeArgs
+	var rawVolumeType = int(-1)
 
 	stmt := `
 SELECT
@@ -92,10 +94,10 @@ LEFT JOIN nodes ON nodes.id = storage_volumes.node_id
 WHERE storage_volumes.id = ?
 `
 
-	err := c.tx.QueryRowContext(ctx, stmt, volumeID).Scan(&response.ID, &response.Name, &response.Description, &response.CreationDate, &response.Type, &response.NodeID, &response.PoolName, &response.ProjectName)
+	err := c.tx.QueryRowContext(ctx, stmt, volumeID).Scan(&response.ID, &response.Name, &response.Description, &response.CreationDate, &rawVolumeType, &response.NodeID, &response.PoolName, &response.ProjectName)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return StorageVolumeArgs{}, api.StatusErrorf(http.StatusNotFound, "Storage pool volume not found")
+			return StorageVolumeArgs{}, api.StatusErrorf(http.StatusNotFound, "Storage volume not found")
 		}
 
 		return StorageVolumeArgs{}, err
@@ -106,17 +108,70 @@ WHERE storage_volumes.id = ?
 		return StorageVolumeArgs{}, err
 	}
 
-	response.TypeName = cluster.StoragePoolVolumeTypeNames[response.Type]
+	response.Type, err = cluster.StoragePoolVolumeTypeFromInt(rawVolumeType)
+	if err != nil {
+		return StorageVolumeArgs{}, err
+	}
+
+	response.TypeName = response.Type.String()
+
+	return response, nil
+}
+
+// GetStoragePoolVolumeWithUUID returns the volume with the given UUID.
+func (c *ClusterTx) GetStoragePoolVolumeWithUUID(ctx context.Context, volumeUUID string) (StorageVolumeArgs, error) {
+	var response StorageVolumeArgs
+	var rawVolumeType = int(-1)
+
+	stmt := `
+SELECT
+	storage_volumes.id,
+	storage_volumes.name,
+	storage_volumes.description,
+	storage_volumes.creation_date,
+	storage_volumes.type,
+	IFNULL(storage_volumes.node_id, -1),
+	storage_pools.name,
+	projects.name
+FROM storage_volumes
+JOIN storage_volumes_config ON storage_volumes.id = storage_volumes_config.storage_volume_id
+JOIN storage_pools ON storage_pools.id = storage_volumes.storage_pool_id
+JOIN projects ON projects.id = storage_volumes.project_id
+LEFT JOIN nodes ON nodes.id = storage_volumes.node_id
+WHERE storage_volumes_config.key = "volatile.uuid" AND storage_volumes_config.value = ?
+`
+
+	err := c.tx.QueryRowContext(ctx, stmt, volumeUUID).Scan(&response.ID, &response.Name, &response.Description, &response.CreationDate, &rawVolumeType, &response.NodeID, &response.PoolName, &response.ProjectName)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return StorageVolumeArgs{}, api.StatusErrorf(http.StatusNotFound, "Storage volume not found")
+		}
+
+		return StorageVolumeArgs{}, err
+	}
+
+	response.Config, err = c.storageVolumeConfigGet(ctx, response.ID, false)
+	if err != nil {
+		return StorageVolumeArgs{}, err
+	}
+
+	response.Type, err = cluster.StoragePoolVolumeTypeFromInt(rawVolumeType)
+	if err != nil {
+		return StorageVolumeArgs{}, err
+	}
+
+	response.TypeName = response.Type.String()
 
 	return response, nil
 }
 
 // StorageVolumeFilter used for filtering storage volumes with GetStorageVolumes().
 type StorageVolumeFilter struct {
-	Type    *int
+	Type    *cluster.StoragePoolVolumeType
 	Project *string
 	Name    *string
 	PoolID  *int64
+	UUIDs   []string
 }
 
 // StorageVolume represents a database storage volume record.
@@ -157,11 +212,11 @@ func (c *ClusterTx) GetStorageVolumes(ctx context.Context, memberSpecific bool, 
 		for i, filter := range filters {
 			// Validate filter.
 			if filter.Name != nil && filter.Type == nil {
-				return nil, fmt.Errorf("Cannot filter by volume name if volume type not specified")
+				return nil, errors.New("Cannot filter by volume name if volume type not specified")
 			}
 
 			if filter.Name != nil && filter.Project == nil {
-				return nil, fmt.Errorf("Cannot filter by volume name if volume project not specified")
+				return nil, errors.New("Cannot filter by volume name if volume project not specified")
 			}
 
 			var qFilters []string
@@ -186,15 +241,38 @@ func (c *ClusterTx) GetStorageVolumes(ctx context.Context, memberSpecific bool, 
 				args = append(args, *filter.Name)
 			}
 
+			if len(filter.UUIDs) > 0 {
+				// Filtering by UUIDs requires checking both regular volume configs and snapshot configs.
+				uuidParams := query.Params(len(filter.UUIDs))
+				uuidSubquery := `storage_volumes_all.id IN (
+					SELECT storage_volume_id FROM storage_volumes_config 
+					WHERE key = 'volatile.uuid' AND value IN ` + uuidParams + `
+					UNION
+					SELECT storage_volume_snapshot_id FROM storage_volumes_snapshots_config 
+					WHERE key = 'volatile.uuid' AND value IN ` + uuidParams + `
+					)`
+
+				qFilters = append(qFilters, uuidSubquery)
+
+				// Add UUIDs twice (once for each subquery).
+				for range 2 {
+					for _, uuid := range filter.UUIDs {
+						args = append(args, uuid)
+					}
+				}
+			}
+
 			if qFilters == nil {
-				return nil, fmt.Errorf("Invalid storage volume filter")
+				return nil, errors.New("Invalid storage volume filter")
 			}
 
 			if i > 0 {
 				q.WriteString(" OR ")
 			}
 
-			q.WriteString(fmt.Sprintf("(%s)", strings.Join(qFilters, " AND ")))
+			q.WriteString("(")
+			q.WriteString(strings.Join(qFilters, " AND "))
+			q.WriteString(")")
 		}
 
 		q.WriteString(")")
@@ -214,24 +292,27 @@ func (c *ClusterTx) GetStorageVolumes(ctx context.Context, memberSpecific bool, 
 	var volumes []*StorageVolume
 
 	err = query.Scan(ctx, c.Tx(), q.String(), func(scan func(dest ...any) error) error {
-		var volumeType = int(-1)
-		var contentType = int(-1)
+		var rawVolumeType = int(-1)
+		var rawContentType = int(-1)
 		var vol StorageVolume
 
-		err := scan(&vol.Project, &vol.ID, &vol.Name, &vol.Location, &volumeType, &contentType, &vol.Description, &vol.CreatedAt, &vol.Pool)
+		err := scan(&vol.Project, &vol.ID, &vol.Name, &vol.Location, &rawVolumeType, &rawContentType, &vol.Description, &vol.CreatedAt, &vol.Pool)
 		if err != nil {
 			return err
 		}
 
-		vol.Type, err = storagePoolVolumeTypeToName(volumeType)
+		volumeType, err := cluster.StoragePoolVolumeTypeFromInt(rawVolumeType)
 		if err != nil {
 			return err
 		}
 
-		vol.ContentType, err = storagePoolVolumeContentTypeToName(contentType)
+		contentType, err := cluster.StoragePoolVolumeContentTypeFromInt(rawContentType)
 		if err != nil {
 			return err
 		}
+
+		vol.Type = volumeType.String()
+		vol.ContentType = contentType.String()
 
 		volumes = append(volumes, &vol)
 
@@ -253,7 +334,7 @@ func (c *ClusterTx) GetStorageVolumes(ctx context.Context, memberSpecific bool, 
 }
 
 // GetStoragePoolVolume returns the storage volume attached to a given storage pool.
-func (c *ClusterTx) GetStoragePoolVolume(ctx context.Context, poolID int64, projectName string, volumeType int, volumeName string, memberSpecific bool) (*StorageVolume, error) {
+func (c *ClusterTx) GetStoragePoolVolume(ctx context.Context, poolID int64, projectName string, volumeType cluster.StoragePoolVolumeType, volumeName string, memberSpecific bool) (*StorageVolume, error) {
 	filters := []StorageVolumeFilter{{
 		Project: &projectName,
 		Type:    &volumeType,
@@ -277,14 +358,14 @@ func (c *ClusterTx) GetStoragePoolVolume(ctx context.Context, poolID int64, proj
 // GetLocalStoragePoolVolumeSnapshotsWithType get all snapshots of a storage volume
 // attached to a given storage pool of a given volume type, on the local member.
 // Returns snapshots slice ordered by when they were created, oldest first.
-func (c *ClusterTx) GetLocalStoragePoolVolumeSnapshotsWithType(ctx context.Context, projectName string, volumeName string, volumeType int, poolID int64) ([]StorageVolumeArgs, error) {
+func (c *ClusterTx) GetLocalStoragePoolVolumeSnapshotsWithType(ctx context.Context, projectName string, volumeName string, volumeType cluster.StoragePoolVolumeType, poolID int64) ([]StorageVolumeArgs, error) {
 	remoteDrivers := StorageRemoteDriverNames()
 
 	// ORDER BY creation_date and then id is important here as the users of this function can expect that the
 	// results will be returned in the order that the snapshots were created. This is specifically used
 	// during migration to ensure that the storage engines can re-create snapshots using the
 	// correct deltas.
-	queryStr := fmt.Sprintf(`
+	queryStr := `
   SELECT
     storage_volumes_snapshots.id, storage_volumes_snapshots.name, storage_volumes_snapshots.description,
     storage_volumes_snapshots.creation_date, storage_volumes_snapshots.expiry_date,
@@ -297,10 +378,11 @@ func (c *ClusterTx) GetLocalStoragePoolVolumeSnapshotsWithType(ctx context.Conte
     AND storage_volumes.type=?
     AND storage_volumes.name=?
     AND projects.name=?
-    AND (storage_volumes.node_id=? OR storage_volumes.node_id IS NULL AND storage_pools.driver IN %s)
-  ORDER BY storage_volumes_snapshots.creation_date, storage_volumes_snapshots.id`, query.Params(len(remoteDrivers)))
+    AND (storage_volumes.node_id=? OR storage_volumes.node_id IS NULL AND storage_pools.driver IN ` + query.Params(len(remoteDrivers)) + `)
+  ORDER BY storage_volumes_snapshots.creation_date, storage_volumes_snapshots.id`
 
-	args := []any{poolID, volumeType, volumeName, projectName, c.nodeID}
+	args := make([]any, 0, 5+len(remoteDrivers))
+	args = append(args, poolID, volumeType, volumeName, projectName, c.nodeID)
 	for _, driver := range remoteDrivers {
 		args = append(args, driver)
 	}
@@ -311,9 +393,9 @@ func (c *ClusterTx) GetLocalStoragePoolVolumeSnapshotsWithType(ctx context.Conte
 		var s StorageVolumeArgs
 		var snapName string
 		var expiryDate sql.NullTime
-		var contentType int
+		var rawContentType = int(-1)
 
-		err := scan(&s.ID, &snapName, &s.Description, &s.CreationDate, &expiryDate, &contentType)
+		err := scan(&s.ID, &snapName, &s.Description, &s.CreationDate, &expiryDate, &rawContentType)
 		if err != nil {
 			return err
 		}
@@ -324,10 +406,12 @@ func (c *ClusterTx) GetLocalStoragePoolVolumeSnapshotsWithType(ctx context.Conte
 		s.Snapshot = true
 		s.ExpiryDate = expiryDate.Time // Convert null to zero.
 
-		s.ContentType, err = storagePoolVolumeContentTypeToName(contentType)
+		contentType, err := cluster.StoragePoolVolumeContentTypeFromInt(rawContentType)
 		if err != nil {
 			return err
 		}
+
+		s.ContentType = contentType.String()
 
 		snapshots = append(snapshots, s)
 
@@ -373,7 +457,7 @@ func storageVolumeSnapshotConfig(ctx context.Context, tx *ClusterTx, volumeSnaps
 }
 
 // UpdateStoragePoolVolume updates the storage volume attached to a given storage pool.
-func (c *ClusterTx) UpdateStoragePoolVolume(ctx context.Context, projectName string, volumeName string, volumeType int, poolID int64, volumeDescription string, volumeConfig map[string]string) error {
+func (c *ClusterTx) UpdateStoragePoolVolume(ctx context.Context, projectName string, volumeName string, volumeType cluster.StoragePoolVolumeType, poolID int64, volumeDescription string, volumeConfig map[string]string) error {
 	isSnapshot := strings.Contains(volumeName, shared.SnapshotDelimiter)
 
 	volume, err := c.GetStoragePoolVolume(ctx, poolID, projectName, volumeType, volumeName, true)
@@ -401,7 +485,7 @@ func (c *ClusterTx) UpdateStoragePoolVolume(ctx context.Context, projectName str
 
 // RemoveStoragePoolVolume deletes the storage volume attached to a given storage
 // pool.
-func (c *ClusterTx) RemoveStoragePoolVolume(ctx context.Context, projectName string, volumeName string, volumeType int, poolID int64) error {
+func (c *ClusterTx) RemoveStoragePoolVolume(ctx context.Context, projectName string, volumeName string, volumeType cluster.StoragePoolVolumeType, poolID int64) error {
 	isSnapshot := strings.Contains(volumeName, shared.SnapshotDelimiter)
 	var stmt string
 	if isSnapshot {
@@ -424,12 +508,11 @@ func (c *ClusterTx) RemoveStoragePoolVolume(ctx context.Context, projectName str
 }
 
 // RenameStoragePoolVolume renames the storage volume attached to a given storage pool.
-func (c *ClusterTx) RenameStoragePoolVolume(ctx context.Context, projectName string, oldVolumeName string, newVolumeName string, volumeType int, poolID int64) error {
+func (c *ClusterTx) RenameStoragePoolVolume(ctx context.Context, projectName string, oldVolumeName string, newVolumeName string, volumeType cluster.StoragePoolVolumeType, poolID int64) error {
 	isSnapshot := strings.Contains(oldVolumeName, shared.SnapshotDelimiter)
 	var stmt string
 	if isSnapshot {
-		parts := strings.Split(newVolumeName, shared.SnapshotDelimiter)
-		newVolumeName = parts[1]
+		_, newVolumeName, _ = strings.Cut(newVolumeName, shared.SnapshotDelimiter)
 		stmt = "UPDATE storage_volumes_snapshots SET name=? WHERE id=?"
 	} else {
 		stmt = "UPDATE storage_volumes SET name=? WHERE id=?"
@@ -449,11 +532,11 @@ func (c *ClusterTx) RenameStoragePoolVolume(ctx context.Context, projectName str
 }
 
 // CreateStoragePoolVolume creates a new storage volume attached to a given storage pool.
-func (c *ClusterTx) CreateStoragePoolVolume(ctx context.Context, projectName string, volumeName string, volumeDescription string, volumeType int, poolID int64, volumeConfig map[string]string, contentType int, creationDate time.Time) (int64, error) {
+func (c *ClusterTx) CreateStoragePoolVolume(ctx context.Context, projectName string, volumeName string, volumeDescription string, volumeType cluster.StoragePoolVolumeType, poolID int64, volumeConfig map[string]string, contentType cluster.StoragePoolVolumeContentType, creationDate time.Time) (int64, error) {
 	var volumeID int64
 
 	if shared.IsSnapshot(volumeName) {
-		return -1, fmt.Errorf("Volume name may not be a snapshot")
+		return -1, errors.New("Volume name may not be a snapshot")
 	}
 
 	remoteDrivers := StorageRemoteDriverNames()
@@ -465,7 +548,7 @@ func (c *ClusterTx) CreateStoragePoolVolume(ctx context.Context, projectName str
 
 	var result sql.Result
 
-	if shared.ValueInSlice(driver, remoteDrivers) {
+	if slices.Contains(remoteDrivers, driver) {
 		result, err = c.tx.ExecContext(ctx, `
 INSERT INTO storage_volumes (storage_pool_id, type, name, description, project_id, content_type, creation_date)
  VALUES (?, ?, ?, ?, (SELECT id FROM projects WHERE name = ?), ?, ?)
@@ -498,10 +581,10 @@ INSERT INTO storage_volumes (storage_pool_id, node_id, type, name, description, 
 
 // Return the ID of a storage volume on a given storage pool of a given storage
 // volume type, on the given node.
-func (c *ClusterTx) storagePoolVolumeGetTypeID(ctx context.Context, project string, volumeName string, volumeType int, poolID, nodeID int64) (int64, error) {
+func (c *ClusterTx) storagePoolVolumeGetTypeID(ctx context.Context, project string, volumeName string, volumeType cluster.StoragePoolVolumeType, poolID, nodeID int64) (int64, error) {
 	remoteDrivers := StorageRemoteDriverNames()
 
-	s := fmt.Sprintf(`
+	s := `
 SELECT storage_volumes_all.id
   FROM storage_volumes_all
   JOIN storage_pools ON storage_volumes_all.storage_pool_id = storage_pools.id
@@ -510,10 +593,10 @@ SELECT storage_volumes_all.id
     AND storage_volumes_all.storage_pool_id=?
     AND storage_volumes_all.name=?
 	AND storage_volumes_all.type=?
-	AND (storage_volumes_all.node_id=? OR storage_volumes_all.node_id IS NULL AND storage_pools.driver IN %s)`, query.Params(len(remoteDrivers)))
+	AND (storage_volumes_all.node_id=? OR storage_volumes_all.node_id IS NULL AND storage_pools.driver IN ` + query.Params(len(remoteDrivers)) + `)`
 
-	args := []any{project, poolID, volumeName, volumeType, nodeID}
-
+	args := make([]any, 0, 5+len(remoteDrivers))
+	args = append(args, project, poolID, volumeName, volumeType, nodeID)
 	for _, driver := range remoteDrivers {
 		args = append(args, driver)
 	}
@@ -524,7 +607,7 @@ SELECT storage_volumes_all.id
 	}
 
 	if len(result) == 0 {
-		return -1, api.StatusErrorf(http.StatusNotFound, "Storage pool volume not found")
+		return -1, api.StatusErrorf(http.StatusNotFound, "Storage volume not found")
 	}
 
 	return int64(result[0]), nil
@@ -532,7 +615,7 @@ SELECT storage_volumes_all.id
 
 // GetStoragePoolNodeVolumeID gets the ID of a storage volume on a given storage pool
 // of a given storage volume type and project, on the current node.
-func (c *ClusterTx) GetStoragePoolNodeVolumeID(ctx context.Context, projectName string, volumeName string, volumeType int, poolID int64) (int64, error) {
+func (c *ClusterTx) GetStoragePoolNodeVolumeID(ctx context.Context, projectName string, volumeName string, volumeType cluster.StoragePoolVolumeType, poolID int64) (int64, error) {
 	return c.storagePoolVolumeGetTypeID(ctx, projectName, volumeName, volumeType, poolID, c.nodeID)
 }
 
@@ -543,7 +626,7 @@ type StorageVolumeArgs struct {
 	Name string
 
 	// At least one of Type or TypeName must be set.
-	Type     int
+	Type     cluster.StoragePoolVolumeType
 	TypeName string
 
 	// At least one of PoolID or PoolName must be set.
@@ -570,7 +653,7 @@ type StorageVolumeArgs struct {
 // The volume name can be either a regular name or a volume snapshot name.
 // If the volume is defined, but without a specific node, then the ErrNoClusterMember error is returned.
 // If the volume is not found then an api.StatusError with code set to http.StatusNotFound is returned.
-func (c *ClusterTx) GetStorageVolumeNodes(ctx context.Context, poolID int64, projectName string, volumeName string, volumeType int) ([]NodeInfo, error) {
+func (c *ClusterTx) GetStorageVolumeNodes(ctx context.Context, poolID int64, projectName string, volumeName string, volumeType cluster.StoragePoolVolumeType) ([]NodeInfo, error) {
 	nodes := []NodeInfo{}
 
 	sql := `
@@ -608,7 +691,7 @@ func (c *ClusterTx) GetStorageVolumeNodes(ctx context.Context, poolID int64, pro
 
 	nodeCount := len(nodes)
 	if nodeCount == 0 {
-		return nil, api.StatusErrorf(http.StatusNotFound, "Storage pool volume not found")
+		return nil, api.StatusErrorf(http.StatusNotFound, "Storage volume not found")
 	} else if nodeCount > 1 {
 		driver, err := c.GetStoragePoolDriver(ctx, poolID)
 		if err != nil {
@@ -621,11 +704,11 @@ func (c *ClusterTx) GetStorageVolumeNodes(ctx context.Context, poolID int64, pro
 		// equivalent to db.ErrNoClusterMember that is used in newer schemas where a single remote volume
 		// DB record is created that is not associated to any single member.
 		if StorageRemoteDriverNames == nil {
-			return nil, fmt.Errorf("No remote storage drivers function defined")
+			return nil, errors.New("No remote storage drivers function defined")
 		}
 
 		remoteDrivers := StorageRemoteDriverNames()
-		if shared.ValueInSlice(driver, remoteDrivers) {
+		if slices.Contains(remoteDrivers, driver) {
 			return nil, ErrNoClusterMember
 		}
 	}
@@ -668,53 +751,52 @@ func (c *ClusterTx) storageVolumeConfigGet(ctx context.Context, volumeID int64, 
 //
 // Note, the code below doesn't deal with snapshots of snapshots.
 // To do that, we'll need to weed out based on # slashes in names.
-func (c *ClusterTx) GetNextStorageVolumeSnapshotIndex(ctx context.Context, pool, name string, typ int, pattern string) int {
+func (c *ClusterTx) GetNextStorageVolumeSnapshotIndex(ctx context.Context, pool, name string, typ cluster.StoragePoolVolumeType, pattern string) (nextIndex int) {
 	remoteDrivers := StorageRemoteDriverNames()
 
-	q := fmt.Sprintf(`
+	q := `
 SELECT storage_volumes_snapshots.name FROM storage_volumes_snapshots
   JOIN storage_volumes ON storage_volumes_snapshots.storage_volume_id=storage_volumes.id
   JOIN storage_pools ON storage_volumes.storage_pool_id=storage_pools.id
  WHERE storage_volumes.type=?
    AND storage_volumes.name=?
    AND storage_pools.name=?
-   AND (storage_volumes.node_id=? OR storage_volumes.node_id IS NULL AND storage_pools.driver IN %s)
-`, query.Params(len(remoteDrivers)))
-	var numstr string
-	inargs := []any{typ, name, pool, c.nodeID}
-	outfmt := []any{numstr}
+   AND (storage_volumes.node_id=? OR storage_volumes.node_id IS NULL AND storage_pools.driver IN ` + query.Params(len(remoteDrivers)) + `)`
 
+	inargs := make([]any, 0, 4+len(remoteDrivers))
+	inargs = append(inargs, typ, name, pool, c.nodeID)
 	for _, driver := range remoteDrivers {
 		inargs = append(inargs, driver)
 	}
 
-	results, err := queryScan(ctx, c, q, inargs, outfmt)
+	if !strings.Contains(pattern, "%d") {
+		return 0
+	}
+
+	err := query.Scan(ctx, c.tx, q, func(scan func(dest ...any) error) error {
+		var substr string
+		err := scan(&substr)
+		if err != nil {
+			return err
+		}
+
+		var num int
+		count, err := fmt.Sscanf(substr, pattern, &num)
+		if err != nil || count != 1 {
+			return nil
+		}
+
+		if num >= nextIndex {
+			nextIndex = num + 1
+		}
+
+		return nil
+	}, inargs...)
 	if err != nil {
 		return 0
 	}
 
-	max := 0
-
-	for _, r := range results {
-		substr, ok := r[0].(string)
-		if !ok {
-			continue
-		}
-
-		fields := strings.SplitN(pattern, "%d", 2)
-
-		var num int
-		count, err := fmt.Sscanf(substr, fmt.Sprintf("%s%%d%s", fields[0], fields[1]), &num)
-		if err != nil || count != 1 {
-			continue
-		}
-
-		if num >= max {
-			max = num + 1
-		}
-	}
-
-	return max
+	return nextIndex
 }
 
 // Updates the description of a storage volume.
@@ -726,7 +808,7 @@ func storageVolumeDescriptionUpdate(tx *sql.Tx, volumeID int64, description stri
 		table = "storage_volumes"
 	}
 
-	stmt := fmt.Sprintf("UPDATE %s SET description=? WHERE id=?", table)
+	stmt := "UPDATE " + table + " SET description=? WHERE id=?"
 	_, err := tx.Exec(stmt, description, volumeID)
 	return err
 }
@@ -776,36 +858,6 @@ func storageVolumeConfigClear(tx *sql.Tx, volumeID int64, isSnapshot bool) error
 	}
 
 	return nil
-}
-
-// Convert a volume integer type code to its human-readable name.
-func storagePoolVolumeTypeToName(volumeType int) (string, error) {
-	switch volumeType {
-	case cluster.StoragePoolVolumeTypeContainer:
-		return cluster.StoragePoolVolumeTypeNameContainer, nil
-	case cluster.StoragePoolVolumeTypeVM:
-		return cluster.StoragePoolVolumeTypeNameVM, nil
-	case cluster.StoragePoolVolumeTypeImage:
-		return cluster.StoragePoolVolumeTypeNameImage, nil
-	case cluster.StoragePoolVolumeTypeCustom:
-		return cluster.StoragePoolVolumeTypeNameCustom, nil
-	}
-
-	return "", fmt.Errorf("Invalid storage volume type")
-}
-
-// Convert a volume integer content type code to its human-readable name.
-func storagePoolVolumeContentTypeToName(contentType int) (string, error) {
-	switch contentType {
-	case cluster.StoragePoolVolumeContentTypeFS:
-		return cluster.StoragePoolVolumeContentTypeNameFS, nil
-	case cluster.StoragePoolVolumeContentTypeBlock:
-		return cluster.StoragePoolVolumeContentTypeNameBlock, nil
-	case cluster.StoragePoolVolumeContentTypeISO:
-		return cluster.StoragePoolVolumeContentTypeNameISO, nil
-	}
-
-	return "", fmt.Errorf("Invalid storage volume content type")
 }
 
 // GetCustomVolumesInProject returns all custom volumes in the given project.
@@ -886,7 +938,7 @@ func (c *ClusterTx) GetStorageVolumeURIs(ctx context.Context, project string) ([
 
 // UpdateStorageVolumeNode changes the name of a storage volume and the cluster member hosting it.
 // It's meant to be used when moving a storage volume backed by ceph from one cluster node to another.
-func (c *ClusterTx) UpdateStorageVolumeNode(ctx context.Context, projectName string, oldName string, newName string, newMemberName string, poolID int64, volumeType int) error {
+func (c *ClusterTx) UpdateStorageVolumeNode(ctx context.Context, projectName string, oldName string, newName string, newMemberName string, poolID int64, volumeType cluster.StoragePoolVolumeType) error {
 	volume, err := c.GetStoragePoolVolume(ctx, poolID, projectName, volumeType, oldName, false)
 	if err != nil {
 		return err
@@ -894,18 +946,18 @@ func (c *ClusterTx) UpdateStorageVolumeNode(ctx context.Context, projectName str
 
 	member, err := c.GetNodeByName(ctx, newMemberName)
 	if err != nil {
-		return fmt.Errorf("Failed to get new member %q info: %w", newMemberName, err)
+		return fmt.Errorf("Failed getting new member %q info: %w", newMemberName, err)
 	}
 
 	stmt := "UPDATE storage_volumes SET node_id=?, name=? WHERE id=?"
 	result, err := c.tx.Exec(stmt, member.ID, newName, volume.ID)
 	if err != nil {
-		return fmt.Errorf("Failed to update volumes's name and member ID: %w", err)
+		return fmt.Errorf("Failed updating volumes's name and member ID: %w", err)
 	}
 
 	n, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("Failed to get rows affected by volume update: %w", err)
+		return fmt.Errorf("Failed getting rows affected by volume update: %w", err)
 	}
 
 	if n != 1 {

@@ -3,11 +3,14 @@ package cluster
 import (
 	"fmt"
 
+	"github.com/canonical/lxd/lxd/db/query"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
 )
 
 // entityTypeContainer implements entityTypeDBInfo for a Container.
-type entityTypeContainer struct{}
+type entityTypeContainer struct {
+	entityTypeCommon
+}
 
 func (e entityTypeContainer) code() int64 {
 	return entityTypeCodeContainer
@@ -23,11 +26,11 @@ WHERE instances.type = %d
 }
 
 func (e entityTypeContainer) urlsByProjectQuery() string {
-	return fmt.Sprintf(`%s AND projects.name = ?`, e.allURLsQuery())
+	return e.allURLsQuery() + " AND projects.name = ?"
 }
 
-func (e entityTypeContainer) urlByIDQuery() string {
-	return fmt.Sprintf(`%s AND instances.id = ?`, e.allURLsQuery())
+func (e entityTypeContainer) urlsByIDsQuery(ids ...int64) string {
+	return e.allURLsQuery() + " AND instances.id IN " + query.IntParams(ids...)
 }
 
 func (e entityTypeContainer) idFromURLQuery() string {
@@ -40,8 +43,4 @@ WHERE projects.name = ?
 	AND instances.name = ? 
 	AND instances.type = %d
 `, instancetype.Container)
-}
-
-func (e entityTypeContainer) onDeleteTriggerSQL() (name string, sql string) {
-	return "", ""
 }

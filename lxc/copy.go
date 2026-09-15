@@ -3,6 +3,8 @@ package main
 import (
 	"errors"
 	"fmt"
+	"maps"
+	"net/http"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -13,7 +15,6 @@ import (
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	cli "github.com/canonical/lxd/shared/cmd"
-	"github.com/canonical/lxd/shared/i18n"
 )
 
 type cmdCopy struct {
@@ -32,15 +33,15 @@ type cmdCopy struct {
 	flagTargetProject     string
 	flagRefresh           bool
 	flagAllowInconsistent bool
+	flagStart             bool
 }
 
 func (c *cmdCopy) command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("copy", i18n.G("[<remote>:]<source>[/<snapshot>] [[<remote>:]<destination>]"))
+	cmd.Use = usage("copy", "[<remote>:]<source>[/<snapshot>] [[<remote>:]<destination>]")
 	cmd.Aliases = []string{"cp"}
-	cmd.Short = i18n.G("Copy instances within or in between LXD servers")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Copy instances within or in between LXD servers
+	cmd.Short = "Copy instance within or in between LXD servers"
+	cmd.Long = cli.FormatSection("Description", cmd.Short+`
 
 Transfer modes (--mode):
  - pull: Target server pulls the data from the source server (source must listen on network)
@@ -48,30 +49,30 @@ Transfer modes (--mode):
  - relay: The CLI connects to both source and server and proxies the data (both source and target must listen on network)
 
 The pull transfer mode is the default as it is compatible with all LXD versions.
-`))
+`)
 
 	cmd.RunE = c.run
-	cmd.Flags().StringArrayVarP(&c.flagConfig, "config", "c", nil, i18n.G("Config key/value to apply to the new instance")+"``")
-	cmd.Flags().StringArrayVarP(&c.flagDevice, "device", "d", nil, i18n.G("New key/value to apply to a specific device")+"``")
-	cmd.Flags().StringArrayVarP(&c.flagProfile, "profile", "p", nil, i18n.G("Profile to apply to the new instance")+"``")
-	cmd.Flags().BoolVarP(&c.flagEphemeral, "ephemeral", "e", false, i18n.G("Ephemeral instance"))
-	cmd.Flags().StringVar(&c.flagMode, "mode", "pull", i18n.G("Transfer mode. One of pull, push or relay")+"``")
-	cmd.Flags().BoolVar(&c.flagInstanceOnly, "instance-only", false, i18n.G("Copy the instance without its snapshots"))
-	cmd.Flags().BoolVar(&c.flagStateless, "stateless", false, i18n.G("Copy a stateful instance stateless"))
-	cmd.Flags().StringVarP(&c.flagStorage, "storage", "s", "", i18n.G("Storage pool name")+"``")
-	cmd.Flags().StringVar(&c.flagTarget, "target", "", i18n.G("Cluster member name")+"``")
-	cmd.Flags().StringVar(&c.flagTargetProject, "target-project", "", i18n.G("Copy to a project different from the source")+"``")
-	cmd.Flags().BoolVar(&c.flagNoProfiles, "no-profiles", false, i18n.G("Create the instance with no profiles applied"))
-	cmd.Flags().BoolVar(&c.flagRefresh, "refresh", false, i18n.G("Perform an incremental copy"))
-	cmd.Flags().BoolVar(&c.flagAllowInconsistent, "allow-inconsistent", false, i18n.G("Ignore copy errors for volatile files"))
-
+	cmd.Flags().StringArrayVarP(&c.flagConfig, "config", "c", nil, cli.FormatStringFlagLabel("Config key/value to apply to the new instance"))
+	cmd.Flags().StringArrayVarP(&c.flagDevice, "device", "d", nil, cli.FormatStringFlagLabel("New key/value to apply to a specific device"))
+	cmd.Flags().StringArrayVarP(&c.flagProfile, "profile", "p", nil, cli.FormatStringFlagLabel("Profile to apply to the new instance"))
+	cmd.Flags().BoolVarP(&c.flagEphemeral, "ephemeral", "e", false, "Ephemeral instance")
+	cmd.Flags().StringVar(&c.flagMode, "mode", "pull", cli.FormatStringFlagLabel("Transfer mode. One of pull, push or relay"))
+	cmd.Flags().BoolVar(&c.flagInstanceOnly, "instance-only", false, "Copy the instance without its snapshots")
+	cmd.Flags().BoolVar(&c.flagStateless, "stateless", false, "Copy a stateful instance stateless")
+	cmd.Flags().StringVarP(&c.flagStorage, "storage", "s", "", cli.FormatStringFlagLabel("Storage pool name"))
+	cmd.Flags().StringVar(&c.flagTarget, "target", "", cli.FormatStringFlagLabel("Cluster member name"))
+	cmd.Flags().StringVar(&c.flagTargetProject, "target-project", "", cli.FormatStringFlagLabel("Copy to a project different from the source"))
+	cmd.Flags().BoolVar(&c.flagNoProfiles, "no-profiles", false, "Create the instance with no profiles applied")
+	cmd.Flags().BoolVar(&c.flagRefresh, "refresh", false, "Perform an incremental copy")
+	cmd.Flags().BoolVar(&c.flagAllowInconsistent, "allow-inconsistent", false, "Ignore copy errors for volatile files")
+	cmd.Flags().BoolVar(&c.flagStart, "start", false, "Start instance after copy")
 	cmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		if len(args) == 0 {
-			return c.global.cmpInstances(toComplete)
+			return c.global.cmpTopLevelResource("instance", toComplete)
 		}
 
 		if len(args) == 1 {
-			return c.global.cmpRemotes(false)
+			return c.global.cmpRemotes(toComplete, ":", true, instanceServerRemoteCompletionFilters(*c.global.conf)...)
 		}
 
 		return nil, cobra.ShellCompDirectiveNoFileComp
@@ -95,12 +96,17 @@ func (c *cmdCopy) copyInstance(conf *config.Config, sourceResource string, destR
 
 	// Make sure we have an instance or snapshot name
 	if sourceName == "" {
-		return errors.New(i18n.G("You must specify a source instance name"))
+		return errors.New("You must specify a source instance name")
 	}
 
 	// Don't allow refreshing without profiles.
 	if c.flagRefresh && c.flagNoProfiles {
-		return errors.New(i18n.G("--no-profiles cannot be used with --refresh"))
+		return errors.New("--no-profiles cannot be used with --refresh")
+	}
+
+	// Don't allow refreshing and starting the instance afterwards as not supported by the migration API.
+	if c.flagRefresh && c.flagStart {
+		return errors.New("--start cannot be used with --refresh")
 	}
 
 	// If the instance is being copied to a different remote and no destination name is
@@ -112,7 +118,7 @@ func (c *cmdCopy) copyInstance(conf *config.Config, sourceResource string, destR
 
 	// Ensure that a destination name is provided.
 	if destName == "" {
-		return errors.New(i18n.G("You must specify a destination instance name"))
+		return errors.New("You must specify a destination instance name")
 	}
 
 	// Connect to the source host
@@ -139,20 +145,25 @@ func (c *cmdCopy) copyInstance(conf *config.Config, sourceResource string, destR
 		dest = dest.UseProject(c.flagTargetProject)
 	}
 
-	// Confirm that --target is only used with a cluster
-	if c.flagTarget != "" && !dest.IsClustered() {
-		return errors.New(i18n.G("To use --target, the destination remote must be a cluster"))
+	// Apply target flag if specified.
+	if c.flagTarget != "" {
+		// Confirm that --target is only used with a cluster
+		if !dest.IsClustered() {
+			return errors.New("To use --target, the destination remote must be a cluster")
+		}
+
+		dest = dest.UseTarget(c.flagTarget)
 	}
 
 	// Parse the config overrides
-	configMap := map[string]string{}
+	configOverrides := map[string]string{}
 	for _, entry := range c.flagConfig {
 		key, value, found := strings.Cut(entry, "=")
 		if !found {
-			return fmt.Errorf(i18n.G("Bad key=value pair: %q"), entry)
+			return fmt.Errorf("Bad key=value pair: %q", entry)
 		}
 
-		configMap[key] = value
+		configOverrides[key] = value
 	}
 
 	deviceOverrides, err := parseDeviceOverrides(c.flagDevice)
@@ -160,112 +171,53 @@ func (c *cmdCopy) copyInstance(conf *config.Config, sourceResource string, destR
 		return err
 	}
 
+	needsRefreshClientFallback := c.flagRefresh && !dest.HasExtension("instance_refresh_config")
+
 	var op lxd.RemoteOperation
 	var writable api.InstancePut
+	var refreshTarget *api.Instance
+	var refreshTargetETag string
 	var start bool
 
-	if shared.IsSnapshot(sourceName) {
+	sourceParentName, sourceSnapName, sourceIsSnap := api.GetParentAndSnapshotName(sourceName)
+
+	if sourceIsSnap {
 		if instanceOnly {
-			return errors.New(i18n.G("--instance-only can't be passed when the source is a snapshot"))
+			return errors.New("--instance-only cannot be passed when the source is a snapshot")
 		}
 
 		// Prepare the instance creation request
 		args := lxd.InstanceSnapshotCopyArgs{
-			Name: destName,
-			Mode: mode,
-			Live: stateful,
+			Name:  destName,
+			Mode:  mode,
+			Live:  stateful,
+			Start: c.flagStart,
 		}
 
 		if c.flagRefresh {
-			return errors.New(i18n.G("--refresh can only be used with instances"))
+			return errors.New("--refresh can only be used with instances")
 		}
 
 		// Copy of a snapshot into a new instance
-		srcFields := strings.SplitN(sourceName, shared.SnapshotDelimiter, 2)
-		entry, _, err := source.GetInstanceSnapshot(srcFields[0], srcFields[1])
+		entry, _, err := source.GetInstanceSnapshot(sourceParentName, sourceSnapName)
 		if err != nil {
 			return err
 		}
 
-		// Overwrite profiles.
-		if c.flagProfile != nil {
-			entry.Profiles = c.flagProfile
-		} else if c.flagNoProfiles {
-			entry.Profiles = []string{}
-		}
-
-		// Check to see if any of the overridden devices are for devices that are not yet defined in the
-		// local devices (and thus maybe expected to be coming from profiles).
-		needProfileExpansion := false
-		for deviceName := range deviceOverrides {
-			_, isLocalDevice := entry.Devices[deviceName]
-			if !isLocalDevice {
-				needProfileExpansion = true
-				break
-			}
-		}
-
-		profileDevices := make(map[string]map[string]string)
-
-		// If there are device overrides that are expected to be applied to profile devices then perform
-		// profile expansion.
-		if needProfileExpansion {
-			// If the list of profiles is empty then LXD would apply the default profile on the server side.
-			profileDevices, err = getProfileDevices(dest, entry.Profiles)
-			if err != nil {
-				return err
-			}
-		}
-
-		// Apply device overrides.
-		entry.Devices, err = shared.ApplyDeviceOverrides(profileDevices, entry.Devices, deviceOverrides)
+		err = c.applyConfigOverrides(dest, pool, keepVolatile, &entry.Profiles, &entry.Config, &entry.Devices, configOverrides, deviceOverrides)
 		if err != nil {
 			return err
-		}
-
-		// Allow setting additional config keys.
-		for key, value := range configMap {
-			entry.Config[key] = value
 		}
 
 		// Allow overriding the ephemeral status
-		if ephemeral == 1 {
+		switch ephemeral {
+		case 1:
 			entry.Ephemeral = true
-		} else if ephemeral == 0 {
+		case 0:
 			entry.Ephemeral = false
 		}
 
-		rootDiskDeviceKey, _, _ := instancetype.GetRootDiskDevice(entry.Devices)
-
-		if rootDiskDeviceKey != "" && pool != "" {
-			entry.Devices[rootDiskDeviceKey]["pool"] = pool
-		} else if pool != "" {
-			entry.Devices["root"] = map[string]string{
-				"type": "disk",
-				"path": "/",
-				"pool": pool,
-			}
-		}
-
-		if entry.Config != nil {
-			// Strip the last_state.power key in all cases
-			delete(entry.Config, "volatile.last_state.power")
-
-			if !keepVolatile {
-				for k := range entry.Config {
-					if !instancetype.InstanceIncludeWhenCopying(k, true) {
-						delete(entry.Config, k)
-					}
-				}
-			}
-		}
-
-		// Do the actual copy
-		if c.flagTarget != "" {
-			dest = dest.UseTarget(c.flagTarget)
-		}
-
-		op, err = dest.CopyInstanceSnapshot(source, srcFields[0], *entry, &args)
+		op, err = dest.CopyInstanceSnapshot(source, sourceParentName, *entry, &args)
 		if err != nil {
 			return err
 		}
@@ -278,108 +230,75 @@ func (c *cmdCopy) copyInstance(conf *config.Config, sourceResource string, destR
 			Mode:              mode,
 			Refresh:           c.flagRefresh,
 			AllowInconsistent: c.flagAllowInconsistent,
+			Start:             c.flagStart,
 		}
 
 		// Copy of an instance into a new instance
-		entry, _, err := source.GetInstance(sourceName)
+		sourceInstance, _, err := source.GetInstance(sourceName)
 		if err != nil {
 			return err
 		}
 
 		// Only start the instance back up if doing a stateless migration.
 		// Its LXD's job to start things back up when receiving a stateful migration.
-		if entry.StatusCode == api.Running && move && !stateful {
+		// This is when copyInstace is called by the move command and server side move
+		// cannot be performed, e.g. when migrating an instance between different LXD servers which are not in the same cluster
+		// or when server side move is simply not supported.
+		// The server will switch to migration so we cannot simply populate the Start field of the InstanceCopyArgs as this
+		// information will get lost during migration and is essentially not received by the target.
+		if sourceInstance.StatusCode == api.Running && move && !stateful {
 			start = true
 		}
 
-		// Overwrite profiles.
-		if c.flagProfile != nil {
-			entry.Profiles = c.flagProfile
-		} else if c.flagNoProfiles {
-			entry.Profiles = []string{}
-		}
-
-		// Check to see if any of the devices overrides are for devices that are not yet defined in the
-		// local devices and thus are expected to be coming from profiles.
-		needProfileExpansion := false
-		for deviceName := range deviceOverrides {
-			_, isLocalDevice := entry.Devices[deviceName]
-			if !isLocalDevice {
-				needProfileExpansion = true
-				break
-			}
-		}
-
-		profileDevices := make(map[string]map[string]string)
-
-		// If there are device overrides that are expected to be applied to profile devices then perform
-		// profile expansion.
-		if needProfileExpansion {
-			profileDevices, err = getProfileDevices(dest, entry.Profiles)
-			if err != nil {
-				return err
-			}
-		}
-
-		// Apply device overrides.
-		entry.Devices, err = shared.ApplyDeviceOverrides(entry.Devices, profileDevices, deviceOverrides)
+		err = c.applyConfigOverrides(dest, pool, keepVolatile, &sourceInstance.Profiles, &sourceInstance.Config, &sourceInstance.Devices, configOverrides, deviceOverrides)
 		if err != nil {
 			return err
 		}
 
-		// Allow setting additional config keys.
-		for key, value := range configMap {
-			entry.Config[key] = value
+		if c.flagRefresh && !needsRefreshClientFallback {
+			refreshTarget, _, err = dest.GetInstance(destName)
+			if err != nil && !api.StatusErrorCheck(err, http.StatusNotFound) {
+				return fmt.Errorf("Failed loading refresh target instance %q: %w", destName, err)
+			}
+
+			if err == nil {
+				writableEntry := sourceInstance.Writable()
+				writableEntry.ApplyRefreshConfig(*refreshTarget)
+				sourceInstance.Config = writableEntry.Config
+				sourceInstance.Devices = writableEntry.Devices
+			}
+		}
+
+		// Traditionally, if instance with snapshots is transferred across projects,
+		// the snapshots keep their own profiles.
+		// This doesn't work if the snapshot profiles don't exist in the target project.
+		// If different profiles are specified for the instance,
+		// instruct the server to apply the profiles of the source instance to the snapshots as well.
+		if c.flagNoProfiles || c.flagProfile != nil {
+			args.OverrideSnapshotProfiles = true
 		}
 
 		// Allow overriding the ephemeral status
-		if ephemeral == 1 {
-			entry.Ephemeral = true
-		} else if ephemeral == 0 {
-			entry.Ephemeral = false
+		switch ephemeral {
+		case 1:
+			sourceInstance.Ephemeral = true
+		case 0:
+			sourceInstance.Ephemeral = false
 		}
 
-		rootDiskDeviceKey, _, _ := instancetype.GetRootDiskDevice(entry.Devices)
-		if rootDiskDeviceKey != "" && pool != "" {
-			entry.Devices[rootDiskDeviceKey]["pool"] = pool
-		} else if pool != "" {
-			entry.Devices["root"] = map[string]string{
-				"type": "disk",
-				"path": "/",
-				"pool": pool,
-			}
-		}
-
-		// Strip the volatile keys if requested
-		if !keepVolatile {
-			for k := range entry.Config {
-				if !instancetype.InstanceIncludeWhenCopying(k, true) {
-					delete(entry.Config, k)
-				}
-			}
-		}
-
-		if entry.Config != nil {
-			// Strip the last_state.power key in all cases
-			delete(entry.Config, "volatile.last_state.power")
-		}
-
-		// Do the actual copy
-		if c.flagTarget != "" {
-			dest = dest.UseTarget(c.flagTarget)
-		}
-
-		op, err = dest.CopyInstance(source, *entry, &args)
+		op, err = dest.CopyInstance(source, *sourceInstance, &args)
 		if err != nil {
 			return err
 		}
 
-		writable = entry.Writable()
+		if needsRefreshClientFallback {
+			writable = sourceInstance.Writable()
+		}
 	}
 
 	// Watch the background operation
 	progress := cli.ProgressRenderer{
-		Format: i18n.G("Transferring instance: %s"),
+		Format: "Transferring instance: %s",
 		Quiet:  c.global.flagQuiet,
 	}
 
@@ -398,32 +317,23 @@ func (c *cmdCopy) copyInstance(conf *config.Config, sourceResource string, destR
 
 	progress.Done("")
 
-	if c.flagRefresh {
-		inst, etag, err := dest.GetInstance(destName)
+	// Compatibility fallback for older servers that don't apply refresh config server-side.
+	if needsRefreshClientFallback {
+		refreshTarget, refreshTargetETag, err = dest.GetInstance(destName)
 		if err != nil {
-			return fmt.Errorf(i18n.G("Failed to refresh target instance '%s': %v"), destName, err)
+			return fmt.Errorf("Failed loading refresh target instance %q: %w", destName, err)
 		}
 
-		// Ensure we don't change the target's volatile.idmap.next value.
-		if inst.Config["volatile.idmap.next"] != writable.Config["volatile.idmap.next"] {
-			writable.Config["volatile.idmap.next"] = inst.Config["volatile.idmap.next"]
-		}
+		writable.ApplyRefreshConfig(*refreshTarget)
 
-		// Ensure we don't change the target's root disk pool.
-		srcRootDiskDeviceKey, _, _ := instancetype.GetRootDiskDevice(writable.Devices)
-		destRootDiskDeviceKey, destRootDiskDevice, _ := instancetype.GetRootDiskDevice(inst.Devices)
-		if srcRootDiskDeviceKey != "" && srcRootDiskDeviceKey == destRootDiskDeviceKey {
-			writable.Devices[destRootDiskDeviceKey]["pool"] = destRootDiskDevice["pool"]
-		}
-
-		op, err := dest.UpdateInstance(destName, writable, etag)
+		op, err := dest.UpdateInstance(destName, writable, refreshTargetETag)
 		if err != nil {
-			return err
+			return fmt.Errorf("Failed applying refresh target instance config for instance %q: %w", destName, err)
 		}
 
 		// Watch the background operation
 		progress := cli.ProgressRenderer{
-			Format: i18n.G("Refreshing instance: %s"),
+			Format: "Refreshing instance: %s",
 			Quiet:  c.global.flagQuiet,
 		}
 
@@ -443,6 +353,12 @@ func (c *cmdCopy) copyInstance(conf *config.Config, sourceResource string, destR
 		progress.Done("")
 	}
 
+	// In case the destination LXD doesn't support instance start on copy,
+	// indicate to start the instance manually.
+	if c.flagStart && !dest.HasExtension("instance_create_start") {
+		start = true
+	}
+
 	// Start the instance if needed
 	if start {
 		req := api.InstanceStatePut{
@@ -457,6 +373,80 @@ func (c *cmdCopy) copyInstance(conf *config.Config, sourceResource string, destR
 		err = op.Wait()
 		if err != nil {
 			return err
+		}
+	}
+
+	return nil
+}
+
+func (c *cmdCopy) applyConfigOverrides(dest lxd.InstanceServer, poolName string, keepVolatile bool, profiles *[]string, config *map[string]string, devices *map[string]map[string]string, configOverrides map[string]string, deviceOverrides map[string]map[string]string) (err error) {
+	if profiles != nil {
+		// Overwrite profiles if specified.
+		if c.flagProfile != nil {
+			*profiles = c.flagProfile
+		} else if c.flagNoProfiles {
+			*profiles = []string{}
+		}
+	}
+
+	if config != nil {
+		// Remove the volatile keys from source if requested.
+		if !keepVolatile {
+			api.InstanceRemoteCopyConfigKeyPolicy.Apply(*config, nil)
+		}
+
+		// Apply config overrides.
+		maps.Copy(*config, configOverrides)
+
+		// Remove create-only keys client-side only when server-side refresh config handling is supported.
+		if dest.HasExtension("instance_refresh_config") {
+			api.InstanceCreateConfigKeyPolicy.Apply(*config, nil)
+		}
+	}
+
+	if devices != nil {
+		// Check to see if any of the devices overrides are for devices that are not yet defined in the
+		// local devices and thus are expected to be coming from profiles.
+		needProfileExpansion := false
+		for deviceName := range deviceOverrides {
+			_, isLocalDevice := (*devices)[deviceName]
+			if !isLocalDevice {
+				needProfileExpansion = true
+				break
+			}
+		}
+
+		profileDevices := make(map[string]map[string]string)
+
+		// If there are device overrides that are expected to be applied to profile devices then perform
+		// profile expansion.
+		if needProfileExpansion && profiles != nil {
+			profileDevices, err = getProfileDevices(dest, *profiles)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Apply device overrides.
+		*devices, err = shared.ApplyDeviceOverrides(*devices, profileDevices, deviceOverrides)
+		if err != nil {
+			return err
+		}
+
+		// Apply storage pool override if specified.
+		if poolName != "" {
+			rootDiskDeviceKey, _, _ := api.GetRootDiskDevice(*devices)
+			if rootDiskDeviceKey != "" {
+				// If a root disk device is already defined, just override the pool.
+				(*devices)[rootDiskDeviceKey]["pool"] = poolName
+			} else {
+				// No root disk device defined, add one with the specified pool.
+				(*devices)["root"] = map[string]string{
+					"type": "disk",
+					"path": "/",
+					"pool": poolName,
+				}
+			}
 		}
 	}
 

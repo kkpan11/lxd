@@ -67,31 +67,31 @@ func TestShouldShow(t *testing.T) {
 	}
 
 	if !list.shouldShow([]string{"u.blah=abc"}, inst, nil, false) {
-		t.Error("u.blah=abc didn't match")
+		t.Error("u.blah=abc did not match")
 	}
 
 	if !list.shouldShow([]string{"user.blah=abc"}, inst, nil, false) {
-		t.Error("user.blah=abc didn't match")
+		t.Error("user.blah=abc did not match")
 	}
 
 	if !list.shouldShow([]string{"status=RUNNING", "user.blah=abc"}, inst, nil, false) {
-		t.Error("user.blah=abc status=RUNNING didn't match")
+		t.Error("user.blah=abc status=RUNNING did not match")
 	}
 
 	if !list.shouldShow([]string{"image.os=Debian", "user.blah=abc"}, inst, nil, false) {
-		t.Error("user.blah=abc os=debian didn't match")
+		t.Error("user.blah=abc os=debian did not match")
 	}
 
 	if !list.shouldShow([]string{"location=mem-brain", "user.blah=abc"}, inst, nil, false) {
-		t.Error("user.blah=abc location=mem-brain didn't match")
+		t.Error("user.blah=abc location=mem-brain did not match")
 	}
 
 	if !list.shouldShow([]string{"architecture=potato", "user.blah=abc"}, inst, nil, false) {
-		t.Error("user.blah=abc architecture=potato didn't match")
+		t.Error("user.blah=abc architecture=potato did not match")
 	}
 
 	if !list.shouldShow([]string{"foo", "user.blah=abc"}, inst, nil, false) {
-		t.Error("user.blah=abc foo didn't match")
+		t.Error("user.blah=abc foo did not match")
 	}
 
 	if list.shouldShow([]string{"image.os=temple-os", "user.blah=abc"}, inst, nil, false) {
@@ -111,19 +111,19 @@ func TestShouldShow(t *testing.T) {
 	}
 
 	if !list.shouldShow([]string{"type=container", "user.blah=abc"}, inst, nil, false) {
-		t.Error("user.blah=abc type=container didn't match")
+		t.Error("user.blah=abc type=container did not match")
 	}
 
 	if list.shouldShow([]string{"bar", "u.blah=abc"}, inst, nil, false) {
-		t.Errorf("name filter didn't work")
+		t.Errorf("name filter did not work")
 	}
 
 	if list.shouldShow([]string{"bar", "u.blah=other"}, inst, nil, false) {
-		t.Errorf("value filter didn't work")
+		t.Errorf("value filter did not work")
 	}
 
 	if !list.shouldShow([]string{"ipv4=10.29.85.0/24"}, inst, state, false) {
-		t.Errorf("net=10.29.85.0/24 filter didn't work")
+		t.Errorf("net=10.29.85.0/24 filter did not work")
 	}
 
 	if list.shouldShow([]string{"ipv4=10.29.85.0/32"}, inst, state, false) {
@@ -135,7 +135,7 @@ func TestShouldShow(t *testing.T) {
 	}
 
 	if !list.shouldShow([]string{"ipv6=fd42:72a:89ac:e457:216:3eff:fe83:8301"}, inst, state, false) {
-		t.Errorf("net=fd42:72a:89ac:e457:216:3eff:fe83:8301 filter didn't work")
+		t.Errorf("net=fd42:72a:89ac:e457:216:3eff:fe83:8301 filter did not work")
 	}
 
 	if list.shouldShow([]string{"ipv6=fd42:072a:89ac:e457:0216:3eff:fe83:ffff/128"}, inst, state, false) {
@@ -143,7 +143,7 @@ func TestShouldShow(t *testing.T) {
 	}
 
 	if !list.shouldShow([]string{"ipv6=fd42:72a:89ac:e457:216:3eff:fe83:ffff/1"}, inst, state, false) {
-		t.Errorf("net=fd42:72a:89ac:e457:216:3eff:fe83:ffff/1 filter filter didn't work")
+		t.Errorf("net=fd42:72a:89ac:e457:216:3eff:fe83:ffff/1 filter filter did not work")
 	}
 
 	if list.shouldShow([]string{"user.blah=abc", "status=stopped"}, inst, nil, false) {
@@ -192,7 +192,7 @@ func TestColumns(t *testing.T) {
 			l = rand.Intn(20) + 20
 		}
 
-		for i := 0; i < l; i++ {
+		for range l {
 			buffer.WriteByte(alphanum[rand.Intn(len(alphanum))])
 		}
 	}
@@ -241,7 +241,7 @@ func TestColumns(t *testing.T) {
 			buffer.WriteString(":0")
 		case 6, 7:
 			buffer.WriteRune(':')
-			buffer.WriteString(strconv.FormatUint(uint64(rand.Uint32()), 10))
+			buffer.WriteString(strconv.FormatUint(uint64(rand.Int31()), 10))
 		}
 
 		// Unconditionally append a comma so that we don't create an invalid
@@ -250,7 +250,7 @@ func TestColumns(t *testing.T) {
 		buffer.WriteRune(',')
 	}
 
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		go func() {
 			var buffer bytes.Buffer
 
@@ -260,7 +260,7 @@ func TestColumns(t *testing.T) {
 			}
 
 			num := l
-			for j := 0; j < l; j++ {
+			for range l {
 				switch rand.Intn(5) {
 				case 0:
 					if buffer.Len() > 0 {
@@ -285,7 +285,7 @@ func TestColumns(t *testing.T) {
 			clustered := strings.Contains(raw, "L")
 			columns, _, err := list.parseColumns(clustered)
 			if err != nil {
-				t.Errorf("Failed to parse columns string.  Input: %s, Error: %s", raw, err)
+				t.Errorf("Failed parsing columns string.  Input: %s, Error: %s", raw, err)
 			}
 
 			if len(columns) != num {

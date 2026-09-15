@@ -33,16 +33,16 @@ func getLSBRelease(filename string) (map[string]string, error) {
 			continue
 		}
 
-		if strings.HasPrefix(line, "#") {
+		if line[0] == '#' {
 			continue
 		}
 
-		tokens := strings.SplitN(line, "=", 2)
-		if len(tokens) != 2 {
+		key, value, found := strings.Cut(line, "=")
+		if !found {
 			return osRelease, fmt.Errorf("%s: invalid format on line %d", filename, i+1)
 		}
 
-		osRelease[tokens[0]] = strings.Trim(tokens[1], `'"`)
+		osRelease[key] = strings.Trim(value, `'"`)
 	}
 
 	return osRelease, nil

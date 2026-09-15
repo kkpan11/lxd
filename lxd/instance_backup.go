@@ -3,18 +3,19 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/gorilla/mux"
-
+	"github.com/canonical/lxd/lxd/auth"
+	"github.com/canonical/lxd/lxd/backup"
+	"github.com/canonical/lxd/lxd/backup/config"
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/db/operationtype"
 	"github.com/canonical/lxd/lxd/instance"
-	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/lifecycle"
 	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/project"
@@ -24,6 +25,8 @@ import (
 	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
+	"github.com/canonical/lxd/shared/entity"
+	"github.com/canonical/lxd/shared/validate"
 	"github.com/canonical/lxd/shared/version"
 )
 
@@ -128,17 +131,13 @@ func instanceBackupsGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := request.ProjectParam(r)
-	cname, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	cname := r.PathValue("name")
 	if shared.IsSnapshot(cname) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+		return response.BadRequest(errors.New("Invalid instance name"))
 	}
 
 	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(s, r, projectName, cname, instanceType)
+	resp, err := forwardedResponseIfInstanceIsRemote(r.Context(), s, projectName, cname, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -147,7 +146,7 @@ func instanceBackupsGet(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	recursion := util.IsRecursionRequest(r)
+	recursion, _ := util.IsRecursionRequest(r)
 
 	c, err := instance.LoadByProjectAndName(s, projectName, cname)
 	if err != nil {
@@ -161,19 +160,31 @@ func instanceBackupsGet(d *Daemon, r *http.Request) response.Response {
 
 	resultString := []string{}
 	resultMap := []*api.InstanceBackup{}
+	canView, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeInstanceBackup)
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	for _, backup := range backups {
-		if !recursion {
-			url := fmt.Sprintf("/%s/instances/%s/backups/%s",
-				version.APIVersion, cname, strings.Split(backup.Name(), "/")[1])
-			resultString = append(resultString, url)
+		_, backupName, ok := strings.Cut(backup.Name(), "/")
+		if !ok {
+			// Not adding the name to the error response here because we were unable to check if the caller is allowed to view it.
+			return response.InternalError(errors.New("Instance backup has invalid name"))
+		}
+
+		if !canView(entity.InstanceBackupURL(projectName, c.Name(), backupName)) {
+			continue
+		}
+
+		if recursion == 0 {
+			resultString = append(resultString, api.NewURL().Path(version.APIVersion, "instances", cname, "backups", backupName).String())
 		} else {
 			render := backup.Render()
 			resultMap = append(resultMap, render)
 		}
 	}
 
-	if !recursion {
+	if recursion == 0 {
 		return response.SyncResponse(true, resultString)
 	}
 
@@ -221,16 +232,12 @@ func instanceBackupsPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	name := r.PathValue("name")
 	if shared.IsSnapshot(name) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+		return response.BadRequest(errors.New("Invalid instance name"))
 	}
 
-	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
 		err := limits.AllowBackupCreation(tx, projectName)
 		return err
 	})
@@ -239,7 +246,7 @@ func instanceBackupsPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Handle requests targeted to a container on a different node.
-	resp, err := forwardedResponseIfInstanceIsRemote(s, r, projectName, name, instanceType)
+	resp, err := forwardedResponseIfInstanceIsRemote(r.Context(), s, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -278,6 +285,13 @@ func instanceBackupsPost(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
+	if req.CompressionAlgorithm != "" {
+		err = validate.IsCompressionAlgorithm(req.CompressionAlgorithm)
+		if err != nil {
+			return response.BadRequest(err)
+		}
+	}
+
 	if req.Name == "" {
 		// come up with a name.
 		backups, err := inst.Backups()
@@ -287,8 +301,9 @@ func instanceBackupsPost(d *Daemon, r *http.Request) response.Response {
 
 		base := name + shared.SnapshotDelimiter + "backup"
 		length := len(base)
-		max := 0
+		backupNo := 0
 
+		// Iterate over previous backups to autoincrement the backup number.
 		for _, backup := range backups {
 			// Ignore backups not containing base.
 			if !strings.HasPrefix(backup.Name(), base) {
@@ -302,23 +317,34 @@ func instanceBackupsPost(d *Daemon, r *http.Request) response.Response {
 				continue
 			}
 
-			if num >= max {
-				max = num + 1
+			if num >= backupNo {
+				backupNo = num + 1
 			}
 		}
 
-		req.Name = fmt.Sprintf("backup%d", max)
+		req.Name = fmt.Sprintf("backup%d", backupNo)
+	}
+
+	// In case no version was selected for the backup format use the globally set format by default.
+	// This allows staying backwards compatible with older CLIs which don't yet support
+	// sending this field.
+	if req.Version == 0 {
+		req.Version = config.DefaultMetadataVersion
+	} else if req.Version > config.MaxMetadataVersion {
+		return response.BadRequest(fmt.Errorf("Invalid backup format version %d", req.Version))
 	}
 
 	// Validate the name.
-	if strings.Contains(req.Name, "/") {
-		return response.BadRequest(fmt.Errorf("Backup names may not contain slashes"))
+	backupName, err := backup.ValidateBackupName(req.Name)
+	if err != nil {
+		return response.BadRequest(err)
 	}
 
-	fullName := name + shared.SnapshotDelimiter + req.Name
-	instanceOnly := req.InstanceOnly || req.ContainerOnly
+	fullName := name + shared.SnapshotDelimiter + backupName
+	// We keep the req.ContainerOnly for backward compatibility.
+	instanceOnly := req.InstanceOnly || req.ContainerOnly //nolint:staticcheck,unused
 
-	backup := func(op *operations.Operation) error {
+	backup := func(ctx context.Context, op *operations.Operation) error {
 		args := db.InstanceBackup{
 			Name:                 fullName,
 			InstanceID:           inst.ID(),
@@ -329,7 +355,7 @@ func instanceBackupsPost(d *Daemon, r *http.Request) response.Response {
 			CompressionAlgorithm: req.CompressionAlgorithm,
 		}
 
-		err := backupCreate(s, args, inst, op)
+		err := backupCreate(ctx, s, args, inst, req.Version, op)
 		if err != nil {
 			return fmt.Errorf("Create backup: %w", err)
 		}
@@ -337,22 +363,25 @@ func instanceBackupsPost(d *Daemon, r *http.Request) response.Response {
 		return nil
 	}
 
-	resources := map[string][]api.URL{}
-	resources["instances"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", name)}
-
-	if inst.Type() == instancetype.Container {
-		resources["containers"] = resources["instances"]
+	metadata := map[string]any{
+		api.MetadataEntityURL: api.NewURL().Path(version.APIVersion, "instances", name, "backups", backupName).Project(inst.Project().Name).String(),
 	}
 
-	resources["backups"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", name, "backups", req.Name)}
+	args := operations.OperationArgs{
+		ProjectName: projectName,
+		EntityURL:   api.NewURL().Path(version.APIVersion, "instances", name).Project(projectName),
+		Type:        operationtype.BackupCreate,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     backup,
+		Metadata:    metadata,
+	}
 
-	op, err := operations.OperationCreate(s, projectName, operations.OperationClassTask,
-		operationtype.BackupCreate, resources, nil, backup, nil, nil, r)
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 // swagger:operation GET /1.0/instances/{name}/backups/{backup} instances instance_backup_get
@@ -404,22 +433,14 @@ func instanceBackupGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	name := r.PathValue("name")
 	if shared.IsSnapshot(name) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+		return response.BadRequest(errors.New("Invalid instance name"))
 	}
 
-	backupName, err := url.PathUnescape(mux.Vars(r)["backupName"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	backupName := r.PathValue("backupName")
 	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(s, r, projectName, name, instanceType)
+	resp, err := forwardedResponseIfInstanceIsRemote(r.Context(), s, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -478,22 +499,14 @@ func instanceBackupPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	name := r.PathValue("name")
 	if shared.IsSnapshot(name) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+		return response.BadRequest(errors.New("Invalid instance name"))
 	}
 
-	backupName, err := url.PathUnescape(mux.Vars(r)["backupName"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	backupName := r.PathValue("backupName")
 	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(s, r, projectName, name, instanceType)
+	resp, err := forwardedResponseIfInstanceIsRemote(r.Context(), s, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -508,9 +521,10 @@ func instanceBackupPost(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
-	// Validate the name
-	if strings.Contains(req.Name, "/") {
-		return response.BadRequest(fmt.Errorf("Backup names may not contain slashes"))
+	// Validate the new backup name.
+	newBackupName, err := backup.ValidateBackupName(req.Name)
+	if err != nil {
+		return response.BadRequest(err)
 	}
 
 	oldName := name + shared.SnapshotDelimiter + backupName
@@ -519,10 +533,13 @@ func instanceBackupPost(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	newName := name + shared.SnapshotDelimiter + req.Name
+	// Save the instance name that was implicitly validated when looking up the backup.
+	name = backup.Instance().Name()
 
-	rename := func(op *operations.Operation) error {
-		err := backup.Rename(newName)
+	newName := name + shared.SnapshotDelimiter + newBackupName
+
+	rename := func(ctx context.Context, op *operations.Operation) error {
+		err := backup.Rename(ctx, newName)
 		if err != nil {
 			return err
 		}
@@ -530,19 +547,27 @@ func instanceBackupPost(d *Daemon, r *http.Request) response.Response {
 		return nil
 	}
 
-	resources := map[string][]api.URL{}
-	resources["instances"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", name)}
-	if instanceType == instancetype.Container {
-		resources["containers"] = resources["instances"]
+	originalEntityURL := api.NewURL().Path(version.APIVersion, "instances", name, "backups", backupName).Project(projectName)
+	metadata := map[string]any{
+		api.MetadataOriginalEntityURL: originalEntityURL.String(),
+		api.MetadataEntityURL:         api.NewURL().Path(version.APIVersion, "instances", name, "backups", newBackupName).Project(projectName).String(),
 	}
 
-	op, err := operations.OperationCreate(s, projectName, operations.OperationClassTask,
-		operationtype.BackupRename, resources, nil, rename, nil, nil, r)
+	args := operations.OperationArgs{
+		ProjectName: projectName,
+		Type:        operationtype.BackupRename,
+		EntityURL:   originalEntityURL,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     rename,
+		Metadata:    metadata,
+	}
+
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 // swagger:operation DELETE /1.0/instances/{name}/backups/{backup} instances instance_backup_delete
@@ -580,22 +605,14 @@ func instanceBackupDelete(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	name := r.PathValue("name")
 	if shared.IsSnapshot(name) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+		return response.BadRequest(errors.New("Invalid instance name"))
 	}
 
-	backupName, err := url.PathUnescape(mux.Vars(r)["backupName"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	backupName := r.PathValue("backupName")
 	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(s, r, projectName, name, instanceType)
+	resp, err := forwardedResponseIfInstanceIsRemote(r.Context(), s, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -610,8 +627,8 @@ func instanceBackupDelete(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	remove := func(op *operations.Operation) error {
-		err := backup.Delete()
+	remove := func(ctx context.Context, op *operations.Operation) error {
+		err := backup.Delete(ctx)
 		if err != nil {
 			return err
 		}
@@ -619,19 +636,20 @@ func instanceBackupDelete(d *Daemon, r *http.Request) response.Response {
 		return nil
 	}
 
-	resources := map[string][]api.URL{}
-	resources["instances"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", name)}
-	if instanceType == instancetype.Container {
-		resources["containers"] = resources["instances"]
+	args := operations.OperationArgs{
+		ProjectName: projectName,
+		EntityURL:   api.NewURL().Path(version.APIVersion, "instances", name, "backups", backupName).Project(projectName),
+		Type:        operationtype.BackupRemove,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     remove,
 	}
 
-	op, err := operations.OperationCreate(s, projectName, operations.OperationClassTask,
-		operationtype.BackupRemove, resources, nil, remove, nil, nil, r)
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 // swagger:operation GET /1.0/instances/{name}/backups/{backup}/export instances instance_backup_export
@@ -665,22 +683,14 @@ func instanceBackupExportGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	name := r.PathValue("name")
 	if shared.IsSnapshot(name) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+		return response.BadRequest(errors.New("Invalid instance name"))
 	}
 
-	backupName, err := url.PathUnescape(mux.Vars(r)["backupName"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	backupName := r.PathValue("backupName")
 	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(s, r, projectName, name, instanceType)
+	resp, err := forwardedResponseIfInstanceIsRemote(r.Context(), s, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -696,10 +706,10 @@ func instanceBackupExportGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	ent := response.FileResponseEntry{
-		Path: shared.VarPath("backups", "instances", project.Instance(projectName, backup.Name())),
+		Path: filepath.Join(d.State().BackupsStoragePath(backup.Instance().Project().Name), "instances", project.Instance(projectName, backup.Name())),
 	}
 
-	s.Events.SendLifecycle(projectName, lifecycle.InstanceBackupRetrieved.Event(fullName, backup.Instance(), nil))
+	s.Events.SendLifecycle(projectName, lifecycle.InstanceBackupRetrieved.Event(r.Context(), fullName, backup.Instance(), nil))
 
 	return response.FileResponse([]response.FileResponseEntry{ent}, nil)
 }

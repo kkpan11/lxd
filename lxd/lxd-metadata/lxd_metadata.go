@@ -12,14 +12,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/canonical/lxd/shared"
-	"github.com/canonical/lxd/shared/api"
+	"go.yaml.in/yaml/v2"
 
-	"gopkg.in/yaml.v2"
+	"github.com/canonical/lxd/lxd/util"
+	"github.com/canonical/lxd/shared/api"
 )
 
 var (
@@ -77,7 +78,7 @@ func getSortedKeysFromMap[K string, V IterableAny](m map[K]V) []K {
 		keys = append(keys, k)
 	}
 
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	slices.Sort(keys)
 	return keys
 }
 
@@ -112,7 +113,7 @@ func expandExpression(input string) string {
 
 		// Split the parts string based on '+'
 		parts := strings.Split(partsStr, "+")
-		var expandedParts []string
+		var expandedParts = make([]string, 0, len(parts))
 		for _, part := range parts {
 			expandedParts = append(expandedParts, prefix+part)
 		}
@@ -124,7 +125,7 @@ func expandExpression(input string) string {
 	return result
 }
 
-func parse(path string, outputJSONPath string, excludedPaths []string, substitutionDBPath string) (*doc, error) {
+func parse(path string, outputJSONPath string, excludedPaths []string, substitutionDBPath string, debug bool) (*doc, error) {
 	jsonDoc := &doc{}
 	docKeys := make(map[string]struct{}, 0)
 	allEntries := make(map[string]map[string]map[string][]any)
@@ -132,13 +133,15 @@ func parse(path string, outputJSONPath string, excludedPaths []string, substitut
 	var substitutionRules map[string]string
 	if substitutionDBPath != "" {
 		// Load the substitution rules
-		data, err := os.ReadFile(substitutionDBPath)
+		substitutionDBFile, err := os.Open(substitutionDBPath)
 		if err != nil {
 			return nil, fmt.Errorf("Error reading substitution database: %v", err)
 		}
 
+		defer func() { _ = substitutionDBFile.Close() }()
+
 		substitutionRules = make(map[string]string)
-		err = yaml.Unmarshal(data, &substitutionRules)
+		err = yaml.NewDecoder(util.MaxBytesReader(substitutionDBFile, util.MaxYAMLFileBytes)).Decode(&substitutionRules)
 		if err != nil {
 			return nil, fmt.Errorf("Error unmarshaling substitution database: %v", err)
 		}
@@ -150,23 +153,29 @@ func parse(path string, outputJSONPath string, excludedPaths []string, substitut
 		}
 
 		// Skip excluded paths
-		if shared.ValueInSlice(path, excludedPaths) {
+		if slices.Contains(excludedPaths, path) {
 			if info.IsDir() {
-				log.Printf("Skipping excluded directory: %v", path)
+				if debug {
+					log.Printf("Skipping excluded directory: %v", path)
+				}
+
 				return filepath.SkipDir
 			}
 
-			log.Printf("Skipping excluded file: %v", path)
-			return nil
-		}
+			if debug {
+				log.Printf("Skipping excluded file: %v", path)
+			}
 
-		// Only process go files
-		if !info.IsDir() && filepath.Ext(path) != ".go" {
 			return nil
 		}
 
 		// Continue walking if directory
 		if info.IsDir() {
+			return nil
+		}
+
+		// Only process go files
+		if filepath.Ext(path) != ".go" {
 			return nil
 		}
 
@@ -187,7 +196,10 @@ func parse(path string, outputJSONPath string, excludedPaths []string, substitut
 					continue
 				}
 
-				log.Printf("Found lxddoc at %s", fset.Position(cg.Pos()).String())
+				if debug {
+					log.Printf("Found lxddoc at %s", fset.Position(cg.Pos()).String())
+				}
+
 				metadata := match[1]
 				longdesc := match[2]
 				data := match[3]
@@ -203,7 +215,7 @@ func parse(path string, outputJSONPath string, excludedPaths []string, substitut
 					mdKey := mdKVMatch[1]
 					mdValue := mdKVMatch[2]
 					// check that the metadata key is among the expected ones
-					if !shared.ValueInSlice(mdKey, mdKeys) {
+					if !slices.Contains(mdKeys, mdKey) {
 						continue
 					}
 
@@ -229,7 +241,7 @@ func parse(path string, outputJSONPath string, excludedPaths []string, substitut
 				for _, entity := range entities {
 					_, ok := uniqueEntities[entity]
 					if ok {
-						return fmt.Errorf("Duplicate entity '%s' found at %s", entity, fset.Position(cg.Pos()).String())
+						return fmt.Errorf("Duplicate entity %q found at %s", entity, fset.Position(cg.Pos()).String())
 					}
 
 					uniqueEntities[entity] = struct{}{}
@@ -240,7 +252,7 @@ func parse(path string, outputJSONPath string, excludedPaths []string, substitut
 					mdKeyHash := fmt.Sprintf("%s/%s/%s", entityKey, groupKey, simpleKey)
 					_, ok := docKeys[mdKeyHash]
 					if ok {
-						return fmt.Errorf("Duplicate key '%s' found at %s", mdKeyHash, fset.Position(cg.Pos()).String())
+						return fmt.Errorf("Duplicate key %q found at %s", mdKeyHash, fset.Position(cg.Pos()).String())
 					}
 
 					docKeys[mdKeyHash] = struct{}{}
@@ -313,7 +325,7 @@ func parse(path string, outputJSONPath string, excludedPaths []string, substitut
 	var metadataConfiguration api.MetadataConfiguration
 	err = json.Unmarshal(data, &metadataConfiguration)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to unmarshal generated metadata into MetadataConfiguration API type: %w", err)
+		return nil, fmt.Errorf("Failed unmarshaling generated metadata into MetadataConfiguration API type: %w", err)
 	}
 
 	if outputJSONPath != "" {
@@ -336,7 +348,7 @@ func writeDocFile(inputJSONPath, outputTxtPath string) error {
 	countMaxBackTicks := func(s string) int {
 		count, currCount := 0, 0
 		n := len(s)
-		for i := 0; i < n; i++ {
+		for i := range n {
 			if s[i] == '`' {
 				currCount++
 				continue
@@ -375,7 +387,7 @@ func writeDocFile(inputJSONPath, outputTxtPath string) error {
 		sortedGroupKeys := getSortedKeysFromMap(entityEntries)
 		for _, groupKey := range sortedGroupKeys {
 			groupEntries := entityEntries[groupKey]
-			buffer.WriteString(fmt.Sprintf("<!-- config group %s-%s start -->\n", entityKey, groupKey))
+			fmt.Fprintf(buffer, "<!-- config group %s-%s start -->\n", entityKey, groupKey)
 			for _, configEntryAny := range groupEntries["keys"] {
 				configEntry, ok := configEntryAny.(map[string]any)
 				if !ok {
@@ -404,7 +416,7 @@ func writeDocFile(inputJSONPath, outputTxtPath string) error {
 
 						configContentValueStr, ok := configContentValue.(string)
 						if ok {
-							if (strings.HasSuffix(configContentValueStr, "`") && strings.HasPrefix(configContentValueStr, "`")) || shared.ValueInSlice(configContentValueStr, specialChars) {
+							if (strings.HasSuffix(configContentValueStr, "`") && strings.HasPrefix(configContentValueStr, "`")) || slices.Contains(specialChars, configContentValueStr) {
 								configContentValueStr = fmt.Sprintf("\"%s\"", configContentValueStr)
 							}
 						} else {
@@ -412,7 +424,7 @@ func writeDocFile(inputJSONPath, outputTxtPath string) error {
 							case int, float64, bool:
 								configContentValueStr = fmt.Sprint(configEntryContentTyped)
 							case time.Time:
-								configContentValueStr = fmt.Sprint(configEntryContentTyped.Format(time.RFC3339))
+								configContentValueStr = configEntryContentTyped.Format(time.RFC3339)
 							}
 						}
 
@@ -432,41 +444,36 @@ func writeDocFile(inputJSONPath, outputTxtPath string) error {
 							quoteFormattedValue = fmt.Sprintf("\"%s\"", configContentValueStr)
 						}
 
-						kvBuffer.WriteString(
-							fmt.Sprintf(
-								":%s: %s\n",
-								configEntryContentKey,
-								quoteFormattedValue,
-							),
-						)
+						fmt.Fprintf(kvBuffer,
+							":%s: %s\n",
+							configEntryContentKey,
+							quoteFormattedValue)
 					}
 
 					if backticksCount < 3 {
-						buffer.WriteString(
-							fmt.Sprintf("```{config:option} %s %s-%s\n%s%s\n```\n\n",
-								configKey,
-								entityKey,
-								groupKey,
-								kvBuffer.String(),
-								strings.TrimLeft(longDescContent, "\n"),
-							))
+						fmt.Fprintf(buffer,
+							"```{config:option} %s %s-%s\n%s%s\n```\n\n",
+							configKey,
+							entityKey,
+							groupKey,
+							kvBuffer.String(),
+							strings.TrimLeft(longDescContent, "\n"))
 					} else {
 						configQuotes := strings.Repeat("`", backticksCount+1)
-						buffer.WriteString(
-							fmt.Sprintf("%s{config:option} %s %s-%s\n%s%s\n%s\n\n",
-								configQuotes,
-								configKey,
-								entityKey,
-								groupKey,
-								kvBuffer.String(),
-								strings.TrimLeft(longDescContent, "\n"),
-								configQuotes,
-							))
+						fmt.Fprintf(buffer,
+							"%s{config:option} %s %s-%s\n%s%s\n%s\n\n",
+							configQuotes,
+							configKey,
+							entityKey,
+							groupKey,
+							kvBuffer.String(),
+							strings.TrimLeft(longDescContent, "\n"),
+							configQuotes)
 					}
 				}
 			}
 
-			buffer.WriteString(fmt.Sprintf("<!-- config group %s-%s end -->\n", entityKey, groupKey))
+			fmt.Fprintf(buffer, "<!-- config group %s-%s end -->\n", entityKey, groupKey)
 		}
 	}
 
@@ -485,14 +492,14 @@ func writeDocFile(inputJSONPath, outputTxtPath string) error {
 
 	for _, entityName := range sortedEntityNames {
 		entity := entities[entityName]
-		buffer.WriteString(fmt.Sprintf("<!-- entity group %s start -->\n", entityName))
+		fmt.Fprintf(buffer, "<!-- entity group %s start -->\n", entityName)
 		for _, entitlement := range entity.Entitlements {
-			buffer.WriteString(fmt.Sprintf("`%s`\n", entitlement.Name))
-			buffer.WriteString(fmt.Sprintf(": %s\n\n", entitlement.Description))
+			fmt.Fprintf(buffer, "`%s`\n", entitlement.Name)
+			fmt.Fprintf(buffer, ": %s\n\n", entitlement.Description)
 		}
 
 		buffer.WriteString("\n")
-		buffer.WriteString(fmt.Sprintf("<!-- entity group %s end -->\n", entityName))
+		fmt.Fprintf(buffer, "<!-- entity group %s end -->\n", entityName)
 	}
 
 	err = os.WriteFile(outputTxtPath, buffer.Bytes(), 0644)

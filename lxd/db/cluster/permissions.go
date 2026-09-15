@@ -4,11 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"maps"
 	"net/http"
+	"slices"
 
 	"github.com/canonical/lxd/lxd/auth"
 	"github.com/canonical/lxd/lxd/db/query"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/entity"
 	"github.com/canonical/lxd/shared/logger"
@@ -17,7 +18,7 @@ import (
 // Permission is the database representation of an api.Permission.
 type Permission struct {
 	ID          int
-	GroupID     int
+	GroupID     int64
 	Entitlement auth.Entitlement
 	EntityType  EntityType
 	EntityID    int
@@ -67,14 +68,12 @@ func GetPermissionEntityURLs(ctx context.Context, tx *sql.Tx, permissions []Perm
 
 	// If there are any entity types with multiple permissions, get all URLs for those entities.
 	if len(entityTypes) > 0 {
-		entityURLsAll, err := GetEntityURLs(ctx, tx, "", entityTypes...)
+		entityURLsAll, err := GetEntityURLsByProjectAndType(ctx, tx, "", entityTypes...)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		for k, v := range entityURLsAll {
-			entityURLs[k] = v
-		}
+		maps.Copy(entityURLs, entityURLsAll)
 	}
 
 	// Iterate over the input permissions and check which ones are present in the entityURLs map.
@@ -103,7 +102,7 @@ func GetPermissionEntityURLs(ctx context.Context, tx *sql.Tx, permissions []Perm
 		entityTypes := make([]EntityType, 0, len(danglingPermissions))
 		for _, perm := range danglingPermissions {
 			permissionIDs = append(permissionIDs, perm.ID)
-			if !shared.ValueInSlice(perm.EntityType, entityTypes) {
+			if !slices.Contains(entityTypes, perm.EntityType) {
 				entityTypes = append(entityTypes, perm.EntityType)
 			}
 		}
@@ -120,20 +119,20 @@ func GetDistinctPermissionsByGroupNames(ctx context.Context, tx *sql.Tx, groupNa
 		return nil, nil
 	}
 
-	var args []any
+	args := make([]any, 0, len(groupNames))
 	for _, effectiveGroup := range groupNames {
 		args = append(args, effectiveGroup)
 	}
 
-	q := fmt.Sprintf(`
+	q := `
 SELECT DISTINCT auth_groups_permissions.entitlement, auth_groups_permissions.entity_type, auth_groups_permissions.entity_id
 FROM auth_groups_permissions
 JOIN auth_groups ON auth_groups_permissions.auth_group_id = auth_groups.id
-WHERE auth_groups.name IN %s`, query.Params(len(groupNames)))
+WHERE auth_groups.name IN ` + query.Params(len(groupNames))
 
 	rows, err := tx.QueryContext(ctx, q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to query distinct permissions by group names: %w", err)
+		return nil, fmt.Errorf("Failed querying distinct permissions by group names: %w", err)
 	}
 
 	var permissions []Permission
@@ -141,11 +140,39 @@ WHERE auth_groups.name IN %s`, query.Params(len(groupNames)))
 		var permission Permission
 		err := rows.Scan(&permission.Entitlement, &permission.EntityType, &permission.EntityID)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to scan effective permissions: %w", err)
+			return nil, fmt.Errorf("Failed scanning effective permissions: %w", err)
 		}
 
 		permissions = append(permissions, permission)
 	}
 
 	return permissions, nil
+}
+
+// GetGroupPermissions returns a map of group name to slice of permissions. This is used by the OpenFGADatastore
+// implementation. It is pre-loaded into an openfga.RequestCache to reduce the total number of queries.
+func GetGroupPermissions(ctx context.Context, tx *sql.Tx) (map[string][]Permission, error) {
+	q := `
+SELECT auth_groups.name, auth_groups_permissions.entity_id, auth_groups_permissions.entity_type, auth_groups_permissions.entitlement
+FROM auth_groups
+JOIN auth_groups_permissions ON auth_groups_permissions.auth_group_id = auth_groups.id
+`
+	rows, err := tx.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("Failed querying group permissions: %w", err)
+	}
+
+	groupPermissions := make(map[string][]Permission)
+	for rows.Next() {
+		var permission Permission
+		var groupName string
+		err := rows.Scan(&groupName, &permission.EntityID, &permission.EntityType, &permission.Entitlement)
+		if err != nil {
+			return nil, fmt.Errorf("Failed scanning effective permissions: %w", err)
+		}
+
+		groupPermissions[groupName] = append(groupPermissions[groupName], permission)
+	}
+
+	return groupPermissions, nil
 }

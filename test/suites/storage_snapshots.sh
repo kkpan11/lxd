@@ -6,42 +6,60 @@ test_storage_volume_snapshots() {
 
   lxd_backend=$(storage_backend "$LXD_DIR")
   LXD_STORAGE_DIR=$(mktemp -d -p "${TEST_DIR}" XXXXXXXXX)
-  chmod +x "${LXD_STORAGE_DIR}"
   spawn_lxd "${LXD_STORAGE_DIR}" false
 
-  local storage_pool storage_volume
+  local storage_pool storage_pool2 storage_volume
   storage_pool="lxdtest-$(basename "${LXD_STORAGE_DIR}")-pool"
   storage_pool2="${storage_pool}2"
   storage_volume="${storage_pool}-vol"
 
-  lxc storage create "$storage_pool" "$lxd_backend"
-  lxc storage volume create "${storage_pool}" "${storage_volume}"
+  if [ "${lxd_backend}" = "pure" ]; then
+    # Pure Storage needs some additional configuration, therefore create it using a helper function.
+    configure_pure_pool "${storage_pool}"
+  else
+    lxc storage create "$storage_pool" "$lxd_backend"
+  fi
+  lxc storage volume create "${storage_pool}" "${storage_volume}" size=1MiB
   lxc launch testimage c1 -s "${storage_pool}"
   lxc storage volume attach "${storage_pool}" "${storage_volume}" c1 /mnt
   # Create file on volume
-  echo foobar > "${TEST_DIR}/testfile"
-  lxc file push "${TEST_DIR}/testfile" c1/mnt/testfile
+  echo foobar | lxc file push --quiet - c1/mnt/testfile
 
   # Validate file
-  lxc exec c1 -- test -f /mnt/testfile
   [ "$(lxc exec c1 -- cat /mnt/testfile)" = 'foobar' ]
 
   lxc storage volume detach "${storage_pool}" "${storage_volume}" c1
   # This will create a snapshot named 'snap0'
   lxc storage volume snapshot "${storage_pool}" "${storage_volume}"
-  lxc storage volume list "${storage_pool}" |  grep "${storage_volume}/snap0"
-  lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" | grep 'name: snap0'
-  lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" | grep 'expires_at: 0001-01-01T00:00:00Z'
+  lxc storage volume list "${storage_pool}" | grep -wF "${storage_volume}/snap0"
+  lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" | grep -xF 'name: snap0'
+  lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" | grep -xF 'expires_at: 0001-01-01T00:00:00Z'
+
+  # Check volume snapshot attachment requires source.snapshot (not source=vol/snap)
+  lxc init --empty c2 -s "${storage_pool}"
+  [ "$(CLIENT_DEBUG="" SHELL_TRACING="" lxc config device add c2 snap-bad disk source="${storage_volume}/snap0" pool="${storage_pool}" path=/mnt/bad 2>&1)" = 'Error: Invalid devices: Device validation failed for "snap-bad": "source" cannot include a snapshot, use "source.snapshot" instead' ]
+  lxc config device add c2 snap-good disk source="${storage_volume}" source.snapshot="snap0" pool="${storage_pool}" path=/mnt/snap-good
+  lxc config device remove c2 snap-good
+  lxc delete c2
 
   # Create a snapshot with an expiry date using a YAML configuration
-  expiry_date_in_one_minute=$(date -u -d '+10 minute' '+%Y-%m-%dT%H:%M:%SZ')
+  expiry_date_in_few_minutes=$(date -u -d '+10 minute' '+%Y-%m-%dT%H:%M:%SZ')
   lxc storage volume snapshot "${storage_pool}" "${storage_volume}" yaml_volume_snapshot <<EOF
 description: foodesc
-expires_at: ${expiry_date_in_one_minute}
+expires_at: ${expiry_date_in_few_minutes}
 EOF
   # Check that the expiry date is set correctly
-  lxc storage volume show "${storage_pool}" "${storage_volume}/yaml_volume_snapshot" | grep "expires_at: ${expiry_date_in_one_minute}"
-  lxc storage volume show "${storage_pool}" "${storage_volume}/yaml_volume_snapshot" | grep "description: foodesc"
+  lxc storage volume show "${storage_pool}" "${storage_volume}/yaml_volume_snapshot" | grep -F "expires_at: ${expiry_date_in_few_minutes}"
+
+  # Dates are formatted differently between `show` and `get --property`
+  property_expiry_date_in_few_minutes="$(date -u -d "${expiry_date_in_few_minutes}" '+%Y-%m-%d %H:%M:%S %z %Z')"
+  [ "$(lxc storage volume get --property "${storage_pool}" "${storage_volume}/yaml_volume_snapshot" expires_at)" = "${property_expiry_date_in_few_minutes}" ]
+
+  # Check that the description property can be set/get correctly
+  [ "$(lxc storage volume get --property "${storage_pool}" "${storage_volume}/yaml_volume_snapshot" description)" = "foodesc" ]
+  lxc storage volume set --property "${storage_pool}" "${storage_volume}/yaml_volume_snapshot" description="bardesc"
+  [ "$(lxc storage volume get --property "${storage_pool}" "${storage_volume}/yaml_volume_snapshot" description)" = "bardesc" ]
+
   # Delete the snapshot
   lxc storage volume delete "${storage_pool}" "${storage_volume}/yaml_volume_snapshot"
 
@@ -59,42 +77,87 @@ EOF
   # This will create a snapshot named 'test0' and 'test1'
   lxc storage volume snapshot "${storage_pool}" "${storage_volume}"
   lxc storage volume snapshot "${storage_pool}" "${storage_volume}"
-  lxc storage volume list "${storage_pool}" |  grep "${storage_volume}/test0"
-  lxc storage volume list "${storage_pool}" |  grep "${storage_volume}/test1"
+  lxc storage volume list "${storage_pool}" | grep -wF "${storage_volume}/test0"
+  lxc storage volume list "${storage_pool}" | grep -wF "${storage_volume}/test1"
   lxc storage volume rm "${storage_pool}" "${storage_volume}/test0"
   lxc storage volume rm "${storage_pool}" "${storage_volume}/test1"
   lxc storage volume unset "${storage_pool}" "${storage_volume}" snapshots.pattern
 
   # edit volume snapshot description
   lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" | sed 's/^description:.*/description: foo/' | lxc storage volume edit "${storage_pool}" "${storage_volume}/snap0"
-  lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" | grep -q 'description: foo'
+  lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" | grep -xF 'description: foo'
 
   # edit volume snapshot expiry date
   lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" | sed 's/^expires_at:.*/expires_at: 2100-01-02T15:04:05Z/' | lxc storage volume edit "${storage_pool}" "${storage_volume}/snap0"
   # Depending on the timezone of the runner, some values will be different.
   # Both the year (2100) and the month (01) will be constant though.
-  lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" | grep -q '^expires_at: 2100-01'
+  lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" | grep '^expires_at: 2100-01'
   # Reset/remove expiry date
   lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" | sed '/^expires_at:/d' | lxc storage volume edit "${storage_pool}" "${storage_volume}/snap0"
-  lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" | grep -q '^expires_at: 0001-01-01T00:00:00Z'
+  lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" | grep '^expires_at: 0001-01-01T00:00:00Z'
+
+  # Test storage volume snapshot editing.
+  # Only description and expires_at can be modified.
+
+  tmp_yaml=$(mktemp)
+  ERROR_MSG='Error: Only "description" and "expires_at" field(s) can be modified for snapshot volumes'
+
+  # Test non editable properties.
+  for field in name content_type config; do
+    lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" > "$tmp_yaml"
+    case $field in
+      config)
+        sed -i "s/^${field}:.*/${field}: {}/" "$tmp_yaml"
+        ;;
+      *)
+        sed -i "s/^${field}:.*/${field}: invalid-${field}/" "$tmp_yaml"
+        ;;
+    esac
+
+    ! lxc storage volume edit "${storage_pool}" "${storage_volume}/snap0" < "$tmp_yaml" 2>&1 | grep -xF "$ERROR_MSG" || false
+  done
+  rm "${tmp_yaml}"
+
+  # Test editable properties.
+  # 1. description.
+  lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" | sed 's/^description:.*/description: "Updated description"/' | lxc storage volume edit "${storage_pool}" "${storage_volume}/snap0"
+  [ "$(lxc storage volume get --property "${storage_pool}" "${storage_volume}/snap0" description)" = "Updated description" ]
+
+  # 2. expires_at.
+  expiry_date=$(date -u -d '+1 day' '+%Y-%m-%dT%H:%M:%SZ')
+  lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" | sed "s/^expires_at:.*/expires_at: ${expiry_date}/" | lxc storage volume edit "${storage_pool}" "${storage_volume}/snap0"
+  lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" | grep -xF "expires_at: ${expiry_date}"
+
+  # Reset expires_at property.
+  lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" | sed '/^expires_at:/d' | lxc storage volume edit "${storage_pool}" "${storage_volume}/snap0"
+
+  # Check the API returns the zero time representation when listing all snapshots in recursive mode.
+  lxc query "/1.0/storage-pools/${storage_pool}/volumes/custom/${storage_volume}/snapshots?recursion=2" | jq --exit-status '.[] | select(.name == "'"${storage_volume}/snap0"'") | .expires_at == "0001-01-01T00:00:00Z"'
 
   lxc storage volume set "${storage_pool}" "${storage_volume}" snapshots.expiry '1d'
   lxc storage volume snapshot "${storage_pool}" "${storage_volume}"
-  ! lxc storage volume show "${storage_pool}" "${storage_volume}/snap1" | grep -q 'expires_at: 0001-01-01T00:00:00Z' || false
+
+  # Get snapshot created_at and expires_at properties.
+  # Remove the " +0000 UTC" from the end of the timestamp so we can add one day using `date`.
+  created_at="$(lxc storage volume get "${storage_pool}" "${storage_volume}/snap1" --property created_at | awk -F' +' '{print $1}')"
+  expires_at="$(lxc storage volume get "${storage_pool}" "${storage_volume}/snap1" --property expires_at | awk -F' +' '{print $1}')"
+
+  # Check if the expires_at property is exactly 1d ahead.
+  [ "$(date -d "${created_at} today + 1days")" = "$(date -d "${expires_at}")" ]
 
   lxc storage volume snapshot "${storage_pool}" "${storage_volume}" --no-expiry
-  lxc storage volume show "${storage_pool}" "${storage_volume}/snap2" | grep -q 'expires_at: 0001-01-01T00:00:00Z' || false
+  lxc storage volume show "${storage_pool}" "${storage_volume}/snap2" | grep -F 'expires_at: 0001-01-01T00:00:00Z'
 
   lxc storage volume rm "${storage_pool}" "${storage_volume}/snap2"
   lxc storage volume rm "${storage_pool}" "${storage_volume}/snap1"
 
   # Test snapshot renaming
   lxc storage volume snapshot "${storage_pool}" "${storage_volume}"
-  lxc storage volume list "${storage_pool}" |  grep "${storage_volume}/snap1"
+  lxc storage volume list "${storage_pool}" | grep -F "${storage_volume}/snap1"
   lxc storage volume show "${storage_pool}" "${storage_volume}/snap1" | grep 'name: snap1'
   lxc storage volume rename "${storage_pool}" "${storage_volume}/snap1" "${storage_volume}/foo"
-  lxc storage volume list "${storage_pool}" |  grep "${storage_volume}/foo"
-  lxc storage volume show "${storage_pool}" "${storage_volume}/foo" | grep 'name: foo'
+  lxc storage volume list "${storage_pool}" | grep -F "${storage_volume}/foo"
+  lxc storage volume show "${storage_pool}" "${storage_volume}/foo" | grep -F 'name: foo'
 
   lxc storage volume attach "${storage_pool}" "${storage_volume}" c1 /mnt
   # Delete file on volume
@@ -120,7 +183,6 @@ EOF
   lxc storage volume attach "${storage_pool}" "${storage_volume}" c1 /mnt
 
   # Validate file
-  lxc exec c1 -- test -f /mnt/testfile
   [ "$(lxc exec c1 -- cat /mnt/testfile)" = 'foobar' ]
 
   lxc storage volume detach "${storage_pool}" "${storage_volume}" c1
@@ -128,8 +190,8 @@ EOF
   lxc storage volume delete "${storage_pool}" "${storage_volume}"
 
   # Check snapshots naming conflicts.
-  lxc storage volume create "${storage_pool}" "vol1"
-  lxc storage volume create "${storage_pool}" "vol1-snap0"
+  lxc storage volume create "${storage_pool}" "vol1" size=1MiB
+  lxc storage volume create "${storage_pool}" "vol1-snap0" size=1MiB
   lxc storage volume snapshot "${storage_pool}" "vol1" "snap0"
   lxc storage volume delete "${storage_pool}" "vol1"
   lxc storage volume delete "${storage_pool}" "vol1-snap0"
@@ -145,19 +207,19 @@ EOF
   ! lxc storage volume create "${storage_pool}" "vol1" --type block block.mount_options=xyz || false
 
   # Check snapshot creation dates.
-  lxc storage volume create "${storage_pool}" "vol1"
+  lxc storage volume create "${storage_pool}" "vol1" size=1MiB
   lxc storage volume snapshot "${storage_pool}" "vol1" "snap0"
-  ! lxc storage volume show "${storage_pool}" "vol1" | grep -q '^created_at: 0001-01-01T00:00:00Z' || false
-  ! lxc storage volume show "${storage_pool}" "vol1/snap0" | grep -q '^created_at: 0001-01-01T00:00:00Z' || false
+  lxc storage volume show "${storage_pool}" "vol1" | grep '^created_at: 2'
+  lxc storage volume show "${storage_pool}" "vol1/snap0" | grep '^created_at: 2'
   lxc storage volume copy "${storage_pool}/vol1" "${storage_pool}/vol2"
-  ! lxc storage volume show "${storage_pool}" "vol2" | grep -q '^created_at: 0001-01-01T00:00:00Z' || false
+  lxc storage volume show "${storage_pool}" "vol2" | grep '^created_at: 2'
   [ "$(lxc storage volume show "${storage_pool}" "vol1/snap0" | awk /created_at:/)" = "$(lxc storage volume show "${storage_pool}" "vol2/snap0" | awk /created_at:/)" ]
   lxc storage volume delete "${storage_pool}" "vol1"
   lxc storage volume delete "${storage_pool}" "vol2"
 
   # Check snapshot copy (mode pull).
   lxc launch testimage "c1"
-  lxc storage volume create "${storage_pool}" "vol1"
+  lxc storage volume create "${storage_pool}" "vol1" size=1MiB
   lxc storage volume attach "${storage_pool}" "vol1" "c1" /mnt
   lxc exec "c1" -- touch /mnt/foo
   lxc delete -f "c1"
@@ -238,13 +300,13 @@ EOF
   # Check snapshot volume only copy.
   ! lxc storage volume copy "${storage_pool}/vol1/snap0" "${storage_pool}/vol2" --volume-only || false
   lxc storage volume copy "${storage_pool}/vol1" "${storage_pool}/vol2" --volume-only
-  [ "$(lxc query "/1.0/storage-pools/${storage_pool}/volumes/custom/vol2/snapshots" | jq "length == 0")" = "true" ]
+  lxc query "/1.0/storage-pools/${storage_pool}/volumes/custom/vol2/snapshots" | jq --exit-status ". == []"
   lxc storage volume delete "${storage_pool}" "vol2"
 
   # Check snapshot volume only copy (remote).
   ! lxc storage volume copy "${storage_pool}/vol1/snap0" "localhost:${storage_pool}/vol2" --volume-only || false
   lxc storage volume copy "${storage_pool}/vol1" "localhost:${storage_pool}/vol2" --volume-only
-  [ "$(lxc query "/1.0/storage-pools/${storage_pool}/volumes/custom/vol2/snapshots" | jq "length == 0")" = "true" ]
+  lxc query "/1.0/storage-pools/${storage_pool}/volumes/custom/vol2/snapshots" | jq --exit-status ". == []"
   lxc storage volume delete "${storage_pool}" "vol2"
 
   # Check snapshot refresh.
@@ -260,22 +322,22 @@ EOF
   # Check snapshot copy between projects.
   lxc project create project1
   lxc storage volume copy "${storage_pool}/vol1/snap0" "${storage_pool}/vol1" --target-project project1
-  [ "$(lxc query "/1.0/storage-pools/${storage_pool}/volumes?project=project1" | jq "length == 1")" = "true" ]
+  lxc query "/1.0/storage-pools/${storage_pool}/volumes?project=project1" | jq --exit-status "length == 1"
   lxc storage volume delete "${storage_pool}" "vol1" --project project1
 
   # Check snapshot copy between projects (remote).
   lxc storage volume copy "${storage_pool}/vol1/snap0" "localhost:${storage_pool}/vol1" --target-project project1
-  [ "$(lxc query "/1.0/storage-pools/${storage_pool}/volumes?project=project1" | jq "length == 1")" = "true" ]
+  lxc query "/1.0/storage-pools/${storage_pool}/volumes?project=project1" | jq --exit-status "length == 1"
   lxc storage volume delete "${storage_pool}" "vol1" --project project1
   lxc storage volume delete "${storage_pool}" "vol1"
 
   # Check snapshot creation dates (remote).
-  lxc storage volume create "${storage_pool}" "vol1"
+  lxc storage volume create "${storage_pool}" "vol1" size=1MiB
   lxc storage volume snapshot "${storage_pool}" "vol1" "snap0"
-  ! lxc storage volume show "${storage_pool}" "vol1" | grep -q '^created_at: 0001-01-01T00:00:00Z' || false
-  ! lxc storage volume show "${storage_pool}" "vol1/snap0" | grep -q '^created_at: 0001-01-01T00:00:00Z' || false
+  lxc storage volume show "${storage_pool}" "vol1" | grep '^created_at: 2'
+  lxc storage volume show "${storage_pool}" "vol1/snap0" | grep '^created_at: 2'
   lxc storage volume copy "${storage_pool}/vol1" "localhost:${storage_pool}/vol1-copy"
-  ! lxc storage volume show "${storage_pool}" "localhost:${storage_pool}" "vol1-copy" | grep -q '^created_at: 0001-01-01T00:00:00Z' || false
+  lxc storage volume show "localhost:${storage_pool}" "vol1-copy" | grep '^created_at: 2'
   [ "$(lxc storage volume show "${storage_pool}" "vol1/snap0" | awk /created_at:/)" = "$(lxc storage volume show "localhost:${storage_pool}" "vol1-copy/snap0" | awk /created_at:/)" ]
   lxc storage volume delete "${storage_pool}" "vol1"
   lxc storage volume delete "${storage_pool}" "vol1-copy"
@@ -283,7 +345,7 @@ EOF
   lxc project delete "project1"
   lxc storage delete "${storage_pool}"
 
-  fingerprint="$(lxc config trust ls --format csv | grep foo | cut -d, -f4)"
+  fingerprint="$(lxc config trust list --format csv | awk -F, '/^client,foo,/ {print $4}')"
   lxc config trust remove "${fingerprint}"
   lxc remote remove "localhost"
 

@@ -2,22 +2,26 @@ package drivers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/canonical/lxd/lxd/archive"
+	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/instancewriter"
 	"github.com/canonical/lxd/lxd/migration"
-	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/rsync"
 	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/lxd/storage/block"
 	"github.com/canonical/lxd/lxd/storage/filesystem"
-	"github.com/canonical/lxd/lxd/sys"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/ioprogress"
@@ -58,9 +62,9 @@ func genericVFSGetResources(d Driver) (*api.ResourcesStoragePool, error) {
 }
 
 // genericVFSRenameVolume is a generic RenameVolume implementation for VFS-only drivers.
-func genericVFSRenameVolume(d Driver, vol Volume, newVolName string, op *operations.Operation) error {
+func genericVFSRenameVolume(d Driver, vol Volume, newVolName string) error {
 	if vol.IsSnapshot() {
-		return fmt.Errorf("Volume must not be a snapshot")
+		return errors.New("Volume must not be a snapshot")
 	}
 
 	revert := revert.New()
@@ -70,12 +74,12 @@ func genericVFSRenameVolume(d Driver, vol Volume, newVolName string, op *operati
 	srcVolumePath := GetVolumeMountPath(d.Name(), vol.volType, vol.name)
 	dstVolumePath := GetVolumeMountPath(d.Name(), vol.volType, newVolName)
 
-	if shared.PathExists(srcVolumePath) {
-		err := os.Rename(srcVolumePath, dstVolumePath)
-		if err != nil {
-			return fmt.Errorf("Failed to rename %q to %q: %w", srcVolumePath, dstVolumePath, err)
-		}
+	err := os.Rename(srcVolumePath, dstVolumePath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("Failed renaming %q to %q: %w", srcVolumePath, dstVolumePath, err)
+	}
 
+	if err == nil {
 		revert.Add(func() { _ = os.Rename(dstVolumePath, srcVolumePath) })
 	}
 
@@ -83,12 +87,12 @@ func genericVFSRenameVolume(d Driver, vol Volume, newVolName string, op *operati
 	srcSnapshotDir := GetVolumeSnapshotDir(d.Name(), vol.volType, vol.name)
 	dstSnapshotDir := GetVolumeSnapshotDir(d.Name(), vol.volType, newVolName)
 
-	if shared.PathExists(srcSnapshotDir) {
-		err := os.Rename(srcSnapshotDir, dstSnapshotDir)
-		if err != nil {
-			return fmt.Errorf("Failed to rename %q to %q: %w", srcSnapshotDir, dstSnapshotDir, err)
-		}
+	err = os.Rename(srcSnapshotDir, dstSnapshotDir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("Failed renaming %q to %q: %w", srcSnapshotDir, dstSnapshotDir, err)
+	}
 
+	if err == nil {
 		revert.Add(func() { _ = os.Rename(dstSnapshotDir, srcSnapshotDir) })
 	}
 
@@ -97,7 +101,7 @@ func genericVFSRenameVolume(d Driver, vol Volume, newVolName string, op *operati
 }
 
 // genericVFSVolumeSnapshots is a generic VolumeSnapshots implementation for VFS-only drivers.
-func genericVFSVolumeSnapshots(d Driver, vol Volume, op *operations.Operation) ([]string, error) {
+func genericVFSVolumeSnapshots(d Driver, vol Volume) ([]string, error) {
 	snapshotDir := GetVolumeSnapshotDir(d.Name(), vol.volType, vol.name)
 	snapshots := []string{}
 
@@ -108,7 +112,7 @@ func genericVFSVolumeSnapshots(d Driver, vol Volume, op *operations.Operation) (
 			return snapshots, nil
 		}
 
-		return nil, fmt.Errorf("Failed to list directory %q: %w", snapshotDir, err)
+		return nil, fmt.Errorf("Failed listing directory %q: %w", snapshotDir, err)
 	}
 
 	for _, ent := range ents {
@@ -128,27 +132,25 @@ func genericVFSVolumeSnapshots(d Driver, vol Volume, op *operations.Operation) (
 }
 
 // genericVFSRenameVolumeSnapshot is a generic RenameVolumeSnapshot implementation for VFS-only drivers.
-func genericVFSRenameVolumeSnapshot(d Driver, snapVol Volume, newSnapshotName string, op *operations.Operation) error {
+func genericVFSRenameVolumeSnapshot(d Driver, snapVol Volume, newSnapshotName string, progressReporter ioprogress.ProgressReporter) error {
 	if !snapVol.IsSnapshot() {
-		return fmt.Errorf("Volume must be a snapshot")
+		return errors.New("Volume must be a snapshot")
 	}
 
 	parentName, _, _ := api.GetParentAndSnapshotName(snapVol.name)
 	oldPath := snapVol.MountPath()
 	newPath := GetVolumeMountPath(d.Name(), snapVol.volType, GetSnapshotVolumeName(parentName, newSnapshotName))
 
-	if shared.PathExists(oldPath) {
-		err := os.Rename(oldPath, newPath)
-		if err != nil {
-			return fmt.Errorf("Failed to rename %q to %q: %w", oldPath, newPath, err)
-		}
+	err := os.Rename(oldPath, newPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("Failed renaming %q to %q: %w", oldPath, newPath, err)
 	}
 
 	return nil
 }
 
 // genericVFSMigrateVolume is a generic MigrateVolume implementation for VFS-only drivers.
-func genericVFSMigrateVolume(d Driver, s *state.State, vol VolumeCopy, conn io.ReadWriteCloser, volSrcArgs *migration.VolumeSourceArgs, op *operations.Operation) error {
+func genericVFSMigrateVolume(d Driver, s *state.State, vol VolumeCopy, conn io.ReadWriteCloser, volSrcArgs *migration.VolumeSourceArgs, progressReporter ioprogress.ProgressReporter) error {
 	bwlimit := d.Config()["rsync.bwlimit"]
 	var rsyncArgs []string
 
@@ -165,16 +167,16 @@ func genericVFSMigrateVolume(d Driver, s *state.State, vol VolumeCopy, conn io.R
 			return ErrNotSupported
 		}
 	} else if vol.contentType == ContentTypeFS {
-		if !shared.ValueInSlice(volSrcArgs.MigrationType.FSType, []migration.MigrationFSType{migration.MigrationFSType_RSYNC, migration.MigrationFSType_RBD_AND_RSYNC}) {
+		if !slices.Contains([]migration.MigrationFSType{migration.MigrationFSType_RSYNC, migration.MigrationFSType_RBD_AND_RSYNC}, volSrcArgs.MigrationType.FSType) {
 			return ErrNotSupported
 		}
 	}
 
 	// Define function to send a filesystem volume.
 	sendFSVol := func(vol Volume, conn io.ReadWriteCloser, mountPath string) error {
-		var wrapper *ioprogress.ProgressTracker
+		var wrapper ioprogress.ReaderWrapper
 		if volSrcArgs.TrackProgress {
-			wrapper = migration.ProgressTracker(op, "fs_progress", vol.name)
+			wrapper = ioprogress.NewProgressReaderWrapper(ioprogress.WithDescriptiveProgressReporter("fs", vol.name, progressReporter))
 		}
 
 		path := shared.AddSlash(mountPath)
@@ -195,11 +197,6 @@ func genericVFSMigrateVolume(d Driver, s *state.State, vol VolumeCopy, conn io.R
 		// Close when done to indicate to target side we are finished sending this volume.
 		defer func() { _ = conn.Close() }()
 
-		var wrapper *ioprogress.ProgressTracker
-		if volSrcArgs.TrackProgress {
-			wrapper = migration.ProgressTracker(op, "block_progress", vol.name)
-		}
-
 		path, err := d.GetVolumeDiskPath(vol)
 		if err != nil {
 			return fmt.Errorf("Error getting VM block volume disk path: %w", err)
@@ -214,11 +211,8 @@ func genericVFSMigrateVolume(d Driver, s *state.State, vol VolumeCopy, conn io.R
 
 		// Setup progress tracker.
 		fromPipe := io.ReadCloser(from)
-		if wrapper != nil {
-			fromPipe = &ioprogress.ProgressReader{
-				ReadCloser: fromPipe,
-				Tracker:    wrapper,
-			}
+		if volSrcArgs.TrackProgress {
+			fromPipe = ioprogress.NewProgressReader(fromPipe, ioprogress.WithDescriptiveProgressReporter("block", vol.name, progressReporter))
 		}
 
 		d.Logger().Debug("Sending block volume", logger.Ctx{"volName": vol.name, "path": path})
@@ -229,7 +223,7 @@ func genericVFSMigrateVolume(d Driver, s *state.State, vol VolumeCopy, conn io.R
 
 		err = from.Close()
 		if err != nil {
-			return fmt.Errorf("Failed to close file %q: %w", path, err)
+			return fmt.Errorf("Failed closing file %q: %w", path, err)
 		}
 
 		return nil
@@ -253,7 +247,7 @@ func genericVFSMigrateVolume(d Driver, s *state.State, vol VolumeCopy, conn io.R
 		}
 
 		// Send snapshot to target (ensure local snapshot volume is mounted if needed).
-		err := snapVol.MountTask(func(mountPath string, op *operations.Operation) error {
+		err := snapVol.MountTask(func(mountPath string, progressReporter ioprogress.ProgressReporter) error {
 			if vol.contentType != ContentTypeBlock || vol.volType != VolumeTypeCustom {
 				err := sendFSVol(snapVol, conn, mountPath)
 				if err != nil {
@@ -269,14 +263,14 @@ func genericVFSMigrateVolume(d Driver, s *state.State, vol VolumeCopy, conn io.R
 			}
 
 			return nil
-		}, op)
+		}, progressReporter)
 		if err != nil {
 			return err
 		}
 	}
 
 	// Send volume to target (ensure local volume is mounted if needed).
-	return vol.MountTask(func(mountPath string, op *operations.Operation) error {
+	return vol.MountTask(func(mountPath string, progressReporter ioprogress.ProgressReporter) error {
 		if !IsContentBlock(vol.contentType) || vol.volType != VolumeTypeCustom {
 			err := sendFSVol(vol.Volume, conn, mountPath)
 			if err != nil {
@@ -292,18 +286,18 @@ func genericVFSMigrateVolume(d Driver, s *state.State, vol VolumeCopy, conn io.R
 		}
 
 		return nil
-	}, op)
+	}, progressReporter)
 }
 
 // genericVFSCreateVolumeFromMigration receives a volume and its snapshots over a non-optimized method.
 // initVolume is run against the main volume (not the snapshots) and is often used for quota initialization.
-func genericVFSCreateVolumeFromMigration(d Driver, initVolume func(vol Volume) (revert.Hook, error), vol VolumeCopy, conn io.ReadWriteCloser, volTargetArgs migration.VolumeTargetArgs, preFiller *VolumeFiller, op *operations.Operation) (revert.Hook, error) {
+func genericVFSCreateVolumeFromMigration(d Driver, initVolume func(vol Volume) (revert.Hook, error), vol VolumeCopy, conn io.ReadWriteCloser, volTargetArgs migration.VolumeTargetArgs, preFiller *VolumeFiller, progressReporter ioprogress.ProgressReporter) (revert.Hook, error) {
 	// Check migration transport type matches volume type.
 	if IsContentBlock(vol.contentType) {
 		if volTargetArgs.MigrationType.FSType != migration.MigrationFSType_BLOCK_AND_RSYNC {
 			return nil, ErrNotSupported
 		}
-	} else if !shared.ValueInSlice(volTargetArgs.MigrationType.FSType, []migration.MigrationFSType{migration.MigrationFSType_RSYNC, migration.MigrationFSType_RBD_AND_RSYNC}) {
+	} else if !slices.Contains([]migration.MigrationFSType{migration.MigrationFSType_RSYNC, migration.MigrationFSType_RBD_AND_RSYNC}, volTargetArgs.MigrationType.FSType) {
 		return nil, ErrNotSupported
 	}
 
@@ -312,18 +306,18 @@ func genericVFSCreateVolumeFromMigration(d Driver, initVolume func(vol Volume) (
 
 	// Create the main volume if not refreshing.
 	if !volTargetArgs.Refresh {
-		err := d.CreateVolume(vol.Volume, preFiller, op)
+		err := d.CreateVolume(vol.Volume, preFiller, progressReporter)
 		if err != nil {
 			return nil, err
 		}
 
-		revert.Add(func() { _ = d.DeleteVolume(vol.Volume, op) })
+		revert.Add(func() { _ = d.DeleteVolume(vol.Volume, progressReporter) })
 	}
 
 	recvFSVol := func(volName string, conn io.ReadWriteCloser, path string) error {
-		var wrapper *ioprogress.ProgressTracker
+		var wrapper ioprogress.ReaderWrapper
 		if volTargetArgs.TrackProgress {
-			wrapper = migration.ProgressTracker(op, "fs_progress", volName)
+			wrapper = ioprogress.NewProgressReaderWrapper(ioprogress.WithDescriptiveProgressReporter("fs", volName, progressReporter))
 		}
 
 		d.Logger().Debug("Receiving filesystem volume started", logger.Ctx{"volName": volName, "path": path, "features": volTargetArgs.MigrationType.Features})
@@ -333,11 +327,6 @@ func genericVFSCreateVolumeFromMigration(d Driver, initVolume func(vol Volume) (
 	}
 
 	recvBlockVol := func(volName string, conn io.ReadWriteCloser, path string) error {
-		var wrapper *ioprogress.ProgressTracker
-		if volTargetArgs.TrackProgress {
-			wrapper = migration.ProgressTracker(op, "block_progress", volName)
-		}
-
 		to, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0)
 		if err != nil {
 			return fmt.Errorf("Error opening file for writing %q: %w", path, err)
@@ -347,11 +336,8 @@ func genericVFSCreateVolumeFromMigration(d Driver, initVolume func(vol Volume) (
 
 		// Setup progress tracker.
 		fromPipe := io.ReadCloser(conn)
-		if wrapper != nil {
-			fromPipe = &ioprogress.ProgressReader{
-				ReadCloser: fromPipe,
-				Tracker:    wrapper,
-			}
+		if volTargetArgs.TrackProgress {
+			fromPipe = ioprogress.NewProgressReader(fromPipe, ioprogress.WithDescriptiveProgressReporter("block", volName, progressReporter))
 		}
 
 		d.Logger().Debug("Receiving block volume started", logger.Ctx{"volName": volName, "path": path})
@@ -366,7 +352,7 @@ func genericVFSCreateVolumeFromMigration(d Driver, initVolume func(vol Volume) (
 	}
 
 	// Ensure the volume is mounted.
-	err := vol.MountTask(func(mountPath string, op *operations.Operation) error {
+	err := vol.MountTask(func(mountPath string, progressReporter ioprogress.ProgressReporter) error {
 		var err error
 
 		// Setup paths to the main volume. We will receive each snapshot to these paths and then create
@@ -415,14 +401,14 @@ func genericVFSCreateVolumeFromMigration(d Driver, initVolume func(vol Volume) (
 
 			// Create the snapshot itself.
 			d.Logger().Debug("Creating snapshot", logger.Ctx{"volName": snapVol.Name()})
-			err = d.CreateVolumeSnapshot(snapVol, op)
+			err = d.CreateVolumeSnapshot(snapVol, progressReporter)
 			if err != nil {
 				return err
 			}
 
 			// Setup the revert.
 			revert.Add(func() {
-				_ = d.DeleteVolumeSnapshot(snapVol, op)
+				_ = d.DeleteVolumeSnapshot(snapVol, progressReporter)
 			})
 		}
 
@@ -467,7 +453,7 @@ func genericVFSCreateVolumeFromMigration(d Driver, initVolume func(vol Volume) (
 		}
 
 		return nil
-	}, op)
+	}, progressReporter)
 	if err != nil {
 		return nil, err
 	}
@@ -501,10 +487,10 @@ func genericVFSGetVolumeDiskPath(vol Volume) (string, error) {
 }
 
 // genericVFSBackupVolume is a generic BackupVolume implementation for VFS-only drivers.
-func genericVFSBackupVolume(d Driver, vol VolumeCopy, tarWriter *instancewriter.InstanceTarWriter, snapshots []string, op *operations.Operation) error {
+func genericVFSBackupVolume(d Driver, vol VolumeCopy, tarWriter *instancewriter.InstanceTarWriter, snapshots []string, progressReporter ioprogress.ProgressReporter) error {
 	if len(snapshots) > 0 {
 		// Check requested snapshot match those in storage.
-		err := d.CheckVolumeSnapshots(vol.Volume, vol.Snapshots, op)
+		err := d.CheckVolumeSnapshots(vol.Volume, vol.Snapshots)
 		if err != nil {
 			return err
 		}
@@ -512,9 +498,14 @@ func genericVFSBackupVolume(d Driver, vol VolumeCopy, tarWriter *instancewriter.
 
 	// Define a function that can copy a volume into the backup target location.
 	backupVolume := func(v Volume, prefix string) error {
-		return v.MountTask(func(mountPath string, op *operations.Operation) error {
+		return v.MountTask(func(mountPath string, progressReporter ioprogress.ProgressReporter) error {
 			// Reset hard link cache as we are copying a new volume (instance or snapshot).
 			tarWriter.ResetHardLinkMap()
+
+			// Never include the backup config in the tarball.
+			alwaysExcludedPaths := []string{
+				filepath.Join(mountPath, "backup.yaml"),
+			}
 
 			if v.contentType != ContentTypeBlock {
 				logMsg := "Copying container filesystem volume"
@@ -543,6 +534,11 @@ func genericVFSBackupVolume(d Driver, vol VolumeCopy, tarWriter *instancewriter.
 						}
 
 						return fmt.Errorf("Error walking file during export: %q: %w", srcPath, err)
+					}
+
+					// Skip any excluded files.
+					if shared.StringHasPrefix(srcPath, alwaysExcludedPaths...) {
+						return nil
 					}
 
 					name := filepath.Join(prefix, strings.TrimPrefix(srcPath, mountPath))
@@ -585,14 +581,16 @@ func genericVFSBackupVolume(d Driver, vol VolumeCopy, tarWriter *instancewriter.
 			if v.IsVMBlock() {
 				logMsg := "Copying virtual machine config volume"
 
+				combinedExcludedPaths := append(exclude, alwaysExcludedPaths...)
+
 				d.Logger().Debug(logMsg, logger.Ctx{"sourcePath": mountPath, "prefix": prefix})
 				err = filepath.Walk(mountPath, func(srcPath string, fi os.FileInfo, err error) error {
 					if err != nil {
 						return err
 					}
 
-					// Skip any exluded files.
-					if shared.StringHasPrefix(srcPath, exclude...) {
+					// Skip any excluded files.
+					if shared.StringHasPrefix(srcPath, combinedExcludedPaths...) {
 						return nil
 					}
 
@@ -609,7 +607,7 @@ func genericVFSBackupVolume(d Driver, vol VolumeCopy, tarWriter *instancewriter.
 				}
 			}
 
-			name := fmt.Sprintf("%s.%s", prefix, genericVolumeBlockExtension)
+			name := prefix + "." + genericVolumeBlockExtension
 
 			logMsg := "Copying virtual machine block volume"
 			if vol.volType == VolumeTypeCustom {
@@ -638,11 +636,11 @@ func genericVFSBackupVolume(d Driver, vol VolumeCopy, tarWriter *instancewriter.
 
 			err = from.Close()
 			if err != nil {
-				return fmt.Errorf("Failed to close file %q: %w", blockPath, err)
+				return fmt.Errorf("Failed closing file %q: %w", blockPath, err)
 			}
 
 			return nil
-		}, op)
+		}, progressReporter)
 	}
 
 	// Handle snapshots.
@@ -699,7 +697,7 @@ func genericVFSBackupVolume(d Driver, vol VolumeCopy, tarWriter *instancewriter.
 // created and a revert function that can be used to undo the actions this function performs should something
 // subsequently fail. For VolumeTypeCustom volumes, a nil post hook is returned as it is expected that the DB
 // record be created before the volume is unpacked due to differences in the archive format that allows this.
-func genericVFSBackupUnpack(d Driver, sysOS *sys.OS, vol VolumeCopy, snapshots []string, srcData io.ReadSeeker, op *operations.Operation) (VolumePostHook, revert.Hook, error) {
+func genericVFSBackupUnpack(d Driver, s *state.State, vol VolumeCopy, snapshots []string, srcData io.ReadSeeker, progressReporter ioprogress.ProgressReporter) (VolumePostHook, revert.Hook, error) {
 	// Define function to unpack a volume from a backup tarball file.
 	unpackVolume := func(r io.ReadSeeker, tarArgs []string, unpacker []string, srcPrefix string, mountPath string) error {
 		volTypeName := "container"
@@ -720,7 +718,7 @@ func genericVFSBackupUnpack(d Driver, sysOS *sys.OS, vol VolumeCopy, snapshots [
 		// Custom block volumes do not have a filesystem component to their volumes.
 		if !vol.IsCustomBlock() {
 			// Prepare tar arguments.
-			srcParts := strings.Split(srcPrefix, string(os.PathSeparator))
+			numSrcParts := strings.Count(srcPrefix, string(os.PathSeparator)) + 1
 			args := append(tarArgs, []string{
 				"-",
 				"--xattrs-include=*",
@@ -735,18 +733,18 @@ func genericVFSBackupUnpack(d Driver, sysOS *sys.OS, vol VolumeCopy, snapshots [
 				// directory's ownership from the backup. We cannot use --strip-components flag because it
 				// removes the top level directory from the unpack list. Instead we use the --transform
 				// flag to remove the prefix path and transform it into the "." current unpack directory.
-				args = append(args, fmt.Sprintf("--transform=s/^%s/./", strings.ReplaceAll(srcPrefix, "/", `\/`)))
+				args = append(args, "--transform=s/^"+strings.ReplaceAll(srcPrefix, "/", `\/`)+"/./")
 			} else {
 				// For instance volumes, the user created files are stored in the rootfs sub-directory
 				// and so strip-components flag works fine.
-				args = append(args, fmt.Sprintf("--strip-components=%d", len(srcParts)))
+				args = append(args, "--strip-components="+strconv.Itoa(numSrcParts))
 			}
 
 			// Directory to unpack comes after other options.
 			args = append(args, srcPrefix)
 
 			// Extract filesystem volume.
-			d.Logger().Debug(fmt.Sprintf("Unpacking %s filesystem volume", volTypeName), logger.Ctx{"source": srcPrefix, "target": mountPath, "args": fmt.Sprintf("%+v", args)})
+			d.Logger().Debug("Unpacking "+volTypeName+" filesystem volume", logger.Ctx{"source": srcPrefix, "target": mountPath, "args": fmt.Sprintf("%+v", args)})
 			_, err := srcData.Seek(0, io.SeekStart)
 			if err != nil {
 				return err
@@ -764,9 +762,18 @@ func genericVFSBackupUnpack(d Driver, sysOS *sys.OS, vol VolumeCopy, snapshots [
 				allowedCmds = append(allowedCmds, unpacker[0])
 			}
 
-			err = archive.ExtractWithFds("tar", args, allowedCmds, io.NopCloser(r), sysOS, f)
+			err = archive.ExtractWithFds(s, "tar", args, allowedCmds, io.NopCloser(r), f)
 			if err != nil {
 				return fmt.Errorf("Error starting unpack: %w", err)
+			}
+
+			if vol.Type() != VolumeTypeCustom {
+				// Check if none of the metadata files are symlinks.
+				// This blocks using backups which reference external files.
+				err = archive.CheckMetadataFilesAreRegular(mountPath)
+				if err != nil {
+					return err
+				}
 			}
 		}
 
@@ -777,9 +784,9 @@ func genericVFSBackupUnpack(d Driver, sysOS *sys.OS, vol VolumeCopy, snapshots [
 				return err
 			}
 
-			srcFile := fmt.Sprintf("%s.%s", srcPrefix, genericVolumeBlockExtension)
+			srcFile := srcPrefix + "." + genericVolumeBlockExtension
 
-			tr, cancelFunc, err := archive.CompressedTarReader(context.Background(), r, unpacker, sysOS, mountPath)
+			tr, cancelFunc, err := archive.CompressedTarReader(s, context.Background(), r, unpacker, mountPath)
 			if err != nil {
 				return err
 			}
@@ -803,7 +810,7 @@ func genericVFSBackupUnpack(d Driver, sysOS *sys.OS, vol VolumeCopy, snapshots [
 				// Allow potentially destructive resize of volume as we are going to be
 				// overwriting it entirely anyway. This allows shrinking of block volumes.
 				allowUnsafeResize = true
-				err = d.SetVolumeQuota(vol.Volume, fmt.Sprintf("%d", size), allowUnsafeResize, op)
+				err = d.SetVolumeQuota(vol.Volume, strconv.FormatInt(size, 10), allowUnsafeResize, progressReporter)
 				if err != nil {
 					return err
 				}
@@ -864,7 +871,7 @@ func genericVFSBackupUnpack(d Driver, sysOS *sys.OS, vol VolumeCopy, snapshots [
 	}
 
 	if volExists {
-		return nil, nil, fmt.Errorf("Cannot restore volume, already exists on target")
+		return nil, nil, errors.New("Cannot restore volume, already exists on target")
 	}
 
 	// Create new empty volume.
@@ -873,7 +880,7 @@ func genericVFSBackupUnpack(d Driver, sysOS *sys.OS, vol VolumeCopy, snapshots [
 		return nil, nil, err
 	}
 
-	revert.Add(func() { _ = d.DeleteVolume(vol.Volume, op) })
+	revert.Add(func() { _ = d.DeleteVolume(vol.Volume, progressReporter) })
 
 	if len(snapshots) > 0 {
 		// Create new snapshots directory.
@@ -891,6 +898,12 @@ func genericVFSBackupUnpack(d Driver, sysOS *sys.OS, vol VolumeCopy, snapshots [
 	}
 
 	for _, snapName := range snapshots {
+		// Defend against path traversal attacks.
+		err := instancetype.ValidSnapName(snapName)
+		if err != nil {
+			return nil, nil, fmt.Errorf("Invalid snapshot name %q: %w", snapName, err)
+		}
+
 		found := false
 		var snapVol Volume
 		for _, snapshot := range vol.Snapshots {
@@ -906,29 +919,29 @@ func genericVFSBackupUnpack(d Driver, sysOS *sys.OS, vol VolumeCopy, snapshots [
 			return nil, nil, fmt.Errorf("Snapshot %q missing in volume's list", snapName)
 		}
 
-		err = vol.MountTask(func(mountPath string, op *operations.Operation) error {
-			backupSnapshotPrefix := fmt.Sprintf("%s/%s", backupSnapshotsPrefix, snapName)
+		err = vol.MountTask(func(mountPath string, progressReporter ioprogress.ProgressReporter) error {
+			backupSnapshotPrefix := backupSnapshotsPrefix + "/" + snapName
 			return unpackVolume(srcData, tarArgs, unpacker, backupSnapshotPrefix, mountPath)
-		}, op)
+		}, progressReporter)
 		if err != nil {
 			return nil, nil, err
 		}
 
 		d.Logger().Debug("Creating volume snapshot", logger.Ctx{"snapshotName": snapVol.Name()})
-		err = d.CreateVolumeSnapshot(snapVol, op)
+		err = d.CreateVolumeSnapshot(snapVol, progressReporter)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		revert.Add(func() { _ = d.DeleteVolumeSnapshot(snapVol, op) })
+		revert.Add(func() { _ = d.DeleteVolumeSnapshot(snapVol, progressReporter) })
 	}
 
-	err = d.MountVolume(vol.Volume, op)
+	err = d.MountVolume(vol.Volume, progressReporter)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	revert.Add(func() { _, _ = d.UnmountVolume(vol.Volume, false, op) })
+	revert.Add(func() { _, _ = d.UnmountVolume(vol.Volume, false, progressReporter) })
 
 	backupPrefix := "backup/container"
 	if vol.IsVMBlock() {
@@ -959,7 +972,7 @@ func genericVFSBackupUnpack(d Driver, sysOS *sys.OS, vol VolumeCopy, snapshots [
 		// backup restoration process). Create a post hook function that will be called at the end of the
 		// backup restore process to unmount the volume if needed.
 		postHook = func(vol Volume) error {
-			_, err = d.UnmountVolume(vol, false, op)
+			_, err = d.UnmountVolume(vol, false, progressReporter)
 			if err != nil {
 				return err
 			}
@@ -968,7 +981,7 @@ func genericVFSBackupUnpack(d Driver, sysOS *sys.OS, vol VolumeCopy, snapshots [
 		}
 	} else {
 		// For custom volumes unmount now, there is no post hook as there is no backup.yaml to generate.
-		_, err = d.UnmountVolume(vol.Volume, false, op)
+		_, err = d.UnmountVolume(vol.Volume, false, progressReporter)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -979,9 +992,9 @@ func genericVFSBackupUnpack(d Driver, sysOS *sys.OS, vol VolumeCopy, snapshots [
 
 // genericVFSCopyVolume copies a volume and its snapshots using a non-optimized method.
 // initVolume is run against the main volume (not the snapshots) and is often used for quota initialization.
-func genericVFSCopyVolume(d Driver, initVolume func(vol Volume) (revert.Hook, error), vol VolumeCopy, srcVol VolumeCopy, refreshSnapshots []string, refresh bool, allowInconsistent bool, op *operations.Operation) (revert.Hook, error) {
+func genericVFSCopyVolume(d Driver, initVolume func(vol Volume) (revert.Hook, error), vol VolumeCopy, srcVol VolumeCopy, refreshSnapshots []string, refresh bool, allowInconsistent bool, progressReporter ioprogress.ProgressReporter) (revert.Hook, error) {
 	if vol.contentType != srcVol.contentType {
-		return nil, fmt.Errorf("Content type of source and target must be the same")
+		return nil, errors.New("Content type of source and target must be the same")
 	}
 
 	bwlimit := d.Config()["rsync.bwlimit"]
@@ -997,12 +1010,12 @@ func genericVFSCopyVolume(d Driver, initVolume func(vol Volume) (revert.Hook, er
 
 	// Create the main volume if not refreshing.
 	if !refresh {
-		err := d.CreateVolume(vol.Volume, nil, op)
+		err := d.CreateVolume(vol.Volume, nil, progressReporter)
 		if err != nil {
 			return nil, err
 		}
 
-		revert.Add(func() { _ = d.DeleteVolume(vol.Volume, op) })
+		revert.Add(func() { _ = d.DeleteVolume(vol.Volume, progressReporter) })
 	}
 
 	// Define function to send a filesystem volume.
@@ -1040,7 +1053,7 @@ func genericVFSCopyVolume(d Driver, initVolume func(vol Volume) (revert.Hook, er
 	}
 
 	// Ensure the volume is mounted.
-	err := vol.MountTask(func(targetMountPath string, op *operations.Operation) error {
+	err := vol.MountTask(func(targetMountPath string, progressReporter ioprogress.ProgressReporter) error {
 		// If copying snapshots is indicated, check the source isn't itself a snapshot.
 		if len(refreshSnapshots) > 0 && !srcVol.IsSnapshot() {
 			for _, refreshSnapshot := range refreshSnapshots {
@@ -1048,7 +1061,7 @@ func genericVFSCopyVolume(d Driver, initVolume func(vol Volume) (revert.Hook, er
 				// A snapshot will then be taken next so it is stored in the correct volume and
 				// subsequent filesystem rsync transfers benefit from only transferring the files
 				// that changed between snapshots.
-				err := srcVol.MountTask(func(srcMountPath string, op *operations.Operation) error {
+				err := srcVol.MountTask(func(srcMountPath string, progressReporter ioprogress.ProgressReporter) error {
 					if srcVol.contentType != ContentTypeBlock || srcVol.volType != VolumeTypeCustom {
 						err := sendFSVol(srcMountPath, targetMountPath)
 						if err != nil {
@@ -1064,7 +1077,7 @@ func genericVFSCopyVolume(d Driver, initVolume func(vol Volume) (revert.Hook, er
 					}
 
 					return nil
-				}, op)
+				}, progressReporter)
 				if err != nil {
 					return err
 				}
@@ -1086,14 +1099,14 @@ func genericVFSCopyVolume(d Driver, initVolume func(vol Volume) (revert.Hook, er
 
 				// Create the snapshot itself.
 				d.Logger().Debug("Creating snapshot", logger.Ctx{"volName": snapVol.Name()})
-				err = d.CreateVolumeSnapshot(snapVol, op)
+				err = d.CreateVolumeSnapshot(snapVol, progressReporter)
 				if err != nil {
 					return err
 				}
 
 				// Setup the revert.
 				revert.Add(func() {
-					_ = d.DeleteVolumeSnapshot(snapVol, op)
+					_ = d.DeleteVolumeSnapshot(snapVol, progressReporter)
 				})
 			}
 		}
@@ -1107,7 +1120,7 @@ func genericVFSCopyVolume(d Driver, initVolume func(vol Volume) (revert.Hook, er
 		}
 
 		// Copy source to destination (mounting each volume if needed).
-		err := srcVol.MountTask(func(srcMountPath string, op *operations.Operation) error {
+		err := srcVol.MountTask(func(srcMountPath string, progressReporter ioprogress.ProgressReporter) error {
 			if srcVol.contentType != ContentTypeBlock || srcVol.volType != VolumeTypeCustom {
 				err := sendFSVol(srcMountPath, targetMountPath)
 				if err != nil {
@@ -1123,7 +1136,7 @@ func genericVFSCopyVolume(d Driver, initVolume func(vol Volume) (revert.Hook, er
 			}
 
 			return nil
-		}, op)
+		}, progressReporter)
 		if err != nil {
 			return err
 		}
@@ -1136,7 +1149,7 @@ func genericVFSCopyVolume(d Driver, initVolume func(vol Volume) (revert.Hook, er
 		}
 
 		return nil
-	}, op)
+	}, progressReporter)
 	if err != nil {
 		return nil, err
 	}
@@ -1154,14 +1167,14 @@ func genericVFSListVolumes(d Driver) ([]Volume, error) {
 	poolMountPath := GetPoolMountPath(poolName)
 
 	for _, volType := range d.Info().VolumeTypes {
-		if len(BaseDirectories[volType]) < 1 {
+		if len(BaseDirectories[volType].Paths) < 1 {
 			return nil, fmt.Errorf("Cannot get base directory name for volume type %q", volType)
 		}
 
-		volTypePath := filepath.Join(poolMountPath, BaseDirectories[volType][0])
+		volTypePath := filepath.Join(poolMountPath, BaseDirectories[volType].Paths[0])
 		ents, err := os.ReadDir(volTypePath)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to list directory %q for volume type %q: %w", volTypePath, volType, err)
+			return nil, fmt.Errorf("Failed listing directory %q for volume type %q: %w", volTypePath, volType, err)
 		}
 
 		for _, ent := range ents {
@@ -1184,4 +1197,139 @@ func genericVFSListVolumes(d Driver) ([]Volume, error) {
 	}
 
 	return vols, nil
+}
+
+type getVolumePathFunc func(Volume, bool) (string, revert.Hook, error)
+type volumeUnmapFunc func(vol Volume) error
+
+// mountVolume mounts a volume and increments ref counter. Please use unmountVolume() helper when done with the volume.
+func mountVolume(d Driver, vol Volume, getDevicePath getVolumePathFunc, progressReporter ioprogress.ProgressReporter) error {
+	unlock, err := vol.MountLock()
+	if err != nil {
+		return err
+	}
+
+	defer unlock()
+
+	revert := revert.New()
+	defer revert.Fail()
+
+	// Activate volume if needed.
+	volDevPath, cleanup, err := getDevicePath(vol, !vol.MountInUse())
+	if err != nil {
+		return err
+	}
+
+	revert.Add(cleanup)
+
+	switch vol.contentType {
+	case ContentTypeFS:
+		mountPath := vol.MountPath()
+		if !filesystem.IsMountPoint(mountPath) {
+			err = vol.EnsureMountPath()
+			if err != nil {
+				return err
+			}
+
+			fsType := vol.ConfigBlockFilesystem()
+
+			if vol.mountFilesystemProbe {
+				fsType, err = block.DiskFSType(volDevPath)
+				if err != nil {
+					return fmt.Errorf("Failed probing filesystem: %w", err)
+				}
+			}
+
+			mountFlags, mountOptions := filesystem.ResolveMountOptions(strings.Split(vol.ConfigBlockMountOptions(), ","))
+			err = TryMount(context.TODO(), volDevPath, mountPath, fsType, mountFlags, mountOptions)
+			if err != nil {
+				return err
+			}
+
+			d.Logger().Debug("Mounted volume", logger.Ctx{"volName": vol.name, "dev": volDevPath, "path": mountPath, "options": mountOptions})
+		}
+
+	case ContentTypeBlock:
+		// For VMs, mount the filesystem volume.
+		if vol.IsVMBlock() {
+			fsVol := vol.NewVMBlockFilesystemVolume()
+			err := d.MountVolume(fsVol, progressReporter)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	vol.MountRefCountIncrement() // From here on it is up to caller to call unmountVolume() when done.
+	revert.Success()
+	return nil
+}
+
+func unmountVolume(d Driver, vol Volume, keepBlockDev bool, getDevicePath getVolumePathFunc, unmapVolume volumeUnmapFunc, progressReporter ioprogress.ProgressReporter) (bool, error) {
+	l := d.Logger().AddContext(logger.Ctx{"volName": vol.name})
+	unlock, err := vol.MountLock()
+	if err != nil {
+		return false, err
+	}
+
+	defer unlock()
+
+	ourUnmount := false
+	mountPath := vol.MountPath()
+	refCount := vol.MountRefCountDecrement()
+
+	// Attempt to unmount the volume.
+	if vol.contentType == ContentTypeFS && filesystem.IsMountPoint(mountPath) {
+		if refCount > 0 {
+			l.Debug("Skipping unmount as in use", logger.Ctx{"refCount": refCount})
+			return false, ErrInUse
+		}
+
+		err := TryUnmount(mountPath, unix.MNT_DETACH)
+		if err != nil {
+			return false, err
+		}
+
+		l.Debug("Unmounted volume", logger.Ctx{"path": mountPath, "keepBlockDev": keepBlockDev})
+
+		// Attempt to unmap.
+		if !keepBlockDev {
+			err = unmapVolume(vol)
+			if err != nil {
+				return false, err
+			}
+		}
+
+		ourUnmount = true
+	} else if IsContentBlock(vol.contentType) {
+		// For VMs, unmount the filesystem volume.
+		if vol.IsVMBlock() {
+			fsVol := vol.NewVMBlockFilesystemVolume()
+			ourUnmount, err = d.UnmountVolume(fsVol, false, progressReporter)
+			if err != nil {
+				return false, err
+			}
+		}
+
+		if !keepBlockDev {
+			// Check if device is currently mapped (but don't map if not).
+			devPath, _, _ := getDevicePath(vol, false)
+			if devPath != "" && shared.PathExists(devPath) {
+				if refCount > 0 {
+					l.Debug("Skipping unmount as in use", logger.Ctx{"refCount": refCount})
+					return false, ErrInUse
+				}
+
+				// Attempt to unmap.
+				err := unmapVolume(vol)
+				if err != nil {
+					return false, err
+				}
+
+				ourUnmount = true
+			}
+		}
+	}
+
+	return ourUnmount, nil
 }

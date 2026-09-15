@@ -1,7 +1,5 @@
 _ensure_removed() {
-  bad=0
-  lxc exec foo -- stat /dev/ttyS0 && bad=1
-  if [ "${bad}" -eq 1 ]; then
+  if lxc exec foo -- stat /dev/ttyS0; then
     echo "device should have been removed; $*"
     false
   fi
@@ -43,32 +41,24 @@ _unix_devs() {
 }
 
 _ensure_fs_unmounted() {
-  bad=0
-  lxc exec foo -- stat /mnt/hello && bad=1
-  if [ "${bad}" -eq 1 ]; then
+  if lxc exec foo -- mountpoint /mnt/hello; then
     echo "device should have been removed; $*"
     false
   fi
 }
 
 _loop_mounts() {
-  loopfile=$(mktemp -p "${TEST_DIR}" loop_XXX)
-  dd if=/dev/zero of="${loopfile}" bs=1M seek=200 count=1
-  mkfs.ext4 -F "${loopfile}"
+  configure_loop_device loop_file_1 loop_device_1
 
-  lpath=$(losetup --show -f "${loopfile}")
-  if [ ! -e "${lpath}" ]; then
-    echo "failed to setup loop"
-    false
-  fi
-  echo "${lpath}" >> "${TEST_DIR}/loops"
+  # shellcheck disable=SC2154
+  mkfs.ext4 -E assume_storage_prezeroed=1 -m0 -F "${loop_device_1}"
 
   mkdir -p "${TEST_DIR}/mnt"
-  mount "${lpath}" "${TEST_DIR}/mnt" || { echo "loop mount failed"; return; }
+  mount "${loop_device_1}" "${TEST_DIR}/mnt"
   touch "${TEST_DIR}/mnt/hello"
   umount -l "${TEST_DIR}/mnt"
   lxc start foo
-  lxc config device add foo mnt disk source="${lpath}" path=/mnt
+  lxc config device add foo mnt disk source="${loop_device_1}" path=/mnt
   lxc exec foo -- stat /mnt/hello
   # Note - we need to add a set_running_config_item to lxc
   # or work around its absence somehow.  Once that's done, we
@@ -82,8 +72,9 @@ _loop_mounts() {
   lxc restart foo --force
   _ensure_fs_unmounted "removed fs re-appeared after restart"
   lxc stop foo --force
-  losetup -d "${lpath}"
-  sed -i "\\|^${lpath}|d" "${TEST_DIR}/loops"
+
+  # shellcheck disable=SC2154
+  deconfigure_loop_device "${loop_file_1}" "${loop_device_1}"
 }
 
 _mount_order() {
@@ -102,10 +93,13 @@ _mount_order() {
   lxc start foo
   lxc exec foo -- cat /mnt/empty/filler
   lxc stop foo --force
+
+  rm -rf "${TEST_DIR}/order"
 }
 
 test_config_profiles() {
   # Unset LXD_DEVMONITOR_DIR as this test uses devices in /dev instead of TEST_DIR.
+  local OLD_LXD_DEVMONITOR_DIR="${LXD_DEVMONITOR_DIR}"
   unset LXD_DEVMONITOR_DIR
   shutdown_lxd "${LXD_DIR}"
   respawn_lxd "${LXD_DIR}" true
@@ -115,46 +109,43 @@ test_config_profiles() {
   lxc init testimage foo -s "lxdtest-$(basename "${LXD_DIR}")"
   lxc profile list | grep default
 
-  # let's check that 'lxc config profile' still works while it's deprecated
-  lxc config profile list | grep default
-
   # setting an invalid config item should error out when setting it, not get
   # into the database and never let the user edit the container again.
   ! lxc config set foo raw.lxc lxc.notaconfigkey=invalid || false
 
   # validate unsets
   lxc profile set default user.foo bar
-  lxc profile show default | grep -q user.foo
+  lxc profile show default | grep -F user.foo
   lxc profile unset default user.foo
-  ! lxc profile show default | grep -q user.foo || false
+  ! lxc profile show default | grep -F user.foo || false
 
   lxc profile device set default eth0 limits.egress 100Mbit
-  lxc profile show default | grep -q limits.egress
+  lxc profile show default | grep -F limits.egress
   lxc profile device unset default eth0 limits.egress
-  ! lxc profile show default | grep -q limits.egress || false
+  ! lxc profile show default | grep -F limits.egress || false
 
   # check that various profile application mechanisms work
   lxc profile create one
   lxc profile create two
   lxc profile assign foo one,two
-  [ "$(lxc list -f json foo | jq -r '.[0].profiles | join(" ")')" = "one two" ]
+  lxc list -f json foo | jq --exit-status '.[0].profiles == ["one","two"]'
   lxc profile assign foo ""
-  [ "$(lxc list -f json foo | jq -r '.[0].profiles | join(" ")')" = "" ]
+  lxc list -f json foo | jq --exit-status '.[0].profiles == []'
   lxc profile apply foo one # backwards compat check with `lxc profile apply`
-  [ "$(lxc list -f json foo | jq -r '.[0].profiles | join(" ")')" = "one" ]
+  lxc list -f json foo | jq --exit-status '.[0].profiles == ["one"]'
   lxc profile assign foo ""
   lxc profile add foo one
-  [ "$(lxc list -f json foo | jq -r '.[0].profiles | join(" ")')" = "one" ]
+  lxc list -f json foo | jq --exit-status '.[0].profiles == ["one"]'
   lxc profile remove foo one
-  [ "$(lxc list -f json foo | jq -r '.[0].profiles | join(" ")')" = "" ]
+  lxc list -f json foo | jq --exit-status '.[0].profiles == []'
 
   lxc profile create stdintest
   echo "BADCONF" | lxc profile set stdintest user.user_data -
-  lxc profile show stdintest | grep BADCONF
+  lxc profile show stdintest | grep -wF BADCONF
   lxc profile delete stdintest
 
   echo "BADCONF" | lxc config set foo user.user_data -
-  lxc config show foo | grep BADCONF
+  lxc config show foo | grep -wF BADCONF
   lxc config unset foo user.user_data
 
   mkdir -p "${TEST_DIR}/mnt1"
@@ -171,64 +162,63 @@ test_config_profiles() {
   # test profile rename
   lxc profile create foo
   lxc profile rename foo bar
-  lxc profile list | grep -qv foo  # the old name is gone
+  ! lxc profile list | grep -wF foo || false  # the old name is gone
   lxc profile delete bar
 
-  lxc config device list foo | grep mnt1
-  lxc config device show foo | grep "/mnt1"
-  lxc config show foo | grep "onenic" -A1 | grep "unconfined"
-  lxc profile list | grep onenic
-  lxc profile device list onenic | grep eth0
-  lxc profile device show onenic | grep p2p
+  [ "$(lxc config device get foo mnt1 path)" = "/mnt1" ]
+  [ "$(lxc config get --property foo profiles)" = "[onenic unconfined]" ]
+  lxc profile list | grep -wF onenic
+  [ "$(lxc profile device get onenic eth0 nictype)" = "p2p" ]
+
+  # test setting limits.cpu.pin_strategy at the local config and profile level
+  ! lxc config set foo limits.cpu.pin_strategy=auto || false
+  [ "$(lxc config get foo limits.cpu.pin_strategy || echo fail)" = "" ]
+  lxc profile set default limits.cpu.pin_strategy=auto
+  ! lxc profile set default limits.cpu=1-2 || false # test adding a cpu limit with limits.cpu.pin_strategy set (should fail)
+  lxc profile unset default limits.cpu.pin_strategy
 
   # test live-adding a nic
   veth_host_name="veth$$"
   lxc start foo
-  lxc exec foo -- cat /proc/self/mountinfo | grep -q "/mnt1.*ro,"
-  ! lxc config show foo | grep -q "raw.lxc" || false
-  lxc config show foo --expanded | grep -q "raw.lxc"
-  ! lxc config show foo | grep -v "volatile.eth0" | grep -q "eth0" || false
-  lxc config show foo --expanded | grep -v "volatile.eth0" | grep -q "eth0"
+  lxc exec foo -- grep "/mnt1.*ro," /proc/self/mountinfo
+  ! lxc config show foo | grep -F "raw.lxc" || false
+  lxc config show foo --expanded | grep -F "raw.lxc"
+  ! lxc config show foo | grep -vF "volatile.eth0" | grep -wF "eth0" || false
+  lxc config show foo --expanded | grep -vF "volatile.eth0" | grep -wF "eth0"
   lxc config device add foo eth2 nic nictype=p2p name=eth10 host_name="${veth_host_name}"
-  lxc exec foo -- /sbin/ifconfig -a | grep eth0
-  lxc exec foo -- /sbin/ifconfig -a | grep eth10
-  lxc config device list foo | grep eth2
+  lxc exec foo -- ip link | grep -wF eth0
+  lxc exec foo -- ip link | grep -wF eth10
+  lxc config device list foo | grep -wF eth2
   lxc config device remove foo eth2
 
   # test live-adding a disk
   mkdir "${TEST_DIR}/mnt2"
   touch "${TEST_DIR}/mnt2/hosts"
   lxc config device add foo mnt2 disk source="${TEST_DIR}/mnt2" path=/mnt2 readonly=true
-  lxc exec foo -- cat /proc/self/mountinfo | grep -q "/mnt2.*ro,"
+  lxc exec foo -- grep "/mnt2.*ro," /proc/self/mountinfo
   lxc exec foo -- ls /mnt2/hosts
-  lxc stop foo --force
-  lxc start foo
+  lxc restart --force foo
   lxc exec foo -- ls /mnt2/hosts
   lxc config device remove foo mnt2
   ! lxc exec foo -- ls /mnt2/hosts || false
-  lxc stop foo --force
-  lxc start foo
+  lxc restart --force foo
   ! lxc exec foo -- ls /mnt2/hosts || false
   lxc stop foo --force
 
   lxc config set foo user.prop value
-  lxc list user.prop=value | grep foo
+  [ "$(lxc list -f csv -c n user.prop=value)" = "foo" ]
   lxc config unset foo user.prop
 
   # Test for invalid raw.lxc
   ! lxc config set foo raw.lxc a || false
   ! lxc profile set default raw.lxc a || false
 
-  bad=0
-  lxc list user.prop=value | grep foo && bad=1
-  if [ "${bad}" -eq 1 ]; then
+  if [ "$(lxc list -f csv -c n user.prop=value)" != "" ]; then
     echo "property unset failed"
     false
   fi
 
-  bad=0
-  lxc config set foo user.prop 2>/dev/null && bad=1
-  if [ "${bad}" -eq 1 ]; then
+  if lxc config set foo user.prop 2>/dev/null; then
     echo "property set succeeded when it shouldn't have"
     false
   fi
@@ -238,7 +228,7 @@ test_config_profiles() {
   [ "$(lxc config get core.metrics_authentication)" = "false" ]
 
   lxc config unset core.metrics_authentication
-  [ -z "$(lxc config get core.metrics_authentication)" ]
+  [ -z "$(lxc config get core.metrics_authentication || echo fail)" ]
 
   # Validate user.* keys
   ! lxc config set user.⍾ foo || false
@@ -253,39 +243,42 @@ test_config_profiles() {
 
   lxc delete foo
 
-  lxc init testimage foo -s "lxdtest-$(basename "${LXD_DIR}")"
-  lxc profile assign foo onenic,unconfined
-  lxc start foo
+  rm -rf "${TEST_DIR}/mnt1"
+  rm -rf "${TEST_DIR}/mnt2"
 
-  if [ -e /sys/module/apparmor ]; then
-    [ "$(lxc exec foo -- cat /proc/self/attr/current)" = "unconfined" ]
-  fi
-  lxc exec foo -- ls /sys/class/net | grep eth0
+  lxc launch testimage foo -s "lxdtest-$(basename "${LXD_DIR}")" -p onenic -p unconfined
 
-  lxc stop foo --force
-  lxc delete foo
+  [ "$(lxc exec foo -- cat /proc/self/attr/current)" = "unconfined" ]
+  lxc exec foo -- ls /sys/class/net | grep -wF eth0
+
+  lxc delete --force foo
+
+  # Restore LXD_DEVMONITOR_DIR
+  LXD_DEVMONITOR_DIR="${OLD_LXD_DEVMONITOR_DIR}"
 }
 
 
 test_config_edit() {
+    local unbuffer=""
     if ! tty -s; then
-        echo "==> SKIP: test_config_edit requires a terminal"
-        return
+        unbuffer="$(command -v unbuffer)"
+        if [ -z "${unbuffer}" ]; then
+            export TEST_UNMET_REQUIREMENT="Requires a terminal or 'unbuffer' command"
+            return 0
+        fi
     fi
 
-    ensure_import_testimage
-
-    lxc init testimage foo -s "lxdtest-$(basename "${LXD_DIR}")"
+    lxc init --empty foo
+    lxc config set foo --property description="hello"
     lxc config show foo | sed 's/^description:.*/description: bar/' | lxc config edit foo
-    lxc config show foo | grep -q 'description: bar'
+    [ "$(lxc config get foo --property description)" = "bar" ]
 
     # Check instance name is included in edit screen.
-    cmd=$(unset -f lxc; command -v lxc)
-    output=$(EDITOR="cat" timeout --foreground 120 "${cmd}" config edit foo)
-    echo "${output}" | grep "name: foo"
+    output=$(EDITOR="cat" ${unbuffer} timeout --foreground 120 "${_LXC}" config edit foo)
+    echo "${output}" | grep -xF "name: foo"
 
     # Check expanded config isn't included in edit screen.
-    ! echo "${output}" | grep "expanded" || false
+    ! echo "${output}" | grep -F "expanded" || false
 
     lxc delete foo
 }
@@ -293,76 +286,78 @@ test_config_edit() {
 test_property() {
   ensure_import_testimage
 
-  lxc init testimage foo -s "lxdtest-$(basename "${LXD_DIR}")"
+  lxc init --empty foo
 
   # Set a property of an instance
   lxc config set foo description="a new description" --property
   # Check that the property is set
-  lxc config show foo | grep -q "description: a new description"
+  [ "$(lxc config get foo description --property)" = "a new description" ]
 
   # Unset a property of an instance
   lxc config unset foo description --property
   # Check that the property is unset
-  ! lxc config show foo | grep -q "description: a new description" || false
+  [ "$(lxc config get foo description --property || echo fail)" = "" ]
 
   # Set a property of an instance (bool)
   lxc config set foo ephemeral=true --property
   # Check that the property is set
-  lxc config show foo | grep -q "ephemeral: true"
+  [ "$(lxc config get foo ephemeral --property)" = "true" ]
 
   # Unset a property of an instance (bool)
   lxc config unset foo ephemeral --property
   # Check that the property is unset (i.e false)
-  lxc config show foo | grep -q "ephemeral: false"
+  [ "$(lxc config get foo ephemeral --property)" = "false" ]
 
   # Create a snap of the instance to set its expiration timestamp
   lxc snapshot foo s1
-  lxc config set foo/s1 expires_at="2024-03-23T17:38:37.753398689-04:00" --property
-  lxc config get foo/s1 expires_at --property | grep -q "2024-03-23 17:38:37.753398689 -0400 -0400"
-  lxc config show foo/s1 | grep -q "expires_at: 2024-03-23T17:38:37.753398689-04:00"
+  lxc config set foo/s1 expires_at="2038-03-23T17:38:37.753398689-04:00" --property
+  [ "$(lxc config get foo/s1 expires_at --property)" = "2038-03-23 17:38:37.753398689 -0400 -0400" ]
+  lxc config show foo/s1 | grep -F "expires_at: 2038-03-23T17:38:37.753398689-04:00"
   lxc config unset foo/s1 expires_at --property
-  lxc config show foo/s1 | grep -q "expires_at: 0001-01-01T00:00:00Z"
-
+  lxc config show foo/s1 | grep -F "expires_at: 0001-01-01T00:00:00Z"
+  lxc delete foo
 
   # Create a storage volume, create a volume snapshot and set its expiration timestamp
   local storage_pool
   storage_pool="lxdtest-$(basename "${LXD_DIR}")"
   storage_volume="${storage_pool}-vol"
 
-  lxc storage volume create "${storage_pool}" "${storage_volume}"
+  lxc storage volume create "${storage_pool}" "${storage_volume}" size=1MiB
   lxc launch testimage c1 -s "${storage_pool}"
 
   # This will create a snapshot named 'snap0'
   lxc storage volume snapshot "${storage_pool}" "${storage_volume}"
 
-  lxc storage volume set "${storage_pool}" "${storage_volume}"/snap0 expires_at="2024-03-23T17:38:37.753398689-04:00" --property
-  lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" | grep 'expires_at: 2024-03-23T17:38:37.753398689-04:00'
+  lxc storage volume set "${storage_pool}" "${storage_volume}"/snap0 expires_at="2038-03-23T17:38:37.753398689-04:00" --property
+  lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" | grep 'expires_at: 2038-03-23T17:38:37.753398689-04:00'
   lxc storage volume unset "${storage_pool}" "${storage_volume}"/snap0 expires_at --property
   lxc storage volume show "${storage_pool}" "${storage_volume}/snap0" | grep 'expires_at: 0001-01-01T00:00:00Z'
 
-  lxc delete -f c1
+  # Toggle the ephemeral flag on a running instance and check that it is deleted on stop
+  lxc config set c1 ephemeral=true --property
+  [ "$(lxc config get c1 ephemeral --property)" = "true" ]
+  lxc stop -f c1
+  [ "$(lxc list -f csv -c n || echo fail)" = "" ]
+
   lxc storage volume delete "${storage_pool}" "${storage_volume}"
-  lxc delete -f foo
 }
 
 test_config_edit_container_snapshot_pool_config() {
     local storage_pool
     storage_pool="lxdtest-$(basename "${LXD_DIR}")"
 
-    ensure_import_testimage
-
-    lxc init testimage c1 -s "$storage_pool"
+    lxc init --empty c1 -s "$storage_pool"
     lxc snapshot c1 s1
     # edit the container volume name
     lxc storage volume show "$storage_pool" container/c1 | \
         sed 's/^description:.*/description: bar/' | \
         lxc storage volume edit "$storage_pool" container/c1
-    lxc storage volume show "$storage_pool" container/c1 | grep -q 'description: bar'
+    lxc storage volume show "$storage_pool" container/c1 | grep -xF 'description: bar'
     # edit the container snapshot volume name
     lxc storage volume show "$storage_pool" container/c1/s1 | \
         sed 's/^description:.*/description: baz/' | \
         lxc storage volume edit "$storage_pool" container/c1/s1
-    lxc storage volume show "$storage_pool" container/c1/s1 | grep -q 'description: baz'
+    lxc storage volume show "$storage_pool" container/c1/s1 | grep -xF 'description: baz'
     lxc delete c1
 }
 
@@ -371,66 +366,71 @@ test_container_metadata() {
     lxc init testimage c
 
     # metadata for the container are printed
-    lxc config metadata show c | grep -q BusyBox
+    lxc config metadata show c | grep -wF BusyBox
 
     # metadata can be edited
     lxc config metadata show c | sed 's/BusyBox/BB/' | lxc config metadata edit c
-    lxc config metadata show c | grep -q BB
+    lxc config metadata show c | grep -wF BB
 
     # templates can be listed
-    lxc config template list c | grep -q template.tpl
+    lxc config template list c | grep -F template.tpl
 
     # template content can be returned
-    lxc config template show c template.tpl | grep -q "name:"
+    lxc config template show c template.tpl | grep -F "name:"
 
     # templates can be added
     lxc config template create c my.tpl
-    lxc config template list c | grep -q my.tpl
+    lxc config template list c | grep -F my.tpl
+
+    # templates cannot contain some illegal chars
+    ! lxc config template create c foo/bar || false
+    ! lxc config template create c foo..bar || false
 
     # template content can be updated
     echo "some content" | lxc config template edit c my.tpl
-    lxc config template show c my.tpl | grep -q "some content"
+    lxc config template show c my.tpl | grep -F "some content"
 
     # templates can be removed
     lxc config template delete c my.tpl
-    ! lxc config template list c | grep -q my.tpl || false
+    ! lxc config template list c | grep -F my.tpl || false
 
     lxc delete c
 }
 
 test_container_snapshot_config() {
+    local unbuffer=""
     if ! tty -s; then
-        echo "==> SKIP: test_container_snapshot_config requires a terminal"
-        return
+        unbuffer="$(command -v unbuffer)"
+        if [ -z "${unbuffer}" ]; then
+            export TEST_UNMET_REQUIREMENT="Requires a terminal or 'unbuffer' command"
+            return 0
+        fi
     fi
 
-    ensure_import_testimage
-
-    lxc init testimage foo -s "lxdtest-$(basename "${LXD_DIR}")"
+    lxc init --empty foo
     lxc snapshot foo
-    lxc config show foo/snap0 | grep -q 'expires_at: 0001-01-01T00:00:00Z'
+    [ "$(lxc config get foo/snap0 expires_at --property)" = "0001-01-01 00:00:00 +0000 UTC" ]
 
     echo 'expires_at: 2100-01-01T00:00:00Z' | lxc config edit foo/snap0
-    lxc config show foo/snap0 | grep -q 'expires_at: 2100-01-01T00:00:00Z'
+    [ "$(lxc config get foo/snap0 expires_at --property)" = "2100-01-01 00:00:00 +0000 UTC" ]
 
     # Remove expiry date using zero time
     echo 'expires_at: 0001-01-01T00:00:00Z' | lxc config edit foo/snap0
-    lxc config show foo/snap0 | grep -q 'expires_at: 0001-01-01T00:00:00Z'
+    [ "$(lxc config get foo/snap0 expires_at --property)" = "0001-01-01 00:00:00 +0000 UTC" ]
 
     echo 'expires_at: 2100-01-01T00:00:00Z' | lxc config edit foo/snap0
-    lxc config show foo/snap0 | grep -q 'expires_at: 2100-01-01T00:00:00Z'
+    [ "$(lxc config get foo/snap0 expires_at --property)" = "2100-01-01 00:00:00 +0000 UTC" ]
 
     # Remove expiry date using empty value
     echo 'expires_at:' | lxc config edit foo/snap0
-    lxc config show foo/snap0 | grep -q 'expires_at: 0001-01-01T00:00:00Z'
+    [ "$(lxc config get foo/snap0 expires_at --property)" = "0001-01-01 00:00:00 +0000 UTC" ]
 
     # Check instance name is included in edit screen.
-    cmd=$(unset -f lxc; command -v lxc)
-    output=$(EDITOR="cat" timeout --foreground 120 "${cmd}" config edit foo/snap0)
-    echo "${output}" | grep "name: snap0"
+    output=$(EDITOR="cat" ${unbuffer} timeout --foreground 120 "${_LXC}" config edit foo/snap0)
+    echo "${output}" | grep -xF "name: snap0"
 
     # Check expanded config isn't included in edit screen.
-    ! echo "${output}"  | grep "expanded" || false
+    ! echo "${output}" | grep -F "expanded" || false
 
-    lxc delete -f foo
+    lxc delete foo
 }

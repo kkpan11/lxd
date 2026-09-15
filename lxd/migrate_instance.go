@@ -2,17 +2,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
-	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/canonical/lxd/lxd/instance"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/instance/operationlock"
-	"github.com/canonical/lxd/lxd/migration"
 	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/shared"
@@ -20,13 +20,14 @@ import (
 	"github.com/canonical/lxd/shared/logger"
 )
 
-func newMigrationSource(inst instance.Instance, stateful bool, instanceOnly bool, allowInconsistent bool, clusterMoveSourceName string, pushTarget *api.InstancePostTarget) (*migrationSourceWs, error) {
+func newMigrationSource(inst instance.Instance, stateful bool, instanceOnly bool, allowInconsistent bool, diskVolumesMode string, clusterMoveSourceName string, pushTarget *api.InstancePostTarget) (*migrationSourceWs, error) {
 	ret := migrationSourceWs{
 		migrationFields: migrationFields{
 			instance:          inst,
 			allowInconsistent: allowInconsistent,
 		},
 		clusterMoveSourceName: clusterMoveSourceName,
+		diskVolumesMode:       diskVolumesMode,
 	}
 
 	if pushTarget != nil {
@@ -40,10 +41,7 @@ func newMigrationSource(inst instance.Instance, stateful bool, instanceOnly bool
 	secretNames := []string{api.SecretNameControl, api.SecretNameFilesystem}
 	if stateful && inst.IsRunning() {
 		if inst.Type() == instancetype.Container {
-			_, err := exec.LookPath("criu")
-			if err != nil {
-				return nil, migration.ErrNoLiveMigrationSource
-			}
+			return nil, api.StatusErrorf(http.StatusBadRequest, "Live migration is not supported for containers")
 		}
 
 		ret.live = true
@@ -84,15 +82,15 @@ func newMigrationSource(inst instance.Instance, stateful bool, instanceOnly bool
 // Do performs the migration operation on the source side for the given state and
 // operation. It sets up the necessary websocket connections for control, state,
 // and filesystem, and then initiates the migration process.
-func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operation) error {
+func (s *migrationSourceWs) Do(ctx context.Context, state *state.State, migrateOp *operations.Operation) error {
 	l := logger.AddContext(logger.Ctx{"project": s.instance.Project().Name, "instance": s.instance.Name(), "live": s.live, "clusterMoveSourceName": s.clusterMoveSourceName, "push": s.pushOperationURL != ""})
 
-	ctx, cancel := context.WithTimeout(context.TODO(), time.Second*10)
+	connectCtx, cancel := context.WithTimeout(ctx, time.Second*10)
 	defer cancel()
 
 	l.Info("Waiting for migration control connection on source")
 
-	_, err := s.conns[api.SecretNameControl].WebSocket(ctx)
+	_, err := s.conns[api.SecretNameControl].WebSocket(connectCtx)
 	if err != nil {
 		return fmt.Errorf("Failed waiting for migration control connection on source: %w", err)
 	}
@@ -105,7 +103,7 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 	stateConnFunc := func(ctx context.Context) (io.ReadWriteCloser, error) {
 		conn := s.conns[api.SecretNameState]
 		if conn == nil {
-			return nil, fmt.Errorf("Migration source control connection not initialized")
+			return nil, errors.New("Migration source control connection not initialized")
 		}
 
 		wsConn, err := conn.WebsocketIO(ctx)
@@ -119,7 +117,7 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 	filesystemConnFunc := func(ctx context.Context) (io.ReadWriteCloser, error) {
 		conn := s.conns[api.SecretNameFilesystem]
 		if conn == nil {
-			return nil, fmt.Errorf("Migration source filesystem connection not initialized")
+			return nil, errors.New("Migration source filesystem connection not initialized")
 		}
 
 		wsConn, err := conn.WebsocketIO(ctx)
@@ -130,8 +128,7 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 		return wsConn, nil
 	}
 
-	s.instance.SetOperation(migrateOp)
-	err = s.instance.MigrateSend(instance.MigrateSendArgs{
+	err = s.instance.MigrateSend(ctx, instance.MigrateSendArgs{
 		MigrateArgs: instance.MigrateArgs{
 			ControlSend:    s.send,
 			ControlReceive: s.recv,
@@ -149,7 +146,8 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 			ClusterMoveSourceName: s.clusterMoveSourceName,
 		},
 		AllowInconsistent: s.allowInconsistent,
-	})
+		DiskVolumesMode:   s.diskVolumesMode,
+	}, migrateOp)
 	if err != nil {
 		l.Error("Failed migration on source", logger.Ctx{"err": err})
 		return fmt.Errorf("Failed migration on source: %w", err)
@@ -169,15 +167,14 @@ func newMigrationSink(args *migrationSinkArgs) (*migrationSink, error) {
 		clusterMoveSourceName: args.clusterMoveSourceName,
 		push:                  args.push,
 		refresh:               args.refresh,
+		attachedVolumes:       args.attachedVolumes,
+		deferredVolumes:       args.deferredVolumes,
 	}
 
 	secretNames := []string{api.SecretNameControl, api.SecretNameFilesystem}
 	if sink.live {
 		if sink.instance.Type() == instancetype.Container {
-			_, err := exec.LookPath("criu")
-			if err != nil {
-				return nil, migration.ErrNoLiveMigrationTarget
-			}
+			return nil, api.StatusErrorf(http.StatusBadRequest, "Live migration is not supported for containers")
 		}
 
 		secretNames = append(secretNames, api.SecretNameState)
@@ -212,15 +209,15 @@ func newMigrationSink(args *migrationSinkArgs) (*migrationSink, error) {
 // Do performs the migration operation on the target side (sink) for the given
 // state and instance operation. It sets up the necessary websocket connections
 // for control, state, and filesystem, and then receives the migration data.
-func (c *migrationSink) Do(state *state.State, instOp *operationlock.InstanceOperation) error {
+func (c *migrationSink) Do(ctx context.Context, instOpLock *operationlock.InstanceOperation, migrateOp *operations.Operation) error {
 	l := logger.AddContext(logger.Ctx{"project": c.instance.Project().Name, "instance": c.instance.Name(), "live": c.live, "clusterMoveSourceName": c.clusterMoveSourceName, "push": c.push})
 
-	ctx, cancel := context.WithTimeout(context.TODO(), time.Second*10)
+	connectCtx, cancel := context.WithTimeout(ctx, time.Second*10)
 	defer cancel()
 
 	l.Info("Waiting for migration control connection on target")
 
-	_, err := c.conns[api.SecretNameControl].WebSocket(ctx)
+	_, err := c.conns[api.SecretNameControl].WebSocket(connectCtx)
 	if err != nil {
 		return fmt.Errorf("Failed waiting for migration control connection on target: %w", err)
 	}
@@ -236,7 +233,7 @@ func (c *migrationSink) Do(state *state.State, instOp *operationlock.InstanceOpe
 	stateConnFunc := func(ctx context.Context) (io.ReadWriteCloser, error) {
 		conn := c.conns[api.SecretNameState]
 		if conn == nil {
-			return nil, fmt.Errorf("Migration target control connection not initialized")
+			return nil, errors.New("Migration target control connection not initialized")
 		}
 
 		wsConn, err := conn.WebsocketIO(ctx)
@@ -250,7 +247,7 @@ func (c *migrationSink) Do(state *state.State, instOp *operationlock.InstanceOpe
 	filesystemConnFunc := func(ctx context.Context) (io.ReadWriteCloser, error) {
 		conn := c.conns[api.SecretNameFilesystem]
 		if conn == nil {
-			return nil, fmt.Errorf("Migration target filesystem connection not initialized")
+			return nil, errors.New("Migration target filesystem connection not initialized")
 		}
 
 		wsConn, err := conn.WebsocketIO(ctx)
@@ -261,7 +258,7 @@ func (c *migrationSink) Do(state *state.State, instOp *operationlock.InstanceOpe
 		return wsConn, nil
 	}
 
-	err = c.instance.MigrateReceive(instance.MigrateReceiveArgs{
+	err = c.instance.MigrateReceive(ctx, instance.MigrateReceiveArgs{
 		MigrateArgs: instance.MigrateArgs{
 			ControlSend:    c.send,
 			ControlReceive: c.recv,
@@ -278,9 +275,11 @@ func (c *migrationSink) Do(state *state.State, instOp *operationlock.InstanceOpe
 			},
 			ClusterMoveSourceName: c.clusterMoveSourceName,
 		},
-		InstanceOperation: instOp,
+		InstanceOperation: instOpLock,
 		Refresh:           c.refresh,
-	})
+		AttachedVolumes:   c.attachedVolumes,
+		DeferredVolumes:   c.deferredVolumes,
+	}, migrateOp)
 	if err != nil {
 		l.Error("Failed migration on target", logger.Ctx{"err": err})
 		return fmt.Errorf("Failed migration on target: %w", err)

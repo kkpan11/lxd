@@ -3,12 +3,12 @@ package backup
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/lifecycle"
-	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/project"
 	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/shared"
@@ -20,7 +20,6 @@ import (
 type Instance interface {
 	Name() string
 	Project() api.Project
-	Operation() *operations.Operation
 }
 
 // InstanceBackup represents an instance backup.
@@ -58,28 +57,27 @@ func (b *InstanceBackup) Instance() Instance {
 }
 
 // Rename renames an instance backup.
-func (b *InstanceBackup) Rename(newName string) error {
-	oldBackupPath := shared.VarPath("backups", "instances", project.Instance(b.instance.Project().Name, b.name))
-	newBackupPath := shared.VarPath("backups", "instances", project.Instance(b.instance.Project().Name, newName))
+func (b *InstanceBackup) Rename(ctx context.Context, newName string) error {
+	backupsPath := b.state.BackupsStoragePath(b.instance.Project().Name)
+	oldBackupPath := filepath.Join(backupsPath, "instances", project.Instance(b.instance.Project().Name, b.name))
+	newBackupPath := filepath.Join(backupsPath, "instances", project.Instance(b.instance.Project().Name, newName))
 
 	// Extract the old and new parent backup paths from the old and new backup names rather than use
 	// instance.Name() as this may be in flux if the instance itself is being renamed, whereas the relevant
 	// instance name is encoded into the backup names.
 	oldParentName, _, _ := api.GetParentAndSnapshotName(b.name)
-	oldParentBackupsPath := shared.VarPath("backups", "instances", project.Instance(b.instance.Project().Name, oldParentName))
+	oldParentBackupsPath := filepath.Join(backupsPath, "instances", project.Instance(b.instance.Project().Name, oldParentName))
 	newParentName, _, _ := api.GetParentAndSnapshotName(newName)
-	newParentBackupsPath := shared.VarPath("backups", "instances", project.Instance(b.instance.Project().Name, newParentName))
+	newParentBackupsPath := filepath.Join(backupsPath, "instances", project.Instance(b.instance.Project().Name, newParentName))
 
 	// Create the new backup path if doesn't exist.
-	if !shared.PathExists(newParentBackupsPath) {
-		err := os.MkdirAll(newParentBackupsPath, 0700)
-		if err != nil {
-			return err
-		}
+	err := os.MkdirAll(newParentBackupsPath, 0700)
+	if err != nil {
+		return err
 	}
 
 	// Rename the backup directory.
-	err := os.Rename(oldBackupPath, newBackupPath)
+	err = os.Rename(oldBackupPath, newBackupPath)
 	if err != nil {
 		return err
 	}
@@ -103,24 +101,23 @@ func (b *InstanceBackup) Rename(newName string) error {
 
 	oldName := b.name
 	b.name = newName
-	b.state.Events.SendLifecycle(b.instance.Project().Name, lifecycle.InstanceBackupRenamed.Event(b.name, b.instance, map[string]any{"old_name": oldName}))
+	b.state.Events.SendLifecycle(b.instance.Project().Name, lifecycle.InstanceBackupRenamed.Event(ctx, b.name, b.instance, map[string]any{"old_name": oldName}))
 	return nil
 }
 
 // Delete removes an instance backup.
-func (b *InstanceBackup) Delete() error {
-	backupPath := shared.VarPath("backups", "instances", project.Instance(b.instance.Project().Name, b.name))
+func (b *InstanceBackup) Delete(ctx context.Context) error {
+	backupsPathBase := b.state.BackupsStoragePath(b.instance.Project().Name)
+	backupPath := filepath.Join(backupsPathBase, "instances", project.Instance(b.instance.Project().Name, b.name))
 
 	// Delete the on-disk data.
-	if shared.PathExists(backupPath) {
-		err := os.RemoveAll(backupPath)
-		if err != nil {
-			return err
-		}
+	err := os.RemoveAll(backupPath)
+	if err != nil {
+		return err
 	}
 
 	// Check if we can remove the instance directory.
-	backupsPath := shared.VarPath("backups", "instances", project.Instance(b.instance.Project().Name, b.instance.Name()))
+	backupsPath := filepath.Join(backupsPathBase, "instances", project.Instance(b.instance.Project().Name, b.instance.Name()))
 	empty, _ := shared.PathIsEmpty(backupsPath)
 	if empty {
 		err := os.Remove(backupsPath)
@@ -130,14 +127,14 @@ func (b *InstanceBackup) Delete() error {
 	}
 
 	// Remove the database record.
-	err := b.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err = b.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		return tx.DeleteInstanceBackup(ctx, b.name)
 	})
 	if err != nil {
 		return err
 	}
 
-	b.state.Events.SendLifecycle(b.instance.Project().Name, lifecycle.InstanceBackupDeleted.Event(b.name, b.instance, nil))
+	b.state.Events.SendLifecycle(b.instance.Project().Name, lifecycle.InstanceBackupDeleted.Event(ctx, b.name, b.instance, nil))
 
 	return nil
 }

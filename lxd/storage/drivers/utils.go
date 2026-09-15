@@ -2,25 +2,37 @@ package drivers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/canonical/lxd/lxd/idmap"
-	"github.com/canonical/lxd/lxd/operations"
+	"github.com/canonical/lxd/lxd/locking"
+	"github.com/canonical/lxd/lxd/storage/block"
 	"github.com/canonical/lxd/lxd/storage/filesystem"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
+	"github.com/canonical/lxd/shared/ioprogress"
 	"github.com/canonical/lxd/shared/logger"
 )
+
+// noKillRetryOpts is used as the default [shared.RunCommandRetryOpts] for storage operations.
+// It instructs [shared.RunCommandRetry] not to kill the command when the context is done.
+var noKillRetryOpts = &shared.RunCommandRetryOpts{
+	NoKill: true,
+}
 
 // defaultVMBlockFilesystemSize is the size of a VM root device block volume's associated filesystem volume.
 const defaultVMBlockFilesystemSize = "100MiB"
@@ -58,10 +70,10 @@ func wipeDirectory(path string) error {
 // forceRemoveAll wipes a path including any immutable/non-append files.
 func forceRemoveAll(path string) error {
 	err := os.RemoveAll(path)
-	if err != nil {
-		_, _ = shared.RunCommand("chattr", "-ai", "-R", path)
+	if err != nil && !os.IsNotExist(err) {
+		_, _ = shared.RunCommand(context.TODO(), "chattr", "-ai", "-R", path)
 		err = os.RemoveAll(path)
-		if err != nil {
+		if err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}
@@ -85,7 +97,7 @@ func forceUnmount(path string) (bool, error) {
 			// Fallback to lazy unmounting.
 			err = unix.Unmount(path, unix.MNT_DETACH)
 			if err != nil {
-				return false, fmt.Errorf("Failed to unmount '%s': %w", path, err)
+				return false, fmt.Errorf("Failed unmounting %q: %w", path, err)
 			}
 		}
 
@@ -101,13 +113,13 @@ func mountReadOnly(srcPath string, dstPath string) (bool, error) {
 	}
 
 	// Create a mount entry.
-	err := TryMount(srcPath, dstPath, "none", unix.MS_BIND, "")
+	err := TryMount(context.TODO(), srcPath, dstPath, "none", unix.MS_BIND, "")
 	if err != nil {
 		return false, err
 	}
 
 	// Make it read-only.
-	err = TryMount("", dstPath, "none", unix.MS_BIND|unix.MS_RDONLY|unix.MS_REMOUNT, "")
+	err = TryMount(context.TODO(), "", dstPath, "none", unix.MS_BIND|unix.MS_RDONLY|unix.MS_REMOUNT, "")
 	if err != nil {
 		_, _ = forceUnmount(dstPath)
 		return false, err
@@ -160,21 +172,41 @@ func sameMount(srcPath string, dstPath string) bool {
 }
 
 // TryMount tries mounting a filesystem multiple times. This is useful for unreliable backends.
-func TryMount(src string, dst string, fs string, flags uintptr, options string) error {
-	var err error
+// By default the mount operation will be retried until the context expires.
+// If no deadline is configured, a default timeout of 10 seconds is used.
+// In case the mount operation doesn't return within the defined deadline,
+// TryMount waits and doesn't return in case the context expired before that.
+func TryMount(ctx context.Context, src string, dst string, fs string, flags uintptr, options string) error {
+	var cancel context.CancelFunc
 
-	// Attempt 20 mounts over 10s
-	for i := 0; i < 20; i++ {
-		err = unix.Mount(src, dst, fs, flags, options)
-		if err == nil {
-			break
+	// Set a default timeout in case it's not set by the caller.
+	// Attempt 20 mounts over 10s.
+	_, ok := ctx.Deadline()
+	if !ok {
+		ctx, cancel = context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+	}
+
+	var lastErr error
+
+mountLoop:
+	for {
+		select {
+		case <-ctx.Done():
+			// Populate the context's error in case it got cancelled before we were able to try the mount for the first time.
+			if lastErr == nil {
+				lastErr = ctx.Err()
+			}
+
+			return fmt.Errorf("Failed mounting %q on %q using %q: %w", src, dst, fs, lastErr)
+		default:
+			lastErr = unix.Mount(src, dst, fs, flags, options)
+			if lastErr == nil {
+				break mountLoop
+			}
 		}
 
 		time.Sleep(500 * time.Millisecond)
-	}
-
-	if err != nil {
-		return fmt.Errorf("Failed to mount %q on %q using %q: %w", src, dst, fs, err)
 	}
 
 	return nil
@@ -184,61 +216,27 @@ func TryMount(src string, dst string, fs string, flags uintptr, options string) 
 func TryUnmount(path string, flags int) error {
 	var err error
 
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		err = unix.Unmount(path, flags)
 		if err == nil {
 			break
 		}
 
-		logger.Debug("Failed to unmount", logger.Ctx{"path": path, "attempt": i, "err": err})
+		logger.Debug("Failed unmounting", logger.Ctx{"path": path, "attempt": i, "err": err})
 		time.Sleep(500 * time.Millisecond)
 	}
 
 	if err != nil {
-		return fmt.Errorf("Failed to unmount %q: %w", path, err)
+		return fmt.Errorf("Failed unmounting %q: %w", path, err)
 	}
 
 	return nil
 }
 
-// tryExists waits for a file to exist or the context being cancelled.
-// The probe happens at intervals of 500 milliseconds.
-func tryExists(ctx context.Context, path string) bool {
-	for {
-		select {
-		case <-ctx.Done():
-			return false
-		default:
-			if shared.PathExists(path) {
-				return true
-			}
-		}
-
-		time.Sleep(500 * time.Millisecond)
-	}
-}
-
-// waitGone waits for a file to not exist anymore or the context being cancelled.
-// The probe happens at intervals of 500 milliseconds.
-func waitGone(ctx context.Context, path string) bool {
-	for {
-		select {
-		case <-ctx.Done():
-			return false
-		default:
-			if !shared.PathExists(path) {
-				return true
-			}
-		}
-
-		time.Sleep(500 * time.Millisecond)
-	}
-}
-
 // fsUUID returns the filesystem UUID for the given block path.
 // error is returned if the given block device exists but has no UUID.
 func fsUUID(path string) (string, error) {
-	val, err := shared.RunCommand("blkid", "-s", "UUID", "-o", "value", path)
+	val, err := block.DiskFSUUID(path)
 	if err != nil {
 		return "", err
 	}
@@ -249,17 +247,7 @@ func fsUUID(path string) (string, error) {
 		return "", fmt.Errorf("No UUID for device %q", path)
 	}
 
-	return strings.TrimSpace(val), nil
-}
-
-// fsProbe returns the filesystem type for the given block path.
-func fsProbe(path string) (string, error) {
-	val, err := shared.RunCommand("blkid", "-s", "TYPE", "-o", "value", path)
-	if err != nil {
-		return "", err
-	}
-
-	return strings.TrimSpace(val), nil
+	return val, nil
 }
 
 // GetPoolMountPath returns the mountpoint of the given pool.
@@ -272,7 +260,7 @@ func GetPoolMountPath(poolName string) string {
 // whether it is a snapshot or not. For VolumeTypeImage the volName is the image fingerprint.
 func GetVolumeMountPath(poolName string, volType VolumeType, volName string) string {
 	if shared.IsSnapshot(volName) {
-		return shared.VarPath("storage-pools", poolName, fmt.Sprintf("%s-snapshots", string(volType)), volName)
+		return shared.VarPath("storage-pools", poolName, string(volType)+"-snapshots", volName)
 	}
 
 	return shared.VarPath("storage-pools", poolName, string(volType), volName)
@@ -281,26 +269,21 @@ func GetVolumeMountPath(poolName string, volType VolumeType, volName string) str
 // GetVolumeSnapshotDir gets the snapshot mount directory for the parent volume.
 func GetVolumeSnapshotDir(poolName string, volType VolumeType, volName string) string {
 	parent, _, _ := api.GetParentAndSnapshotName(volName)
-	return shared.VarPath("storage-pools", poolName, fmt.Sprintf("%s-snapshots", string(volType)), parent)
+	return shared.VarPath("storage-pools", poolName, string(volType)+"-snapshots", parent)
 }
 
 // GetSnapshotVolumeName returns the full volume name for a parent volume and snapshot name.
 func GetSnapshotVolumeName(parentName, snapshotName string) string {
-	return fmt.Sprintf("%s%s%s", parentName, shared.SnapshotDelimiter, snapshotName)
+	return parentName + shared.SnapshotDelimiter + snapshotName
 }
 
 // createParentSnapshotDirIfMissing creates the parent directory for volume snapshots.
 func createParentSnapshotDirIfMissing(poolName string, volType VolumeType, volName string) error {
 	snapshotsPath := GetVolumeSnapshotDir(poolName, volType, volName)
 
-	// If it's missing, create it.
-	if !shared.PathExists(snapshotsPath) {
-		err := os.Mkdir(snapshotsPath, 0700)
-		if err != nil {
-			return fmt.Errorf("Failed to create parent snapshot directory %q: %w", snapshotsPath, err)
-		}
-
-		return nil
+	err := os.Mkdir(snapshotsPath, 0700)
+	if err != nil && !os.IsExist(err) {
+		return fmt.Errorf("Failed creating parent snapshot directory %q: %w", snapshotsPath, err)
 	}
 
 	return nil
@@ -311,18 +294,11 @@ func createParentSnapshotDirIfMissing(poolName string, volType VolumeType, volNa
 func deleteParentSnapshotDirIfEmpty(poolName string, volType VolumeType, volName string) error {
 	snapshotsPath := GetVolumeSnapshotDir(poolName, volType, volName)
 
-	// If it exists, try to delete it.
-	if shared.PathExists(snapshotsPath) {
-		isEmpty, err := shared.PathIsEmpty(snapshotsPath)
-		if err != nil {
-			return err
-		}
-
-		if isEmpty {
-			err := os.Remove(snapshotsPath)
-			if err != nil && !os.IsNotExist(err) {
-				return fmt.Errorf("Failed to remove '%s': %w", snapshotsPath, err)
-			}
+	err := os.Remove(snapshotsPath)
+	if err != nil && !os.IsNotExist(err) {
+		// If removal failed because the directory is not empty, that's fine.
+		if !errors.Is(err, unix.ENOTEMPTY) {
+			return fmt.Errorf("Failed removing %q: %w", snapshotsPath, err)
 		}
 	}
 
@@ -334,14 +310,14 @@ func deleteParentSnapshotDirIfEmpty(poolName string, volType VolumeType, volName
 func ensureSparseFile(filePath string, sizeBytes int64) error {
 	f, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
-		return fmt.Errorf("Failed to open %s: %w", filePath, err)
+		return fmt.Errorf("Failed opening %q: %w", filePath, err)
 	}
 
 	defer func() { _ = f.Close() }()
 
 	err = f.Truncate(sizeBytes)
 	if err != nil {
-		return fmt.Errorf("Failed to create sparse file %s: %w", filePath, err)
+		return fmt.Errorf("Failed creating sparse file %q: %w", filePath, err)
 	}
 
 	return f.Close()
@@ -354,18 +330,18 @@ func ensureSparseFile(filePath string, sizeBytes int64) error {
 // instead return ErrNotSupported.
 func ensureVolumeBlockFile(vol Volume, path string, sizeBytes int64, allowUnsafeResize bool, unsupportedResizeTypes ...VolumeType) (bool, error) {
 	if sizeBytes <= 0 {
-		return false, fmt.Errorf("Size cannot be zero")
+		return false, errors.New("Size cannot be zero")
 	}
 
 	// Get rounded block size to avoid QEMU boundary issues.
 	sizeBytes = vol.driver.roundVolumeBlockSizeBytes(vol, sizeBytes)
 
-	if shared.PathExists(path) {
-		fi, err := os.Stat(path)
-		if err != nil {
-			return false, err
-		}
+	fi, err := os.Stat(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
 
+	if err == nil {
 		oldSizeBytes := fi.Size()
 		if sizeBytes == oldSizeBytes {
 			return false, nil
@@ -377,10 +353,8 @@ func ensureVolumeBlockFile(vol Volume, path string, sizeBytes int64, allowUnsafe
 			// Reject if would try and resize a volume type that is not supported.
 			// This needs to come before the ErrCannotBeShrunk check below so that any resize attempt
 			// is blocked with ErrNotSupported error.
-			for _, unsupportedType := range unsupportedResizeTypes {
-				if unsupportedType == vol.volType {
-					return false, ErrNotSupported
-				}
+			if slices.Contains(unsupportedResizeTypes, vol.volType) {
+				return false, ErrNotSupported
 			}
 
 			if sizeBytes < oldSizeBytes {
@@ -388,7 +362,7 @@ func ensureVolumeBlockFile(vol Volume, path string, sizeBytes int64, allowUnsafe
 			}
 
 			if vol.MountInUse() {
-				return false, ErrInUse // We don't allow online resizing of block volumes.
+				return false, ErrInUse // We do not allow online resizing of block volumes.
 			}
 		}
 
@@ -402,7 +376,7 @@ func ensureVolumeBlockFile(vol Volume, path string, sizeBytes int64, allowUnsafe
 
 	// If path doesn't exist, then there has been no filler function supplied to create it from another source.
 	// So instead create an empty volume (use for PXE booting a VM).
-	err := ensureSparseFile(path, sizeBytes)
+	err = ensureSparseFile(path, sizeBytes)
 	if err != nil {
 		return false, fmt.Errorf("Failed creating disk image %q as size %d: %w", path, sizeBytes, err)
 	}
@@ -425,19 +399,19 @@ func makeFSType(path string, fsType string, options *mkfsOptions) (string, error
 		fsOptions = &mkfsOptions{}
 	}
 
-	cmd := []string{fmt.Sprintf("mkfs.%s", fsType)}
+	cmd := []string{"mkfs." + fsType}
 	if fsOptions.Label != "" {
 		cmd = append(cmd, "-L", fsOptions.Label)
 	}
 
 	if fsType == "ext4" {
-		cmd = append(cmd, "-E", "nodiscard,lazy_itable_init=0,lazy_journal_init=0")
+		cmd = append(cmd, "-E", "lazy_itable_init=0,lazy_journal_init=0")
 	}
 
 	// Always add the path to the device as the last argument for wider compatibility with versions of mkfs.
 	cmd = append(cmd, path)
 
-	msg, err = shared.TryRunCommand(cmd[0], cmd[1:]...)
+	msg, err = shared.RunCommandRetry(context.TODO(), noKillRetryOpts, cmd[0], cmd[1:]...)
 	if err != nil {
 		return msg, err
 	}
@@ -451,7 +425,7 @@ func filesystemTypeCanBeShrunk(fsType string) bool {
 		fsType = DefaultFilesystem
 	}
 
-	if shared.ValueInSlice(fsType, []string{"ext4", "btrfs"}) {
+	if slices.Contains([]string{"ext4", "btrfs"}, fsType) {
 		return true
 	}
 
@@ -473,12 +447,13 @@ func shrinkFileSystem(fsType string, devPath string, vol Volume, byteSize int64,
 	}
 
 	// The smallest unit that resize2fs accepts in byte size (rather than blocks) is kilobytes.
-	strSize := fmt.Sprintf("%dK", byteSize/1024)
+	// btrfs filesystem resize also accepts kilobytes.
+	strSize := strconv.FormatInt(byteSize/1024, 10) + "K"
 
 	switch fsType {
 	case "ext4":
-		return vol.UnmountTask(func(op *operations.Operation) error {
-			output, err := shared.RunCommand("e2fsck", "-f", "-y", devPath)
+		return vol.UnmountTask(func(progressReporter ioprogress.ProgressReporter) error {
+			output, err := shared.RunCommand(context.TODO(), "e2fsck", "-f", "-y", devPath)
 			if err != nil {
 				exitCodeFSModified := false
 				runErr, ok := err.(shared.RunError)
@@ -509,7 +484,7 @@ func shrinkFileSystem(fsType string, devPath string, vol Volume, byteSize int64,
 			}
 
 			args = append(args, devPath, strSize)
-			_, err = shared.RunCommand("resize2fs", args...)
+			_, err = shared.RunCommand(context.TODO(), "resize2fs", args...)
 			if err != nil {
 				return err
 			}
@@ -517,8 +492,8 @@ func shrinkFileSystem(fsType string, devPath string, vol Volume, byteSize int64,
 			return nil
 		}, true, nil)
 	case "btrfs":
-		return vol.MountTask(func(mountPath string, op *operations.Operation) error {
-			_, err := shared.RunCommand("btrfs", "filesystem", "resize", strSize, mountPath)
+		return vol.MountTask(func(mountPath string, progressReporter ioprogress.ProgressReporter) error {
+			_, err := shared.RunCommand(context.TODO(), "btrfs", "filesystem", "resize", strSize, mountPath)
 			if err != nil {
 				return err
 			}
@@ -536,15 +511,15 @@ func growFileSystem(fsType string, devPath string, vol Volume) error {
 		fsType = DefaultFilesystem
 	}
 
-	return vol.MountTask(func(mountPath string, op *operations.Operation) error {
+	return vol.MountTask(func(mountPath string, progressReporter ioprogress.ProgressReporter) error {
 		var err error
 		switch fsType {
 		case "ext4":
-			_, err = shared.TryRunCommand("resize2fs", devPath)
+			_, err = shared.RunCommandRetry(context.TODO(), noKillRetryOpts, "resize2fs", devPath)
 		case "xfs":
-			_, err = shared.TryRunCommand("xfs_growfs", mountPath)
+			_, err = shared.RunCommandRetry(context.TODO(), noKillRetryOpts, "xfs_growfs", mountPath)
 		case "btrfs":
-			_, err = shared.TryRunCommand("btrfs", "filesystem", "resize", "max", mountPath)
+			_, err = shared.RunCommandRetry(context.TODO(), noKillRetryOpts, "btrfs", "filesystem", "resize", "max", mountPath)
 		default:
 			return fmt.Errorf("Unrecognised filesystem type %q", fsType)
 		}
@@ -557,8 +532,8 @@ func growFileSystem(fsType string, devPath string, vol Volume) error {
 	}, nil)
 }
 
-// renegerateFilesystemUUIDNeeded returns true if fsType requires UUID regeneration, false if not.
-func renegerateFilesystemUUIDNeeded(fsType string) bool {
+// regenerateFilesystemUUIDNeeded returns true if fsType requires UUID regeneration, false if not.
+func regenerateFilesystemUUIDNeeded(fsType string) bool {
 	switch fsType {
 	case "btrfs":
 		return true
@@ -579,19 +554,22 @@ func regenerateFilesystemUUID(fsType string, devPath string) error {
 		return regenerateFilesystemXFSUUID(devPath)
 	}
 
-	return fmt.Errorf("Filesystem not supported")
+	return errors.New("Filesystem not supported")
 }
 
 // regenerateFilesystemBTRFSUUID changes the BTRFS filesystem UUID to a new randomly generated one.
 func regenerateFilesystemBTRFSUUID(devPath string) error {
 	// If the snapshot was taken whilst instance was running there may be outstanding transactions that will
 	// cause btrfstune to corrupt superblock, so ensure these are cleared out first.
-	_, err := shared.RunCommand("btrfs", "rescue", "zero-log", devPath)
+	_, err := shared.RunCommand(context.TODO(), "btrfs", "rescue", "zero-log", devPath)
 	if err != nil {
 		return err
 	}
 
-	_, err = shared.RunCommand("btrfstune", "-f", "-u", devPath)
+	// `-m` modifies the metadata_uuid which is much faster than `-u` that rewrites all metadata blocks.
+	// The resulting filesystem needs kernel 5.0+ to be mounted or running `btrfstune -u` to regain compat
+	// with older kernels.
+	_, err = shared.RunCommand(context.TODO(), "btrfstune", "-f", "-m", devPath)
 	if err != nil {
 		return err
 	}
@@ -602,20 +580,20 @@ func regenerateFilesystemBTRFSUUID(devPath string) error {
 // regenerateFilesystemXFSUUID changes the XFS filesystem UUID to a new randomly generated one.
 func regenerateFilesystemXFSUUID(devPath string) error {
 	// Attempt to generate a new UUID.
-	msg, err := shared.RunCommand("xfs_admin", "-U", "generate", devPath)
+	msg, err := shared.RunCommand(context.TODO(), "xfs_admin", "-U", "generate", devPath)
 	if err != nil {
 		return err
 	}
 
 	if msg != "" {
 		// Exit 0 with a msg usually means some log entry getting in the way.
-		_, err = shared.RunCommand("xfs_repair", "-o", "force_geometry", "-L", devPath)
+		_, err = shared.RunCommand(context.TODO(), "xfs_repair", "-o", "force_geometry", "-L", devPath)
 		if err != nil {
 			return err
 		}
 
 		// Attempt to generate a new UUID again.
-		_, err = shared.RunCommand("xfs_admin", "-U", "generate", devPath)
+		_, err = shared.RunCommand(context.TODO(), "xfs_admin", "-U", "generate", devPath)
 		if err != nil {
 			return err
 		}
@@ -624,14 +602,49 @@ func regenerateFilesystemXFSUUID(devPath string) error {
 	return nil
 }
 
+// addNoRecoveryMountOption adds the `norecovery` mount option to the provided mount options.
+// btrfs/ext4/xfs can do some form of recovery if the filesystem was not cleanly unmounted.
+// To prevent this kind of write access, we mount the filesystem with the ro,norecovery mount options.
+// For ext4, norecovery is a synonym for noload, which prevents the journal from being loaded on mounting.
+func addNoRecoveryMountOption(mountOptions string, filesystem string) string {
+	// If the filesystem is not one of the supported types, return unchanged.
+	if !slices.Contains(blockBackedAllowedFilesystems, filesystem) {
+		return mountOptions
+	}
+
+	// Add norecovery as the first mount options.
+	if mountOptions == "" {
+		return "norecovery"
+	}
+
+	// Already contains norecovery, so return unchanged.
+	options := strings.Split(mountOptions, ",")
+
+	// For ext4, noload is a synonym for norecovery.
+	if filesystem == "ext4" {
+		for i, option := range options {
+			if option == "noload" {
+				options[i] = "norecovery"
+				break
+			}
+		}
+	}
+
+	if !slices.Contains(options, "norecovery") {
+		options = append(options, "norecovery")
+	}
+
+	return strings.Join(options, ",")
+}
+
 // copyDevice copies one device path to another using dd running at low priority.
 // It expects outputPath to exist already, so will not create it.
 func copyDevice(inputPath string, outputPath string) error {
 	cmd := []string{
 		"nice", "-n19", // Run dd with low priority to reduce CPU impact on other processes.
-		"dd", fmt.Sprintf("if=%s", inputPath), fmt.Sprintf("of=%s", outputPath),
+		"dd", "if=" + inputPath, "of=" + outputPath,
 		"bs=16M",       // Use large buffer to reduce syscalls and speed up copy.
-		"conv=nocreat", // Don't create output file if missing (expect caller to have created output file).
+		"conv=nocreat", // Do not create output file if missing (expect caller to have created output file).
 	}
 
 	// Check for Direct I/O support.
@@ -647,7 +660,7 @@ func copyDevice(inputPath string, outputPath string) error {
 		_ = to.Close()
 	}
 
-	_, err = shared.RunCommand(cmd[0], cmd[1:]...)
+	_, err = shared.RunCommand(context.TODO(), cmd[0], cmd[1:]...)
 	if err != nil {
 		return err
 	}
@@ -657,7 +670,7 @@ func copyDevice(inputPath string, outputPath string) error {
 
 // loopFilePath returns the loop file path for a storage pool.
 func loopFilePath(poolName string) string {
-	return filepath.Join(shared.VarPath("disks"), fmt.Sprintf("%s.img", poolName))
+	return filepath.Join(shared.VarPath("disks"), poolName+".img")
 }
 
 // ShiftBtrfsRootfs shifts the BTRFS root filesystem.
@@ -674,17 +687,19 @@ func UnshiftBtrfsRootfs(path string, diskIdmap *idmap.IdmapSet) error {
 func shiftBtrfsRootfs(path string, diskIdmap *idmap.IdmapSet, shift bool) error {
 	var err error
 	roSubvols := []string{}
-	subvols, _ := BTRFSSubVolumesGet(path)
+	subvols, _ := btrfsSubVolumesGet(path)
 	sort.Strings(subvols)
+	d := &btrfs{}
 	for _, subvol := range subvols {
 		subvol = filepath.Join(path, subvol)
 
-		if !BTRFSSubVolumeIsRo(subvol) {
+		if !btrfsSubVolumeIsRo(subvol) {
 			continue
 		}
 
 		roSubvols = append(roSubvols, subvol)
-		_ = BTRFSSubVolumeMakeRw(subvol)
+
+		_ = d.setSubvolumeReadonlyProperty(subvol, false)
 	}
 
 	if shift {
@@ -694,14 +709,14 @@ func shiftBtrfsRootfs(path string, diskIdmap *idmap.IdmapSet, shift bool) error 
 	}
 
 	for _, subvol := range roSubvols {
-		_ = BTRFSSubVolumeMakeRo(subvol)
+		_ = d.setSubvolumeReadonlyProperty(subvol, true)
 	}
 
 	return err
 }
 
-// BTRFSSubVolumesGet gets subvolumes.
-func BTRFSSubVolumesGet(path string) ([]string, error) {
+// btrfsSubVolumesGet gets subvolumes.
+func btrfsSubVolumesGet(path string) ([]string, error) {
 	result := []string{}
 
 	if !strings.HasSuffix(path, "/") {
@@ -726,7 +741,8 @@ func BTRFSSubVolumesGet(path string) ([]string, error) {
 		}
 
 		// Check if a btrfs subvolume.
-		if btrfsIsSubVolume(fpath) {
+		d := &btrfs{}
+		if d.isSubvolume(fpath) {
 			result = append(result, strings.TrimPrefix(fpath, path))
 		}
 
@@ -736,43 +752,14 @@ func BTRFSSubVolumesGet(path string) ([]string, error) {
 	return result, nil
 }
 
-// Deprecated: Use IsSubvolume from the Btrfs driver instead.
-// btrfsIsSubvolume checks if a given path is a subvolume.
-func btrfsIsSubVolume(subvolPath string) bool {
-	fs := unix.Stat_t{}
-	err := unix.Lstat(subvolPath, &fs)
-	if err != nil {
-		return false
-	}
-
-	// Check if BTRFS_FIRST_FREE_OBJECTID
-	if fs.Ino != 256 {
-		return false
-	}
-
-	return true
-}
-
-// BTRFSSubVolumeIsRo returns if subvolume is read only.
-func BTRFSSubVolumeIsRo(path string) bool {
-	output, err := shared.RunCommand("btrfs", "property", "get", "-ts", path)
+// btrfsSubVolumeIsRo returns if subvolume is read only.
+func btrfsSubVolumeIsRo(path string) bool {
+	output, err := shared.RunCommand(context.TODO(), "btrfs", "property", "get", "-ts", path)
 	if err != nil {
 		return false
 	}
 
 	return strings.HasPrefix(string(output), "ro=true")
-}
-
-// BTRFSSubVolumeMakeRo makes a subvolume read only. Deprecated use btrfs.setSubvolumeReadonlyProperty().
-func BTRFSSubVolumeMakeRo(path string) error {
-	_, err := shared.RunCommand("btrfs", "property", "set", "-ts", path, "ro", "true")
-	return err
-}
-
-// BTRFSSubVolumeMakeRw makes a sub volume read/write. Deprecated use btrfs.setSubvolumeReadonlyProperty().
-func BTRFSSubVolumeMakeRw(path string) error {
-	_, err := shared.RunCommand("btrfs", "property", "set", "-ts", path, "ro", "false")
-	return err
 }
 
 // ShiftZFSSkipper indicates which files not to shift for ZFS.
@@ -791,7 +778,7 @@ func ShiftZFSSkipper(dir string, absPath string, fi os.FileInfo) bool {
 
 // OperationLockName returns the storage specific lock name to use with locking package.
 func OperationLockName(operationName string, poolName string, volType VolumeType, contentType ContentType, volName string) string {
-	return fmt.Sprintf("%s/%s/%s/%s/%s", operationName, poolName, volType, contentType, volName)
+	return operationName + "/" + poolName + "/" + string(volType) + "/" + string(contentType) + "/" + volName
 }
 
 // loopFileSizeDefault returns the size in GiB to use as the default size for a pool loop file.
@@ -807,27 +794,55 @@ func loopFileSizeDefault() (uint64, error) {
 	if gibAvailable > 30 {
 		return 30, nil // Default to no more than 30GiB.
 	} else if gibAvailable > 5 {
-		return gibAvailable / 5, nil // Use 20% of free space otherwise.
+		return max(gibAvailable/5, 5), nil // Use at least 5GiB or 20% of free space otherwise.
 	} else if gibAvailable == 5 {
 		return gibAvailable, nil // Need at least 5GiB free.
 	}
 
-	return 0, fmt.Errorf("Insufficient free space to create default sized 5GiB pool")
+	return 0, errors.New("Insufficient free space to create default sized 5GiB pool")
+}
+
+// loopFileSizeResolve returns the size string to use for a loop file at sourcePath.
+// If recover is true and the file already exists, it derives the size from the existing file.
+// Otherwise it computes a default size based on available free space.
+func loopFileSizeResolve(sourcePath string, sourceRecover bool) (string, error) {
+	if sourceRecover {
+		fi, err := os.Stat(sourcePath)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("Failed getting size of existing source file %q: %w", sourcePath, err)
+		}
+
+		if err == nil {
+			sizeBytes := fi.Size()
+			if sizeBytes%(1024*1024*1024) == 0 {
+				return strconv.FormatInt(sizeBytes/(1024*1024*1024), 10) + "GiB", nil
+			}
+
+			return strconv.FormatInt(sizeBytes, 10) + "B", nil
+		}
+	}
+
+	defaultSize, err := loopFileSizeDefault()
+	if err != nil {
+		return "", err
+	}
+
+	return strconv.FormatUint(defaultSize, 10) + "GiB", nil
 }
 
 // loopFileSetup sets up a loop device for the provided sourcePath.
 // It tries to enable direct I/O if supported.
 func loopDeviceSetup(sourcePath string) (string, error) {
-	out, err := shared.RunCommand("losetup", "--find", "--nooverlap", "--direct-io=on", "--show", sourcePath)
+	out, err := shared.RunCommand(context.TODO(), "losetup", "--find", "--nooverlap", "--direct-io=on", "--show", sourcePath)
 	if err == nil {
 		return strings.TrimSpace(out), nil
 	}
 
-	if !(strings.Contains(err.Error(), "direct io") || strings.Contains(err.Error(), "Invalid argument")) {
+	if !strings.Contains(err.Error(), "direct io") && !strings.Contains(err.Error(), "Invalid argument") {
 		return "", err
 	}
 
-	out, err = shared.RunCommand("losetup", "--find", "--nooverlap", "--show", sourcePath)
+	out, err = shared.RunCommand(context.TODO(), "losetup", "--find", "--nooverlap", "--show", sourcePath)
 	if err == nil {
 		return strings.TrimSpace(out), nil
 	}
@@ -837,13 +852,13 @@ func loopDeviceSetup(sourcePath string) (string, error) {
 
 // loopFileAutoDetach enables auto detach mode for a loop device.
 func loopDeviceAutoDetach(loopDevPath string) error {
-	_, err := shared.RunCommand("losetup", "--detach", loopDevPath)
+	_, err := shared.RunCommand(context.TODO(), "losetup", "--detach", loopDevPath)
 	return err
 }
 
 // loopDeviceSetCapacity forces the loop driver to reread the size of the file associated with the specified loop device.
 func loopDeviceSetCapacity(loopDevPath string) error {
-	_, err := shared.RunCommand("losetup", "--set-capacity", loopDevPath)
+	_, err := shared.RunCommand(context.TODO(), "losetup", "--set-capacity", loopDevPath)
 	return err
 }
 
@@ -893,4 +908,100 @@ func roundAbove(above, val int64) int64 {
 	}
 
 	return rounded
+}
+
+// ResolveServerName returns the given server name if it is not "none".
+// If the server name is "none", it retrieves and returns the server's hostname.
+func ResolveServerName(serverName string) (string, error) {
+	if serverName != "none" {
+		return serverName, nil
+	}
+
+	hostname, err := os.Hostname()
+	if err != nil {
+		return "", fmt.Errorf("Failed getting hostname: %w", err)
+	}
+
+	return hostname, nil
+}
+
+// ResolveServerNameWithConnectorType returns the name used for storage array host entries.
+// It resolves the server name and appends the connector type as a suffix so the same server
+// has distinct host entries per connector type, as some storage arrays do not support
+// mixing NQNs, IQNs, and WWNs for the same host entry.
+//
+// Any "/" in connectorType is replaced with "-" because "/" is not valid in host names.
+func ResolveServerNameWithConnectorType(serverName string, connectorType string) (string, error) {
+	resolvedServerName, err := ResolveServerName(serverName)
+	if err != nil {
+		return "", err
+	}
+
+	return resolvedServerName + "-" + strings.ReplaceAll(connectorType, "/", "-"), nil
+}
+
+// remoteVolumeMapLock acquires a lock used when mapping or unmapping remote
+// storage volumes. This lock prevents conflicts between operations trying to
+// associate or disassociate volumes with the LXD host. If the lock is
+// successfully acquired, unlock function is returned.
+func remoteVolumeMapLock(connectorName string, driverName string) (locking.UnlockFunc, error) {
+	l := logger.AddContext(logger.Ctx{"connector": connectorName, "driver": driverName})
+	l.Debug("Acquiring lock for remote volume map")
+	defer l.Debug("Lock acquired for remote volume map")
+
+	return locking.Lock(context.TODO(), "RemoteVolumeMap_"+connectorName+"_"+driverName)
+}
+
+// ValidPoolName validates a pool name.
+func ValidPoolName(poolName string) error {
+	if poolName == "" {
+		return errors.New("Cannot be empty")
+	}
+
+	if strings.HasPrefix(poolName, ".") {
+		return errors.New("Cannot start with a dot")
+	}
+
+	if strings.HasPrefix(poolName, "-") {
+		return errors.New("Cannot start with a hyphen")
+	}
+
+	if strings.Contains(poolName, shared.SnapshotDelimiter) {
+		return errors.New("Cannot contain slashes")
+	}
+
+	for _, r := range poolName {
+		if unicode.IsSpace(r) {
+			return errors.New("Cannot contain white space")
+		}
+	}
+
+	return nil
+}
+
+// ValidVolumeName validates a volume name.
+func ValidVolumeName(volumeName string) error {
+	if volumeName == "" {
+		return errors.New("Cannot be empty")
+	}
+
+	if volumeName == ".." {
+		return errors.New(`Cannot be ".."`)
+	}
+
+	if strings.Contains(volumeName, "\\") {
+		return errors.New("Cannot contain backslashes")
+	}
+
+	if strings.Contains(volumeName, shared.SnapshotDelimiter) {
+		return errors.New("Cannot contain slashes")
+	}
+
+	for _, r := range volumeName {
+		if unicode.IsSpace(r) {
+			return errors.New("Cannot contain white space")
+		}
+	}
+
+	return nil
 }

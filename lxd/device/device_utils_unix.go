@@ -1,9 +1,11 @@
 package device
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -20,29 +22,44 @@ import (
 // unixDefaultMode default mode to create unix devices with if not specified in device config.
 const unixDefaultMode = 0660
 
-// unixDeviceAttributes returns the decice type, major and minor numbers for a device.
-func unixDeviceAttributes(path string) (string, uint32, uint32, error) {
+// unixDeviceAttributes returns the device type, major and minor numbers for a device.
+func unixDeviceAttributes(path string) (dType string, major uint32, minor uint32, err error) {
 	// Get a stat struct from the provided path
 	stat := unix.Stat_t{}
-	err := unix.Stat(path, &stat)
+	err = unix.Stat(path, &stat)
 	if err != nil {
 		return "", 0, 0, err
 	}
 
 	// Check what kind of file it is
-	dType := ""
-	if stat.Mode&unix.S_IFMT == unix.S_IFBLK {
+	switch stat.Mode & unix.S_IFMT {
+	case unix.S_IFBLK:
 		dType = "b"
-	} else if stat.Mode&unix.S_IFMT == unix.S_IFCHR {
+	case unix.S_IFCHR:
 		dType = "c"
-	} else {
-		return "", 0, 0, fmt.Errorf("Not a device")
+	default:
+		return "", 0, 0, errors.New("Not a device")
 	}
 
 	// Return the device information
-	major := unix.Major(uint64(stat.Rdev))
-	minor := unix.Minor(uint64(stat.Rdev))
+	major = unix.Major(uint64(stat.Rdev))
+	minor = unix.Minor(uint64(stat.Rdev))
+
 	return dType, major, minor, nil
+}
+
+// unixDeviceOwnership returns the ownership (gid and uid) for a device.
+func unixDeviceOwnership(path string) (gid uint32, uid uint32, err error) {
+	stat := unix.Stat_t{}
+	err = unix.Stat(path, &stat)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	gid = stat.Gid
+	uid = stat.Uid
+
+	return gid, uid, nil
 }
 
 // unixDeviceModeOct converts a string unix octal mode to an int.
@@ -97,17 +114,18 @@ func unixDeviceDestPath(m deviceConfig.Device) string {
 // defaultMode is set as true, then the device is created with the supplied or default mode (0660)
 // respectively, otherwise the origin device's mode is used. If the device config doesn't contain a
 // type field then it defaults to created a unix-char device. The ownership of the created device
-// defaults to root (0) but can be specified with the uid and gid fields in the device config map.
+// defaults to root (0) but can be specified with the uid and gid fields in the device config map. If ownership.inherit is set to true, the device ownership is inherited from the host.
 // It returns a UnixDevice containing information about the device created.
 func UnixDeviceCreate(s *state.State, idmapSet *idmap.IdmapSet, devicesPath string, prefix string, m deviceConfig.Device, defaultMode bool) (*UnixDevice, error) {
 	var err error
 	d := UnixDevice{}
 
 	// Extra checks for nesting.
+	deviceProperties := []string{"major", "minor", "mode", "uid", "gid"}
 	if s.OS.RunningInUserNS {
 		for key, value := range m {
-			if shared.ValueInSlice(key, []string{"major", "minor", "mode", "uid", "gid"}) && value != "" {
-				return nil, fmt.Errorf("The \"%s\" property may not be set when adding a device to a nested container", key)
+			if value != "" && slices.Contains(deviceProperties, key) {
+				return nil, fmt.Errorf("The %q property may not be set when adding a device to a nested container", key)
 			}
 		}
 	}
@@ -119,21 +137,21 @@ func UnixDeviceCreate(s *state.State, idmapSet *idmap.IdmapSet, devicesPath stri
 		// If no major and minor are set, use those from the device on the host.
 		_, d.Major, d.Minor, err = unixDeviceAttributes(srcPath)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to get device attributes for %s: %w", srcPath, err)
+			return nil, fmt.Errorf("Failed getting device attributes for %q: %w", srcPath, err)
 		}
 	} else if m["major"] == "" || m["minor"] == "" {
 		return nil, fmt.Errorf("Both major and minor must be supplied for device: %s", srcPath)
 	} else {
 		tmp, err := strconv.ParseUint(m["major"], 10, 32)
 		if err != nil {
-			return nil, fmt.Errorf("Bad major %s in device %s", m["major"], srcPath)
+			return nil, fmt.Errorf("Bad major %q in device %q", m["major"], srcPath)
 		}
 
 		d.Major = uint32(tmp)
 
 		tmp, err = strconv.ParseUint(m["minor"], 10, 32)
 		if err != nil {
-			return nil, fmt.Errorf("Bad minor %s in device %s", m["minor"], srcPath)
+			return nil, fmt.Errorf("Bad minor %q in device %q", m["minor"], srcPath)
 		}
 
 		d.Minor = uint32(tmp)
@@ -144,7 +162,7 @@ func UnixDeviceCreate(s *state.State, idmapSet *idmap.IdmapSet, devicesPath stri
 	if m["mode"] != "" {
 		tmp, err := unixDeviceModeOct(m["mode"])
 		if err != nil {
-			return nil, fmt.Errorf("Bad mode %s in device %s", m["mode"], srcPath)
+			return nil, fmt.Errorf("Bad mode %q in device %q", m["mode"], srcPath)
 		}
 
 		d.Mode = os.FileMode(tmp)
@@ -155,7 +173,7 @@ func UnixDeviceCreate(s *state.State, idmapSet *idmap.IdmapSet, devicesPath stri
 		if err != nil {
 			errno, isErrno := shared.GetErrno(err)
 			if !isErrno || errno != unix.ENOENT {
-				return nil, fmt.Errorf("Failed to retrieve mode of device %s: %w", srcPath, err)
+				return nil, fmt.Errorf("Failed retrieving mode of device %q: %w", srcPath, err)
 			}
 
 			d.Mode = os.FileMode(unixDefaultMode)
@@ -171,26 +189,44 @@ func UnixDeviceCreate(s *state.State, idmapSet *idmap.IdmapSet, devicesPath stri
 	}
 
 	// Get the device owner.
-	if m["uid"] != "" {
-		d.UID, err = strconv.Atoi(m["uid"])
-		if err != nil {
-			return nil, fmt.Errorf("Invalid uid %s in device %s", m["uid"], srcPath)
-		}
-	}
+	if shared.IsTrue(m["ownership.inherit"]) {
+		if m["uid"] == "" {
+			_, uid, err := unixDeviceOwnership(srcPath)
+			if err != nil {
+				return nil, fmt.Errorf("Failed retrieving host UID of device %q: %w", srcPath, err)
+			}
 
-	if m["gid"] != "" {
-		d.GID, err = strconv.Atoi(m["gid"])
-		if err != nil {
-			return nil, fmt.Errorf("Invalid gid %s in device %s", m["gid"], srcPath)
+			d.UID = int(uid)
+		}
+
+		if m["gid"] == "" {
+			gid, _, err := unixDeviceOwnership(srcPath)
+			if err != nil {
+				return nil, fmt.Errorf("Failed retrieving host GID of device %q: %w", srcPath, err)
+			}
+
+			d.GID = int(gid)
+		}
+	} else {
+		if m["uid"] != "" {
+			d.UID, err = strconv.Atoi(m["uid"])
+			if err != nil {
+				return nil, fmt.Errorf("Invalid UID %q in device %q", m["uid"], srcPath)
+			}
+		}
+
+		if m["gid"] != "" {
+			d.GID, err = strconv.Atoi(m["gid"])
+			if err != nil {
+				return nil, fmt.Errorf("Invalid GID %q in device %q", m["gid"], srcPath)
+			}
 		}
 	}
 
 	// Create the devices directory if missing.
-	if !shared.PathExists(devicesPath) {
-		err := os.Mkdir(devicesPath, 0711)
-		if err != nil {
-			return nil, fmt.Errorf("Failed to create devices path: %s", err)
-		}
+	err = os.Mkdir(devicesPath, 0711)
+	if err != nil && !errors.Is(err, os.ErrExist) {
+		return nil, fmt.Errorf("Failed creating devices path: %s", err)
 	}
 
 	destPath := unixDeviceDestPath(m)
@@ -200,32 +236,32 @@ func UnixDeviceCreate(s *state.State, idmapSet *idmap.IdmapSet, devicesPath stri
 
 	// Create the new entry.
 	if !s.OS.RunningInUserNS {
-		if s.OS.Nodev {
-			return nil, fmt.Errorf("Can't create device as devices path is mounted nodev")
+		if s.OS.Nodev.Load() {
+			return nil, errors.New("Cannot create device as devices path is mounted nodev")
 		}
 
 		devNum := int(unix.Mkdev(d.Major, d.Minor))
 		err := unix.Mknod(devPath, uint32(d.Mode), devNum)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to create device %s for %s: %w", devPath, srcPath, err)
+			return nil, fmt.Errorf("Failed creating device %q for %q: %w", devPath, srcPath, err)
 		}
 
 		err = os.Chown(devPath, d.UID, d.GID)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to chown device %s: %w", devPath, err)
+			return nil, fmt.Errorf("Failed chowning device %q: %w", devPath, err)
 		}
 
 		// Needed as mknod respects the umask.
 		err = os.Chmod(devPath, d.Mode)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to chmod device %s: %w", devPath, err)
+			return nil, fmt.Errorf("Failed chmoding device %q: %w", devPath, err)
 		}
 
 		if idmapSet != nil {
 			err := idmapSet.ShiftFile(devPath)
 			if err != nil {
 				// uidshift failing is weird, but not a big problem. Log and proceed.
-				logger.Debugf("Failed to uidshift device %s: %s\n", srcPath, err)
+				logger.Debugf("Failed uidshifting device %q: %s\n", srcPath, err)
 			}
 		}
 	} else {
@@ -276,7 +312,7 @@ func unixDeviceSetup(s *state.State, devicesPath string, typePrefix string, devi
 		// Remove the LXD device type and name prefix, leaving just the encoded dest path.
 		idx := strings.LastIndex(devName, ".")
 		if idx == -1 {
-			return fmt.Errorf("Invalid device name \"%s\"", devName)
+			return fmt.Errorf("Invalid device name %q", devName)
 		}
 
 		encRelDestFile := devName[idx+1:]
@@ -304,7 +340,7 @@ func unixDeviceSetup(s *state.State, devicesPath string, typePrefix string, devi
 
 	// Instruct LXD to perform the mount.
 	runConf.Mounts = append(runConf.Mounts, deviceConfig.MountEntryItem{
-		DevPath:    d.HostPath,
+		DevSource:  deviceConfig.DevSourcePath{Path: d.HostPath},
 		TargetPath: d.RelativePath,
 		FSType:     "none",
 		Opts:       []string{"bind", "create=file"},
@@ -326,16 +362,13 @@ func unixDeviceSetup(s *state.State, devicesPath string, typePrefix string, devi
 // device to ascertain these attributes. If defaultMode is true or mode is supplied in the device
 // config then the origin device does not need to be accessed for its file mode.
 func unixDeviceSetupCharNum(s *state.State, devicesPath string, typePrefix string, deviceName string, m deviceConfig.Device, major uint32, minor uint32, path string, defaultMode bool, runConf *deviceConfig.RunConfig) error {
-	configCopy := deviceConfig.Device{}
-	for k, v := range m {
-		configCopy[k] = v
-	}
+	configCopy := m.Clone()
 
-	// Overridng these in the config copy should avoid the need for unixDeviceSetup to stat
+	// Overriding these in the config copy should avoid the need for unixDeviceSetup to stat
 	// the origin device to ascertain this information.
 	configCopy["type"] = "unix-char"
-	configCopy["major"] = fmt.Sprintf("%d", major)
-	configCopy["minor"] = fmt.Sprintf("%d", minor)
+	configCopy["major"] = strconv.FormatUint(uint64(major), 10)
+	configCopy["minor"] = strconv.FormatUint(uint64(minor), 10)
 	configCopy["path"] = path
 
 	return unixDeviceSetup(s, devicesPath, typePrefix, deviceName, configCopy, defaultMode, runConf)
@@ -347,16 +380,13 @@ func unixDeviceSetupCharNum(s *state.State, devicesPath string, typePrefix strin
 // device to ascertain these attributes. If defaultMode is true or mode is supplied in the device
 // config then the origin device does not need to be accessed for its file mode.
 func unixDeviceSetupBlockNum(s *state.State, devicesPath string, typePrefix string, deviceName string, m deviceConfig.Device, major uint32, minor uint32, path string, defaultMode bool, runConf *deviceConfig.RunConfig) error {
-	configCopy := deviceConfig.Device{}
-	for k, v := range m {
-		configCopy[k] = v
-	}
+	configCopy := m.Clone()
 
-	// Overridng these in the config copy should avoid the need for unixDeviceSetup to stat
+	// Overriding these in the config copy should avoid the need for unixDeviceSetup to stat
 	// the origin device to ascertain this information.
 	configCopy["type"] = "unix-block"
-	configCopy["major"] = fmt.Sprintf("%d", major)
-	configCopy["minor"] = fmt.Sprintf("%d", minor)
+	configCopy["major"] = strconv.FormatUint(uint64(major), 10)
+	configCopy["minor"] = strconv.FormatUint(uint64(minor), 10)
 	configCopy["path"] = path
 
 	return unixDeviceSetup(s, devicesPath, typePrefix, deviceName, configCopy, defaultMode, runConf)
@@ -420,7 +450,7 @@ func unixDeviceRemove(devicesPath string, typePrefix string, deviceName string, 
 		// Remove the LXD device type and name prefix, leaving just the encoded dest path.
 		idx := strings.LastIndex(otherDev, ".")
 		if idx == -1 {
-			return fmt.Errorf("Invalid device name \"%s\"", otherDev)
+			return fmt.Errorf("Invalid device name %q", otherDev)
 		}
 
 		encRelDestFile := otherDev[idx+1:]
@@ -432,19 +462,13 @@ func unixDeviceRemove(devicesPath string, typePrefix string, deviceName string, 
 		// Remove the LXD device type and name prefix, leaving just the encoded dest path.
 		idx := strings.LastIndex(ourDev, ".")
 		if idx == -1 {
-			return fmt.Errorf("Invalid device name \"%s\"", ourDev)
+			return fmt.Errorf("Invalid device name %q", ourDev)
 		}
 
 		ourEncRelDestFile := ourDev[idx+1:]
 
 		// Look for devices for other LXD devices that match the same path.
-		dupe := false
-		for _, encRelDevFile := range encRelDevFiles {
-			if encRelDevFile == ourEncRelDestFile {
-				dupe = true
-				break
-			}
-		}
+		dupe := slices.Contains(encRelDevFiles, ourEncRelDestFile)
 
 		// If a device has been found that points to the same device inside the instance
 		// then we cannot request it be umounted inside the instance as it's still in use.
@@ -460,7 +484,7 @@ func unixDeviceRemove(devicesPath string, typePrefix string, deviceName string, 
 		absDevPath := filepath.Join(devicesPath, ourDev)
 		dType, dMajor, dMinor, err := unixDeviceAttributes(absDevPath)
 		if err != nil {
-			return fmt.Errorf("Failed to get UNIX device attributes for '%s': %w", absDevPath, err)
+			return fmt.Errorf("Failed getting UNIX device attributes for %q: %w", absDevPath, err)
 		}
 
 		// Append a deny cgroup fule for this device.
@@ -525,7 +549,7 @@ func unixValidDeviceNum(value string) error {
 
 	_, err := strconv.ParseUint(value, 10, 32)
 	if err != nil {
-		return fmt.Errorf("Invalid value for a UNIX device number")
+		return errors.New("Invalid value for a UNIX device number")
 	}
 
 	return nil
@@ -539,7 +563,7 @@ func unixValidUserID(value string) error {
 
 	_, err := strconv.ParseUint(value, 10, 32)
 	if err != nil {
-		return fmt.Errorf("Invalid value for a UNIX ID")
+		return errors.New("Invalid value for a UNIX ID")
 	}
 
 	return nil
@@ -553,7 +577,7 @@ func unixValidOctalFileMode(value string) error {
 
 	_, err := strconv.ParseUint(value, 8, 32)
 	if err != nil {
-		return fmt.Errorf("Invalid value for an octal file mode")
+		return errors.New("Invalid value for an octal file mode")
 	}
 
 	return nil

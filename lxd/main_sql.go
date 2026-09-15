@@ -2,22 +2,25 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"slices"
 
-	"github.com/olekukonko/tablewriter"
 	"github.com/spf13/cobra"
 
 	"github.com/canonical/lxd/client"
-	"github.com/canonical/lxd/shared"
+	cli "github.com/canonical/lxd/shared/cmd"
 )
 
-type cmdSql struct {
-	global *cmdGlobal
+type cmdSQL struct {
+	global     *cmdGlobal
+	flagFormat string
 }
 
-func (c *cmdSql) Command() *cobra.Command {
+func (c *cmdSQL) command() *cobra.Command {
 	cmd := &cobra.Command{}
 	cmd.Use = "sql <local|global> <query>"
 	cmd.Short = "Execute a SQL query against the LXD local or global database"
@@ -50,13 +53,14 @@ func (c *cmdSql) Command() *cobra.Command {
   This command targets the global LXD database and works in both local
   and cluster mode.
 `
-	cmd.RunE = c.Run
+	cmd.RunE = c.run
 	cmd.Hidden = true
+	cmd.Flags().StringVarP(&c.flagFormat, "format", "f", cli.TableFormatSQLResult, `Format (sql|csv|json|table|yaml|compact) (default "sql")`)
 
 	return cmd
 }
 
-func (c *cmdSql) Run(cmd *cobra.Command, args []string) error {
+func (c *cmdSQL) run(cmd *cobra.Command, args []string) error {
 	if len(args) != 2 {
 		_ = cmd.Help()
 
@@ -64,23 +68,23 @@ func (c *cmdSql) Run(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 
-		return fmt.Errorf("Missing required arguments")
+		return errors.New("Missing required arguments")
 	}
 
 	database := args[0]
 	query := args[1]
 
-	if !shared.ValueInSlice(database, []string{"local", "global"}) {
+	if !slices.Contains([]string{"local", "global"}, database) {
 		_ = cmd.Help()
 
-		return fmt.Errorf("Invalid database type")
+		return errors.New("Invalid database type")
 	}
 
 	if query == "-" {
 		// Read from stdin
 		bytes, err := io.ReadAll(os.Stdin)
 		if err != nil {
-			return fmt.Errorf("Failed to read from stdin: %w", err)
+			return fmt.Errorf("Failed reading from stdin: %w", err)
 		}
 
 		query = string(bytes)
@@ -97,20 +101,20 @@ func (c *cmdSql) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	if query == ".dump" || query == ".schema" {
-		url := fmt.Sprintf("/internal/sql?database=%s", database)
+		url := "/internal/sql?database=" + database
 		if query == ".schema" {
 			url += "&schema=1"
 		}
 
-		response, _, err := d.RawQuery("GET", url, nil, "")
+		response, _, err := d.RawQuery(http.MethodGet, url, nil, "")
 		if err != nil {
-			return fmt.Errorf("failed to request dump: %w", err)
+			return fmt.Errorf("failed requesting dump: %w", err)
 		}
 
 		dump := internalSQLDump{}
 		err = json.Unmarshal(response.Metadata, &dump)
 		if err != nil {
-			return fmt.Errorf("failed to parse dump response: %w", err)
+			return fmt.Errorf("failed parsing dump response: %w", err)
 		}
 
 		fmt.Print(dump.Text)
@@ -122,7 +126,7 @@ func (c *cmdSql) Run(cmd *cobra.Command, args []string) error {
 		Query:    query,
 	}
 
-	response, _, err := d.RawQuery("POST", "/internal/sql", data, "")
+	response, _, err := d.RawQuery(http.MethodPost, "/internal/sql", data, "")
 	if err != nil {
 		return err
 	}
@@ -139,7 +143,10 @@ func (c *cmdSql) Run(cmd *cobra.Command, args []string) error {
 		}
 
 		if result.Type == "select" {
-			sqlPrintSelectResult(result)
+			err = sqlPrintSelectResult(c.flagFormat, result)
+			if err != nil {
+				return err
+			}
 		} else {
 			fmt.Printf("Rows affected: %d\n", result.RowsAffected)
 		}
@@ -151,20 +158,16 @@ func (c *cmdSql) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func sqlPrintSelectResult(result internalSQLResult) {
-	table := tablewriter.NewWriter(os.Stdout)
-	table.SetAlignment(tablewriter.ALIGN_LEFT)
-	table.SetAutoWrapText(false)
-	table.SetAutoFormatHeaders(false)
-	table.SetHeader(result.Columns)
+func sqlPrintSelectResult(format string, result internalSQLResult) error {
+	data := make([][]string, 0, len(result.Rows))
 	for _, row := range result.Rows {
-		data := []string{}
+		r := make([]string, 0, len(row))
 		for _, col := range row {
-			data = append(data, fmt.Sprintf("%v", col))
+			r = append(r, fmt.Sprint(col))
 		}
 
-		table.Append(data)
+		data = append(data, r)
 	}
 
-	table.Render()
+	return cli.RenderTable(format, result.Columns, data, result)
 }

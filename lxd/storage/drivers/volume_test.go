@@ -1,7 +1,7 @@
 package drivers
 
 import (
-	"fmt"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -42,17 +42,17 @@ func Test_Volume_ConfigSizeFromSource(t *testing.T) {
 		},
 		{
 			// Check the volume's default block disk size is used when volume is a block type and
-			// neighter volume or pool volume size is specified and empty image source volume used.
+			// neither volume or pool volume size is specified and empty image source volume used.
 			vol:    Volume{driver: &nonBlockBackedDriver, volType: VolumeTypeVM, contentType: ContentTypeBlock},
 			srcVol: Volume{volType: VolumeTypeImage},
 			err:    nil,
-			size:   DefaultBlockSize,
+			size:   defaultBlockSize,
 		},
 		{
 			// Check that the volume's smaller size than source image's rootfs size causes error.
 			vol:    Volume{driver: &nonBlockBackedDriver, volType: VolumeTypeContainer, config: map[string]string{"size": "1GiB"}},
 			srcVol: Volume{volType: VolumeTypeImage, config: map[string]string{"volatile.rootfs.size": "15GiB"}},
-			err:    fmt.Errorf("Source image size (16106127360) exceeds specified volume size (1073741824)"),
+			err:    errors.New("Source image size (16106127360) exceeds specified volume size (1073741824)"),
 			size:   "",
 		},
 		{
@@ -93,7 +93,7 @@ func Test_Volume_ConfigSizeFromSource(t *testing.T) {
 			vol:    Volume{driver: &blockBackedDriver, volType: VolumeTypeVM, config: map[string]string{}},
 			srcVol: Volume{volType: VolumeTypeImage, config: map[string]string{"volatile.rootfs.size": "5GiB"}},
 			err:    nil,
-			size:   DefaultBlockSize,
+			size:   defaultBlockSize,
 		},
 		{
 			// Check volume's size is used when VM filesystem volume is supplied with image source.
@@ -108,5 +108,36 @@ func Test_Volume_ConfigSizeFromSource(t *testing.T) {
 		size, err := test.vol.ConfigSizeFromSource(test.srcVol)
 		assert.Equal(t, test.size, size)
 		assert.Equal(t, test.err, err)
+	}
+}
+
+// Test NewVMBlockFilesystemVolume.
+func Test_NewVMBlockFilesystemVolume(t *testing.T) {
+	testDriver := dir{}
+
+	tests := []struct {
+		vol        Volume
+		parentUUID string
+	}{
+		{
+			// Check a FS volume derived from a regular volume doesn't have a parent UUID.
+			vol:        Volume{driver: &testDriver, config: map[string]string{}, name: "foo"},
+			parentUUID: "",
+		},
+		{
+			// Check a FS volume derived from a regular volume doesn't have a parent UUID even if the parent volume falsely has a parent UUID assigned.
+			vol:        Volume{driver: &testDriver, config: map[string]string{}, name: "foo", parentUUID: "b9e0b32f-5bb7-4782-8993-9f0c458fde75"},
+			parentUUID: "",
+		},
+		{
+			// Check a FS volume derived from a snapshot volume does have the parent's UUID.
+			vol:        Volume{driver: &testDriver, config: map[string]string{}, name: "foo/snap0", parentUUID: "b9e0b32f-5bb7-4782-8993-9f0c458fde75"},
+			parentUUID: "b9e0b32f-5bb7-4782-8993-9f0c458fde75",
+		},
+	}
+
+	for _, test := range tests {
+		vol := test.vol.NewVMBlockFilesystemVolume()
+		assert.Equal(t, test.parentUUID, vol.parentUUID)
 	}
 }

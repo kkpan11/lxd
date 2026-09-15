@@ -5,15 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/canonical/lxd/lxd/auth"
 	"github.com/canonical/lxd/lxd/cluster"
 	"github.com/canonical/lxd/lxd/db"
 	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/db/operationtype"
+	deviceConfig "github.com/canonical/lxd/lxd/device/config"
 	"github.com/canonical/lxd/lxd/instance"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/instance/operationlock"
@@ -26,6 +27,7 @@ import (
 	"github.com/canonical/lxd/lxd/task"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
+	"github.com/canonical/lxd/shared/entity"
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/revert"
 )
@@ -33,12 +35,12 @@ import (
 // Helper functions
 
 // instanceCreateAsEmpty creates an empty instance.
-func instanceCreateAsEmpty(s *state.State, args db.InstanceArgs) (instance.Instance, error) {
+func instanceCreateAsEmpty(ctx context.Context, s *state.State, args db.InstanceArgs, op *operations.Operation) (instance.Instance, error) {
 	revert := revert.New()
 	defer revert.Fail()
 
 	// Create the instance record.
-	inst, instOp, cleanup, err := instance.CreateInternal(s, args, true)
+	inst, instOp, cleanup, err := instance.CreateInternal(ctx, s, args, true)
 	if err != nil {
 		return nil, fmt.Errorf("Failed creating instance record: %w", err)
 	}
@@ -56,7 +58,7 @@ func instanceCreateAsEmpty(s *state.State, args db.InstanceArgs) (instance.Insta
 		return nil, fmt.Errorf("Failed creating instance: %w", err)
 	}
 
-	revert.Add(func() { _ = inst.Delete(true) })
+	revert.Add(func() { _ = inst.Delete(context.Background(), true, "", nil) })
 
 	err = inst.UpdateBackupFile()
 	if err != nil {
@@ -68,16 +70,16 @@ func instanceCreateAsEmpty(s *state.State, args db.InstanceArgs) (instance.Insta
 }
 
 // instanceImageTransfer transfers an image from another cluster node.
-func instanceImageTransfer(s *state.State, r *http.Request, projectName string, hash string, nodeAddress string) error {
+func instanceImageTransfer(ctx context.Context, s *state.State, localProjectName string, remoteProjectName string, hash string, nodeAddress string) error {
 	logger.Debugf("Transferring image %q from node %q", hash, nodeAddress)
-	client, err := cluster.Connect(nodeAddress, s.Endpoints.NetworkCert(), s.ServerCert(), r, false)
+	client, err := cluster.Connect(ctx, nodeAddress, s.Endpoints.NetworkCert(), s.ServerCert(), false)
 	if err != nil {
 		return err
 	}
 
-	client = client.UseProject(projectName)
+	client = client.UseProject(remoteProjectName)
 
-	err = imageImportFromNode(filepath.Join(s.OS.VarDir, "images"), client, hash)
+	err = imageImportFromNode(s.ImagesStoragePath(localProjectName), client, hash)
 	if err != nil {
 		return err
 	}
@@ -85,7 +87,7 @@ func instanceImageTransfer(s *state.State, r *http.Request, projectName string, 
 	return nil
 }
 
-func ensureImageIsLocallyAvailable(s *state.State, r *http.Request, img *api.Image, projectName string) error {
+func ensureImageIsLocallyAvailable(ctx context.Context, s *state.State, img *api.Image, projectName string) error {
 	// Check if the image is available locally or it's on another member.
 	// Ensure we are the only ones operating on this image. Otherwise another instance created at the same
 	// time may also arrive at the conclusion that the image doesn't exist on this cluster member and then
@@ -111,7 +113,7 @@ func ensureImageIsLocallyAvailable(s *state.State, r *http.Request, img *api.Ima
 
 	if memberAddress != "" {
 		// The image is available from another node, let's try to import it.
-		err = instanceImageTransfer(s, r, projectName, img.Fingerprint, memberAddress)
+		err = instanceImageTransfer(ctx, s, projectName, projectName, img.Fingerprint, memberAddress)
 		if err != nil {
 			return fmt.Errorf("Failed transferring image %q from %q: %w", img.Fingerprint, memberAddress, err)
 		}
@@ -129,7 +131,7 @@ func ensureImageIsLocallyAvailable(s *state.State, r *http.Request, img *api.Ima
 }
 
 // instanceCreateFromImage creates an instance from a rootfs image.
-func instanceCreateFromImage(s *state.State, img *api.Image, args db.InstanceArgs, op *operations.Operation) error {
+func instanceCreateFromImage(ctx context.Context, s *state.State, img *api.Image, args db.InstanceArgs, op *operations.Operation) error {
 	revert := revert.New()
 	defer revert.Fail()
 
@@ -140,13 +142,13 @@ func instanceCreateFromImage(s *state.State, img *api.Image, args db.InstanceArg
 	}
 
 	if imgType != args.Type {
-		return fmt.Errorf("Requested image's type %q doesn't match instance type %q", imgType, args.Type)
+		return fmt.Errorf("Requested image's type %q does not match instance type %q", imgType, args.Type)
 	}
 
 	// Set the "image.*" keys.
 	if img.Properties != nil {
 		for k, v := range img.Properties {
-			args.Config[fmt.Sprintf("image.%s", k)] = v
+			args.Config["image."+k] = v
 		}
 	}
 
@@ -154,7 +156,7 @@ func instanceCreateFromImage(s *state.State, img *api.Image, args db.InstanceArg
 	args.BaseImage = img.Fingerprint
 
 	// Create the instance.
-	inst, instOp, cleanup, err := instance.CreateInternal(s, args, true)
+	inst, instOp, cleanup, err := instance.CreateInternal(ctx, s, args, true)
 	if err != nil {
 		return fmt.Errorf("Failed creating instance record: %w", err)
 	}
@@ -179,12 +181,21 @@ func instanceCreateFromImage(s *state.State, img *api.Image, args db.InstanceArg
 		return fmt.Errorf("Failed loading instance storage pool: %w", err)
 	}
 
-	err = pool.CreateInstanceFromImage(inst, img.Fingerprint, op)
+	// Lock this operation to ensure that concurrent image operations don't conflict.
+	// Other operations will wait for this one to finish.
+	unlock, err := imageOperationLock(img.Fingerprint)
+	if err != nil {
+		return err
+	}
+
+	defer unlock()
+
+	err = pool.CreateInstanceFromImage(ctx, inst, img.Fingerprint, op)
 	if err != nil {
 		return fmt.Errorf("Failed creating instance from image: %w", err)
 	}
 
-	revert.Add(func() { _ = inst.Delete(true) })
+	revert.Add(func() { _ = inst.Delete(ctx, true, "", op) })
 
 	err = inst.UpdateBackupFile()
 	if err != nil {
@@ -195,7 +206,7 @@ func instanceCreateFromImage(s *state.State, img *api.Image, args db.InstanceArg
 	return nil
 }
 
-func instanceRebuildFromImage(s *state.State, r *http.Request, inst instance.Instance, img *api.Image, op *operations.Operation) error {
+func instanceRebuildFromImage(ctx context.Context, s *state.State, inst instance.Instance, img *api.Image, op *operations.Operation) error {
 	// Validate the type of the image matches the type of the instance.
 	imgType, err := instancetype.New(img.Type)
 	if err != nil {
@@ -203,15 +214,15 @@ func instanceRebuildFromImage(s *state.State, r *http.Request, inst instance.Ins
 	}
 
 	if imgType != inst.Type() {
-		return fmt.Errorf("Requested image's type %q doesn't match instance type %q", imgType, inst.Type())
+		return fmt.Errorf("Requested image's type %q does not match instance type %q", imgType, inst.Type())
 	}
 
-	err = ensureImageIsLocallyAvailable(s, r, img, inst.Project().Name)
+	err = ensureImageIsLocallyAvailable(ctx, s, img, inst.Project().Name)
 	if err != nil {
 		return err
 	}
 
-	err = inst.Rebuild(img, op)
+	err = inst.Rebuild(ctx, img, op)
 	if err != nil {
 		return fmt.Errorf("Failed rebuilding instance from image: %w", err)
 	}
@@ -219,8 +230,8 @@ func instanceRebuildFromImage(s *state.State, r *http.Request, inst instance.Ins
 	return nil
 }
 
-func instanceRebuildFromEmpty(inst instance.Instance, op *operations.Operation) error {
-	err := inst.Rebuild(nil, op) // Rebuild as empty.
+func instanceRebuildFromEmpty(ctx context.Context, inst instance.Instance, op *operations.Operation) error {
+	err := inst.Rebuild(ctx, nil, op) // Rebuild as empty.
 	if err != nil {
 		return fmt.Errorf("Failed rebuilding as an empty instance: %w", err)
 	}
@@ -228,18 +239,55 @@ func instanceRebuildFromEmpty(inst instance.Instance, op *operations.Operation) 
 	return nil
 }
 
+// adjustSnapRootDiskPool returns a clone of snapLocalDevices with the root-disk pool rewritten
+// to parentRootDiskPool when it diverges from the snapshot's expanded root disk pool.
+// parentRootDiskKey is used as the device name when a new local root device must be injected.
+// This is the canonical logic for aligning a snapshot's root disk with its new parent instance
+// before persisting; call it in both the copy path and any pre-flight validation.
+func adjustSnapRootDiskPool(snapLocalDevices deviceConfig.Devices, snapExpandedDevices deviceConfig.Devices, parentRootDiskKey, parentRootDiskPool string) deviceConfig.Devices {
+	result := snapLocalDevices.Clone()
+
+	snapRootKey, snapRootDev, err := api.GetRootDiskDevice(snapExpandedDevices.CloneNative())
+	if err == nil {
+		if snapRootDev["pool"] != parentRootDiskPool {
+			localRoot, found := result[snapRootKey]
+			if found {
+				localRoot["pool"] = parentRootDiskPool
+				result[snapRootKey] = localRoot
+			} else {
+				result[parentRootDiskKey] = deviceConfig.Device{
+					"type": "disk",
+					"path": "/",
+					"pool": parentRootDiskPool,
+				}
+			}
+		}
+	} else if errors.Is(err, api.ErrNoRootDisk) {
+		result[parentRootDiskKey] = deviceConfig.Device{
+			"type": "disk",
+			"path": "/",
+			"pool": parentRootDiskPool,
+		}
+	}
+	// If err is anything else (e.g. multiple root disks) leave result unmodified;
+	// instanceCreateAsCopy cannot safely fix that case either.
+
+	return result
+}
+
 // instanceCreateAsCopyOpts options for copying an instance.
 type instanceCreateAsCopyOpts struct {
-	sourceInstance       instance.Instance // Source instance.
-	targetInstance       db.InstanceArgs   // Configuration for new instance.
-	instanceOnly         bool              // Only copy the instance and not it's snapshots.
-	refresh              bool              // Refresh an existing target instance.
-	applyTemplateTrigger bool              // Apply deferred TemplateTriggerCopy.
-	allowInconsistent    bool              // Ignore some copy errors
+	sourceInstance           instance.Instance // Source instance.
+	targetInstance           db.InstanceArgs   // Configuration for new instance.
+	instanceOnly             bool              // Only copy the instance and not it's snapshots.
+	refresh                  bool              // Refresh an existing target instance.
+	applyTemplateTrigger     bool              // Apply deferred TemplateTriggerCopy.
+	allowInconsistent        bool              // Ignore some copy errors
+	overrideSnapshotProfiles bool              // Copy the target instance profiles to the instance snapshots
 }
 
 // instanceCreateAsCopy create a new instance by copying from an existing instance.
-func instanceCreateAsCopy(s *state.State, opts instanceCreateAsCopyOpts, op *operations.Operation) (instance.Instance, error) {
+func instanceCreateAsCopy(ctx context.Context, s *state.State, opts instanceCreateAsCopyOpts, op *operations.Operation) (instance.Instance, error) {
 	var inst instance.Instance
 	var instOp *operationlock.InstanceOperation
 	var err error
@@ -252,14 +300,26 @@ func instanceCreateAsCopy(s *state.State, opts instanceCreateAsCopyOpts, op *ope
 		// Load the target instance.
 		inst, err = instance.LoadByProjectAndName(s, opts.targetInstance.Project, opts.targetInstance.Name)
 		if err != nil {
+			if !api.StatusErrorCheck(err, http.StatusNotFound) {
+				return nil, err
+			}
+
 			opts.refresh = false // Instance doesn't exist, so switch to copy mode.
+		} else {
+			// Validate and apply refresh target config before the storage refresh.
+			err = inst.Update(ctx, opts.targetInstance, instance.UpdateActionUserRefresh)
+			if err != nil {
+				return nil, fmt.Errorf("Failed applying refresh target instance config: %w", err)
+			}
 		}
 	}
 
 	// If we are not in refresh mode, then create a new instance as we are in copy mode.
 	if !opts.refresh {
+		api.InstanceCreateConfigKeyPolicy.Apply(opts.targetInstance.Config, nil)
+
 		// Create the instance.
-		inst, instOp, cleanup, err = instance.CreateInternal(s, opts.targetInstance, true)
+		inst, instOp, cleanup, err = instance.CreateInternal(ctx, s, opts.targetInstance, true)
 		if err != nil {
 			return nil, fmt.Errorf("Failed creating instance record: %w", err)
 		}
@@ -276,7 +336,7 @@ func instanceCreateAsCopy(s *state.State, opts instanceCreateAsCopyOpts, op *ope
 
 	// At this point we have already figured out the instance's root disk device so we can simply retrieve it
 	// from the expanded devices.
-	instRootDiskDeviceKey, instRootDiskDevice, err := instancetype.GetRootDiskDevice(inst.ExpandedDevices().CloneNative())
+	instRootDiskDeviceKey, instRootDiskDevice, err := api.GetRootDiskDevice(inst.ExpandedDevices().CloneNative())
 	if err != nil {
 		return nil, err
 	}
@@ -321,7 +381,7 @@ func instanceCreateAsCopy(s *state.State, opts instanceCreateAsCopyOpts, op *ope
 
 			// Delete extra snapshots first.
 			for _, deleteTargetSnapIndex := range deleteTargetSnapshotIndexes {
-				err := targetSnaps[deleteTargetSnapIndex].Delete(true)
+				err := targetSnaps[deleteTargetSnapIndex].Delete(ctx, true, "", op)
 				if err != nil {
 					return nil, err
 				}
@@ -341,44 +401,13 @@ func instanceCreateAsCopy(s *state.State, opts instanceCreateAsCopyOpts, op *ope
 		}
 
 		for _, srcSnap := range snapshots {
-			snapLocalDevices := srcSnap.LocalDevices().Clone()
+			snapLocalDevices := adjustSnapRootDiskPool(
+				srcSnap.LocalDevices(), srcSnap.ExpandedDevices(),
+				instRootDiskDeviceKey, instRootDiskDevice["pool"],
+			)
 
-			// Load snap root disk from expanded devices (in case it doesn't have its own root disk).
-			snapExpandedRootDiskDevKey, snapExpandedRootDiskDev, err := instancetype.GetRootDiskDevice(srcSnap.ExpandedDevices().CloneNative())
-			if err == nil {
-				// If the expanded devices has a root disk, but its pool doesn't match our new
-				// parent instance's pool, then either modify the device if it is local or add a
-				// new one to local devices if its coming from the profiles.
-				if snapExpandedRootDiskDev["pool"] != instRootDiskDevice["pool"] {
-					localRootDiskDev, found := snapLocalDevices[snapExpandedRootDiskDevKey]
-					if found {
-						// Modify exist local device's pool.
-						localRootDiskDev["pool"] = instRootDiskDevice["pool"]
-						snapLocalDevices[snapExpandedRootDiskDevKey] = localRootDiskDev
-					} else {
-						// Add a new local device using parent instance's pool.
-						snapLocalDevices[instRootDiskDeviceKey] = map[string]string{
-							"type": "disk",
-							"path": "/",
-							"pool": instRootDiskDevice["pool"],
-						}
-					}
-				}
-			} else if errors.Is(err, instancetype.ErrNoRootDisk) {
-				// If no root disk defined in either local devices or profiles, then add one to the
-				// snapshot local devices using the same device name from the parent instance.
-				snapLocalDevices[instRootDiskDeviceKey] = map[string]string{
-					"type": "disk",
-					"path": "/",
-					"pool": instRootDiskDevice["pool"],
-				}
-			} else { //nolint:staticcheck,revive // (keep the empty branch for the comment)
-				// Snapshot has multiple root disk devices, we can't automatically fix this so
-				// leave alone so we don't prevent copy.
-			}
-
-			fields := strings.SplitN(srcSnap.Name(), shared.SnapshotDelimiter, 2)
-			newSnapName := fmt.Sprintf("%s/%s", inst.Name(), fields[1])
+			_, origSnapName, _ := strings.Cut(srcSnap.Name(), shared.SnapshotDelimiter)
+			newSnapName := inst.Name() + "/" + origSnapName
 			snapInstArgs := db.InstanceArgs{
 				Architecture: srcSnap.Architecture(),
 				Config:       srcSnap.LocalConfig(),
@@ -394,8 +423,13 @@ func instanceCreateAsCopy(s *state.State, opts instanceCreateAsCopyOpts, op *ope
 				CreationDate: srcSnap.CreationDate(),
 			}
 
+			// Fix target profiles
+			if opts.overrideSnapshotProfiles {
+				snapInstArgs.Profiles = opts.targetInstance.Profiles
+			}
+
 			// Create the snapshots.
-			_, snapInstOp, cleanup, err := instance.CreateInternal(s, snapInstArgs, true)
+			_, snapInstOp, cleanup, err := instance.CreateInternal(ctx, s, snapInstArgs, true)
 			if err != nil {
 				return nil, fmt.Errorf("Failed creating instance snapshot record %q: %w", newSnapName, err)
 			}
@@ -416,17 +450,17 @@ func instanceCreateAsCopy(s *state.State, opts instanceCreateAsCopyOpts, op *ope
 	}
 
 	if opts.refresh {
-		err = pool.RefreshInstance(inst, opts.sourceInstance, snapshots, opts.allowInconsistent, op)
+		err = pool.RefreshInstance(ctx, inst, opts.sourceInstance, snapshots, opts.allowInconsistent, op)
 		if err != nil {
-			return nil, fmt.Errorf("Refresh instance: %w", err)
+			return nil, fmt.Errorf("Failed refreshing instance: %w", err)
 		}
 	} else {
-		err = pool.CreateInstanceFromCopy(inst, opts.sourceInstance, !opts.instanceOnly, opts.allowInconsistent, op)
+		err = pool.CreateInstanceFromCopy(ctx, inst, opts.sourceInstance, !opts.instanceOnly, opts.allowInconsistent, op)
 		if err != nil {
 			return nil, fmt.Errorf("Create instance from copy: %w", err)
 		}
 
-		revert.Add(func() { _ = inst.Delete(true) })
+		revert.Add(func() { _ = inst.Delete(ctx, true, "", op) })
 
 		if opts.applyTemplateTrigger {
 			// Trigger the templates on next start.
@@ -495,13 +529,8 @@ func autoCreateInstanceSnapshots(ctx context.Context, s *state.State, instances 
 			return err
 		}
 
-		expiry, err := shared.GetExpiry(time.Now(), inst.ExpandedConfig()["snapshots.expiry"])
-		if err != nil {
-			l.Error("Error getting snapshots.expiry date")
-			return err
-		}
-
-		err = inst.Snapshot(snapshotName, expiry, false)
+		// Don't track progress for automated snapshot creation
+		err = inst.Snapshot(ctx, snapshotName, nil, false, api.DiskVolumesModeRoot, nil)
 		if err != nil {
 			l.Error("Error creating snapshot", logger.Ctx{"snapshot": snapshotName, "err": err})
 			return err
@@ -526,10 +555,11 @@ func pruneExpiredInstanceSnapshots(ctx context.Context, snapshots []instance.Ins
 			continue // Deletion of this snapshot is already running, skip.
 		}
 
-		err = snapshot.Delete(true)
+		// Don't track progress for automated snapshot pruning.
+		err = snapshot.Delete(ctx, true, "", nil)
 		instSnapshotsPruneRunning.Delete(snapshot.ID())
 		if err != nil {
-			return fmt.Errorf("Failed to delete expired instance snapshot %q in project %q: %w", snapshot.Name(), snapshot.Project().Name, err)
+			return fmt.Errorf("Failed deleting expired instance snapshot %q in project %q: %w", snapshot.Name(), snapshot.Project().Name, err)
 		}
 
 		logger.Debug("Deleted instance snapshot", logger.Ctx{"project": snapshot.Project().Name, "snapshot": snapshot.Name()})
@@ -538,176 +568,12 @@ func pruneExpiredInstanceSnapshots(ctx context.Context, snapshots []instance.Ins
 	return nil
 }
 
-func pruneExpiredAndAutoCreateInstanceSnapshotsTask(d *Daemon) (task.Func, task.Schedule) {
-	// `f` creates new scheduled instance snapshots and then, prune the expired ones
+func pruneExpiredAndAutoCreateInstanceSnapshotsTask(stateFunc func() *state.State) (task.Func, task.Schedule) {
+	// `f` prunes expired instance snapshots and then creates new scheduled ones.
 	f := func(ctx context.Context) {
-		s := d.State()
-		var instances, expiredSnapshotInstances []instance.Instance
-
-		// Get list of expired instance snapshots for this local member.
-		err := s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
-			expiredSnaps, err := tx.GetLocalExpiredInstanceSnapshots(ctx)
-			if err != nil {
-				return fmt.Errorf("Failed loading expired instance snapshots: %w", err)
-			}
-
-			if len(expiredSnaps) > 0 {
-				expiredSnapshots := make([]dbCluster.Instance, 0, len(expiredSnaps))
-				parents := make(map[string]*dbCluster.Instance, 0)
-
-				// Enrich expired snapshot list with info from parent (opportunistically loading
-				// the parent info from the DB if not already loaded).
-				for _, snapshot := range expiredSnaps {
-					parentInstanceKey := snapshot.Project + "/" + snapshot.Instance
-					parent, ok := parents[parentInstanceKey]
-					if !ok {
-						parent, err = dbCluster.GetInstance(ctx, tx.Tx(), snapshot.Project, snapshot.Instance)
-						if err != nil {
-							return fmt.Errorf("Failed loading instance %q (project %q): %w", snapshot.Instance, snapshot.Project, err)
-						}
-
-						parents[parentInstanceKey] = parent
-					}
-
-					expiredSnapshots = append(expiredSnapshots, snapshot.ToInstance(parent.Name, parent.Node, parent.Type, parent.Architecture))
-				}
-
-				// Load expired snapshot configs.
-				snapshotArgs, err := tx.InstancesToInstanceArgs(ctx, true, expiredSnapshots...)
-				if err != nil {
-					return fmt.Errorf("Failed loading expired instance snapshots info: %w", err)
-				}
-
-				projects := make(map[string]*api.Project)
-
-				expiredSnapshotInstances = make([]instance.Instance, 0)
-				for _, snapshotArg := range snapshotArgs {
-					// Load project if not already loaded.
-					p, found := projects[snapshotArg.Project]
-					if !found {
-						dbProject, err := dbCluster.GetProject(ctx, tx.Tx(), snapshotArg.Project)
-						if err != nil {
-							return fmt.Errorf("Failed loading project %q: %w", snapshotArg.Project, err)
-						}
-
-						p, err = dbProject.ToAPI(ctx, tx.Tx())
-						if err != nil {
-							return fmt.Errorf("Failed loading project %q config: %w", snapshotArg.Project, err)
-						}
-
-						projects[snapshotArg.Project] = p
-					}
-
-					inst, err := instance.Load(s, snapshotArg, *p)
-					if err != nil {
-						return fmt.Errorf("Failed loading instance snapshot %q (project %q) for prune task: %w", snapshotArg.Name, snapshotArg.Project, err)
-					}
-
-					logger.Debug("Scheduling instance snapshot expiry", logger.Ctx{"instance": inst.Name(), "project": inst.Project().Name})
-					expiredSnapshotInstances = append(expiredSnapshotInstances, inst)
-				}
-			}
-
-			return nil
-		})
+		err := pruneExpiredAndAutoCreateInstanceSnapshots(ctx, stateFunc())
 		if err != nil {
-			logger.Error("Failed getting instance snapshot expiry info", logger.Ctx{"err": err})
-			return
-		}
-
-		// Get list of instances on the local member that are due to have snaphots creating.
-		filter := dbCluster.InstanceFilter{Node: &s.ServerName}
-
-		err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
-			return tx.InstanceList(ctx, func(dbInst db.InstanceArgs, p api.Project) error {
-				err = limits.AllowSnapshotCreation(&p)
-				if err != nil {
-					return nil
-				}
-
-				inst, err := instance.Load(s, dbInst, p)
-				if err != nil {
-					return fmt.Errorf("Failed loading instance %q (project %q) for snapshot task: %w", dbInst.Name, dbInst.Project, err)
-				}
-
-				// Check if instance has snapshot schedule enabled.
-				schedule, ok := inst.ExpandedConfig()["snapshots.schedule"]
-				if !ok || schedule == "" {
-					return nil
-				}
-
-				// Check if snapshot is scheduled.
-				if !snapshotIsScheduledNow(schedule, int64(inst.ID())) {
-					return nil
-				}
-
-				// If snapshot should only be taken if instance is running, check if running.
-				if shared.IsFalseOrEmpty(inst.ExpandedConfig()["snapshots.schedule.stopped"]) && !inst.IsRunning() {
-					return nil
-				}
-
-				logger.Debug("Scheduling auto instance snapshot", logger.Ctx{"instance": inst.Name(), "project": inst.Project().Name})
-				instances = append(instances, inst)
-
-				return nil
-			}, filter)
-		})
-		if err != nil {
-			logger.Error("Failed getting instance snapshot schedule info", logger.Ctx{"err": err})
-			return
-		}
-
-		// Handle snapshot expiry first before creating new ones to reduce the chances of running out of
-		// disk space.
-		if len(expiredSnapshotInstances) > 0 {
-			opRun := func(op *operations.Operation) error {
-				return pruneExpiredInstanceSnapshots(ctx, expiredSnapshotInstances)
-			}
-
-			op, err := operations.OperationCreate(s, "", operations.OperationClassTask, operationtype.SnapshotsExpire, nil, nil, opRun, nil, nil, nil)
-			if err != nil {
-				logger.Error("Failed creating instance snapshots expiry operation", logger.Ctx{"err": err})
-			} else {
-				logger.Info("Pruning expired instance snapshots")
-
-				err = op.Start()
-				if err != nil {
-					logger.Error("Failed starting instance snapshots expiry operation", logger.Ctx{"err": err})
-				} else {
-					err = op.Wait(ctx)
-					if err != nil {
-						logger.Error("Failed pruning instance snapshots", logger.Ctx{"err": err})
-					} else {
-						logger.Info("Done pruning expired instance snapshots")
-					}
-				}
-			}
-		}
-
-		// Handle snapshot auto creation.
-		if len(instances) > 0 {
-			opRun := func(op *operations.Operation) error {
-				return autoCreateInstanceSnapshots(ctx, s, instances)
-			}
-
-			op, err := operations.OperationCreate(s, "", operations.OperationClassTask, operationtype.SnapshotCreate, nil, nil, opRun, nil, nil, nil)
-			if err != nil {
-				logger.Error("Failed creating scheduled instance snapshot operation", logger.Ctx{"err": err})
-			} else {
-				logger.Info("Creating scheduled instance snapshots")
-
-				err = op.Start()
-				if err != nil {
-					logger.Error("Failed starting scheduled instance snapshot operation", logger.Ctx{"err": err})
-				} else {
-					err = op.Wait(ctx)
-					if err != nil {
-						logger.Error("Failed scheduled instance snapshots", logger.Ctx{"err": err})
-					} else {
-						logger.Info("Done creating scheduled instance snapshots")
-					}
-				}
-			}
+			logger.Error("Failed running scheduled instance snapshot task", logger.Ctx{"err": err})
 		}
 	}
 
@@ -724,6 +590,215 @@ func pruneExpiredAndAutoCreateInstanceSnapshotsTask(d *Daemon) (task.Func, task.
 	}
 
 	return f, schedule
+}
+
+// pruneExpiredAndAutoCreateInstanceSnapshots prunes expired instance snapshots and then creates new scheduled ones.
+func pruneExpiredAndAutoCreateInstanceSnapshots(ctx context.Context, s *state.State) error {
+	var instances, expiredSnapshotInstances []instance.Instance
+
+	// Get list of expired instance snapshots for this local member.
+	err := s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		expiredSnaps, err := tx.GetLocalExpiredInstanceSnapshots(ctx)
+		if err != nil {
+			return fmt.Errorf("Failed loading expired instance snapshots: %w", err)
+		}
+
+		if len(expiredSnaps) > 0 {
+			expiredSnapshots := make([]dbCluster.Instance, 0, len(expiredSnaps))
+			parents := make(map[string]*dbCluster.Instance, 0)
+
+			// Enrich expired snapshot list with info from parent (opportunistically loading
+			// the parent info from the DB if not already loaded).
+			for _, snapshot := range expiredSnaps {
+				parentInstanceKey := snapshot.Project + "/" + snapshot.Instance
+				parent, ok := parents[parentInstanceKey]
+				if !ok {
+					parent, err = dbCluster.GetInstance(ctx, tx.Tx(), snapshot.Project, snapshot.Instance)
+					if err != nil {
+						return fmt.Errorf("Failed loading instance %q (project %q): %w", snapshot.Instance, snapshot.Project, err)
+					}
+
+					parents[parentInstanceKey] = parent
+				}
+
+				expiredSnapshots = append(expiredSnapshots, snapshot.ToInstance(parent.Name, parent.Node, parent.Type, parent.Architecture))
+			}
+
+			// Load expired snapshot configs.
+			snapshotArgs, err := tx.InstancesToInstanceArgs(ctx, true, expiredSnapshots...)
+			if err != nil {
+				return fmt.Errorf("Failed loading expired instance snapshots info: %w", err)
+			}
+
+			projects := make(map[string]*api.Project)
+
+			expiredSnapshotInstances = make([]instance.Instance, 0)
+			for _, snapshotArg := range snapshotArgs {
+				// Load project if not already loaded.
+				p, found := projects[snapshotArg.Project]
+				if !found {
+					dbProject, err := dbCluster.GetProject(ctx, tx.Tx(), snapshotArg.Project)
+					if err != nil {
+						return fmt.Errorf("Failed loading project %q: %w", snapshotArg.Project, err)
+					}
+
+					p, err = dbProject.ToAPI(ctx, tx.Tx())
+					if err != nil {
+						return fmt.Errorf("Failed loading project %q config: %w", snapshotArg.Project, err)
+					}
+
+					projects[snapshotArg.Project] = p
+				}
+
+				inst, err := instance.Load(s, snapshotArg, *p)
+				if err != nil {
+					return fmt.Errorf("Failed loading instance snapshot %q (project %q) for prune task: %w", snapshotArg.Name, snapshotArg.Project, err)
+				}
+
+				logger.Debug("Scheduling instance snapshot expiry", logger.Ctx{"instance": inst.Name(), "project": inst.Project().Name})
+				expiredSnapshotInstances = append(expiredSnapshotInstances, inst)
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("Failed getting instance snapshot expiry info: %w", err)
+	}
+
+	// Get list of instances on the local member that are due to have snapshots created.
+	filter := dbCluster.InstanceFilter{Node: &s.ServerName}
+
+	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		return tx.InstanceList(ctx, func(dbInst db.InstanceArgs, p api.Project) error {
+			err = limits.AllowSnapshotCreation(&p)
+			if err != nil {
+				return nil
+			}
+
+			inst, err := instance.Load(s, dbInst, p)
+			if err != nil {
+				return fmt.Errorf("Failed loading instance %q (project %q) for snapshot task: %w", dbInst.Name, dbInst.Project, err)
+			}
+
+			// Check if instance has snapshot schedule enabled.
+			schedule, ok := inst.ExpandedConfig()["snapshots.schedule"]
+			if !ok || schedule == "" {
+				return nil
+			}
+
+			// Check if snapshot is scheduled.
+			if !snapshotIsScheduledNow(schedule, int64(inst.ID())) {
+				return nil
+			}
+
+			// If snapshot should only be taken if instance is running, check if running.
+			if shared.IsFalseOrEmpty(inst.ExpandedConfig()["snapshots.schedule.stopped"]) && !inst.IsRunning() {
+				return nil
+			}
+
+			logger.Debug("Scheduling auto instance snapshot", logger.Ctx{"instance": inst.Name(), "project": inst.Project().Name})
+			instances = append(instances, inst)
+
+			return nil
+		}, filter)
+	})
+	if err != nil {
+		return fmt.Errorf("Failed getting instance snapshot schedule info: %w", err)
+	}
+
+	// Handle snapshot expiry first before creating new ones to reduce the chances of running out of
+	// disk space.
+	if len(expiredSnapshotInstances) > 0 {
+		opRun := func(ctx context.Context, op *operations.Operation) error {
+			return pruneExpiredInstanceSnapshots(ctx, expiredSnapshotInstances)
+		}
+
+		args := operations.OperationArgs{
+			Type:    operationtype.SnapshotsExpire,
+			Class:   operationtype.OperationClassTask,
+			RunHook: opRun,
+		}
+
+		logger.Info("Pruning expired instance snapshots")
+		op, err := operations.ScheduleServerOperation(s, args)
+		if err != nil {
+			return fmt.Errorf("Failed creating instance snapshots expiry operation: %w", err)
+		}
+
+		err = op.Wait(ctx)
+		if err != nil {
+			return fmt.Errorf("Failed pruning instance snapshots: %w", err)
+		}
+
+		logger.Info("Done pruning expired instance snapshots")
+	}
+
+	// Handle snapshot auto creation.
+	if len(instances) > 0 {
+		opRun := func(ctx context.Context, op *operations.Operation) error {
+			return autoCreateInstanceSnapshots(ctx, s, instances)
+		}
+
+		args := operations.OperationArgs{
+			Type:    operationtype.SnapshotsCreateScheduled,
+			Class:   operationtype.OperationClassTask,
+			RunHook: opRun,
+		}
+
+		logger.Info("Creating scheduled instance snapshots")
+		op, err := operations.ScheduleServerOperation(s, args)
+		if err != nil {
+			return fmt.Errorf("Failed creating scheduled instance snapshot operation: %w", err)
+		}
+
+		err = op.Wait(ctx)
+		if err != nil {
+			return fmt.Errorf("Failed creating scheduled instance snapshots: %w", err)
+		}
+
+		logger.Info("Done creating scheduled instance snapshots")
+	}
+
+	return nil
+}
+
+// resolveSourceImageFromCache searches the image to use for an instance source in the local cache.
+// This can be used to find either a cached copy of a remote image when a remote image is specified, or to find a local image when a local source image is specified.
+// If an image is not found locally, this function returns `nil` instead of an image and no error.
+// If an image is found, but is in a different project and is private, a function is returned to perform an authorization check on the image.
+// This must be called by the caller if non-nil.
+func resolveSourceImageFromCache(r *http.Request, s *state.State, tx *db.ClusterTx, targetProjectName string, source api.InstanceSource, imageRef *string, instType string) (*api.Image, func(ctx context.Context) error, error) {
+	// Resolve the project used for local cache lookup to find the image.
+	localLookupProject := targetProjectName
+	if source.Server == "" && source.Project != "" {
+		// For local images, if a source project is explicitly provided, use it to locate the image.
+		localLookupProject = source.Project
+	}
+
+	// Check if the image has an entry in the database but fail only if the error
+	// is different than the image not being found.
+	sourceImage, err := getSourceImageFromInstanceSource(r.Context(), s, tx, localLookupProject, source, imageRef, instType)
+	if err != nil && !api.StatusErrorCheck(err, http.StatusNotFound) {
+		return nil, nil, err
+	}
+
+	// If the image is locally available, private, and from a different project, return an authorization checker function
+	// so that the caller can check access when the transaction has ended.
+	var authCheckFunc func(ctx context.Context) error
+	if sourceImage != nil && localLookupProject != targetProjectName && !sourceImage.Public {
+		// Get the effective image project based on the "features.images" value.
+		effectiveImageProject, err := project.ImageProject(r.Context(), tx.Tx(), localLookupProject)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		authCheckFunc = func(ctx context.Context) error {
+			return s.Authorizer.CheckPermission(ctx, entity.ImageURL(effectiveImageProject, sourceImage.Fingerprint), auth.EntitlementCanView)
+		}
+	}
+
+	return sourceImage, authCheckFunc, nil
 }
 
 // getSourceImageFromInstanceSource returns the image to use for an instance source.
@@ -765,5 +840,5 @@ func instanceOperationLock(ctx context.Context, projectName string, instanceName
 	l.Debug("Acquiring lock for instance")
 	defer l.Debug("Lock acquired for instance")
 
-	return locking.Lock(ctx, fmt.Sprintf("InstanceOperation_%s", project.Instance(projectName, instanceName)))
+	return locking.Lock(ctx, "InstanceOperation_"+project.Instance(projectName, instanceName))
 }

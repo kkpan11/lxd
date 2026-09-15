@@ -4,37 +4,42 @@ package subprocess
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"syscall"
 
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/canonical/lxd/shared"
 )
 
 // Process struct. Has ability to set runtime arguments.
 type Process struct {
-	exitCode int64 `yaml:"-"`
-	exitErr  error `yaml:"-"`
+	exitCode int64
+	exitErr  error
 
-	chExit     chan struct{} `yaml:"-"`
-	hasMonitor bool          `yaml:"-"`
-	closeFds   bool          `yaml:"-"`
+	chExit     chan struct{}
+	hasMonitor bool
+	closeFds   bool
+	proc       *os.Process
 
-	Name     string         `yaml:"name"`
-	Args     []string       `yaml:"args,flow"`
-	Apparmor string         `yaml:"apparmor"`
-	PID      int64          `yaml:"pid"`
-	Stdin    io.ReadCloser  `yaml:"-"`
-	Stdout   io.WriteCloser `yaml:"-"`
-	Stderr   io.WriteCloser `yaml:"-"`
+	Name     string   `yaml:"name"`
+	Args     []string `yaml:"args,flow"`
+	Apparmor string   `yaml:"apparmor"`
+	PID      int      `yaml:"pid"`
+	BootID   string   `yaml:"boot_id"`
+	stdin    io.ReadCloser
+	stdout   io.WriteCloser
+	stderr   io.WriteCloser
 
 	UID       uint32 `yaml:"uid"`
 	GID       uint32 `yaml:"gid"`
 	SetGroups bool   `yaml:"set_groups"`
+	Dir       string `yaml:"dir"`
+	StartTime int64  `yaml:"start_time"`
 
 	SysProcAttr *syscall.SysProcAttr
 }
@@ -44,39 +49,12 @@ func (p *Process) hasApparmor() bool {
 		return false
 	}
 
-	_, err := exec.LookPath("aa-exec")
-	if err != nil {
-		return false
-	}
-
 	if !shared.PathExists("/sys/kernel/security/apparmor") {
 		return false
 	}
 
-	return true
-}
-
-// GetPid returns the pid for the given process object.
-func (p *Process) GetPid() (int64, error) {
-	pr, err := os.FindProcess(int(p.PID))
-	if err != nil {
-		if err == os.ErrProcessDone {
-			return 0, ErrNotRunning
-		}
-
-		return 0, err
-	}
-
-	err = pr.Signal(syscall.Signal(0))
-	if err != nil {
-		if err == os.ErrProcessDone {
-			return 0, ErrNotRunning
-		}
-
-		return 0, err
-	}
-
-	return p.PID, nil
+	_, err := exec.LookPath("aa-exec")
+	return err == nil
 }
 
 // SetApparmor allows setting the AppArmor profile.
@@ -90,39 +68,39 @@ func (p *Process) SetCreds(uid uint32, gid uint32) {
 	p.GID = gid
 }
 
+func (p *Process) release() {
+	if p.proc == nil {
+		return
+	}
+
+	_ = p.proc.Release()
+	p.proc = nil
+}
+
+func (p *Process) finish() {
+	if p.hasMonitor {
+		<-p.chExit
+		return
+	}
+
+	p.release()
+}
+
 // Stop will stop the given process object.
 func (p *Process) Stop() error {
-	pr, err := os.FindProcess(int(p.PID))
-	if err != nil {
-		if err == os.ErrProcessDone {
-			if p.hasMonitor {
-				<-p.chExit
-			}
-
-			return ErrNotRunning
-		}
-
-		return err
+	if p.proc == nil {
+		return ErrNotRunning
 	}
 
-	// Check if process exists.
-	err = pr.Signal(syscall.Signal(0))
+	err := p.proc.Signal(syscall.SIGKILL)
 	if err == nil {
-		err = pr.Kill()
-		if err == nil {
-			if p.hasMonitor {
-				<-p.chExit
-			}
+		p.finish()
 
-			return nil // Killed successfully.
-		}
+		return nil
 	}
 
-	// Check if either the existence check or the kill resulted in an already finished error.
-	if err == os.ErrProcessDone {
-		if p.hasMonitor {
-			<-p.chExit
-		}
+	if errors.Is(err, os.ErrProcessDone) {
+		p.finish()
 
 		return ErrNotRunning
 	}
@@ -149,9 +127,10 @@ func (p *Process) start(ctx context.Context, fds []*os.File) error {
 		cmd = exec.CommandContext(ctx, p.Name, p.Args...)
 	}
 
-	cmd.Stdout = p.Stdout
-	cmd.Stderr = p.Stderr
-	cmd.Stdin = p.Stdin
+	cmd.Stdout = p.stdout
+	cmd.Stderr = p.stderr
+	cmd.Stdin = p.stdin
+	cmd.Dir = p.Dir
 	cmd.SysProcAttr = p.SysProcAttr
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
@@ -169,22 +148,34 @@ func (p *Process) start(ctx context.Context, fds []*os.File) error {
 		cmd.ExtraFiles = fds
 	}
 
-	if p.Stdout != nil && p.closeFds {
-		defer func() { _ = p.Stdout.Close() }()
+	if p.stdout != nil && p.closeFds {
+		defer func() { _ = p.stdout.Close() }()
 	}
 
-	if p.Stderr != nil && p.Stderr != p.Stdout && p.closeFds {
-		defer func() { _ = p.Stderr.Close() }()
+	if p.stderr != nil && p.stderr != p.stdout && p.closeFds {
+		defer func() { _ = p.stderr.Close() }()
 	}
 
 	// Start the process.
 	err := cmd.Start()
 	if err != nil {
-		return fmt.Errorf("Unable to start process: %w", err)
+		return fmt.Errorf("Cannot start process: %w", err)
 	}
 
-	p.PID = int64(cmd.Process.Pid)
+	p.BootID = ""
+	p.StartTime = 0
+	p.proc = cmd.Process
+	p.PID = cmd.Process.Pid
 
+	starttime, err := processStartTime(p.PID)
+	if err == nil {
+		p.StartTime = starttime
+	}
+
+	bootID, err := currentBootID()
+	if err == nil {
+		p.BootID = bootID
+	}
 	// Reset exitCode/exitErr
 	p.exitCode = 0
 	p.exitErr = nil
@@ -221,12 +212,12 @@ func (p *Process) start(ctx context.Context, fds []*os.File) error {
 func (p *Process) Restart(ctx context.Context) error {
 	err := p.Stop()
 	if err != nil {
-		return fmt.Errorf("Unable to stop process: %w", err)
+		return fmt.Errorf("Cannot stop process: %w", err)
 	}
 
 	err = p.Start(ctx)
 	if err != nil {
-		return fmt.Errorf("Unable to start process: %w", err)
+		return fmt.Errorf("Cannot start process: %w", err)
 	}
 
 	return nil
@@ -234,40 +225,33 @@ func (p *Process) Restart(ctx context.Context) error {
 
 // Reload sends the SIGHUP signal to the given process object.
 func (p *Process) Reload() error {
-	pr, err := os.FindProcess(int(p.PID))
+	if p.proc == nil {
+		return ErrNotRunning
+	}
+
+	err := p.proc.Signal(syscall.SIGHUP)
 	if err != nil {
-		if err == os.ErrProcessDone {
+		if errors.Is(err, os.ErrProcessDone) {
+			p.finish()
 			return ErrNotRunning
 		}
 
 		return fmt.Errorf("Could not reload process: %w", err)
 	}
 
-	err = pr.Signal(syscall.Signal(0))
-	if err == nil {
-		err = pr.Signal(syscall.SIGHUP)
-		if err != nil {
-			return fmt.Errorf("Could not reload process: %w", err)
-		}
-
-		return nil
-	} else if err == os.ErrProcessDone {
-		return ErrNotRunning
-	}
-
-	return fmt.Errorf("Could not reload process: %w", err)
+	return nil
 }
 
 // Save will save the given process object to a YAML file. Can be imported at a later point.
 func (p *Process) Save(path string) error {
 	dat, err := yaml.Marshal(p)
 	if err != nil {
-		return fmt.Errorf("Unable to serialize process struct to YAML: %w", err)
+		return fmt.Errorf("Cannot serialize process struct to YAML: %w", err)
 	}
 
-	err = os.WriteFile(path, dat, 0644)
+	err = os.WriteFile(path, dat, 0600)
 	if err != nil {
-		return fmt.Errorf("Unable to write to file '%s': %w", path, err)
+		return fmt.Errorf("Cannot write to file %q: %w", path, err)
 	}
 
 	return nil
@@ -275,34 +259,27 @@ func (p *Process) Save(path string) error {
 
 // Signal will send a signal to the given process object given a signal value.
 func (p *Process) Signal(signal int64) error {
-	pr, err := os.FindProcess(int(p.PID))
-	if err != nil {
-		if err == os.ErrProcessDone {
-			return ErrNotRunning
-		}
-
-		return err
-	}
-
-	err = pr.Signal(syscall.Signal(0))
-	if err == nil {
-		err = pr.Signal(syscall.Signal(signal))
-		if err != nil {
-			return fmt.Errorf("Could not signal process: %w", err)
-		}
-
-		return nil
-	} else if err == os.ErrProcessDone {
+	if p.proc == nil {
 		return ErrNotRunning
 	}
 
-	return fmt.Errorf("Could not signal process: %w", err)
+	err := p.proc.Signal(syscall.Signal(signal))
+	if err != nil {
+		if errors.Is(err, os.ErrProcessDone) {
+			p.finish()
+			return ErrNotRunning
+		}
+
+		return fmt.Errorf("Could not signal process: %w", err)
+	}
+
+	return nil
 }
 
 // Wait will wait for the given process object exit code.
 func (p *Process) Wait(ctx context.Context) (int64, error) {
 	if !p.hasMonitor {
-		return -1, fmt.Errorf("Unable to wait on process we didn't spawn")
+		return -1, errors.New("Cannot wait on process we did not spawn")
 	}
 
 	select {

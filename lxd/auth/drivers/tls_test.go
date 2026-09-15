@@ -2,16 +2,18 @@ package drivers
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"slices"
 	"testing"
 
 	"github.com/dustinkirkland/golang-petname"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/canonical/lxd/lxd/auth"
+	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/identity"
 	"github.com/canonical/lxd/lxd/request"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/entity"
 	"github.com/canonical/lxd/shared/logger"
@@ -19,10 +21,9 @@ import (
 
 type tlsSuite struct {
 	suite.Suite
-	authorizer          auth.Authorizer
-	idCache             *identity.Cache
-	fooRestrictedClient identity.CacheEntry
-	unrestrictedClient  identity.CacheEntry
+	authorizer   auth.Authorizer
+	cluster      *db.Cluster
+	closeCluster func()
 }
 
 func TestTLSSuite(t *testing.T) {
@@ -30,47 +31,52 @@ func TestTLSSuite(t *testing.T) {
 }
 
 func (s *tlsSuite) SetupSuite() {
+	s.cluster, s.closeCluster = db.NewTestCluster(s.T())
 	var err error
-	s.idCache = &identity.Cache{}
-	s.authorizer, err = LoadAuthorizer(context.Background(), DriverTLS, logger.Log, s.idCache)
-	s.Require().NoError(err)
-	s.fooRestrictedClient = s.newIdentity("foo-restricted", api.IdentityTypeCertificateClientRestricted, []string{"foo"})
-	s.unrestrictedClient = s.newIdentity("unrestricted", api.IdentityTypeCertificateClientUnrestricted, nil)
-	err = s.idCache.ReplaceAll([]identity.CacheEntry{s.fooRestrictedClient, s.unrestrictedClient}, nil)
+	s.authorizer, err = LoadAuthorizer(context.Background(), DriverTLS, logger.Log)
 	s.Require().NoError(err)
 }
 
-func (s *tlsSuite) newIdentity(name string, identityType string, projects []string) identity.CacheEntry {
-	cert, _, err := shared.GenerateMemCert(true, shared.CertOptions{})
-	s.Require().NoError(err)
-	x509Cert, err := shared.ParseCert(cert)
-	s.Require().NoError(err)
-	certFingerprint := shared.CertFingerprint(x509Cert)
-	return identity.CacheEntry{
-		Identifier:           certFingerprint,
-		Name:                 name,
-		AuthenticationMethod: api.AuthenticationMethodTLS,
-		IdentityType:         identityType,
-		Projects:             projects,
-		Certificate:          x509Cert,
-	}
+func (s *tlsSuite) TearDownSuite() {
+	s.closeCluster()
 }
 
-func (s *tlsSuite) setupCtx(id *identity.CacheEntry) context.Context {
-	ctx := context.Background()
-	if id == nil {
-		ctx = context.WithValue(ctx, request.CtxTrusted, false)
-		return ctx
+func (s *tlsSuite) setupCtx(details request.RequestorArgs) context.Context {
+	r := &http.Request{
+		RemoteAddr: "127.0.0.1:53423",
 	}
 
-	ctx = context.WithValue(ctx, request.CtxTrusted, true)
-	ctx = context.WithValue(ctx, request.CtxProtocol, id.AuthenticationMethod)
-	return context.WithValue(ctx, request.CtxUsername, id.Identifier)
+	err := request.SetRequestor(r, func(ctx context.Context, authenticationMethod string, identifier string) (*request.RequestorHookResult, error) {
+		switch identifier {
+		case "foo-restricted":
+			return &request.RequestorHookResult{
+				IdentityID:   1,
+				IdentityType: identity.CertificateClientRestricted{},
+				Projects: map[string]map[string]bool{
+					"foo": {
+						"features.images":          true,
+						"features.profiles":        true,
+						"features.storage.volumes": true,
+						"features.storage.buckets": true,
+					},
+				},
+			}, nil
+		case "unrestricted":
+			return &request.RequestorHookResult{
+				IdentityID:   2,
+				IdentityType: identity.CertificateClientUnrestricted{},
+			}, nil
+		}
+
+		return nil, fmt.Errorf("Unknown identity %q", identifier)
+	}, details)
+	s.Require().NoError(err)
+	return r.Context()
 }
 
 func (s *tlsSuite) TestTLSAuthorizer() {
 	type testCase struct {
-		id            *identity.CacheEntry
+		id            string
 		entityURL     *api.URL
 		entitlements  []auth.Entitlement
 		expectErr     bool
@@ -80,7 +86,7 @@ func (s *tlsSuite) TestTLSAuthorizer() {
 	// Initial cases represent exceptions to entity types that are not project specific (e.g. cases handled by `allowProjectUnspecificEntityType`).
 	cases := []testCase{
 		{
-			id:        &s.fooRestrictedClient,
+			id:        "foo-restricted",
 			entityURL: entity.ServerURL(),
 			entitlements: []auth.Entitlement{
 				auth.EntitlementCanViewResources,
@@ -88,7 +94,7 @@ func (s *tlsSuite) TestTLSAuthorizer() {
 			},
 		},
 		{
-			id:        &s.fooRestrictedClient,
+			id:        "foo-restricted",
 			entityURL: entity.ServerURL(),
 			entitlements: []auth.Entitlement{
 				auth.EntitlementCanEdit,
@@ -99,20 +105,20 @@ func (s *tlsSuite) TestTLSAuthorizer() {
 				auth.EntitlementCanCreateStoragePools,
 				auth.EntitlementCanCreateProjects,
 				auth.EntitlementCanOverrideClusterTargetRestriction,
-				auth.EntitlementCanViewPrivilegedEvents,
+				auth.EntitlementCanViewEvents,
 				auth.EntitlementCanViewWarnings,
 			},
 			expectErr:     true,
 			expectErrCode: http.StatusForbidden,
 		},
 		{
-			id:           &s.fooRestrictedClient,
-			entityURL:    entity.IdentityURL(api.AuthenticationMethodTLS, s.fooRestrictedClient.Identifier),
+			id:           "foo-restricted",
+			entityURL:    entity.IdentityURL(api.AuthenticationMethodTLS, "foo-restricted"),
 			entitlements: []auth.Entitlement{auth.EntitlementCanView},
 		},
 		{
-			id:        &s.fooRestrictedClient,
-			entityURL: entity.IdentityURL(api.AuthenticationMethodTLS, s.fooRestrictedClient.Identifier),
+			id:        "foo-restricted",
+			entityURL: entity.IdentityURL(api.AuthenticationMethodTLS, "foo-restricted"),
 			entitlements: []auth.Entitlement{
 				auth.EntitlementCanEdit,
 				auth.EntitlementCanDelete,
@@ -121,7 +127,7 @@ func (s *tlsSuite) TestTLSAuthorizer() {
 			expectErrCode: http.StatusForbidden,
 		},
 		{
-			id:        &s.fooRestrictedClient,
+			id:        "foo-restricted",
 			entityURL: entity.IdentityURL(api.AuthenticationMethodTLS, petname.Generate(2, "-")),
 			entitlements: []auth.Entitlement{
 				auth.EntitlementCanView,
@@ -132,13 +138,13 @@ func (s *tlsSuite) TestTLSAuthorizer() {
 			expectErrCode: http.StatusForbidden,
 		},
 		{
-			id:           &s.fooRestrictedClient,
-			entityURL:    entity.CertificateURL(s.fooRestrictedClient.Identifier),
+			id:           "foo-restricted",
+			entityURL:    entity.CertificateURL("foo-restricted"),
 			entitlements: []auth.Entitlement{auth.EntitlementCanView},
 		},
 		{
-			id:        &s.fooRestrictedClient,
-			entityURL: entity.CertificateURL(s.fooRestrictedClient.Identifier),
+			id:        "foo-restricted",
+			entityURL: entity.CertificateURL("foo-restricted"),
 			entitlements: []auth.Entitlement{
 				auth.EntitlementCanEdit,
 				auth.EntitlementCanDelete,
@@ -147,7 +153,7 @@ func (s *tlsSuite) TestTLSAuthorizer() {
 			expectErrCode: http.StatusForbidden,
 		},
 		{
-			id:        &s.fooRestrictedClient,
+			id:        "foo-restricted",
 			entityURL: entity.CertificateURL(petname.Generate(2, "-")),
 			entitlements: []auth.Entitlement{
 				auth.EntitlementCanView,
@@ -158,7 +164,7 @@ func (s *tlsSuite) TestTLSAuthorizer() {
 			expectErrCode: http.StatusForbidden,
 		},
 		{
-			id:        &s.fooRestrictedClient,
+			id:        "foo-restricted",
 			entityURL: entity.ProjectURL("foo"),
 			entitlements: []auth.Entitlement{
 				auth.EntitlementCanView,
@@ -177,7 +183,7 @@ func (s *tlsSuite) TestTLSAuthorizer() {
 			},
 		},
 		{
-			id:        &s.fooRestrictedClient,
+			id:        "foo-restricted",
 			entityURL: entity.ProjectURL("foo"),
 			entitlements: []auth.Entitlement{
 				auth.EntitlementCanEdit,
@@ -187,7 +193,7 @@ func (s *tlsSuite) TestTLSAuthorizer() {
 			expectErrCode: http.StatusForbidden,
 		},
 		{
-			id:        &s.fooRestrictedClient,
+			id:        "foo-restricted",
 			entityURL: entity.ProjectURL(petname.Generate(2, "-")),
 			entitlements: []auth.Entitlement{
 				auth.EntitlementCanEdit,
@@ -232,15 +238,15 @@ func (s *tlsSuite) TestTLSAuthorizer() {
 		if !projectSpecific {
 			// Unrestricted client has full access.
 			cases = append(cases, testCase{
-				id:           &s.unrestrictedClient,
+				id:           "unrestricted",
 				entityURL:    entityURL,
 				entitlements: entitlements,
 			})
 
-			if !shared.ValueInSlice(entityType, []entity.Type{entity.TypeServer, entity.TypeStoragePool, entity.TypeIdentity, entity.TypeProject, entity.TypeCertificate}) {
+			if !slices.Contains([]entity.Type{entity.TypeServer, entity.TypeStoragePool, entity.TypeIdentity, entity.TypeProject, entity.TypeCertificate}, entityType) {
 				// If it's not project specific and we don't have a special case, all access checks should be denied.
 				cases = append(cases, testCase{
-					id:            &s.fooRestrictedClient,
+					id:            "foo-restricted",
 					entityURL:     entityURL,
 					entitlements:  entitlements,
 					expectErr:     true,
@@ -258,18 +264,18 @@ func (s *tlsSuite) TestTLSAuthorizer() {
 
 		// All checks against "foo" project should succeed. All checks in "not foo" should not succeed.
 		cases = append(cases, testCase{
-			id:           &s.fooRestrictedClient,
+			id:           "foo-restricted",
 			entityURL:    fooEntityURL,
 			entitlements: entitlements,
 		}, testCase{
-			id:            &s.fooRestrictedClient,
+			id:            "foo-restricted",
 			entityURL:     notFooEntityURL,
 			entitlements:  entitlements,
 			expectErr:     true,
 			expectErrCode: http.StatusForbidden,
 		}, testCase{
 			// Unrestricted client has full access.
-			id:           &s.unrestrictedClient,
+			id:           "unrestricted",
 			entityURL:    notFooEntityURL,
 			entitlements: entitlements,
 		})
@@ -280,22 +286,28 @@ func (s *tlsSuite) TestTLSAuthorizer() {
 		s.Require().NoError(err)
 
 		for _, entitlement := range tt.entitlements {
-			ctx := s.setupCtx(tt.id)
+			details := request.RequestorArgs{
+				Trusted:  true,
+				Username: tt.id,
+				Protocol: api.AuthenticationMethodTLS,
+			}
+
+			ctx := s.setupCtx(details)
 			err := s.authorizer.CheckPermission(ctx, tt.entityURL, entitlement)
 			if tt.expectErr {
-				s.T().Logf("%q does not have %q on %q", tt.id.Name, entitlement, tt.entityURL)
-				s.Assert().Error(err)
-				s.Assert().True(api.StatusErrorCheck(err, tt.expectErrCode))
+				s.T().Logf("%q does not have %q on %q", tt.id, entitlement, tt.entityURL)
+				s.Error(err)
+				s.True(api.StatusErrorCheck(err, tt.expectErrCode))
 			} else {
-				s.T().Logf("%q has %q on %q", tt.id.Name, entitlement, tt.entityURL)
-				s.Assert().NoError(err)
+				s.T().Logf("%q has %q on %q", tt.id, entitlement, tt.entityURL)
+				s.NoError(err)
 			}
 
 			// If we don't expect an error from CheckPermission (e.g. access is allowed), then we expect the permission
 			// checker to return true (and vice versa).
 			permissionChecker, err := s.authorizer.GetPermissionChecker(ctx, entitlement, entityType)
-			s.Assert().NoError(err)
-			s.Assert().Equal(!tt.expectErr, permissionChecker(tt.entityURL))
+			s.NoError(err)
+			s.Equal(!tt.expectErr, permissionChecker(tt.entityURL))
 		}
 	}
 }

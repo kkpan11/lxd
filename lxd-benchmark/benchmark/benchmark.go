@@ -15,7 +15,7 @@ import (
 const userConfigKey = "user.lxd-benchmark"
 
 // PrintServerInfo prints out information about the server.
-func PrintServerInfo(c lxd.ContainerServer) error {
+func PrintServerInfo(c lxd.InstanceServer) error {
 	server, _, err := c.GetServer()
 	if err != nil {
 		return err
@@ -26,30 +26,28 @@ func PrintServerInfo(c lxd.ContainerServer) error {
 	fmt.Println("  Server backend:", env.Server)
 	fmt.Println("  Server version:", env.ServerVersion)
 	fmt.Println("  Kernel:", env.Kernel)
-	fmt.Println("  Kernel tecture:", env.KernelArchitecture)
+	fmt.Println("  Kernel architecture:", env.KernelArchitecture)
 	fmt.Println("  Kernel version:", env.KernelVersion)
 	fmt.Println("  Storage backend:", env.Storage)
 	fmt.Println("  Storage version:", env.StorageVersion)
-	fmt.Println("  Container backend:", env.Driver)
-	fmt.Println("  Container version:", env.DriverVersion)
+	fmt.Println("  Driver backend:", env.Driver)
+	fmt.Println("  Driver version:", env.DriverVersion)
 	fmt.Println("")
 	return nil
 }
 
 // LaunchContainers launches a set of containers.
-func LaunchContainers(c lxd.ContainerServer, count int, parallel int, image string, privileged bool, start bool, freeze bool) (time.Duration, error) {
+func LaunchContainers(c lxd.InstanceServer, count int, parallel int, image string, privileged bool, start bool, freeze bool) (time.Duration, error) {
 	var duration time.Duration
 
-	batchSize, err := getBatchSize(parallel)
-	if err != nil {
-		return duration, err
-	}
+	batchSize := getBatchSize(parallel)
 
 	printTestConfig(count, batchSize, image, privileged, freeze)
 
 	fingerprint, err := ensureImage(c, image)
 	if err != nil {
-		return duration, fmt.Errorf("Failed ensuring image: %w", err)
+		logf("Failed ensuring image: %s", err)
+		return duration, err
 	}
 
 	batchStart := func(index int, wg *sync.WaitGroup) {
@@ -59,21 +57,21 @@ func LaunchContainers(c lxd.ContainerServer, count int, parallel int, image stri
 
 		err := createContainer(c, fingerprint, name, privileged)
 		if err != nil {
-			logf("Failed to launch container '%s': %s", name, err)
+			logf("Failed launching container %q: %s", name, err)
 			return
 		}
 
 		if start {
 			err := startContainer(c, name)
 			if err != nil {
-				logf("Failed to start container '%s': %s", name, err)
+				logf("Failed starting container %q: %s", name, err)
 				return
 			}
 
 			if freeze {
 				err := freezeContainer(c, name)
 				if err != nil {
-					logf("Failed to freeze container '%s': %s", name, err)
+					logf("Failed freezing container %q: %s", name, err)
 					return
 				}
 			}
@@ -84,37 +82,11 @@ func LaunchContainers(c lxd.ContainerServer, count int, parallel int, image stri
 	return duration, nil
 }
 
-// CreateContainers create the specified number of containers.
-func CreateContainers(c lxd.ContainerServer, count int, parallel int, fingerprint string, privileged bool) (time.Duration, error) {
-	var duration time.Duration
-
-	batchSize, err := getBatchSize(parallel)
-	if err != nil {
-		return duration, err
-	}
-
-	batchCreate := func(index int, wg *sync.WaitGroup) {
-		defer wg.Done()
-
-		name := getContainerName(count, index)
-
-		err := createContainer(c, fingerprint, name, privileged)
-		if err != nil {
-			logf("Failed to launch container '%s': %s", name, err)
-			return
-		}
-	}
-
-	duration = processBatch(count, batchSize, batchCreate)
-
-	return duration, nil
-}
-
 // GetContainers returns containers created by the benchmark.
-func GetContainers(c lxd.ContainerServer) ([]api.Container, error) {
-	containers := []api.Container{}
+func GetContainers(c lxd.InstanceServer) ([]api.Instance, error) {
+	containers := []api.Instance{}
 
-	allContainers, err := c.GetContainers()
+	allContainers, err := c.GetInstances(lxd.GetInstancesArgs{InstanceType: api.InstanceTypeContainer})
 	if err != nil {
 		return containers, err
 	}
@@ -129,13 +101,10 @@ func GetContainers(c lxd.ContainerServer) ([]api.Container, error) {
 }
 
 // StartContainers starts containers created by the benchmark.
-func StartContainers(c lxd.ContainerServer, containers []api.Container, parallel int) (time.Duration, error) {
+func StartContainers(c lxd.InstanceServer, containers []api.Instance, parallel int) (time.Duration, error) {
 	var duration time.Duration
 
-	batchSize, err := getBatchSize(parallel)
-	if err != nil {
-		return duration, err
-	}
+	batchSize := getBatchSize(parallel)
 
 	count := len(containers)
 	logf("Starting %d containers", count)
@@ -147,7 +116,7 @@ func StartContainers(c lxd.ContainerServer, containers []api.Container, parallel
 		if !container.IsActive() {
 			err := startContainer(c, container.Name)
 			if err != nil {
-				logf("Failed to start container '%s': %s", container.Name, err)
+				logf("Failed starting container %q: %s", container.Name, err)
 				return
 			}
 		}
@@ -158,13 +127,10 @@ func StartContainers(c lxd.ContainerServer, containers []api.Container, parallel
 }
 
 // StopContainers stops containers created by the benchmark.
-func StopContainers(c lxd.ContainerServer, containers []api.Container, parallel int) (time.Duration, error) {
+func StopContainers(c lxd.InstanceServer, containers []api.Instance, parallel int) (time.Duration, error) {
 	var duration time.Duration
 
-	batchSize, err := getBatchSize(parallel)
-	if err != nil {
-		return duration, err
-	}
+	batchSize := getBatchSize(parallel)
 
 	count := len(containers)
 	logf("Stopping %d containers", count)
@@ -176,7 +142,7 @@ func StopContainers(c lxd.ContainerServer, containers []api.Container, parallel 
 		if container.IsActive() {
 			err := stopContainer(c, container.Name)
 			if err != nil {
-				logf("Failed to stop container '%s': %s", container.Name, err)
+				logf("Failed stopping container %q: %s", container.Name, err)
 				return
 			}
 		}
@@ -187,13 +153,10 @@ func StopContainers(c lxd.ContainerServer, containers []api.Container, parallel 
 }
 
 // DeleteContainers removes containers created by the benchmark.
-func DeleteContainers(c lxd.ContainerServer, containers []api.Container, parallel int) (time.Duration, error) {
+func DeleteContainers(c lxd.InstanceServer, containers []api.Instance, parallel int) (time.Duration, error) {
 	var duration time.Duration
 
-	batchSize, err := getBatchSize(parallel)
-	if err != nil {
-		return duration, err
-	}
+	batchSize := getBatchSize(parallel)
 
 	count := len(containers)
 	logf("Deleting %d containers", count)
@@ -206,14 +169,14 @@ func DeleteContainers(c lxd.ContainerServer, containers []api.Container, paralle
 		if container.IsActive() {
 			err := stopContainer(c, name)
 			if err != nil {
-				logf("Failed to stop container '%s': %s", name, err)
+				logf("Failed stopping container %q: %s", name, err)
 				return
 			}
 		}
 
-		err = deleteContainer(c, name)
+		err := deleteContainer(c, name)
 		if err != nil {
-			logf("Failed to delete container: %s", name)
+			logf("Failed deleting container %q: %s", name, err)
 			return
 		}
 	}
@@ -222,7 +185,7 @@ func DeleteContainers(c lxd.ContainerServer, containers []api.Container, paralle
 	return duration, nil
 }
 
-func ensureImage(c lxd.ContainerServer, image string) (string, error) {
+func ensureImage(c lxd.InstanceServer, image string) (string, error) {
 	var fingerprint string
 
 	if strings.Contains(image, ":") {
@@ -252,16 +215,16 @@ func ensureImage(c lxd.ContainerServer, image string) (string, error) {
 
 		_, _, err = c.GetImage(fingerprint)
 		if err != nil {
-			logf("Importing image into local store: %s", fingerprint)
+			logf("Importing image into local store: %q", fingerprint)
 			image, _, err := imageServer.GetImage(fingerprint)
 			if err != nil {
-				logf("Failed to import image: %s", err)
+				logf("Failed importing image: %s", err)
 				return "", err
 			}
 
 			err = copyImage(c, imageServer, *image)
 			if err != nil {
-				logf("Failed to import image: %s", err)
+				logf("Failed importing image: %s", err)
 				return "", err
 			}
 		}
@@ -275,11 +238,11 @@ func ensureImage(c lxd.ContainerServer, image string) (string, error) {
 		}
 
 		if err != nil {
-			logf("Image not found in local store: %s", image)
+			logf("Image not found in local store: %q", image)
 			return "", err
 		}
 	}
 
-	logf("Found image in local store: %s", fingerprint)
+	logf("Found image in local store: %q", fingerprint)
 	return fingerprint, nil
 }

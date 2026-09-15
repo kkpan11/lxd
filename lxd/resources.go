@@ -2,11 +2,9 @@ package main
 
 import (
 	"net/http"
-	"net/url"
-
-	"github.com/gorilla/mux"
 
 	"github.com/canonical/lxd/lxd/auth"
+	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/resources"
 	"github.com/canonical/lxd/lxd/response"
 	storagePools "github.com/canonical/lxd/lxd/storage"
@@ -15,13 +13,15 @@ import (
 )
 
 var api10ResourcesCmd = APIEndpoint{
-	Path: "resources",
+	Path:        "resources",
+	MetricsType: entity.TypeServer,
 
 	Get: APIEndpointAction{Handler: api10ResourcesGet, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanViewResources)},
 }
 
 var storagePoolResourcesCmd = APIEndpoint{
-	Path: "storage-pools/{name}/resources",
+	Path:        "storage-pools/{name}/resources",
+	MetricsType: entity.TypeStoragePool,
 
 	Get: APIEndpointAction{Handler: storagePoolResourcesGet, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanViewResources)},
 }
@@ -70,7 +70,8 @@ func api10ResourcesGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	// If a target was specified, forward the request to the relevant node.
-	resp := forwardedResponseIfTargetIsRemote(s, r)
+	target := request.QueryParam(r, "target")
+	resp := forwardedResponseToNode(r.Context(), s, target)
 	if resp != nil {
 		return resp
 	}
@@ -128,17 +129,14 @@ func storagePoolResourcesGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	// If a target was specified, forward the request to the relevant node.
-	resp := forwardedResponseIfTargetIsRemote(s, r)
+	target := request.QueryParam(r, "target")
+	resp := forwardedResponseToNode(r.Context(), s, target)
 	if resp != nil {
 		return resp
 	}
 
 	// Get the existing storage pool
-	poolName, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	poolName := r.PathValue("name")
 	var res *api.ResourcesStoragePool
 
 	pool, err := storagePools.LoadByName(s, poolName)

@@ -5,13 +5,48 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/instance"
 	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/lxd/util"
+	"github.com/canonical/lxd/shared/api"
 )
+
+// vSockServer creates an http.Server capable of handling /dev/lxd requests over vsock.
+func vSockServer(d *Daemon) *http.Server {
+	return &http.Server{
+		Handler:           devLXDAPI(d, vSockAuthenticator{}),
+		IdleTimeout:       30 * time.Second,
+		ReadHeaderTimeout: util.HTTPServerReadTimeout,
+		ReadTimeout:       util.HTTPServerReadTimeout,
+	}
+}
+
+// vSockAuthenticator implements DevLXDAuthenticator for vsock connections.
+type vSockAuthenticator struct{}
+
+// IsVsock returns true indicating that this authenticator is used for vsock connections.
+func (vSockAuthenticator) IsVsock() bool {
+	return true
+}
+
+// AuthenticateInstance authenticates a VM accessing /dev/lxd over vsock using its agent certificate,
+// and returns the corresponding VM instance.
+func (vSockAuthenticator) AuthenticateInstance(d *Daemon, r *http.Request) (instance.Instance, error) {
+	trusted, inst, err := authenticateAgentCert(d.State(), r)
+	if err != nil {
+		return nil, api.NewStatusError(http.StatusInternalServerError, err.Error())
+	}
+
+	if !trusted {
+		return nil, api.NewGenericStatusError(http.StatusUnauthorized)
+	}
+
+	return inst, nil
+}
 
 func authenticateAgentCert(s *state.State, r *http.Request) (bool, instance.Instance, error) {
 	var vsockID int
@@ -44,9 +79,10 @@ func authenticateAgentCert(s *state.State, r *http.Request) (bool, instance.Inst
 	}
 
 	agentCert := inst.(instance.VM).AgentCertificate()
+	trustedCerts := map[string]x509.Certificate{"0": *agentCert}
 
 	for _, cert := range r.TLS.PeerCertificates {
-		trusted, _ = util.CheckMutualTLS(*cert, map[string]x509.Certificate{"0": *agentCert})
+		trusted, _ = util.CheckMutualTLS(*cert, trustedCerts)
 		if trusted {
 			return true, inst, nil
 		}

@@ -54,6 +54,13 @@ The following server options configure external user authentication through {ref
     :end-before: <!-- config group server-oidc end -->
 ```
 
+```{important}
+Setting `oidc.client.secret` might prevent LXD CLI clients from authenticating via the Identity Provider.
+This is because the client secret is used only for communication between LXD and the Identity Provider.
+LXD CLI clients, who do not have access to the client secret, authenticate separately with the Identity Provider and send their credentials to LXD for verification.
+You can create a separate client in the identity provider for the LXD CLI and configure this using the `oidc.device.client.id`
+```
+
 (server-options-cluster)=
 ## Cluster configuration
 
@@ -90,7 +97,7 @@ The following server options configure the external log aggregation system:
 (server-options-misc)=
 ## Miscellaneous options
 
-The following server options configure server-specific settings for {ref}`instances`, MAAS integration, {ref}`OVN <network-ovn>` integration, {ref}`Backups <backups>` and {ref}`storage`:
+The following server options configure server-specific settings for {ref}`instances`, {ref}`OVN <network-ovn>` integration, {ref}`Backups <backups>` and {ref}`storage`:
 
 % Include content from [metadata.txt](metadata.txt)
 ```{include} metadata.txt

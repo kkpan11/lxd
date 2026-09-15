@@ -17,6 +17,7 @@ package usbid
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -77,44 +78,44 @@ func ParseIDs(r io.Reader) (map[ID]*Vendor, map[ClassCode]*Class, error) {
 	vendors := make(map[ID]*Vendor, 2800)
 	classes := make(map[ClassCode]*Class) // TODO(kevlar): count
 
-	split := func(s string) (kind string, level int, id uint64, name string, err error) {
-		pieces := strings.SplitN(s, "  ", 2)
-		if len(pieces) != 2 {
+	split := func(s string) (kind string, level int, id uint16, name string, err error) {
+		left, right, found := strings.Cut(s, "  ")
+		if !found {
 			err = fmt.Errorf("malformatted line %q", s)
-			return
+			return kind, level, id, name, err
 		}
 
 		// Save the name
-		name = pieces[1]
+		name = right
 
 		// Parse out the level
-		for len(pieces[0]) > 0 && pieces[0][0] == '\t' {
-			level, pieces[0] = level+1, pieces[0][1:]
+		for len(left) > 0 && left[0] == '\t' {
+			level, left = level+1, left[1:]
 		}
 
 		// Parse the first piece to see if it has a kind
-		first := strings.SplitN(pieces[0], " ", 2)
-		if len(first) == 2 {
-			kind, pieces[0] = first[0], first[1]
+		firstKind, firstRest, found := strings.Cut(left, " ")
+		if found {
+			kind, left = firstKind, firstRest
 		}
 
 		// Parse the ID
-		i, err := strconv.ParseUint(pieces[0], 16, 16)
+		i, err := strconv.ParseUint(left, 16, 16)
 		if err != nil {
-			err = fmt.Errorf("malformatted id %q: %w", pieces[0], err)
-			return
+			err = fmt.Errorf("malformatted id %q: %w", left, err)
+			return kind, level, id, name, err
 		}
 
-		id = i
+		id = uint16(i)
 
-		return
+		return kind, level, id, name, err
 	}
 
 	// Hold the interim values
 	var vendor *Vendor
 	var device *Product
 
-	parseVendor := func(level int, raw uint64, name string) error {
+	parseVendor := func(level int, raw uint16, name string) error {
 		id := ID(raw)
 
 		switch level {
@@ -127,7 +128,7 @@ func ParseIDs(r io.Reader) (map[ID]*Vendor, map[ClassCode]*Class, error) {
 
 		case 1:
 			if vendor == nil {
-				return fmt.Errorf("product line without vendor line")
+				return errors.New("product line without vendor line")
 			}
 
 			device = &Product{
@@ -142,7 +143,7 @@ func ParseIDs(r io.Reader) (map[ID]*Vendor, map[ClassCode]*Class, error) {
 
 		case 2:
 			if device == nil {
-				return fmt.Errorf("interface line without device line")
+				return errors.New("interface line without device line")
 			}
 
 			if device.Interface == nil {
@@ -152,7 +153,7 @@ func ParseIDs(r io.Reader) (map[ID]*Vendor, map[ClassCode]*Class, error) {
 			device.Interface[id] = name
 
 		default:
-			return fmt.Errorf("too many levels of nesting for vendor block")
+			return errors.New("too many levels of nesting for vendor block")
 		}
 
 		return nil
@@ -162,7 +163,11 @@ func ParseIDs(r io.Reader) (map[ID]*Vendor, map[ClassCode]*Class, error) {
 	var class *Class
 	var subclass *SubClass
 
-	parseClass := func(level int, id uint64, name string) error {
+	parseClass := func(level int, id uint16, name string) error {
+		if id > 255 {
+			return errors.New("integer overflow")
+		}
+
 		switch level {
 		case 0:
 			class = &Class{
@@ -173,7 +178,7 @@ func ParseIDs(r io.Reader) (map[ID]*Vendor, map[ClassCode]*Class, error) {
 
 		case 1:
 			if class == nil {
-				return fmt.Errorf("subclass line without class line")
+				return errors.New("subclass line without class line")
 			}
 
 			subclass = &SubClass{
@@ -188,7 +193,7 @@ func ParseIDs(r io.Reader) (map[ID]*Vendor, map[ClassCode]*Class, error) {
 
 		case 2:
 			if subclass == nil {
-				return fmt.Errorf("protocol line without subclass line")
+				return errors.New("protocol line without subclass line")
 			}
 
 			if subclass.Protocol == nil {
@@ -198,15 +203,15 @@ func ParseIDs(r io.Reader) (map[ID]*Vendor, map[ClassCode]*Class, error) {
 			subclass.Protocol[Protocol(id)] = name
 
 		default:
-			return fmt.Errorf("too many levels of nesting for class")
+			return errors.New("too many levels of nesting for class")
 		}
 
 		return nil
 	}
 
 	// TODO(kevlar): Parse class information, etc
-	//var class *Class
-	//var subclass *SubClass
+	// var class *Class
+	// var subclass *SubClass
 
 	var kind string
 

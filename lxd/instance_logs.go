@@ -1,71 +1,60 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
-
-	"github.com/gorilla/mux"
 
 	"github.com/canonical/lxd/lxd/auth"
 	"github.com/canonical/lxd/lxd/instance"
-	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/lifecycle"
-	"github.com/canonical/lxd/lxd/project"
 	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/lxd/storage"
 	"github.com/canonical/lxd/shared"
+	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/entity"
+	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/revert"
 	"github.com/canonical/lxd/shared/version"
 )
 
 var instanceLogCmd = APIEndpoint{
-	Name: "instanceLog",
-	Path: "instances/{name}/logs/{file}",
-	Aliases: []APIEndpointAlias{
-		{Name: "containerLog", Path: "containers/{name}/logs/{file}"},
-		{Name: "vmLog", Path: "virtual-machines/{name}/logs/{file}"},
-	},
+	Path:            "instances/{name}/logs/{file}",
+	MetricsType:     entity.TypeInstance,
+	ProjectSpecific: true,
 
-	Delete: APIEndpointAction{Handler: instanceLogDelete, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanEdit, "name")},
-	Get:    APIEndpointAction{Handler: instanceLogGet, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanView, "name")},
+	Get: APIEndpointAction{Handler: instanceLogGet, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanView, "name")},
 }
 
 var instanceLogsCmd = APIEndpoint{
-	Name: "instanceLogs",
-	Path: "instances/{name}/logs",
-	Aliases: []APIEndpointAlias{
-		{Name: "containerLogs", Path: "containers/{name}/logs"},
-		{Name: "vmLogs", Path: "virtual-machines/{name}/logs"},
-	},
+	Path:            "instances/{name}/logs",
+	MetricsType:     entity.TypeInstance,
+	ProjectSpecific: true,
 
 	Get: APIEndpointAction{Handler: instanceLogsGet, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanView, "name")},
 }
 
 var instanceExecOutputCmd = APIEndpoint{
-	Name: "instanceExecOutput",
-	Path: "instances/{name}/logs/exec-output/{file}",
-	Aliases: []APIEndpointAlias{
-		{Name: "containerExecOutput", Path: "containers/{name}/logs/exec-output/{file}"},
-		{Name: "vmExecOutput", Path: "virtual-machines/{name}/logs/exec-output/{file}"},
-	},
+	Path:            "instances/{name}/logs/exec-output/{file}",
+	MetricsType:     entity.TypeInstance,
+	ProjectSpecific: true,
 
 	Delete: APIEndpointAction{Handler: instanceExecOutputDelete, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanExec, "name")},
 	Get:    APIEndpointAction{Handler: instanceExecOutputGet, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanExec, "name")},
 }
 
+// instanceProtectedLogFiles is the list of instance log files that may be retrieved but not deleted.
+var instanceProtectedLogFiles = []string{"edk2.log", "lxc.log", "qemu.log", "qemu.early.log"}
+
 var instanceExecOutputsCmd = APIEndpoint{
-	Name: "instanceExecOutputs",
-	Path: "instances/{name}/logs/exec-output",
-	Aliases: []APIEndpointAlias{
-		{Name: "containerExecOutputs", Path: "containers/{name}/logs/exec-output"},
-		{Name: "vmExecOutputs", Path: "virtual-machines/{name}/logs/exec-output"},
-	},
+	Path:            "instances/{name}/logs/exec-output",
+	MetricsType:     entity.TypeInstance,
+	ProjectSpecific: true,
 
 	Get: APIEndpointAction{Handler: instanceExecOutputsGet, AccessHandler: allowPermission(entity.TypeInstance, auth.EntitlementCanExec, "name")},
 }
@@ -135,17 +124,15 @@ func instanceLogsGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
+	name := r.PathValue("name")
+	if shared.IsSnapshot(name) {
+		return response.BadRequest(errors.New("Invalid instance name"))
 	}
 
-	if shared.IsSnapshot(name) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
-	}
+	s := d.State()
 
 	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(d.State(), r, projectName, name, instanceType)
+	resp, err := forwardedResponseIfInstanceIsRemote(r.Context(), s, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -154,15 +141,15 @@ func instanceLogsGet(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	err = instancetype.ValidName(name, false)
+	// Ensure instance exists.
+	inst, err := instance.LoadByProjectAndName(s, projectName, name)
 	if err != nil {
-		return response.BadRequest(err)
+		return response.SmartError(err)
 	}
 
 	result := []string{}
 
-	fullName := project.Instance(projectName, name)
-	dents, err := os.ReadDir(shared.LogPath(fullName))
+	dents, err := os.ReadDir(inst.LogPath())
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -172,7 +159,7 @@ func instanceLogsGet(d *Daemon, r *http.Request) response.Response {
 			continue
 		}
 
-		result = append(result, fmt.Sprintf("/%s/instances/%s/logs/%s", version.APIVersion, name, f.Name()))
+		result = append(result, api.NewURL().Path(version.APIVersion, "instances", name, "logs", f.Name()).String())
 	}
 
 	return response.SyncResponse(true, result)
@@ -213,150 +200,27 @@ func instanceLogsGet(d *Daemon, r *http.Request) response.Response {
 func instanceLogGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	instanceType, err := urlInstanceTypeDetect(r)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	if shared.IsSnapshot(name) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
-	}
-
-	// Ensure instance exists.
-	inst, err := instance.LoadByProjectAndName(s, projectName, name)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(s, r, projectName, name, instanceType)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	inst, projectName, _, resp := forwardedInstanceResponseWithInstance(s, r)
 	if resp != nil {
 		return resp
 	}
 
-	file, err := url.PathUnescape(mux.Vars(r)["file"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	err = instancetype.ValidName(name, false)
-	if err != nil {
-		return response.BadRequest(err)
-	}
-
+	file := r.PathValue("file")
 	if !validLogFileName(file) {
 		return response.BadRequest(fmt.Errorf("Log file name %q not valid", file))
 	}
 
 	ent := response.FileResponseEntry{
-		Path:     shared.LogPath(project.Instance(projectName, name), file),
+		Path:     filepath.Join(inst.LogPath(), file),
 		Filename: file,
 	}
 
-	s.Events.SendLifecycle(projectName, lifecycle.InstanceLogRetrieved.Event(file, inst, request.CreateRequestor(r), nil))
+	s.Events.SendLifecycle(projectName, lifecycle.InstanceLogRetrieved.Event(file, inst, request.CreateRequestor(r.Context()), nil))
 
 	return response.FileResponse([]response.FileResponseEntry{ent}, nil)
 }
 
-// swagger:operation DELETE /1.0/instances/{name}/logs/{filename} instances instance_log_delete
-//
-//	Delete the log file
-//
-//	Removes the log file.
-//
-//	---
-//	produces:
-//	  - application/json
-//	parameters:
-//	  - in: query
-//	    name: project
-//	    description: Project name
-//	    type: string
-//	    example: default
-//	responses:
-//	  "200":
-//	    $ref: "#/responses/EmptySyncResponse"
-//	  "400":
-//	    $ref: "#/responses/BadRequest"
-//	  "403":
-//	    $ref: "#/responses/Forbidden"
-//	  "404":
-//	    $ref: "#/responses/NotFound"
-//	  "500":
-//	    $ref: "#/responses/InternalServerError"
-func instanceLogDelete(d *Daemon, r *http.Request) response.Response {
-	s := d.State()
-
-	instanceType, err := urlInstanceTypeDetect(r)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	if shared.IsSnapshot(name) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
-	}
-
-	// Ensure instance exists.
-	inst, err := instance.LoadByProjectAndName(s, projectName, name)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(s, r, projectName, name, instanceType)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	if resp != nil {
-		return resp
-	}
-
-	file, err := url.PathUnescape(mux.Vars(r)["file"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	err = instancetype.ValidName(name, false)
-	if err != nil {
-		return response.BadRequest(err)
-	}
-
-	if !validLogFileName(file) {
-		return response.BadRequest(fmt.Errorf("Log file name %q not valid", file))
-	}
-
-	if !strings.HasSuffix(file, ".log") || file == "lxc.log" || file == "qemu.log" {
-		return response.BadRequest(fmt.Errorf("Only log files excluding qemu.log and lxc.log may be deleted"))
-	}
-
-	err = os.Remove(shared.LogPath(project.Instance(projectName, name), file))
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	s.Events.SendLifecycle(projectName, lifecycle.InstanceLogDeleted.Event(file, inst, request.CreateRequestor(r), nil))
-
-	return response.EmptySyncResponse
-}
-
-// swagger:operation GET /1.0/instances/{name}/logs/exec-output instances instance_exec-outputs_get
+// swagger:operation GET /1.0/instances/{name}/logs/exec-output instances instance_exec-output_get
 //
 //	Get the exec record-output files
 //
@@ -409,40 +273,9 @@ func instanceLogDelete(d *Daemon, r *http.Request) response.Response {
 func instanceExecOutputsGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	instanceType, err := urlInstanceTypeDetect(r)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	if shared.IsSnapshot(name) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
-	}
-
-	// Ensure instance exists.
-	inst, err := instance.LoadByProjectAndName(s, projectName, name)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(d.State(), r, projectName, name, instanceType)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	inst, projectName, name, resp := forwardedInstanceResponseWithInstance(s, r)
 	if resp != nil {
 		return resp
-	}
-
-	err = instancetype.ValidName(name, false)
-	if err != nil {
-		return response.BadRequest(err)
 	}
 
 	// Mount the instance's root volume
@@ -456,10 +289,29 @@ func instanceExecOutputsGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	defer func() { _ = pool.UnmountInstance(inst, nil) }()
+	defer func() {
+		err := pool.UnmountInstance(inst, nil)
+		if err != nil {
+			logger.Warn("Failed unmounting instance", logger.Ctx{"project": projectName, "instance": name, "err": err})
+		}
+	}()
+
+	execOutputRoot, err := inst.OpenExecOutput()
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	defer func() { _ = execOutputRoot.Close() }()
 
 	// Read exec record-output files
-	dents, err := os.ReadDir(inst.ExecOutputPath())
+	execOutputDir, err := execOutputRoot.Open(".")
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	defer func() { _ = execOutputDir.Close() }()
+
+	dents, err := execOutputDir.ReadDir(-1)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -470,7 +322,7 @@ func instanceExecOutputsGet(d *Daemon, r *http.Request) response.Response {
 			continue
 		}
 
-		result = append(result, fmt.Sprintf("/%s/instances/%s/logs/exec-output/%s", version.APIVersion, name, f.Name()))
+		result = append(result, api.NewURL().Path(version.APIVersion, "instances", name, "logs", "exec-output", f.Name()).String())
 	}
 
 	return response.SyncResponse(true, result)
@@ -514,47 +366,12 @@ func instanceExecOutputGet(d *Daemon, r *http.Request) response.Response {
 
 	s := d.State()
 
-	instanceType, err := urlInstanceTypeDetect(r)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	if shared.IsSnapshot(name) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
-	}
-
-	// Ensure instance exists.
-	inst, err := instance.LoadByProjectAndName(s, projectName, name)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(s, r, projectName, name, instanceType)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	inst, projectName, name, resp := forwardedInstanceResponseWithInstance(s, r)
 	if resp != nil {
 		return resp
 	}
 
-	file, err := url.PathUnescape(mux.Vars(r)["file"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	err = instancetype.ValidName(name, false)
-	if err != nil {
-		return response.BadRequest(err)
-	}
-
+	file := r.PathValue("file")
 	if !validExecOutputFileName(file) {
 		return response.BadRequest(fmt.Errorf("Exec record-output file name %q not valid", file))
 	}
@@ -570,17 +387,29 @@ func instanceExecOutputGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	revert.Add(func() { _ = pool.UnmountInstance(inst, nil) })
+	revert.Add(func() {
+		err := pool.UnmountInstance(inst, nil)
+		if err != nil {
+			logger.Warn("Failed unmounting instance", logger.Ctx{"project": projectName, "instance": name, "err": err})
+		}
+	})
 	cleanup := revert.Clone()
 	revert.Success()
 
+	execOutputRoot, err := inst.OpenExecOutput()
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	defer func() { _ = execOutputRoot.Close() }()
+
 	ent := response.FileResponseEntry{
-		Path:     filepath.Join(inst.ExecOutputPath(), file),
+		Path:     filepath.Join(execOutputRoot.Name(), file),
 		Filename: file,
 		Cleanup:  cleanup.Fail,
 	}
 
-	s.Events.SendLifecycle(projectName, lifecycle.InstanceLogRetrieved.Event(file, inst, request.CreateRequestor(r), nil))
+	s.Events.SendLifecycle(projectName, lifecycle.InstanceLogRetrieved.Event(file, inst, request.CreateRequestor(r.Context()), nil))
 
 	return response.FileResponse([]response.FileResponseEntry{ent}, nil)
 }
@@ -614,47 +443,12 @@ func instanceExecOutputGet(d *Daemon, r *http.Request) response.Response {
 func instanceExecOutputDelete(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	instanceType, err := urlInstanceTypeDetect(r)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	if shared.IsSnapshot(name) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
-	}
-
-	// Ensure instance exists.
-	inst, err := instance.LoadByProjectAndName(s, projectName, name)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(s, r, projectName, name, instanceType)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	inst, projectName, name, resp := forwardedInstanceResponseWithInstance(s, r)
 	if resp != nil {
 		return resp
 	}
 
-	file, err := url.PathUnescape(mux.Vars(r)["file"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	err = instancetype.ValidName(name, false)
-	if err != nil {
-		return response.BadRequest(err)
-	}
-
+	file := r.PathValue("file")
 	if !validExecOutputFileName(file) {
 		return response.BadRequest(fmt.Errorf("Exec record-output file name %q not valid", file))
 	}
@@ -670,31 +464,53 @@ func instanceExecOutputDelete(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	defer func() { _ = pool.UnmountInstance(inst, nil) }()
+	defer func() {
+		err := pool.UnmountInstance(inst, nil)
+		if err != nil {
+			logger.Warn("Failed unmounting instance", logger.Ctx{"project": projectName, "instance": name, "err": err})
+		}
+	}()
 
-	err = os.Remove(filepath.Join(inst.ExecOutputPath(), file))
+	execOutputRoot, err := inst.OpenExecOutput()
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	s.Events.SendLifecycle(projectName, lifecycle.InstanceLogDeleted.Event(file, inst, request.CreateRequestor(r), nil))
+	defer func() { _ = execOutputRoot.Close() }()
+
+	err = execOutputRoot.Remove(file)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	s.Events.SendLifecycle(projectName, lifecycle.InstanceLogDeleted.Event(file, inst, request.CreateRequestor(r.Context()), nil))
 
 	return response.EmptySyncResponse
 }
 
 func validLogFileName(fname string) bool {
+	if !shared.IsFileName(fname) {
+		return false
+	}
+
+	// Make sure that there's nothing fishy about the provided file name.
+	if filepath.Base(fname) != fname {
+		return false
+	}
+
 	/* Let's just require that the paths be relative, so that we don't have
 	 * to deal with any escaping or whatever.
 	 */
-	return fname == "lxc.log" ||
-		fname == "lxc.conf" ||
-		fname == "qemu.log" ||
+	return fname == "lxc.conf" ||
 		fname == "qemu.conf" ||
-		strings.HasPrefix(fname, "migration_") ||
-		strings.HasPrefix(fname, "snapshot_")
+		slices.Contains(instanceProtectedLogFiles, fname)
 }
 
 func validExecOutputFileName(fName string) bool {
+	if !shared.IsFileName(fName) {
+		return false
+	}
+
 	return (strings.HasSuffix(fName, ".stdout") || strings.HasSuffix(fName, ".stderr")) &&
 		strings.HasPrefix(fName, "exec_")
 }

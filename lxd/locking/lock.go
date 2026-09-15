@@ -58,14 +58,34 @@ func Lock(ctx context.Context, lockName string) (UnlockFunc, error) {
 		}
 
 		// An existing operation is ongoing, lets wait for that to finish and then try
-		// to get exlusive access to create a new operation again.
+		// to get exclusive access to create a new operation again.
 		locksMutex.Unlock()
 
 		select {
 		case <-waitCh:
 			continue
 		case <-ctx.Done():
-			return nil, fmt.Errorf("Failed to obtain lock %q: %w", lockName, ctx.Err())
+			return nil, fmt.Errorf("Failed obtaining lock %q: %w", lockName, ctx.Err())
 		}
 	}
+}
+
+// TryLock attempts to acquire a lock without blocking.
+// If it succeeds it returns an unlock function.
+// If it fails it returns nil.
+func TryLock(lockName string) UnlockFunc {
+	// Create a new context and cancel it.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Request lock with an already cancelled context.
+	// If the lock is already acquired we give up.
+	unlock, err := Lock(ctx, lockName)
+	if err != nil {
+		return nil
+	}
+
+	// The lock has been successfully acquired.
+	// Return the respective unlock function.
+	return unlock
 }

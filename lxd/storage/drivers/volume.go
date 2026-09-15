@@ -4,13 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 
 	"github.com/canonical/lxd/lxd/locking"
-	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/refcount"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
+	"github.com/canonical/lxd/shared/ioprogress"
 	"github.com/canonical/lxd/shared/revert"
 	"github.com/canonical/lxd/shared/units"
 )
@@ -22,7 +23,7 @@ const tmpVolSuffix = ".lxdtmp"
 const isoVolSuffix = ".iso"
 
 // DefaultBlockSize is the default size of block volumes.
-const DefaultBlockSize = "10GiB"
+const defaultBlockSize = "10GiB"
 
 // DefaultFilesystem filesytem to use for block devices by default.
 const DefaultFilesystem = "ext4"
@@ -76,13 +77,17 @@ const ContentTypeISO = ContentType("iso")
 // VolumePostHook function returned from a storage action that should be run later to complete the action.
 type VolumePostHook func(vol Volume) error
 
+type baseDirectory struct {
+	Paths []string
+	Mode  os.FileMode
+}
+
 // BaseDirectories maps volume types to the expected directories.
-var BaseDirectories = map[VolumeType][]string{
-	VolumeTypeBucket:    {"buckets"},
-	VolumeTypeContainer: {"containers", "containers-snapshots"},
-	VolumeTypeCustom:    {"custom", "custom-snapshots"},
-	VolumeTypeImage:     {"images"},
-	VolumeTypeVM:        {"virtual-machines", "virtual-machines-snapshots"},
+var BaseDirectories = map[VolumeType]baseDirectory{
+	VolumeTypeContainer: {Paths: []string{"containers", "containers-snapshots"}, Mode: 0o711}, // Containers may be run as non-root, so 0700 won't work, however as containers have their own sub-directory with correct ownership that is 0100 this is OK.
+	VolumeTypeCustom:    {Paths: []string{"custom", "custom-snapshots"}, Mode: 0o700},
+	VolumeTypeImage:     {Paths: []string{"images"}, Mode: 0o700},
+	VolumeTypeVM:        {Paths: []string{"virtual-machines", "virtual-machines-snapshots"}, Mode: 0o700},
 }
 
 // Volume represents a storage volume, and provides functions to mount and unmount it.
@@ -141,7 +146,7 @@ func (v Volume) ExpandedConfig(key string) string {
 		return volVal
 	}
 
-	return v.poolConfig[fmt.Sprintf("volume.%s", key)]
+	return v.poolConfig["volume."+key]
 }
 
 // NewSnapshot instantiates a new Volume struct representing a snapshot of the parent volume.
@@ -150,7 +155,7 @@ func (v Volume) ExpandedConfig(key string) string {
 // Load the snapshot from the database instead if you want to access its own UUID.
 func (v Volume) NewSnapshot(snapshotName string) (Volume, error) {
 	if v.IsSnapshot() {
-		return Volume{}, fmt.Errorf("Cannot create a snapshot volume from a snapshot")
+		return Volume{}, errors.New("Cannot create a snapshot volume from a snapshot")
 	}
 
 	// Deep copy the volume's config.
@@ -191,7 +196,7 @@ func (v Volume) MountPath() string {
 	volName := v.name
 
 	if v.volType == VolumeTypeCustom && v.contentType == ContentTypeISO {
-		volName = fmt.Sprintf("%s%s", volName, isoVolSuffix)
+		volName = volName + isoVolSuffix
 	}
 
 	return GetVolumeMountPath(v.pool, v.volType, volName)
@@ -230,28 +235,28 @@ func (v Volume) EnsureMountPath() error {
 	revert := revert.New()
 	defer revert.Fail()
 
-	// Create volume's mount path if missing, with any created directories set to 0711.
-	if !shared.PathExists(volPath) {
-		if v.IsSnapshot() {
-			// Create the parent directory if needed.
-			parentName, _, _ := api.GetParentAndSnapshotName(v.name)
-			err := createParentSnapshotDirIfMissing(v.pool, v.volType, parentName)
-			if err != nil {
-				return err
-			}
-		}
-
-		err := os.Mkdir(volPath, 0711)
+	// Create the parent snapshot directory if needed.
+	if v.IsSnapshot() {
+		parentName, _, _ := api.GetParentAndSnapshotName(v.name)
+		err := createParentSnapshotDirIfMissing(v.pool, v.volType, parentName)
 		if err != nil {
-			return fmt.Errorf("Failed to create mount directory %q: %w", volPath, err)
+			return err
 		}
+	}
 
+	// Create volume's mount path if missing, with any created directories set to 0711.
+	err := os.Mkdir(volPath, 0711)
+	if err != nil && !os.IsExist(err) {
+		return fmt.Errorf("Failed creating mount directory %q: %w", volPath, err)
+	}
+
+	if err == nil {
 		revert.Add(func() { _ = os.Remove(volPath) })
 	}
 
-	// Set very restrictive mode 0100 for non-custom, non-bucket and non-image volumes.
+	// Set very restrictive mode 0100 for non-custom and non-image volumes.
 	mode := os.FileMode(0711)
-	if v.volType != VolumeTypeCustom && v.volType != VolumeTypeImage && v.volType != VolumeTypeBucket {
+	if v.volType != VolumeTypeCustom && v.volType != VolumeTypeImage {
 		mode = os.FileMode(0100)
 	}
 
@@ -271,7 +276,7 @@ func (v Volume) EnsureMountPath() error {
 		// If the volume is a snapshot, we must ignore the error as snapshots are readonly and cannot be
 		// modified after they are taken, such that any permission error is not fixable at mount time.
 		if err != nil && !v.IsSnapshot() {
-			return fmt.Errorf("Failed to chmod mount directory %q (%04o): %w", volPath, mode, err)
+			return fmt.Errorf("Failed chmoding mount directory %q (%04o): %w", volPath, mode, err)
 		}
 	}
 
@@ -281,28 +286,28 @@ func (v Volume) EnsureMountPath() error {
 
 // MountTask runs the supplied task after mounting the volume if needed. If the volume was mounted
 // for this then it is unmounted when the task finishes.
-func (v Volume) MountTask(task func(mountPath string, op *operations.Operation) error, op *operations.Operation) error {
+func (v Volume) MountTask(task func(mountPath string, progressReporter ioprogress.ProgressReporter) error, progressReporter ioprogress.ProgressReporter) error {
 	// If the volume is a snapshot then call the snapshot specific mount/unmount functions as
 	// these will mount the snapshot read only.
 	var err error
 
 	if v.IsSnapshot() {
-		err = v.driver.MountVolumeSnapshot(v, op)
+		err = v.driver.MountVolumeSnapshot(v, progressReporter)
 	} else {
-		err = v.driver.MountVolume(v, op)
+		err = v.driver.MountVolume(v, progressReporter)
 	}
 
 	if err != nil {
 		return err
 	}
 
-	taskErr := task(v.MountPath(), op)
+	taskErr := task(v.MountPath(), progressReporter)
 
 	// Try and unmount, even on task error.
 	if v.IsSnapshot() {
-		_, err = v.driver.UnmountVolumeSnapshot(v, op)
+		_, err = v.driver.UnmountVolumeSnapshot(v, progressReporter)
 	} else {
-		_, err = v.driver.UnmountVolume(v, false, op)
+		_, err = v.driver.UnmountVolume(v, false, progressReporter)
 	}
 
 	// Return task error if failed.
@@ -321,39 +326,39 @@ func (v Volume) MountTask(task func(mountPath string, op *operations.Operation) 
 // UnmountTask runs the supplied task after unmounting the volume if needed.
 // If the volume was unmounted for this then it is mounted when the task finishes.
 // keepBlockDev indicates if backing block device should be not be deactivated if volume is unmounted.
-func (v Volume) UnmountTask(task func(op *operations.Operation) error, keepBlockDev bool, op *operations.Operation) error {
+func (v Volume) UnmountTask(task func(progressReporter ioprogress.ProgressReporter) error, keepBlockDev bool, progressReporter ioprogress.ProgressReporter) error {
 	// If the volume is a snapshot then call the snapshot specific mount/unmount functions as
 	// these will mount the snapshot read only.
 	if v.IsSnapshot() {
-		ourUnmount, err := v.driver.UnmountVolumeSnapshot(v, op)
+		ourUnmount, err := v.driver.UnmountVolumeSnapshot(v, progressReporter)
 		if err != nil {
 			return err
 		}
 
 		if ourUnmount {
-			defer func() { _ = v.driver.MountVolumeSnapshot(v, op) }()
+			defer func() { _ = v.driver.MountVolumeSnapshot(v, progressReporter) }()
 		}
 	} else {
-		ourUnmount, err := v.driver.UnmountVolume(v, keepBlockDev, op)
+		ourUnmount, err := v.driver.UnmountVolume(v, keepBlockDev, progressReporter)
 		if err != nil {
 			return err
 		}
 
 		if ourUnmount {
-			defer func() { _ = v.driver.MountVolume(v, op) }()
+			defer func() { _ = v.driver.MountVolume(v, progressReporter) }()
 		}
 	}
 
-	return task(op)
+	return task(progressReporter)
 }
 
 // Snapshots returns a list of snapshots for the volume (in no particular order).
-func (v Volume) Snapshots(op *operations.Operation) ([]Volume, error) {
+func (v Volume) Snapshots(progressReporter ioprogress.ProgressReporter) ([]Volume, error) {
 	if v.IsSnapshot() {
-		return nil, fmt.Errorf("Volume is a snapshot")
+		return nil, errors.New("Volume is a snapshot")
 	}
 
-	snapshots, err := v.driver.VolumeSnapshots(v, op)
+	snapshots, err := v.driver.VolumeSnapshots(v)
 	if err != nil {
 		return nil, err
 	}
@@ -421,12 +426,20 @@ func (v Volume) NewVMBlockFilesystemVolume() Volume {
 	// Propagate filesystem probe mode of parent volume.
 	vol.SetMountFilesystemProbe(v.mountFilesystemProbe)
 
+	// Propagate mount custom path of parent volume.
+	vol.SetMountCustomPath(v.mountCustomPath)
+
+	if v.IsSnapshot() {
+		// Propagate UUID of parent volume.
+		vol.SetParentUUID(v.parentUUID)
+	}
+
 	return vol
 }
 
 // SetQuota calls SetVolumeQuota on the Volume's driver.
-func (v Volume) SetQuota(size string, allowUnsafeResize bool, op *operations.Operation) error {
-	return v.driver.SetVolumeQuota(v, size, allowUnsafeResize, op)
+func (v Volume) SetQuota(size string, allowUnsafeResize bool, progressReporter ioprogress.ProgressReporter) error {
+	return v.driver.SetVolumeQuota(v, size, allowUnsafeResize, progressReporter)
 }
 
 // SetConfigSize sets the size config property on the Volume (does not resize volume).
@@ -437,6 +450,11 @@ func (v Volume) SetConfigSize(size string) {
 // SetConfigStateSize sets the size.state config property on the Volume (does not resize volume).
 func (v Volume) SetConfigStateSize(size string) {
 	v.config["size.state"] = size
+}
+
+// SetMountCustomPath sets a custom path for mounting the volume.
+func (v *Volume) SetMountCustomPath(path string) {
+	v.mountCustomPath = path
 }
 
 // ConfigBlockFilesystem returns the filesystem to use for block volumes. Returns config value "block.filesystem"
@@ -475,7 +493,7 @@ func (v Volume) ConfigSize() string {
 	// If volume size isn't defined in either volume or pool config, then for block volumes or block-backed
 	// volumes return the defaultBlockSize.
 	if (size == "" || size == "0") && (v.contentType == ContentTypeBlock || v.IsBlockBacked()) {
-		return DefaultBlockSize
+		return v.driver.Info().DefaultBlockSize
 	}
 
 	// Return defined size or empty string if not defined.
@@ -565,19 +583,25 @@ func (v *Volume) SetParentUUID(parentUUID string) {
 	v.parentUUID = parentUUID
 }
 
+// GetParent returns a parent volume that has volatile.uuid set to the current's volume parent UUID.
+func (v *Volume) GetParent() Volume {
+	parentName, _, _ := api.GetParentAndSnapshotName(v.name)
+	parentVolConfig := map[string]string{
+		"volatile.uuid": v.parentUUID,
+	}
+
+	return NewVolume(v.driver, v.pool, v.volType, v.contentType, parentName, parentVolConfig, nil)
+}
+
 // Clone returns a copy of the volume.
 func (v Volume) Clone() Volume {
 	// Copy the config map to avoid internal modifications affecting external state.
 	newConfig := make(map[string]string, len(v.config))
-	for k, v := range v.config {
-		newConfig[k] = v
-	}
+	maps.Copy(newConfig, v.config)
 
 	// Copy the pool config map to avoid internal modifications affecting external state.
 	newPoolConfig := make(map[string]string, len(v.poolConfig))
-	for k, v := range v.poolConfig {
-		newPoolConfig[k] = v
-	}
+	maps.Copy(newPoolConfig, v.poolConfig)
 
 	return NewVolume(v.driver, v.pool, v.volType, v.contentType, v.name, newConfig, newPoolConfig)
 }

@@ -4,15 +4,16 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/db/warningtype"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/entity"
 )
@@ -30,7 +31,7 @@ func (c *ClusterTx) UpsertWarningLocalNode(ctx context.Context, projectName stri
 	}
 
 	if localName == "" {
-		return fmt.Errorf("Local member name not available")
+		return errors.New("Local member name not available")
 	}
 
 	return c.UpsertWarning(ctx, localName, projectName, entityType, entityID, typeCode, message)
@@ -49,7 +50,7 @@ func (c *ClusterTx) UpsertWarning(ctx context.Context, nodeName string, projectN
 		// Validate that the entity exists.
 		_, err := cluster.GetEntityURL(ctx, c.Tx(), entityType, entityID)
 		if err != nil {
-			return fmt.Errorf("Failed to validate warning: %w", err)
+			return fmt.Errorf("Failed validating warning: %w", err)
 		}
 	}
 
@@ -64,7 +65,7 @@ func (c *ClusterTx) UpsertWarning(ctx context.Context, nodeName string, projectN
 
 	warnings, err := cluster.GetWarnings(ctx, c.tx, filter)
 	if err != nil {
-		return fmt.Errorf("Failed to retrieve warnings: %w", err)
+		return fmt.Errorf("Failed retrieving warnings: %w", err)
 	}
 
 	if len(warnings) > 1 {
@@ -111,12 +112,12 @@ func (c *ClusterTx) UpdateWarningStatus(UUID string, status warningtype.Status) 
 	str := "UPDATE warnings SET status=?, updated_date=? WHERE uuid=?"
 	res, err := c.tx.Exec(str, status, time.Now(), UUID)
 	if err != nil {
-		return fmt.Errorf("Failed to update warning status for warning %q: %w", UUID, err)
+		return fmt.Errorf("Failed updating warning status for warning %q: %w", UUID, err)
 	}
 
 	rowsAffected, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("Failed to get affected rows to update warning status %q: %w", UUID, err)
+		return fmt.Errorf("Failed getting affected rows to update warning status %q: %w", UUID, err)
 	}
 
 	if rowsAffected == 0 {
@@ -133,12 +134,12 @@ func (c *ClusterTx) UpdateWarningState(UUID string, message string, status warni
 
 	res, err := c.tx.Exec(str, message, now, now, status, UUID)
 	if err != nil {
-		return fmt.Errorf("Failed to update warning %q: %w", UUID, err)
+		return fmt.Errorf("Failed updating warning %q: %w", UUID, err)
 	}
 
 	rowsAffected, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("Failed to get affected rows to update warning state %q: %w", UUID, err)
+		return fmt.Errorf("Failed getting affected rows to update warning state %q: %w", UUID, err)
 	}
 
 	if rowsAffected == 0 {
@@ -153,11 +154,11 @@ func (c *ClusterTx) createWarning(ctx context.Context, object cluster.Warning) (
 	// Check if a warning with the same key exists.
 	exists, err := cluster.WarningExists(ctx, c.tx, object.UUID)
 	if err != nil {
-		return -1, fmt.Errorf("Failed to check for duplicates: %w", err)
+		return -1, fmt.Errorf("Failed checking for duplicates: %w", err)
 	}
 
 	if exists {
-		return -1, fmt.Errorf("This warning already exists")
+		return -1, errors.New("This warning already exists")
 	}
 
 	args := make([]any, 12)
@@ -167,7 +168,7 @@ func (c *ClusterTx) createWarning(ctx context.Context, object cluster.Warning) (
 		// Ensure node exists
 		_, err = c.GetNodeByName(ctx, object.Node)
 		if err != nil {
-			return -1, fmt.Errorf("Failed to get node: %w", err)
+			return -1, fmt.Errorf("Failed getting node: %w", err)
 		}
 
 		args[0] = object.Node
@@ -177,10 +178,10 @@ func (c *ClusterTx) createWarning(ctx context.Context, object cluster.Warning) (
 		// Ensure project exists
 		projects, err := cluster.GetProjectNames(context.Background(), c.tx)
 		if err != nil {
-			return -1, fmt.Errorf("Failed to get project names: %w", err)
+			return -1, fmt.Errorf("Failed getting project names: %w", err)
 		}
 
-		if !shared.ValueInSlice(object.Project, projects) {
+		if !slices.Contains(projects, object.Project) {
 			return -1, fmt.Errorf("Unknown project %q", object.Project)
 		}
 
@@ -207,18 +208,18 @@ func (c *ClusterTx) createWarning(ctx context.Context, object cluster.Warning) (
 	// Prepared statement to use.
 	stmt, err := cluster.Stmt(c.tx, warningCreate)
 	if err != nil {
-		return -1, fmt.Errorf("Failed to get \"warningCreate\" prepared statement: %w", err)
+		return -1, fmt.Errorf("Failed getting \"warningCreate\" prepared statement: %w", err)
 	}
 
 	// Execute the statement.
 	result, err := stmt.Exec(args...)
 	if err != nil {
-		return -1, fmt.Errorf("Failed to create warning: %w", err)
+		return -1, fmt.Errorf("Failed creating warning: %w", err)
 	}
 
 	id, err := result.LastInsertId()
 	if err != nil {
-		return -1, fmt.Errorf("Failed to fetch warning ID: %w", err)
+		return -1, fmt.Errorf("Failed fetching warning ID: %w", err)
 	}
 
 	return id, nil

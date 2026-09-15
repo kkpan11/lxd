@@ -1,6 +1,7 @@
 package device
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -57,19 +58,22 @@ func (d *unixCommon) validateConfig(instConf instance.ConfigReader) error {
 				return nil
 			}
 
-			if strings.HasPrefix(value, d.state.DevMonitor.PrefixPath()) {
+			prefixPath := d.state.DevMonitor.PrefixPath()
+			if strings.HasPrefix(value, prefixPath) {
 				return nil
 			}
 
-			return &drivers.ErrInvalidPath{PrefixPath: d.state.DevMonitor.PrefixPath()}
+			return &drivers.ErrInvalidPath{PrefixPath: prefixPath}
 		},
+
 		// lxdmeta:generate(entities=device-unix-{char+block}; group=device-conf; key=path)
 		//
 		// ---
 		//  type: string
 		//  required: either `source` or `path` must be set
-		//  shortdesc: Path inside the instance
+		//  shortdesc: Path inside the container
 		"path": validate.IsAny,
+
 		// lxdmeta:generate(entities=device-unix-{char+block}; group=device-conf; key=major)
 		//
 		// ---
@@ -77,6 +81,7 @@ func (d *unixCommon) validateConfig(instConf instance.ConfigReader) error {
 		//  defaultdesc: device on host
 		//  shortdesc: Device major number
 		"major": unixValidDeviceNum,
+
 		// lxdmeta:generate(entities=device-unix-{char+block}; group=device-conf; key=minor)
 		//
 		// ---
@@ -84,12 +89,13 @@ func (d *unixCommon) validateConfig(instConf instance.ConfigReader) error {
 		//  defaultdesc: device on host
 		//  shortdesc: Device minor number
 		"minor": unixValidDeviceNum,
+
 		// lxdmeta:generate(entities=device-unix-{char+block+hotplug}; group=device-conf; key=uid)
 		//
 		// ---
 		//  type: integer
 		//  defaultdesc: `0`
-		//  shortdesc: UID of the device owner in the instance
+		//  shortdesc: UID of the device owner in the container
 
 		// lxdmeta:generate(entities=device-unix-usb; group=device-conf; key=uid)
 		//
@@ -97,14 +103,15 @@ func (d *unixCommon) validateConfig(instConf instance.ConfigReader) error {
 		//  type: integer
 		//  defaultdesc: `0`
 		//  condition: container
-		//  shortdesc: UID of the device owner in the container
+		//  shortdesc: UID of the device owner in the instance
 		"uid": unixValidUserID,
+
 		// lxdmeta:generate(entities=device-unix-{char+block+hotplug}; group=device-conf; key=gid)
 		//
 		// ---
 		//  type: integer
 		//  defaultdesc: `0`
-		//  shortdesc: GID of the device owner in the instance
+		//  shortdesc: GID of the device owner in the container
 
 		// lxdmeta:generate(entities=device-unix-usb; group=device-conf; key=gid)
 		//
@@ -112,14 +119,15 @@ func (d *unixCommon) validateConfig(instConf instance.ConfigReader) error {
 		//  type: integer
 		//  defaultdesc: `0`
 		//  condition: container
-		//  shortdesc: GID of the device owner in the container
+		//  shortdesc: GID of the device owner in the instance
 		"gid": unixValidUserID,
+
 		// lxdmeta:generate(entities=device-unix-{char+block+hotplug}; group=device-conf; key=mode)
 		//
 		// ---
 		//  type: integer
 		//  defaultdesc: `0660`
-		//  shortdesc: Mode of the device in the instance
+		//  shortdesc: Mode of the device in the container
 
 		// lxdmeta:generate(entities=device-unix-usb; group=device-conf; key=mode)
 		//
@@ -127,23 +135,24 @@ func (d *unixCommon) validateConfig(instConf instance.ConfigReader) error {
 		//  type: integer
 		//  defaultdesc: `0660`
 		//  condition: container
-		//  shortdesc: Mode of the device in the container
+		//  shortdesc: Mode of the device in the instance
 		"mode": unixValidOctalFileMode,
+
 		// lxdmeta:generate(entities=device-unix-char; group=device-conf; key=required)
 		// See {ref}`devices-unix-char-hotplugging` for more information.
 		// ---
 		//  type: bool
 		//  defaultdesc: `true`
-		//  shortdesc: Whether this device is required to start the instance
+		//  shortdesc: Whether this device is required to start the container
 
 		// lxdmeta:generate(entities=device-unix-block; group=device-conf; key=required)
 		// See {ref}`devices-unix-block-hotplugging` for more information.
 		// ---
 		//  type: bool
 		//  defaultdesc: `true`
-		//  shortdesc: Whether this device is required to start the instance
+		//  shortdesc: Whether this device is required to start the container
 
-		// lxdmeta:generate(entities=device-unix-{hotplug+usb}; group=device-conf; key=required)
+		// lxdmeta:generate(entities=device-unix-usb; group=device-conf; key=required)
 		// The default is `false`, which means that all devices can be hotplugged.
 		// ---
 		//  type: bool
@@ -158,7 +167,7 @@ func (d *unixCommon) validateConfig(instConf instance.ConfigReader) error {
 	}
 
 	if d.config["source"] == "" && d.config["path"] == "" {
-		return fmt.Errorf("Unix device entry is missing the required \"source\" or \"path\" property")
+		return errors.New("Unix device entry is missing the required \"source\" or \"path\" property")
 	}
 
 	return nil
@@ -193,7 +202,8 @@ func (d *unixCommon) Register() error {
 
 		runConf := deviceConfig.RunConfig{}
 
-		if e.Action == fsmonitor.EventAdd {
+		switch e.Action {
+		case fsmonitor.EventAdd:
 			// Skip if host side instance device file already exists.
 			if shared.PathExists(devPath) {
 				return nil, nil
@@ -219,7 +229,8 @@ func (d *unixCommon) Register() error {
 			if err != nil {
 				return nil, err
 			}
-		} else if e.Action == fsmonitor.EventRemove {
+
+		case fsmonitor.EventRemove:
 			// Skip if host side instance device file doesn't exist.
 			if !shared.PathExists(devPath) {
 				return nil, nil
@@ -234,7 +245,7 @@ func (d *unixCommon) Register() error {
 			runConf.PostHooks = []func() error{func() error {
 				err := unixDeviceDeleteFiles(state, devicesPath, "unix", deviceName, relativeDestPath)
 				if err != nil {
-					return fmt.Errorf("Failed to delete files for device '%s': %w", deviceName, err)
+					return fmt.Errorf("Failed deleting files for device %q: %w", deviceName, err)
 				}
 
 				return nil
@@ -282,7 +293,7 @@ func (d *unixCommon) Start() (*deviceConfig.RunConfig, error) {
 			}
 		} else if d.isRequired() {
 			// If the file is missing and the device is required then we cannot proceed.
-			return nil, fmt.Errorf("The required device path doesn't exist and the major and minor settings are not specified")
+			return nil, errors.New("The required device path does not exist and the major and minor settings are not specified")
 		}
 	}
 
@@ -314,7 +325,7 @@ func (d *unixCommon) postStop() error {
 	// Remove host files for this device.
 	err := unixDeviceDeleteFiles(d.state, d.inst.DevicesPath(), "unix", d.name, "")
 	if err != nil {
-		return fmt.Errorf("Failed to delete files for device '%s': %w", d.name, err)
+		return fmt.Errorf("Failed deleting files for device %q: %w", d.name, err)
 	}
 
 	return nil

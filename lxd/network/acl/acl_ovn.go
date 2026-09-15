@@ -1,10 +1,15 @@
 package acl
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -66,7 +71,7 @@ func OVNNetworkPrefix(networkID int64) string {
 
 // OVNIntSwitchName returns the internal logical switch name for a Network ID.
 func OVNIntSwitchName(networkID int64) openvswitch.OVNSwitch {
-	return openvswitch.OVNSwitch(fmt.Sprintf("%s-ls-int", OVNNetworkPrefix(networkID)))
+	return openvswitch.OVNSwitch(OVNNetworkPrefix(networkID) + "-ls-int")
 }
 
 // OVNIntSwitchRouterPortName returns OVN logical internal switch router port name.
@@ -81,13 +86,13 @@ func OVNIntSwitchRouterPortName(networkID int64) openvswitch.OVNSwitchPort {
 // of the database and applied. For each network provided in aclNets, the network specific port group for each ACL
 // is checked for existence (it is created & applies network specific ACL rules if not).
 // Returns a revert fail function that can be used to undo this function if a subsequent step fails.
-func OVNEnsureACLs(s *state.State, l logger.Logger, client *openvswitch.OVN, aclProjectName string, aclNameIDs map[string]int64, aclNets map[string]NetworkACLUsage, aclNames []string, reapplyRules bool) (revert.Hook, error) {
+func OVNEnsureACLs(ctx context.Context, s *state.State, l logger.Logger, client *openvswitch.OVN, aclProjectName string, aclNameIDs map[string]int64, aclNets map[string]NetworkACLUsage, aclNames []string, reapplyRules bool) (revert.Hook, error) {
 	revert := revert.New()
 	defer revert.Fail()
 
 	var err error
 	var projectID int64
-	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 		projectID, err = cluster.GetProjectID(ctx, tx.Tx(), aclProjectName)
 		if err != nil {
 			return fmt.Errorf("Failed getting project ID for project %q: %w", aclProjectName, err)
@@ -135,7 +140,7 @@ func OVNEnsureACLs(s *state.State, l logger.Logger, client *openvswitch.OVN, acl
 		if portGroupUUID == "" {
 			var aclInfo *api.NetworkACL
 
-			err := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+			err := s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 				// Load the config we'll need to create the port group with ACL rules.
 				_, aclInfo, err = tx.GetNetworkACL(ctx, aclProjectName, aclName)
 
@@ -170,7 +175,7 @@ func OVNEnsureACLs(s *state.State, l logger.Logger, client *openvswitch.OVN, acl
 			// the default rule we add. We also need to reapply the rules if we are adding any
 			// new per-ACL-per-network port groups.
 			if reapplyRules || !portGroupHasACLs || len(addACLNets) > 0 {
-				err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+				err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 					_, aclInfo, err = tx.GetNetworkACL(ctx, aclProjectName, aclName)
 
 					return err
@@ -309,7 +314,7 @@ func ovnAddReferencedACLs(info *api.NetworkACL, referencedACLNames map[string]st
 				continue // Skip subjects already seen.
 			}
 
-			if shared.ValueInSlice(subject, append(ruleSubjectInternalAliases, ruleSubjectExternalAliases...)) {
+			if slices.Contains(append(ruleSubjectInternalAliases, ruleSubjectExternalAliases...), subject) {
 				continue // Skip special reserved subjects that are not ACL names.
 			}
 
@@ -414,8 +419,8 @@ func ovnApplyToPortGroup(l logger.Logger, client *openvswitch.OVN, aclInfo *api.
 
 		// Setup per-network dynamic replacements for @internal/@external subject port selectors.
 		matchReplace := map[string]string{
-			fmt.Sprintf("@%s", ruleSubjectInternal): fmt.Sprintf("@%s", OVNIntSwitchPortGroupName(aclNet.ID)),
-			fmt.Sprintf("@%s", ruleSubjectExternal): fmt.Sprintf(`"%s"`, OVNIntSwitchRouterPortName(aclNet.ID)),
+			"@" + ruleSubjectInternal: fmt.Sprintf("@%s", OVNIntSwitchPortGroupName(aclNet.ID)),
+			"@" + ruleSubjectExternal: fmt.Sprintf(`"%s"`, OVNIntSwitchRouterPortName(aclNet.ID)),
 		}
 
 		err = client.PortGroupSetACLRules(netPortGroupName, matchReplace, networkRules...)
@@ -491,7 +496,7 @@ func ovnRuleCriteriaToOVNACLRule(direction string, rule *api.NetworkACLRule, por
 	}
 
 	// Add protocol filters.
-	if shared.ValueInSlice(rule.Protocol, []string{"tcp", "udp"}) {
+	if slices.Contains([]string{"tcp", "udp"}, rule.Protocol) {
 		matchParts = append(matchParts, rule.Protocol)
 
 		if rule.SourcePort != "" {
@@ -501,7 +506,7 @@ func ovnRuleCriteriaToOVNACLRule(direction string, rule *api.NetworkACLRule, por
 		if rule.DestinationPort != "" {
 			matchParts = append(matchParts, ovnRulePortToOVNACLMatch(rule.Protocol, "dst", shared.SplitNTrimSpace(rule.DestinationPort, ",", -1, false)...))
 		}
-	} else if shared.ValueInSlice(rule.Protocol, []string{"icmp4", "icmp6"}) {
+	} else if slices.Contains([]string{"icmp4", "icmp6"}, rule.Protocol) {
 		matchParts = append(matchParts, rule.Protocol)
 
 		if rule.ICMPType != "" {
@@ -525,11 +530,11 @@ func ovnRulePortToOVNACLMatch(protocol string, direction string, portCriteria ..
 	fieldParts := make([]string, 0, len(portCriteria))
 
 	for _, portCriterion := range portCriteria {
-		criterionParts := strings.SplitN(portCriterion, "-", 2)
-		if len(criterionParts) > 1 {
-			fieldParts = append(fieldParts, fmt.Sprintf("(%s.%s >= %s && %s.%s <= %s)", protocol, direction, criterionParts[0], protocol, direction, criterionParts[1]))
+		firstPort, lastPort, found := strings.Cut(portCriterion, "-")
+		if found {
+			fieldParts = append(fieldParts, fmt.Sprintf("(%s.%s >= %s && %s.%s <= %s)", protocol, direction, firstPort, protocol, direction, lastPort))
 		} else {
-			fieldParts = append(fieldParts, fmt.Sprintf("%s.%s == %s", protocol, direction, criterionParts[0]))
+			fieldParts = append(fieldParts, fmt.Sprintf("%s.%s == %s", protocol, direction, firstPort))
 		}
 	}
 
@@ -546,19 +551,19 @@ func ovnRuleSubjectToOVNACLMatch(direction string, aclNameIDs map[string]int64, 
 	// For each criterion check if value looks like an IP range or IP CIDR, and if not use it as an ACL name.
 	for _, subjectCriterion := range subjectCriteria {
 		if validate.IsNetworkRange(subjectCriterion) == nil {
-			criterionParts := strings.SplitN(subjectCriterion, "-", 2)
-			if len(criterionParts) <= 1 {
+			firstIP, lastIP, found := strings.Cut(subjectCriterion, "-")
+			if !found {
 				return "", false, nil, fmt.Errorf("Invalid IP range %q", subjectCriterion)
 			}
 
-			ip := net.ParseIP(criterionParts[0])
+			ip := net.ParseIP(firstIP)
 			if ip != nil {
 				protocol := "ip4"
 				if ip.To4() == nil {
 					protocol = "ip6"
 				}
 
-				fieldParts = append(fieldParts, fmt.Sprintf("(%s.%s >= %s && %s.%s <= %s)", protocol, direction, criterionParts[0], protocol, direction, criterionParts[1]))
+				fieldParts = append(fieldParts, fmt.Sprintf("(%s.%s >= %s && %s.%s <= %s)", protocol, direction, firstIP, protocol, direction, lastIP))
 			}
 		} else {
 			// Try parsing subject as single IP or CIDR.
@@ -577,28 +582,29 @@ func ovnRuleSubjectToOVNACLMatch(direction string, aclNameIDs map[string]int64, 
 			} else {
 				// If not valid IP subnet, check if subject is ACL name or network peer name.
 				var subjectPortSelector openvswitch.OVNPortGroup
-				if shared.ValueInSlice(subjectCriterion, ruleSubjectInternalAliases) {
+				peerRef, hasPeerRef := strings.CutPrefix(subjectCriterion, "@")
+				if slices.Contains(ruleSubjectInternalAliases, subjectCriterion) {
 					// Use pseudo port group name for special reserved port selector types.
 					// These will be expanded later for each network specific rule.
 					// Convert deprecated #internal to non-deprecated @internal if needed.
 					subjectPortSelector = openvswitch.OVNPortGroup(ruleSubjectInternal)
 					networkSpecific = true
-				} else if shared.ValueInSlice(subjectCriterion, ruleSubjectExternalAliases) {
+				} else if slices.Contains(ruleSubjectExternalAliases, subjectCriterion) {
 					// Use pseudo port group name for special reserved port selector types.
 					// These will be expanded later for each network specific rule.
 					// Convert deprecated #external to non-deprecated @external if needed.
 					subjectPortSelector = openvswitch.OVNPortGroup(ruleSubjectExternal)
 					networkSpecific = true
-				} else if strings.HasPrefix(subjectCriterion, "@") {
+				} else if hasPeerRef {
 					// Subject is a network peer name. Convert to address set criteria.
-					peerParts := strings.SplitN(strings.TrimPrefix(subjectCriterion, "@"), "/", 2)
-					if len(peerParts) != 2 {
+					networkName, peerName, found := strings.Cut(peerRef, "/")
+					if !found {
 						return "", false, nil, fmt.Errorf("Cannot parse subject as peer %q", subjectCriterion)
 					}
 
 					peer := db.NetworkPeer{
-						NetworkName: peerParts[0],
-						PeerName:    peerParts[1],
+						NetworkName: networkName,
+						PeerName:    peerName,
 					}
 
 					networkID, found := peerTargetNetIDs[peer]
@@ -637,6 +643,7 @@ func ovnRuleSubjectToOVNACLMatch(direction string, aclNameIDs map[string]int64, 
 
 // OVNApplyNetworkBaselineRules applies preset baseline logical switch rules to a allow access to network services.
 func OVNApplyNetworkBaselineRules(client *openvswitch.OVN, switchName openvswitch.OVNSwitch, routerPortName openvswitch.OVNSwitchPort, intRouterIPs []*net.IPNet, dnsIPs []net.IP) error {
+	//nolint:prealloc
 	rules := []openvswitch.OVNACLRule{
 		{
 			Direction: "to-lport",
@@ -756,12 +763,12 @@ func OVNApplyNetworkBaselineRules(client *openvswitch.OVN, switchName openvswitc
 // The combination of ignoring the specifified usage type and explicit keep ACLs allows the caller to ensure that
 // the desired ACLs are considered unused by the usage type even if the referring config has not yet been removed
 // from the database.
-func OVNPortGroupDeleteIfUnused(s *state.State, l logger.Logger, client *openvswitch.OVN, aclProjectName string, ignoreUsageType any, ignoreUsageNicName string, keepACLs ...string) error {
+func OVNPortGroupDeleteIfUnused(ctx context.Context, s *state.State, l logger.Logger, client *openvswitch.OVN, aclProjectName string, ignoreUsageType any, ignoreUsageNicName string, keepACLs ...string) error {
 	var aclNameIDs map[string]int64
 	var aclNames []string
 	var projectID int64
 
-	err := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err := s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 		var err error
 
 		// Get map of ACL names to DB IDs (used for generating OVN port group names).
@@ -832,13 +839,13 @@ func OVNPortGroupDeleteIfUnused(s *state.State, l logger.Logger, client *openvsw
 	// Find alls ACLs that are either directly referred to by OVN entities (networks, instance/profile NICs)
 	// or indirectly by being referred to by a ruleset of another ACL that is itself in use by OVN entities.
 	// For the indirectly referred to ACLs, store a list of the ACLs that are referring to it.
-	err = UsedBy(s, aclProjectName, func(ctx context.Context, tx *db.ClusterTx, matchedACLNames []string, usageType any, nicName string, nicConfig map[string]string) error {
+	err = UsedBy(ctx, s, aclProjectName, func(ctx context.Context, tx *db.ClusterTx, matchedACLNames []string, usageType any, nicName string, nicConfig map[string]string) error {
 		switch u := usageType.(type) {
 		case db.InstanceArgs:
 			ignoreInst, isIgnoreInst := ignoreUsageType.(instance.Instance)
 
 			if isIgnoreInst && ignoreUsageNicName == "" {
-				return fmt.Errorf("ignoreUsageNicName should be specified when providing an instance in ignoreUsageType")
+				return errors.New("ignoreUsageNicName should be specified when providing an instance in ignoreUsageType")
 			}
 
 			// If an ignore instance was provided, then skip the device that the ACLs were just removed
@@ -850,7 +857,7 @@ func OVNPortGroupDeleteIfUnused(s *state.State, l logger.Logger, client *openvsw
 
 			netID, network, _, err := tx.GetNetworkInAnyState(ctx, aclProjectName, nicConfig["network"])
 			if err != nil {
-				return fmt.Errorf("Failed to load network %q: %w", nicConfig["network"], err)
+				return fmt.Errorf("Failed loading network %q: %w", nicConfig["network"], err)
 			}
 
 			if network.Type == "ovn" {
@@ -866,7 +873,7 @@ func OVNPortGroupDeleteIfUnused(s *state.State, l logger.Logger, client *openvsw
 			ignoreNet, isIgnoreNet := ignoreUsageType.(*api.Network)
 
 			if isIgnoreNet && ignoreUsageNicName != "" {
-				return fmt.Errorf("ignoreUsageNicName should be empty when providing a network in ignoreUsageType")
+				return errors.New("ignoreUsageNicName should be empty when providing a network in ignoreUsageType")
 			}
 
 			// If an ignore network was provided, then skip the network that the ACLs were just removed
@@ -879,7 +886,7 @@ func OVNPortGroupDeleteIfUnused(s *state.State, l logger.Logger, client *openvsw
 			if u.Type == "ovn" {
 				netID, _, _, err := tx.GetNetworkInAnyState(ctx, aclProjectName, u.Name)
 				if err != nil {
-					return fmt.Errorf("Failed to load network %q: %w", nicConfig["network"], err)
+					return fmt.Errorf("Failed loading network %q: %w", nicConfig["network"], err)
 				}
 
 				for _, matchedACLName := range matchedACLNames {
@@ -894,7 +901,7 @@ func OVNPortGroupDeleteIfUnused(s *state.State, l logger.Logger, client *openvsw
 			ignoreProfile, isIgnoreProfile := ignoreUsageType.(cluster.Profile)
 
 			if isIgnoreProfile && ignoreUsageNicName == "" {
-				return fmt.Errorf("ignoreUsageNicName should be specified when providing a profile in ignoreUsageType")
+				return errors.New("ignoreUsageNicName should be specified when providing a profile in ignoreUsageType")
 			}
 
 			// If an ignore profile was provided, then skip the device that the ACLs were just removed
@@ -906,7 +913,7 @@ func OVNPortGroupDeleteIfUnused(s *state.State, l logger.Logger, client *openvsw
 
 			netID, network, _, err := tx.GetNetworkInAnyState(ctx, aclProjectName, nicConfig["network"])
 			if err != nil {
-				return fmt.Errorf("Failed to load network %q: %w", nicConfig["network"], err)
+				return fmt.Errorf("Failed loading network %q: %w", nicConfig["network"], err)
 			}
 
 			if network.Type == "ovn" {
@@ -925,7 +932,7 @@ func OVNPortGroupDeleteIfUnused(s *state.State, l logger.Logger, client *openvsw
 					aclUsedACLS[matchedACLName] = make([]string, 0, 1)
 				}
 
-				if !shared.ValueInSlice(u.Name, aclUsedACLS[matchedACLName]) {
+				if !slices.Contains(aclUsedACLS[matchedACLName], u.Name) {
 					// Record as in use by another ACL entity.
 					aclUsedACLS[matchedACLName] = append(aclUsedACLS[matchedACLName], u.Name)
 				}
@@ -972,7 +979,7 @@ func OVNPortGroupDeleteIfUnused(s *state.State, l logger.Logger, client *openvsw
 	if len(removePortGroups) > 0 {
 		err = client.PortGroupDelete(removePortGroups...)
 		if err != nil {
-			return fmt.Errorf("Failed to delete unused OVN port groups: %w", err)
+			return fmt.Errorf("Failed deleting unused OVN port groups: %w", err)
 		}
 	}
 
@@ -993,11 +1000,11 @@ func OVNPortGroupInstanceNICSchedule(portUUID openvswitch.OVNSwitchPortUUID, cha
 
 // OVNApplyInstanceNICDefaultRules applies instance NIC default rules to per-network port group.
 func OVNApplyInstanceNICDefaultRules(client *openvswitch.OVN, switchPortGroup openvswitch.OVNPortGroup, logPrefix string, nicPortName openvswitch.OVNSwitchPort, ingressAction string, ingressLogged bool, egressAction string, egressLogged bool) error {
-	if !shared.ValueInSlice(ingressAction, ValidActions) {
+	if !slices.Contains(ValidActions, ingressAction) {
 		return fmt.Errorf("Invalid ingress action %q", ingressAction)
 	}
 
-	if !shared.ValueInSlice(egressAction, ValidActions) {
+	if !slices.Contains(ValidActions, egressAction) {
 		return fmt.Errorf("Invalid egress action %q", egressAction)
 	}
 
@@ -1006,7 +1013,7 @@ func OVNApplyInstanceNICDefaultRules(client *openvswitch.OVN, switchPortGroup op
 			Direction: "to-lport",
 			Action:    egressAction,
 			Log:       egressLogged,
-			LogName:   fmt.Sprintf("%s-egress", logPrefix), // Max 63 chars.
+			LogName:   logPrefix + "-egress", // Max 63 chars.
 			Priority:  ovnACLPriorityNICDefaultActionEgress,
 			Match:     fmt.Sprintf(`inport == "%s"`, nicPortName), // From NIC.
 		},
@@ -1014,7 +1021,7 @@ func OVNApplyInstanceNICDefaultRules(client *openvswitch.OVN, switchPortGroup op
 			Direction: "to-lport",
 			Action:    ingressAction,
 			Log:       ingressLogged,
-			LogName:   fmt.Sprintf("%s-ingress", logPrefix), // Max 63 chars.
+			LogName:   logPrefix + "-ingress", // Max 63 chars.
 			Priority:  ovnACLPriorityNICDefaultActionIngress,
 			Match:     fmt.Sprintf(`outport == "%s"`, nicPortName), // To NIC.
 		},
@@ -1041,9 +1048,26 @@ type ovnLogEntry struct {
 	Action   string `json:"action"`
 }
 
-// ovnParseLogEntry takes a log line and expected ACL prefix and returns a re-formated log entry if matching.
-func ovnParseLogEntry(input string, prefix string) string {
-	fields := strings.Split(input, "|")
+// ovnParseLogEntry takes a log line (that comes from either an ovn controller log file or from the syslogs)
+// and expected ACL prefix and returns a re-formated log entry if matching.
+// The 'timestamp' string is in microseconds format. If empty, the timestamp is extracted from the log entry.
+func ovnParseLogEntry(logline string, syslogTimestamp string, prefix string) string {
+	parseLogTimeFromFields := func(fields []string) (time.Time, error) {
+		return time.Parse(time.RFC3339, fields[0])
+	}
+
+	parseLogTimeFromTimestamp := func(syslogTimestamp string) (time.Time, error) {
+		tsInt, err := strconv.ParseInt(syslogTimestamp, 10, 64)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("Failed parsing timestamp: %w", err)
+		}
+
+		// The provided timestamp is in microseconds and need to be converted to nanoseconds.
+		tsNs := tsInt * 1000
+		return time.Unix(0, tsNs).UTC(), nil
+	}
+
+	fields := strings.Split(logline, "|")
 
 	// Skip unknown formatting.
 	if len(fields) != 5 {
@@ -1058,12 +1082,12 @@ func ovnParseLogEntry(input string, prefix string) string {
 	// Parse the ACL log entry.
 	aclEntry := map[string]string{}
 	for _, entry := range shared.SplitNTrimSpace(fields[4], ",", -1, true) {
-		pair := strings.Split(entry, "=")
-		if len(pair) != 2 {
+		key, value, found := strings.Cut(entry, "=")
+		if !found {
 			continue
 		}
 
-		aclEntry[strings.Trim(pair[0], "\"")] = strings.Trim(pair[1], "\"")
+		aclEntry[strings.Trim(key, "\"")] = strings.Trim(value, "\"")
 	}
 
 	// Filter for our ACL.
@@ -1071,19 +1095,23 @@ func ovnParseLogEntry(input string, prefix string) string {
 		return ""
 	}
 
-	// Parse the timestamp.
-	logTime, err := time.Parse(time.RFC3339, fields[0])
+	var logTime time.Time
+	var err error
+	if syslogTimestamp == "" {
+		logTime, err = parseLogTimeFromFields(fields)
+	} else {
+		logTime, err = parseLogTimeFromTimestamp(syslogTimestamp)
+	}
+
 	if err != nil {
 		return ""
 	}
 
 	// Get the protocol.
-	directionFields := strings.Split(aclEntry["direction"], " ")
-	if len(directionFields) != 2 {
+	_, protocol, found := strings.Cut(aclEntry["direction"], " ")
+	if !found {
 		return ""
 	}
-
-	protocol := directionFields[1]
 
 	// Get the source and destination addresses.
 	srcAddr, ok := aclEntry["nw_src"]
@@ -1130,4 +1158,57 @@ func ovnParseLogEntry(input string, prefix string) string {
 	}
 
 	return string(out)
+}
+
+// ovnParseLogEntriesFromJournald reads the OVN log entries from the systemd journal and returns them as a list of string entries.
+// Also, we chose to output the last 1000 entries to avoid overloading the system with too many log entries.
+func ovnParseLogEntriesFromJournald(ctx context.Context, systemdUnitName string, filter string) ([]string, error) {
+	var logEntries []string
+	cmd := []string{
+		"journalctl",
+		"--unit", systemdUnitName,
+		"--no-pager",
+		"--boot", "0",
+		"--case-sensitive",
+		"--grep", filter,
+		"--output-fields", "MESSAGE",
+		"-n", "1000",
+		"-o", "json",
+	}
+
+	stdout := bytes.Buffer{}
+	err := shared.RunCommandWithFds(ctx, nil, &stdout, cmd[0], cmd[1:]...)
+	if err != nil {
+		return nil, fmt.Errorf("Failed running journalctl to fetch OVN ACL logs: %w", err)
+	}
+
+	decoder := json.NewDecoder(&stdout)
+	for {
+		var sdLogEntry map[string]any
+		err = decoder.Decode(&sdLogEntry)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return nil, fmt.Errorf("Failed parsing log entry: %w", err)
+		}
+
+		message, ok := sdLogEntry["MESSAGE"].(string)
+		if !ok {
+			continue
+		}
+
+		timestamp, ok := sdLogEntry["__REALTIME_TIMESTAMP"].(string)
+		if !ok {
+			continue
+		}
+
+		logEntry := ovnParseLogEntry(message, timestamp, filter)
+		if logEntry == "" {
+			continue
+		}
+
+		logEntries = append(logEntries, logEntry)
+	}
+
+	return logEntries, nil
 }

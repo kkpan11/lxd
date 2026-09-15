@@ -1,7 +1,6 @@
 package lxd
 
 import (
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -19,7 +18,7 @@ func (r *ProtocolLXD) GetNetworkACLNames() ([]string, error) {
 	// Fetch the raw URL values.
 	urls := []string{}
 	baseURL := "/network-acls"
-	_, err = r.queryStruct("GET", baseURL, nil, "", &urls)
+	_, err = r.queryStruct(http.MethodGet, baseURL, nil, "", &urls)
 	if err != nil {
 		return nil, err
 	}
@@ -38,7 +37,24 @@ func (r *ProtocolLXD) GetNetworkACLs() ([]api.NetworkACL, error) {
 	acls := []api.NetworkACL{}
 
 	// Fetch the raw value.
-	_, err = r.queryStruct("GET", "/network-acls?recursion=1", nil, "", &acls)
+	_, err = r.queryStruct(http.MethodGet, "/network-acls?recursion=1", nil, "", &acls)
+	if err != nil {
+		return nil, err
+	}
+
+	return acls, nil
+}
+
+// GetNetworkACLsAllProjects returns a list of Network ACLs across all projects.
+func (r *ProtocolLXD) GetNetworkACLsAllProjects() ([]api.NetworkACL, error) {
+	err := r.CheckExtension("network_acls_all_projects")
+	if err != nil {
+		return nil, err
+	}
+
+	acls := []api.NetworkACL{}
+	u := api.NewURL().Path("network-acls").WithQuery("recursion", "1").WithQuery("all-projects", "true")
+	_, err = r.queryStruct(http.MethodGet, u.String(), nil, "", &acls)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +72,7 @@ func (r *ProtocolLXD) GetNetworkACL(name string) (*api.NetworkACL, string, error
 	acl := api.NetworkACL{}
 
 	// Fetch the raw value.
-	etag, err := r.queryStruct("GET", fmt.Sprintf("/network-acls/%s", url.PathEscape(name)), nil, "", &acl)
+	etag, err := r.queryStruct(http.MethodGet, "/network-acls/"+url.PathEscape(name), nil, "", &acl)
 	if err != nil {
 		return nil, "", err
 	}
@@ -74,13 +90,13 @@ func (r *ProtocolLXD) GetNetworkACLLogfile(name string) (io.ReadCloser, error) {
 	}
 
 	// Prepare the HTTP request
-	url := fmt.Sprintf("%s/1.0/network-acls/%s/log", r.httpBaseURL.String(), url.PathEscape(name))
+	url := r.httpBaseURL.String() + "/1.0/network-acls/" + url.PathEscape(name) + "/log"
 	url, err = r.setQueryAttributes(url)
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -103,65 +119,115 @@ func (r *ProtocolLXD) GetNetworkACLLogfile(name string) (io.ReadCloser, error) {
 }
 
 // CreateNetworkACL defines a new network ACL using the provided struct.
-func (r *ProtocolLXD) CreateNetworkACL(acl api.NetworkACLsPost) error {
+func (r *ProtocolLXD) CreateNetworkACL(acl api.NetworkACLsPost) (Operation, error) {
 	err := r.CheckExtension("network_acl")
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	var op Operation
 
 	// Send the request.
-	_, _, err = r.query("POST", "/network-acls", acl, "")
-	if err != nil {
-		return err
+	err = r.CheckExtension("storage_and_network_operations")
+	if err != nil || r.isClusterOperationNotification() {
+		// Use a synchronous request when the server lacks async endpoint support
+		// or when handling a cluster operation notification.
+		op = noopOperation{}
+		_, _, err = r.query(http.MethodPost, "/network-acls", acl, "")
+	} else {
+		op, _, err = r.queryOperation(http.MethodPost, "/network-acls", acl, "", true)
 	}
 
-	return nil
+	if err != nil {
+		return nil, err
+	}
+
+	return op, nil
 }
 
 // UpdateNetworkACL updates the network ACL to match the provided struct.
-func (r *ProtocolLXD) UpdateNetworkACL(name string, acl api.NetworkACLPut, ETag string) error {
+func (r *ProtocolLXD) UpdateNetworkACL(name string, acl api.NetworkACLPut, ETag string) (Operation, error) {
 	err := r.CheckExtension("network_acl")
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	path := api.NewURL().Path("network-acls", name)
+
+	var op Operation
 
 	// Send the request.
-	_, _, err = r.query("PUT", fmt.Sprintf("/network-acls/%s", url.PathEscape(name)), acl, ETag)
-	if err != nil {
-		return err
+	err = r.CheckExtension("storage_and_network_operations")
+	if err != nil || r.isClusterOperationNotification() {
+		// Use a synchronous request when the server lacks async endpoint support
+		// or when handling a cluster operation notification.
+		op = noopOperation{}
+		_, _, err = r.query(http.MethodPut, path.String(), acl, ETag)
+	} else {
+		op, _, err = r.queryOperation(http.MethodPut, path.String(), acl, ETag, true)
 	}
 
-	return nil
+	if err != nil {
+		return nil, err
+	}
+
+	return op, nil
 }
 
 // RenameNetworkACL renames an existing network ACL entry.
-func (r *ProtocolLXD) RenameNetworkACL(name string, acl api.NetworkACLPost) error {
+func (r *ProtocolLXD) RenameNetworkACL(name string, acl api.NetworkACLPost) (Operation, error) {
 	err := r.CheckExtension("network_acl")
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	path := api.NewURL().Path("network-acls", name)
+
+	var op Operation
 
 	// Send the request.
-	_, _, err = r.query("POST", fmt.Sprintf("/network-acls/%s", url.PathEscape(name)), acl, "")
-	if err != nil {
-		return err
+	err = r.CheckExtension("storage_and_network_operations")
+	if err != nil || r.isClusterOperationNotification() {
+		// Use a synchronous request when the server lacks async endpoint support
+		// or when handling a cluster operation notification.
+		op = noopOperation{}
+		_, _, err = r.query(http.MethodPost, path.String(), acl, "")
+	} else {
+		op, _, err = r.queryOperation(http.MethodPost, path.String(), acl, "", true)
 	}
 
-	return nil
+	if err != nil {
+		return nil, err
+	}
+
+	return op, nil
 }
 
 // DeleteNetworkACL deletes an existing network ACL.
-func (r *ProtocolLXD) DeleteNetworkACL(name string) error {
+func (r *ProtocolLXD) DeleteNetworkACL(name string) (Operation, error) {
 	err := r.CheckExtension("network_acl")
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	path := api.NewURL().Path("network-acls", name)
+
+	var op Operation
 
 	// Send the request.
-	_, _, err = r.query("DELETE", fmt.Sprintf("/network-acls/%s", url.PathEscape(name)), nil, "")
-	if err != nil {
-		return err
+	err = r.CheckExtension("storage_and_network_operations")
+	if err != nil || r.isClusterOperationNotification() {
+		// Use a synchronous request when the server lacks async endpoint support
+		// or when handling a cluster operation notification.
+		op = noopOperation{}
+		_, _, err = r.query(http.MethodDelete, path.String(), nil, "")
+	} else {
+		op, _, err = r.queryOperation(http.MethodDelete, path.String(), nil, "", true)
 	}
 
-	return nil
+	if err != nil {
+		return nil, err
+	}
+
+	return op, nil
 }

@@ -3,14 +3,13 @@ package cgroup
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/canonical/lxd/shared"
 )
 
 // NewFileReadWriter returns a CGroup instance using the filesystem as its backend.
-func NewFileReadWriter(pid int, unifiedCapable bool) (*CGroup, error) {
+func NewFileReadWriter(pid int) (*CGroup, error) {
 	// Setup the read/writer struct.
 	rw := fileReadWriter{}
 
@@ -22,7 +21,13 @@ func NewFileReadWriter(pid int, unifiedCapable bool) (*CGroup, error) {
 		return nil, err
 	}
 
-	for _, line := range strings.Split(string(controllers), "\n") {
+	hasUnifiedMount := shared.PathExists("/sys/fs/cgroup/unified")
+	cgroupBasePath := "/sys/fs/cgroup"
+	if hasUnifiedMount {
+		cgroupBasePath = "/sys/fs/cgroup/unified"
+	}
+
+	for line := range strings.SplitSeq(string(controllers), "\n") {
 		// Skip empty lines.
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -30,26 +35,27 @@ func NewFileReadWriter(pid int, unifiedCapable bool) (*CGroup, error) {
 		}
 
 		// Extract the fields.
-		fields := strings.Split(line, ":")
-
-		// Determine the mount path.
-		path := filepath.Join("/sys/fs/cgroup", fields[1], fields[2])
-		if fields[0] == "0" {
-			fields[1] = "unified"
-			if shared.PathExists("/sys/fs/cgroup/unified") {
-				path = filepath.Join("/sys/fs/cgroup", "unified", fields[2])
-			} else {
-				path = filepath.Join("/sys/fs/cgroup", fields[2])
-			}
-
-			if strings.HasSuffix(fields[2], "/init.scope") {
-				path = filepath.Dir(path)
-			}
+		hierarchyID, rest, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
 		}
 
-		// Add the controllers individually.
-		for _, ctrl := range strings.Split(fields[1], ",") {
-			rw.paths[ctrl] = path
+		controllerList, cgroupPath, ok := strings.Cut(rest, ":")
+		if !ok {
+			continue
+		}
+
+		// Determine the mount path.
+		if hierarchyID == "0" {
+			cgroupPath, _ = strings.CutSuffix(cgroupPath, "/init.scope")
+			rw.paths["unified"] = cgroupBasePath + "/" + cgroupPath
+		} else {
+			path := "/sys/fs/cgroup/" + controllerList + "/" + cgroupPath
+
+			// Add the controllers individually.
+			for ctrl := range strings.SplitSeq(controllerList, ",") {
+				rw.paths[ctrl] = path
+			}
 		}
 	}
 
@@ -58,7 +64,7 @@ func NewFileReadWriter(pid int, unifiedCapable bool) (*CGroup, error) {
 		return nil, err
 	}
 
-	cg.UnifiedCapable = unifiedCapable
+	cg.UnifiedCapable = true // cgroup2: introduced in lxc 4.0.0
 	return cg, nil
 }
 
@@ -66,10 +72,25 @@ type fileReadWriter struct {
 	paths map[string]string
 }
 
-func (rw *fileReadWriter) Get(version Backend, controller string, key string) (string, error) {
-	path := filepath.Join(rw.paths[controller], key)
+// path returns the full path for a cgroup key under the given controller.
+func (rw *fileReadWriter) path(controller string, key string) (string, error) {
+	base := rw.paths[controller]
 	if cgLayout == CgroupsUnified {
-		path = filepath.Join(rw.paths["unified"], key)
+		base = rw.paths["unified"]
+	}
+
+	if base == "" {
+		return "", ErrControllerMissing
+	}
+
+	return base + "/" + key, nil
+}
+
+// Get returns the value of a cgroup key for a specific controller.
+func (rw *fileReadWriter) Get(version Backend, controller string, key string) (string, error) {
+	path, err := rw.path(controller, key)
+	if err != nil {
+		return "", err
 	}
 
 	value, err := os.ReadFile(path)
@@ -80,10 +101,11 @@ func (rw *fileReadWriter) Get(version Backend, controller string, key string) (s
 	return strings.TrimSpace(string(value)), nil
 }
 
+// Set applies the given value to a cgroup key for a specific controller.
 func (rw *fileReadWriter) Set(version Backend, controller string, key string, value string) error {
-	path := filepath.Join(rw.paths[controller], key)
-	if cgLayout == CgroupsUnified {
-		path = filepath.Join(rw.paths["unified"], key)
+	path, err := rw.path(controller, key)
+	if err != nil {
+		return err
 	}
 
 	return os.WriteFile(path, []byte(value), 0600)

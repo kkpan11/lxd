@@ -3,11 +3,11 @@ package schema
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 
 	"github.com/canonical/lxd/lxd/db/query"
-	"github.com/canonical/lxd/shared"
 )
 
 // DoesSchemaTableExist return whether the schema table is present in the
@@ -24,7 +24,7 @@ SELECT COUNT(name) FROM sqlite_master WHERE type = 'table' AND name = 'schema'
 	defer func() { _ = rows.Close() }()
 
 	if !rows.Next() {
-		return false, fmt.Errorf("schema table query returned no rows")
+		return false, errors.New("schema table query returned no rows")
 	}
 
 	var count int
@@ -73,29 +73,29 @@ CREATE TABLE schema (
 }
 
 // Insert a new version into the schema table.
-func insertSchemaVersion(tx *sql.Tx, new int) error {
+func insertSchemaVersion(tx *sql.Tx, newVersion int) error {
 	statement := `
 INSERT INTO schema (version, updated_at) VALUES (?, strftime("%s"))
 `
-	_, err := tx.Exec(statement, new)
+	_, err := tx.Exec(statement, newVersion)
 	return err
 }
 
 // Read the given file (if it exists) and executes all queries it contains.
 func execFromFile(ctx context.Context, tx *sql.Tx, path string, hook Hook) error {
-	if !shared.PathExists(path) {
-		return nil
-	}
-
 	bytes, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("failed to read file: %w", err)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+
+		return fmt.Errorf("failed reading file: %w", err)
 	}
 
 	if hook != nil {
 		err := hook(ctx, -1, tx)
 		if err != nil {
-			return fmt.Errorf("failed to execute hook: %w", err)
+			return fmt.Errorf("failed executing hook: %w", err)
 		}
 	}
 
@@ -106,7 +106,7 @@ func execFromFile(ctx context.Context, tx *sql.Tx, path string, hook Hook) error
 
 	err = os.Remove(path)
 	if err != nil {
-		return fmt.Errorf("failed to remove file: %w", err)
+		return fmt.Errorf("failed removing file: %w", err)
 	}
 
 	return nil

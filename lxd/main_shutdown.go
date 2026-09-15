@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -19,6 +20,7 @@ type cmdShutdown struct {
 	flagTimeout int
 }
 
+// Command returns a cobra.Command object representing the "shutdown" command.
 func (c *cmdShutdown) Command() *cobra.Command {
 	cmd := &cobra.Command{}
 	cmd.Use = "shutdown"
@@ -33,12 +35,13 @@ func (c *cmdShutdown) Command() *cobra.Command {
   shutdown, especially if a non-standard timeout was configured for them.
 `
 	cmd.RunE = c.Run
-	cmd.Flags().IntVarP(&c.flagTimeout, "timeout", "t", 0, "Number of seconds to wait before giving up"+"``")
-	cmd.Flags().BoolVarP(&c.flagForce, "force", "f", false, "Force shutdown instead of waiting for running operations to finish"+"``")
+	cmd.Flags().IntVarP(&c.flagTimeout, "timeout", "t", 0, "Number of seconds to wait before giving up")
+	cmd.Flags().BoolVarP(&c.flagForce, "force", "f", false, "Force shutdown instead of waiting for running operations to finish")
 
 	return cmd
 }
 
+// Run executes the "shutdown" command.
 func (c *cmdShutdown) Run(cmd *cobra.Command, args []string) error {
 	connArgs := &lxd.ConnectionArgs{
 		SkipGetServer: true,
@@ -63,10 +66,15 @@ func (c *cmdShutdown) Run(cmd *cobra.Command, args []string) error {
 		}
 
 		// Request shutdown, this shouldn't return until daemon has stopped so use a large request timeout.
-		httpTransport := httpClient.Transport.(*http.Transport)
+		httpTransport, ok := httpClient.Transport.(*http.Transport)
+		if !ok {
+			chResult <- errors.New("httpClient.Transport is not *http.Transport")
+			return
+		}
+
 		httpTransport.ResponseHeaderTimeout = 3600 * time.Second
 
-		_, _, err = d.RawQuery("PUT", fmt.Sprintf("/internal/shutdown?%s", v.Encode()), nil, "")
+		_, _, err = d.RawQuery(http.MethodPut, "/internal/shutdown?"+v.Encode(), nil, "")
 		if err != nil {
 			chResult <- err
 			return

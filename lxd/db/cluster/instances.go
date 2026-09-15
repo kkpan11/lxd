@@ -5,12 +5,11 @@ package cluster
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"time"
 
-	"github.com/canonical/lxd/lxd/device/config"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
-	"github.com/canonical/lxd/shared/api"
-	"github.com/canonical/lxd/shared/osarch"
 )
 
 // Code generation directives.
@@ -44,11 +43,12 @@ import (
 //go:generate mapper method -i -e instance GetMany references=Config,Device
 //go:generate mapper method -i -e instance GetOne
 //go:generate mapper method -i -e instance ID
-//go:generate mapper method -i -e instance Exists
 //go:generate mapper method -i -e instance Create references=Config,Device
 //go:generate mapper method -i -e instance Rename
 //go:generate mapper method -i -e instance DeleteOne-by-Project-and-Name
 //go:generate mapper method -i -e instance Update references=Config,Device
+//go:generate goimports -w instances.mapper.go
+//go:generate goimports -w instances.interface.mapper.go
 
 // Instance is a value object holding db-related details about an instance.
 type Instance struct {
@@ -76,60 +76,19 @@ type InstanceFilter struct {
 	Type    *instancetype.Type
 }
 
-// ToAPI converts the database Instance to API type.
-func (i *Instance) ToAPI(ctx context.Context, tx *sql.Tx, globalConfig map[string]any) (*api.Instance, error) {
-	profiles, err := GetInstanceProfiles(ctx, tx, i.ID)
+// GetMostRecentSnapshotCreationDate returns the creation date of the most recent snapshot of the instance with the given ID.
+// It returns nil if there are no snapshots.
+func GetMostRecentSnapshotCreationDate(ctx context.Context, tx *sql.Tx, instanceID int64) (*time.Time, error) {
+	var creationDate time.Time
+	row := tx.QueryRowContext(ctx, `SELECT creation_date FROM instances_snapshots WHERE instance_id = ? ORDER BY creation_date DESC LIMIT 1`, instanceID)
+	err := row.Scan(&creationDate)
 	if err != nil {
-		return nil, err
-	}
-
-	apiProfiles := make([]api.Profile, 0, len(profiles))
-	profileNames := make([]string, 0, len(profiles))
-	for _, p := range profiles {
-		apiProfile, err := p.ToAPI(ctx, tx)
-		if err != nil {
-			return nil, err
+		if !errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("Failed getting last snapshot creation date: %w", err)
 		}
 
-		apiProfiles = append(apiProfiles, *apiProfile)
-		profileNames = append(profileNames, p.Name)
+		return nil, nil
 	}
 
-	devices, err := GetInstanceDevices(ctx, tx, i.ID)
-	if err != nil {
-		return nil, err
-	}
-
-	apiDevices := DevicesToAPI(devices)
-	expandedDevices := instancetype.ExpandInstanceDevices(config.NewDevices(apiDevices), apiProfiles)
-
-	config, err := GetInstanceConfig(ctx, tx, i.ID)
-	if err != nil {
-		return nil, err
-	}
-
-	expandedConfig := instancetype.ExpandInstanceConfig(globalConfig, config, apiProfiles)
-
-	archName, err := osarch.ArchitectureName(i.Architecture)
-	if err != nil {
-		return nil, err
-	}
-
-	return &api.Instance{
-		Architecture:    archName,
-		Config:          config,
-		Devices:         apiDevices,
-		Ephemeral:       i.Ephemeral,
-		Profiles:        profileNames,
-		Stateful:        i.Stateful,
-		Description:     i.Description,
-		CreatedAt:       i.CreationDate,
-		ExpandedConfig:  expandedConfig,
-		ExpandedDevices: expandedDevices.CloneNative(),
-		Name:            i.Name,
-		LastUsedAt:      i.LastUseDate.Time,
-		Location:        i.Node,
-		Type:            i.Type.String(),
-		Project:         i.Project,
-	}, nil
+	return &creationDate, nil
 }

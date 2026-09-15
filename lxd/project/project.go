@@ -3,22 +3,68 @@ package project
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
+	"github.com/canonical/lxd/shared/validate"
 )
 
 // separator is used to delimit the project name from the suffix.
 const separator = "_"
 
+// ValidName validates a project name.
+func ValidName(name string) error {
+	if name == "" {
+		return errors.New("No name provided")
+	}
+
+	if name == "*" {
+		return errors.New("Reserved project name")
+	}
+
+	if name == "." || name == ".." {
+		return fmt.Errorf("Invalid project name %q", name)
+	}
+
+	if strings.Contains(name, "\\") {
+		return errors.New("Project names may not contain back slashes")
+	}
+
+	if strings.Contains(name, "/") {
+		return errors.New("Project names may not contain slashes")
+	}
+
+	if strings.Contains(name, " ") {
+		return errors.New("Project names may not contain spaces")
+	}
+
+	if strings.Contains(name, "_") {
+		return errors.New("Project names may not contain underscores")
+	}
+
+	if strings.Contains(name, "'") || strings.Contains(name, `"`) {
+		return errors.New("Project names may not contain quotes")
+	}
+
+	// Validate ASCII-only.
+	err := validate.IsEntityName(name)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // Instance adds the "<project>_" prefix to instance name when the given project name is not "default".
 func Instance(projectName string, instanceName string) string {
 	if projectName != api.ProjectDefaultName {
-		return fmt.Sprintf("%s%s%s", projectName, separator, instanceName)
+		return projectName + separator + instanceName
 	}
 
 	return instanceName
@@ -27,7 +73,7 @@ func Instance(projectName string, instanceName string) string {
 // DNS adds ".<project>" as a suffix to instance name when the given project name is not "default".
 func DNS(projectName string, instanceName string) string {
 	if projectName != api.ProjectDefaultName {
-		return fmt.Sprintf("%s.%s", instanceName, projectName)
+		return instanceName + "." + projectName
 	}
 
 	return instanceName
@@ -52,20 +98,20 @@ func InstanceParts(projectInstanceName string) (projectName string, instanceName
 
 // StorageVolume adds the "<project>_prefix" to the storage volume name. Even if the project name is "default".
 func StorageVolume(projectName string, storageVolumeName string) string {
-	return fmt.Sprintf("%s%s%s", projectName, separator, storageVolumeName)
+	return projectName + separator + storageVolumeName
 }
 
 // StorageVolumeParts takes a project prefixed storage volume name and returns the project and storage volume
 // name as separate variables.
 func StorageVolumeParts(projectStorageVolumeName string) (projectName string, storageVolumeName string) {
-	parts := strings.SplitN(projectStorageVolumeName, "_", 2)
+	projectName, storageVolumeName, found := strings.Cut(projectStorageVolumeName, "_")
 
 	// If the given name doesn't contain any project, only return the volume name.
-	if len(parts) == 1 {
+	if !found {
 		return "", projectStorageVolumeName
 	}
 
-	return parts[0], parts[1]
+	return projectName, storageVolumeName
 }
 
 // StorageVolumeProject returns the project name to use to for the volume based on the requested project.
@@ -73,7 +119,7 @@ func StorageVolumeParts(projectStorageVolumeName string) (projectName string, st
 // For custom volume type, if the project specified has the "features.storage.volumes" flag enabled then the
 // project name is returned, otherwise the default project name is returned.
 // For all other volume types the supplied project name is returned.
-func StorageVolumeProject(c *db.Cluster, projectName string, volumeType int) (string, error) {
+func StorageVolumeProject(c *db.Cluster, projectName string, volumeType cluster.StoragePoolVolumeType) (string, error) {
 	// Image volumes are effectively a cache and so are always linked to default project.
 	// Optimisation to avoid loading project record.
 	if volumeType == cluster.StoragePoolVolumeTypeImage {
@@ -92,7 +138,7 @@ func StorageVolumeProject(c *db.Cluster, projectName string, volumeType int) (st
 		return err
 	})
 	if err != nil {
-		return "", fmt.Errorf("Failed to load project %q: %w", projectName, err)
+		return "", fmt.Errorf("Failed loading project %q: %w", projectName, err)
 	}
 
 	return StorageVolumeProjectFromRecord(project, volumeType), nil
@@ -103,7 +149,7 @@ func StorageVolumeProject(c *db.Cluster, projectName string, volumeType int) (st
 // For custom volume type, if the project supplied has the "features.storage.volumes" flag enabled then the
 // project name is returned, otherwise the default project name is returned.
 // For all other volume types the supplied project's name is returned.
-func StorageVolumeProjectFromRecord(p *api.Project, volumeType int) string {
+func StorageVolumeProjectFromRecord(p *api.Project, volumeType cluster.StoragePoolVolumeType) string {
 	// Image volumes are effectively a cache and so are always linked to default project.
 	if volumeType == cluster.StoragePoolVolumeTypeImage {
 		return api.ProjectDefaultName
@@ -139,7 +185,7 @@ func StorageBucketProject(ctx context.Context, c *db.Cluster, projectName string
 		return err
 	})
 	if err != nil {
-		return "", fmt.Errorf("Failed to load project %q: %w", projectName, err)
+		return "", fmt.Errorf("Failed loading project %q: %w", projectName, err)
 	}
 
 	return StorageBucketProjectFromRecord(p), nil
@@ -175,7 +221,7 @@ func NetworkProject(c *db.Cluster, projectName string) (string, *api.Project, er
 		return err
 	})
 	if err != nil {
-		return "", nil, fmt.Errorf("Failed to load project %q: %w", projectName, err)
+		return "", nil, fmt.Errorf("Failed loading project %q: %w", projectName, err)
 	}
 
 	effectiveProjectName := NetworkProjectFromRecord(p)
@@ -209,7 +255,7 @@ func NetworkAllowed(reqProjectConfig map[string]string, networkName string, isMa
 	}
 
 	// Don't allow access to unmanaged networks if only managed network access is allowed.
-	if shared.ValueInSlice(reqProjectConfig["restricted.devices.nic"], []string{"managed", ""}) && !isManaged {
+	if !isManaged && slices.Contains([]string{"managed", ""}, reqProjectConfig["restricted.devices.nic"]) {
 		return false
 	}
 
@@ -218,9 +264,9 @@ func NetworkAllowed(reqProjectConfig map[string]string, networkName string, isMa
 		return true
 	}
 
-	// Check if reqquested network is in list of allowed networks.
+	// Check if requested network is in list of allowed networks.
 	allowedRestrictedNetworks := shared.SplitNTrimSpace(reqProjectConfig["restricted.networks.access"], ",", -1, false)
-	return shared.ValueInSlice(networkName, allowedRestrictedNetworks)
+	return slices.Contains(allowedRestrictedNetworks, networkName)
 }
 
 // ProfileProject returns the effective project to use for the profile based on the requested project.
@@ -292,7 +338,7 @@ func NetworkZoneProject(c *db.Cluster, projectName string) (string, *api.Project
 		return err
 	})
 	if err != nil {
-		return "", nil, fmt.Errorf("Failed to load project %q: %w", projectName, err)
+		return "", nil, fmt.Errorf("Failed loading project %q: %w", projectName, err)
 	}
 
 	effectiveProjectName := NetworkZoneProjectFromRecord(p)

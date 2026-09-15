@@ -21,28 +21,126 @@ test_tls_restrictions() {
   lxc_remote project create localhost:blah
 
   # Validate normal view with no restrictions
-  lxc_remote project list localhost: | grep -q default
-  lxc_remote project list localhost: | grep -q blah
+  lxc_remote project list localhost: | grep -wF default
+  lxc_remote project list localhost: | grep -wF blah
+
+  # Confirm certificates cannot be edited to have "server" type.
+  ! lxc_remote config trust show "localhost:${FINGERPRINT}" | sed -e "s/type: client/type: server/" | lxc_remote config trust edit "localhost:${FINGERPRINT}" || false
 
   # Apply restrictions
   lxc config trust show "${FINGERPRINT}" | sed -e "s/restricted: false/restricted: true/" | lxc config trust edit "${FINGERPRINT}"
 
+  # Confirm restricted client cannot edit certificate type, name, restrictions, or projects.
+  ! lxc_remote config trust show "localhost:${FINGERPRINT}" | sed -e "s/type: client/type: server/" | lxc_remote config trust edit "localhost:${FINGERPRINT}" || false
+  ! lxc_remote config trust show "localhost:${FINGERPRINT}" | sed -e "s/type: client/type: metrics/" | lxc_remote config trust edit "localhost:${FINGERPRINT}" || false
+  ! lxc_remote config trust show "localhost:${FINGERPRINT}" | sed -e "s/name: foo/name: bar/" | lxc_remote config trust edit "localhost:${FINGERPRINT}" || false
+  ! lxc_remote config trust show "localhost:${FINGERPRINT}" | sed -e "s/restricted: true/restricted: false/" | lxc_remote config trust edit "localhost:${FINGERPRINT}" || false
+  ! lxc_remote config trust show "localhost:${FINGERPRINT}" | sed -e "s/projects: \[\]/projects: ['default']/" | lxc_remote config trust edit "localhost:${FINGERPRINT}" || false
+  ! lxc_remote query -X PATCH "localhost:/1.0/certificates/${FINGERPRINT}" -d '{"type": "server"}' || false
+  ! lxc_remote query -X PATCH "localhost:/1.0/certificates/${FINGERPRINT}" -d '{"type": "metrics"}' || false
+  ! lxc_remote query -X PATCH "localhost:/1.0/certificates/${FINGERPRINT}" -d '{"restricted": false, "projects": []}' || false
+  ! lxc_remote query -X PATCH "localhost:/1.0/certificates/${FINGERPRINT}" -d '{"projects": ["default"]}' || false
+  ! lxc_remote query -X PATCH "localhost:/1.0/certificates/${FINGERPRINT}" -d '{"name": "bar"}' || false
+
+  # Confirm client with restricted certificate cannot see server configuration.
+  lxc config set user.foo bar
+
+  # Unrestricted admin caller can view server configuration.
+  lxc query /1.0 | jq --exit-status '.config."user.foo" == "bar"'
+
+  # Restricted client is authenticated so it receives public configuration (volatile.uuid),
+  # but cannot see server configuration.
+  lxc_remote query localhost:/1.0 | jq --exit-status '(.config | length) == 1 and .config."volatile.uuid" != null'
+  lxc_remote query localhost:/1.0 | jq --exit-status '.config."user.foo" == null'
+  lxc config unset user.foo
+
   # Confirm no project visible when none listed
-  [ "$(lxc_remote project list localhost: --format csv | wc -l)" = 0 ]
+  [ "$(lxc_remote project list localhost: --format csv || echo fail)" = "" ]
 
   # Confirm we can still view storage pools
   [ "$(lxc_remote storage list localhost: --format csv | wc -l)" = 1 ]
 
   # Confirm we cannot view storage pool configuration
   pool_name="$(lxc_remote storage list localhost: --format csv | cut -d, -f1)"
-  ! lxc_remote storage show "localhost:${pool_name}" | grep -F 'source:' || false
+  lxc_remote storage show "localhost:${pool_name}" | yq --exit-status '.config | length == 0'
 
+  sub_test "Verify restricted client cannot see other certificates"
+  # Add a second (admin) certificate that the restricted client should not be able to see.
+  gen_cert_and_key "other-admin"
+  lxc config trust add "${LXD_CONF}/other-admin.crt"
+  OTHER_ADMIN_FINGERPRINT="$(cert_fingerprint "${LXD_CONF}/other-admin.crt")"
+
+  # The admin can see both certificates (non-recursive and recursive).
+  lxc query /1.0/certificates | jq --exit-status 'length == 2'
+  lxc query /1.0/certificates?recursion=1 | jq --exit-status 'length == 2'
+
+  # The restricted client should only see its own certificate in both non-recursive and recursive modes.
+  lxc_remote query localhost:/1.0/certificates | jq --exit-status 'length == 1'
+  lxc_remote query localhost:/1.0/certificates | jq --exit-status '.[0]' | grep -F "${FINGERPRINT}"
+
+  lxc_remote query localhost:/1.0/certificates?recursion=1 | jq --exit-status 'length == 1'
+  lxc_remote query localhost:/1.0/certificates?recursion=1 | jq --exit-status '.[0].fingerprint' | grep -F "${FINGERPRINT}"
+
+  # The number of results in non-recursive and recursive modes must match (both are filtered).
+  non_recursive_count="$(lxc_remote query localhost:/1.0/certificates | jq --exit-status 'length')"
+  recursive_count="$(lxc_remote query localhost:/1.0/certificates?recursion=1 | jq --exit-status 'length')"
+  [ "${non_recursive_count}" = "${recursive_count}" ]
+
+  # The restricted client should not be able to view the other admin certificate directly.
+  ! lxc_remote query "localhost:/1.0/certificates/${OTHER_ADMIN_FINGERPRINT}" || false
+
+  # Clean up the extra admin certificate.
+  lxc config trust remove "${OTHER_ADMIN_FINGERPRINT}"
+
+  sub_test "Verify restricted client only sees events for allowed projects"
   # Allow access to project blah
   lxc config trust show "${FINGERPRINT}" | sed -e "s/projects: \[\]/projects: ['blah']/" -e "s/restricted: false/restricted: true/" | lxc config trust edit "${FINGERPRINT}"
 
+  # The restricted caller can listen for events on all projects, but the events are filtered to only those in the projects they have access to.
+  monfile_root="${TEST_DIR}/mon-root.jsonl"
+  lxc_monitor_start "${monfile_root}" --all-projects --type lifecycle --format json
+  mon_root_pid="${LXC_MONITOR_PID}"
+
+  monfile_restricted="${TEST_DIR}/mon-restricted.jsonl"
+  lxc remote switch localhost
+  lxc_monitor_start "${monfile_restricted}" --all-projects --format json
+  mon_restricted_pid="${LXC_MONITOR_PID}"
+
+  lxc remote switch local
+  lxc storage volume create "${pool_name}" vol1
+  lxc profile create p1 --project blah
+
+  kill_go_proc "${mon_root_pid}" || true
+  kill_go_proc "${mon_restricted_pid}" || true
+
+  # The events for the restricted caller should have only the profile creation lifecycle event because the profile
+  # was created in project "blah". The storage volume creation event should not be visible because it occurred in
+  # project "default".
+  jq --exit-status --slurp 'length == 1 and .[0].type == "lifecycle" and .[0].metadata.action == "profile-created"' "${monfile_restricted}"
+
+  # Whereas events for the root user will contain both storage volume and profile creation events.
+  jq --exit-status --slurp 'length == 2 and .[1].metadata.action == "profile-created" and .[0].metadata.action == "storage-volume-created"' "${monfile_root}"
+
+  # Clean up event filtering checks
+  lxc profile delete p1 --project blah
+  lxc storage volume delete "${pool_name}" vol1
+  rm "${monfile_restricted}"
+  rm "${monfile_root}"
+
+  # The restricted caller is able to list operations for all projects, but this is filtered to only show operations they have access to.
+  lxc init --empty foo
+  lxc init --empty bar -s"${pool_name}" --project blah
+  lxd_websocket_operation foo 1s &
+  lxd_websocket_operation bar 1s blah &
+  sleep 0.1
+  [ "$(lxc operation list --all-projects -f csv | grep -Ec ',WEBSOCKET,Executing command,(PENDING|RUNNING),')" = 2 ] # Two exec operations exist
+  [ "$(lxc_remote operation list localhost: --all-projects -f csv | grep -Ec ',WEBSOCKET,Executing command,(PENDING|RUNNING),')" = 1 ] # Restricted caller can only view the one in project blah
+
+  lxc delete foo
+  lxc delete bar --project blah
+
   # Validate restricted view
-  ! lxc_remote project list localhost: | grep -q default || false
-  lxc_remote project list localhost: | grep -q blah
+  lxc_remote project list -f json localhost: | jq --exit-status 'map(.name) == ["blah"]'
 
   # Validate that the restricted caller cannot edit or delete the project.
   ! lxc_remote project set localhost:blah user.foo=bar || false
@@ -50,6 +148,9 @@ test_tls_restrictions() {
 
   # Validate restricted caller cannot create projects.
   ! lxc_remote project create localhost:blah1 || false
+
+  # Validate restricted caller cannot create instances in projects they don't have access to
+  ! lxc_remote init testimage localhost: --project default || false
 
   # Validate restricted caller cannot list resources in projects they do not have access to
   ! lxc_remote list localhost: --project default || false
@@ -64,7 +165,7 @@ test_tls_restrictions() {
   test_image_fingerprint="$(lxc image info testimage --project default | awk '/^Fingerprint/ {print $2}')"
 
   # We can always list images, but there are no public images in the default project now, so the list should be empty.
-  [ "$(lxc_remote image list localhost: --project default --format csv)" = "" ]
+  [ "$(lxc_remote image list localhost: --project default --format csv || echo fail)" = "" ]
   ! lxc_remote image show localhost:testimage --project default || false
 
   # Set the image to public and ensure we can view it.
@@ -74,7 +175,7 @@ test_tls_restrictions() {
 
   # Check we can export the public image:
   lxc image export localhost:testimage "${TEST_DIR}/" --project default
-  [ "${test_image_fingerprint}" = "$(sha256sum "${TEST_DIR}/${test_image_fingerprint}.tar.xz" | cut -d' ' -f1)" ]
+  [ "${test_image_fingerprint}" = "$(sha256sum "${TEST_DIR}/${test_image_fingerprint}.tar"* | cut -d' ' -f1)" ]
 
   # While the image is public, copy it to the blah project and create an alias for it.
   lxc_remote image copy localhost:testimage localhost: --project default --target-project blah
@@ -127,7 +228,7 @@ test_tls_restrictions() {
   lxc_remote image delete "localhost:${test_image_fingerprint}" --project blah
 
   # The restricted client can create images.
-  lxc_remote image import "${TEST_DIR}/${test_image_fingerprint}.tar.xz" localhost: --project blah
+  lxc_remote image import "${TEST_DIR}/${test_image_fingerprint}.tar"* localhost: --project blah
 
   # Clean up
   lxc_remote image delete "localhost:${test_image_fingerprint}" --project blah
@@ -137,11 +238,14 @@ test_tls_restrictions() {
 
   # Create a network in the default project.
   networkName="net$$"
-  lxc network create "${networkName}" --project default
+  lxc network create "${networkName}" --project default ipv4.address=none ipv6.address=none
 
   # The network we created in the default project is visible in project blah.
   lxc_remote network show "localhost:${networkName}" --project blah
   lxc_remote network list localhost: --project blah | grep -F "${networkName}"
+
+  # The reported project is blah when listing networks with request project set to blah.
+  lxc_remote query -X GET "/1.0/networks?project=blah&recursion=1" | jq --exit-status '.[] | select(.name == "'"${networkName}"'") | .project == "blah"'
 
   # The restricted client can't view it via project default.
   ! lxc_remote network show "localhost:${networkName}" --project default || false
@@ -154,7 +258,7 @@ test_tls_restrictions() {
   lxc_remote network delete "localhost:${networkName}" --project blah
 
   # Create a network in the blah project.
-  lxc_remote network create localhost:blah-network --project blah
+  lxc_remote network create localhost:blah-network --project blah ipv4.address=none ipv6.address=none
 
   # Network is visible to restricted client in project blah.
   lxc_remote network show localhost:blah-network --project blah
@@ -169,6 +273,42 @@ test_tls_restrictions() {
   # The restricted client can delete the network.
   lxc_remote network delete localhost:blah-network --project blah
 
+  # Create a network ACL in the default project.
+  networkACLName="netacl$$"
+  lxc network acl create "${networkACLName}" --project default
+
+  # The network ACL we created in the default project is visible in project blah.
+  lxc_remote network acl show "localhost:${networkACLName}" --project blah
+  [ "$(lxc_remote network acl list localhost: --project blah | grep -cF "${networkACLName}")" = "1" ]
+
+  # The reported project is blah when listing network ACLs with request project set to blah.
+  lxc_remote query -X GET "/1.0/network-acls?project=blah&recursion=1" | jq --exit-status '.[] | select(.name == "'"${networkACLName}"'") | .project == "blah"'
+
+  # The restricted client can't view it via project default.
+  ! lxc_remote network acl show "localhost:${networkACLName}" --project default || false
+  ! lxc_remote network acl list localhost: --project default | grep -F "${networkACLName}" || false
+
+  # The restricted client can edit the network ACL.
+  lxc_remote network acl set "localhost:${networkACLName}" user.foo=bar --project blah
+
+  # The restricted client can delete the network ACL.
+  lxc_remote network acl delete "localhost:${networkACLName}" --project blah
+
+  # Create a network ACL in the blah project.
+  lxc_remote network acl create localhost:blah-network-acl --project blah
+
+  # Network ACL is visible to restricted client in project blah.
+  lxc_remote network acl show localhost:blah-network-acl --project blah
+  [ "$(lxc_remote network acl list localhost: --project blah | grep -cF blah-network-acl)" = "1" ]
+
+  # The network ACL is actually in the default project.
+  lxc network acl show blah-network-acl --project default
+
+  # The restricted client can't view it via the default project.
+  ! lxc_remote network acl show localhost:blah-network-acl --project default || false
+
+  # The restricted client can delete the network ACL.
+  lxc_remote network acl delete localhost:blah-network-acl --project blah
 
   ### NETWORK ZONES (initial value is false in new projects).
 
@@ -206,6 +346,48 @@ test_tls_restrictions() {
   # The restricted client can delete the network zone.
   lxc_remote network zone delete localhost:blah-zone --project blah
 
+  ### Network allocations
+
+  # Create a network in the default project.
+  networkName="net$$"
+  lxc network create "${networkName}" --project default ipv4.address=192.0.2.1/24 ipv6.address=2001:db8:1:2::1/64
+
+  # Create instances in the default project and in the blah project that use the network
+  ensure_import_testimage
+  lxc image copy testimage local: --project default --target-project blah
+  lxc init testimage foo --network "${networkName}"
+  lxc_remote init testimage localhost:bar --network "${networkName}" --project blah
+
+  # The restricted client can't view allocations in the default project
+  ! lxc_remote network list-allocations localhost: || false
+  ! lxc_remote network list-allocations localhost: --project default || false
+
+  # The restricted client can't view allocations for all projects
+  ! lxc_remote network list-allocations localhost: --all-projects || false
+
+  # The restricted client can view allocations for the blah project. Since blah doesn't have networks enabled, the client
+  # should see allocations for the default project, but they can't see the foo instance
+  # The allocations for the default lxdbr0 are ignored due to being visible by
+  # all users and this network often being present due to other tests.
+  # shellcheck disable=SC2126
+  [ "$(lxc_remote network list-allocations localhost: --project blah --format csv | grep -vF '/1.0/networks/lxdbr0,' | wc -l)" = 3 ]
+  ! lxc_remote network list-allocations localhost: --project blah --format csv | grep 'instances/foo' || false
+
+  # Check restrictions when using blah as current project.
+  lxc_remote project switch localhost:blah
+  # shellcheck disable=SC2126
+  [ "$(lxc_remote network list-allocations localhost: --format csv | grep -vF '/1.0/networks/lxdbr0,' | wc -l)" = 3 ]
+  ! lxc_remote network list-allocations localhost: --format csv | grep 'instances/foo' || false
+
+  # Can't switch back to default while restricted to blah, so we need to modify the config file.
+  ! lxc_remote project switch localhost:default || false
+  sed -i 's/project: blah/project: default/g' "${LXD_CONF}/config.yml"
+
+  # Clean up
+  lxc delete foo
+  lxc delete bar --project blah
+  lxc image delete testimage --project blah
+  lxc network delete "${networkName}"
 
   ### PROFILES (initial value is true for new projects)
 
@@ -287,54 +469,66 @@ test_tls_restrictions() {
   lxc_remote storage volume delete "localhost:${pool_name}" blah-volume --project blah
 
   ### STORAGE BUCKETS (initial value is true for new projects)
-  create_object_storage_pool s3
+  if [ "$(storage_backend "$LXD_DIR")" = "ceph" ] && [ -n "${LXD_CEPH_CEPHOBJECT_RADOSGW:-}" ]; then
+    create_object_storage_pool s3
 
-  # Unset the storage buckets feature (the default is false).
-  lxc project unset blah features.storage.buckets
+    # Unset the storage buckets feature (the default is false).
+    lxc project unset blah features.storage.buckets
 
-  # Create a storage bucket in the default project.
-  bucketName="bucket$$"
-  lxc storage bucket create s3 "${bucketName}" --project default
+    # Create a storage bucket in the default project.
+    bucketName="bucket$$"
+    lxc storage bucket create s3 "${bucketName}" --project default
 
-  # The storage bucket we created in the default project is visible in project blah.
-  lxc_remote storage bucket show localhost:s3 "${bucketName}" --project blah
-  lxc_remote storage bucket list localhost:s3 --project blah | grep -F "${bucketName}"
+    # The storage bucket we created in the default project is visible in project blah.
+    lxc_remote storage bucket show localhost:s3 "${bucketName}" --project blah
+    lxc_remote storage bucket list localhost:s3 --project blah | grep -F "${bucketName}"
 
-  # The restricted client can't view it via project default.
-  ! lxc_remote storage bucket show localhost:s3 "${bucketName}" --project default || false
-  ! lxc_remote storage bucket list localhost:s3 --project default | grep -F "${bucketName}" || false
+    # The restricted client can't view it via project default.
+    ! lxc_remote storage bucket show localhost:s3 "${bucketName}" --project default || false
+    ! lxc_remote storage bucket list localhost:s3 --project default | grep -F "${bucketName}" || false
 
-  # The restricted client can edit the storage bucket.
-  lxc_remote storage bucket set localhost:s3 "${bucketName}" user.foo=bar --project blah
+    # The restricted client can edit the storage bucket.
+    lxc_remote storage bucket set localhost:s3 "${bucketName}" user.foo=bar --project blah
 
-  # The restricted client can delete the storage bucket.
-  lxc_remote storage bucket delete localhost:s3 "${bucketName}" --project blah
+    # The restricted client can delete the storage bucket.
+    lxc_remote storage bucket delete localhost:s3 "${bucketName}" --project blah
 
-  # Create a storage bucket in the blah project.
-  lxc_remote storage bucket create localhost:s3 blah-bucket --project blah
+    # Create a storage bucket in the blah project.
+    lxc_remote storage bucket create localhost:s3 blah-bucket --project blah
 
-  # Storage bucket is visible to restricted client in project blah.
-  lxc_remote storage bucket show localhost:s3 blah-bucket --project blah
-  lxc_remote storage bucket list localhost:s3 --project blah | grep blah-bucket
+    # Storage bucket is visible to restricted client in project blah.
+    lxc_remote storage bucket show localhost:s3 blah-bucket --project blah
+    lxc_remote storage bucket list localhost:s3 --project blah | grep blah-bucket
 
-  # The storage bucket is actually in the default project.
-  lxc storage bucket show s3 blah-bucket --project default
+    # The storage bucket is actually in the default project.
+    lxc storage bucket show s3 blah-bucket --project default
 
-  # The restricted client can't view it via the default project.
-  ! lxc_remote storage bucket show localhost:s3 blah-bucket --project default || false
+    # The restricted client can't view it via the default project.
+    ! lxc_remote storage bucket show localhost:s3 blah-bucket --project default || false
 
-  # The restricted client can delete the storage bucket.
-  lxc_remote storage bucket delete localhost:s3 blah-bucket --project blah
+    # The restricted client can delete the storage bucket.
+    lxc_remote storage bucket delete localhost:s3 blah-bucket --project blah
 
-  # Cleanup
-  delete_object_storage_pool s3
-  rm "${TEST_DIR}/${test_image_fingerprint}.tar.xz"
+    # Cleanup
+    delete_object_storage_pool s3
+  fi
+
+  echo "Trying to set restricted=false while projects is non-empty should fail."
+  ! lxc config trust show "${FINGERPRINT}" | sed -e "s/restricted: true/restricted: false/" | lxc config trust edit "${FINGERPRINT}" || false
+
+  rm "${TEST_DIR}/${test_image_fingerprint}.tar"*
+
+  # First clear projects (while still restricted=true, so validation allows it).
+  lxc config trust show "${FINGERPRINT}" | sed -e '/^- blah$/d' -e 's/^projects:$/projects: []/' | lxc config trust edit "${FINGERPRINT}"
+
+  # Then set restricted=false (now projects is already empty, validation passes).
   lxc config trust show "${FINGERPRINT}" | sed -e "s/restricted: true/restricted: false/" | lxc config trust edit "${FINGERPRINT}"
+
+  # Delete project first (while cert still has access).
   lxc project delete blah
 }
 
 test_certificate_edit() {
-  ensure_import_testimage
   ensure_has_localhost_remote "${LXD_ADDR}"
 
   # Generate a certificate
@@ -342,9 +536,12 @@ test_certificate_edit() {
 
   FINGERPRINT="$(lxc config trust list --format csv | cut -d, -f4)"
 
+  # Ensure the old certificate is in place
+  [ -n "${FINGERPRINT}" ]
+
   # Try replacing the old certificate with a new one.
   # This should succeed as the user is listed as an admin.
-  my_curl -X PATCH -d "{\"certificate\":\"$(sed ':a;N;$!ba;s/\n/\\n/g' "${LXD_CONF}/client-new.crt")\"}" "https://${LXD_ADDR}/1.0/certificates/${FINGERPRINT}"
+  my_curl -X PATCH --fail-with-body -H 'Content-Type: application/json' -d '{"certificate":"'"$(sed ':a;N;$!ba;s/\n/\\n/g' "${LXD_CONF}/client-new.crt")"'"}' "https://${LXD_ADDR}/1.0/certificates/${FINGERPRINT}"
 
   # Record new fingerprint
   FINGERPRINT="$(lxc config trust list --format csv | cut -d, -f4)"
@@ -366,7 +563,7 @@ test_certificate_edit() {
 
   # Try replacing the new certificate with the old one.
   # This should succeed as well as the certificate may be changed.
-  my_curl -X PATCH -d "{\"certificate\":\"$(sed ':a;N;$!ba;s/\n/\\n/g' "${LXD_CONF}/client.crt.bak")\"}" "https://${LXD_ADDR}/1.0/certificates/${FINGERPRINT}"
+  my_curl -X PATCH --fail-with-body -H 'Content-Type: application/json' -d '{"certificate":"'"$(sed ':a;N;$!ba;s/\n/\\n/g' "${LXD_CONF}/client.crt.bak")"'"}' "https://${LXD_ADDR}/1.0/certificates/${FINGERPRINT}"
 
   # Move new certificate and key to LXD_CONF.
   mv "${LXD_CONF}/client.crt.bak" "${LXD_CONF}/client.crt"
@@ -378,87 +575,45 @@ test_certificate_edit() {
   # Trying to change other fields should fail as a non-admin.
   ! lxc_remote config trust show "${FINGERPRINT}" | sed -e "s/restricted: true/restricted: false/" | lxc_remote config trust edit localhost:"${FINGERPRINT}" || false
 
-  my_curl -X PATCH -d "{\"restricted\": false}" "https://${LXD_ADDR}/1.0/certificates/${FINGERPRINT}" | grep -F '"error_code":403'
+  my_curl -X PATCH -H 'Content-Type: application/json' -d '{"restricted": false}' "https://${LXD_ADDR}/1.0/certificates/${FINGERPRINT}" | jq --exit-status '.error_code == 403'
 
   ! lxc_remote config trust show "${FINGERPRINT}" | sed -e "s/name:.*/name: bar/" | lxc_remote config trust edit localhost:"${FINGERPRINT}" || false
 
-  my_curl -X PATCH -d "{\"name\": \"bar\"}" "https://${LXD_ADDR}/1.0/certificates/${FINGERPRINT}" | grep -F '"error_code":403'
+  my_curl -X PATCH -H 'Content-Type: application/json' -d '{"name": "bar"}' "https://${LXD_ADDR}/1.0/certificates/${FINGERPRINT}" | jq --exit-status '.error_code == 403'
 
   ! lxc_remote config trust show "${FINGERPRINT}" | sed -e ':a;N;$!ba;s/projects:\n- blah/projects: \[\]/' | lxc_remote config trust edit localhost:"${FINGERPRINT}" || false
 
-  my_curl -X PATCH -d "{\"projects\": []}" "https://${LXD_ADDR}/1.0/certificates/${FINGERPRINT}" | grep -F '"error_code":403'
+  my_curl -X PATCH -H 'Content-Type: application/json' -d '{"projects": []}' "https://${LXD_ADDR}/1.0/certificates/${FINGERPRINT}" | jq --exit-status '.error_code == 403'
 
-  # Cleanup
+  echo "Trying to set restricted=false while projects is non-empty should fail."
+  ! lxc config trust show "${FINGERPRINT}" | sed -e "s/restricted: true/restricted: false/" | lxc config trust edit "${FINGERPRINT}" || false
+
+  # Clean up.
+  # First clear projects (while still restricted=true, so validation allows it).
+  lxc config trust show "${FINGERPRINT}" | sed -e '/^- blah$/d' -e 's/^projects:$/projects: []/' | lxc config trust edit "${FINGERPRINT}"
+
+  # Then set restricted=false (now projects is already empty, validation passes).
   lxc config trust show "${FINGERPRINT}" | sed -e "s/restricted: true/restricted: false/" | lxc config trust edit "${FINGERPRINT}"
-
-  lxc config trust show "${FINGERPRINT}" | sed -e ':a;N;$!ba;s/projects:\n- blah/projects: \[\]/' | lxc config trust edit "${FINGERPRINT}"
 
   lxc project delete blah
 }
 
 test_tls_version() {
+  ensure_has_localhost_remote "${LXD_ADDR}"
+
   echo "TLS 1.3 just works"
-  my_curl -X GET "https://${LXD_ADDR}"
-  my_curl --tlsv1.3 -X GET "https://${LXD_ADDR}"
+  my_curl "https://${LXD_ADDR}"
+  my_curl --tlsv1.3 "https://${LXD_ADDR}"
 
   echo "TLS 1.3 with various ciphersuites"
   for cipher in TLS_AES_256_GCM_SHA384 TLS_CHACHA20_POLY1305_SHA256 TLS_AES_128_GCM_SHA256; do
     echo "Testing TLS 1.3: ${cipher}"
-    my_curl --tlsv1.3 --tls13-ciphers "${cipher}" -X GET "https://${LXD_ADDR}"
+    my_curl --tlsv1.3 --tls13-ciphers "${cipher}" "https://${LXD_ADDR}"
   done
 
   echo "TLS 1.2 is refused with a protocol version error"
-  ! my_curl --tls-max 1.2 -X GET "https://${LXD_ADDR}" -w "%{errormsg}\n" || false
-  my_curl --tls-max 1.2 -X GET "https://${LXD_ADDR}" -w "%{errormsg}\n" | grep -F "alert protocol version"
-
-  echo "Enable TLS 1.2 with LXD_INSECURE_TLS=true"
-  shutdown_lxd "${LXD_DIR}"
-  export LXD_INSECURE_TLS=true
-  respawn_lxd "${LXD_DIR}" true
-
-  echo "TLS 1.3 is still working and used by default"
-  my_curl -X GET "https://${LXD_ADDR}"
-  my_curl --tlsv1.3 -X GET "https://${LXD_ADDR}"
-
-  echo "TLS 1.2 is now working"
-  my_curl --tls-max 1.2 -X GET "https://${LXD_ADDR}"
-
-  echo "TLS 1.2 with ciphers known to work"
-  for cipher in ECDHE-ECDSA-AES128-GCM-SHA256 ECDHE-ECDSA-AES256-GCM-SHA384 ECDHE-ECDSA-CHACHA20-POLY1305; do
-    echo "Testing TLS 1.2: ${cipher}"
-    my_curl --tls-max 1.2 --ciphers "${cipher}" -X GET "https://${LXD_ADDR}"
-  done
-
-  echo "TLS 1.2 does not work with RSA auth when the server uses ECDSA cert"
-  for cipher in ECDHE-RSA-AES128-GCM-SHA256 ECDHE-RSA-AES256-GCM-SHA384; do
-    echo "Testing TLS 1.2: ${cipher}"
-    ! my_curl --tls-max 1.2 --ciphers "${cipher}" -X GET "https://${LXD_ADDR}" -w "%{errormsg}\n" || false
-    my_curl --tls-max 1.2 --ciphers "${cipher}" -X GET "https://${LXD_ADDR}" -w "%{errormsg}\n" | grep -F "alert handshake failure"
-  done
-
-  echo "TLS 1.2 with ciphers known to be refused with a handshake failure"
-  for cipher in ECDHE-ECDSA-AES128-SHA256 ECDHE-ECDSA-AES256-SHA384; do
-    echo "Testing TLS 1.2: ${cipher}"
-    ! my_curl --tls-max 1.2 --ciphers "${cipher}" -X GET "https://${LXD_ADDR}" -w "%{errormsg}\n" || false
-    my_curl --tls-max 1.2 --ciphers "${cipher}" -X GET "https://${LXD_ADDR}" -w "%{errormsg}\n" | grep -F "alert handshake failure"
-  done
-
-  echo "TLS 1.2 with ciphers known to be cause broken pipe errors or empty replies or connection resets"
-  for cipher in ECDHE-ECDSA-AES128-SHA ECDHE-ECDSA-AES256-SHA; do
-    echo "Testing TLS 1.2: ${cipher}"
-    ! my_curl --tls-max 1.2 --ciphers "${cipher}" -X GET "https://${LXD_ADDR}" -w "%{errormsg}\n" || false
-  done
-
-  echo "TLS 1.1 is not working"
-  ! my_curl --tls-max 1.1 -X GET "https://${LXD_ADDR}" -w "%{errormsg}\n" || false
-  my_curl --tls-max 1.1 -X GET "https://${LXD_ADDR}" -w "%{errormsg}\n" | grep -F "no protocols available"
-
-  echo "Disable TLS 1.2"
-  shutdown_lxd "${LXD_DIR}"
-  unset LXD_INSECURE_TLS
-  respawn_lxd "${LXD_DIR}" true
-
-  echo "TLS 1.2 is refused with a protocol version error"
-  ! my_curl --tls-max 1.2 -X GET "https://${LXD_ADDR}" -w "%{errormsg}\n" || false
-  my_curl --tls-max 1.2 -X GET "https://${LXD_ADDR}" -w "%{errormsg}\n" | grep -F "alert protocol version"
+  ! my_curl --tls-max 1.2 "https://${LXD_ADDR}" -w "%{errormsg}\n" || false
+  # rc=35: SSL connect error. The SSL handshaking failed.
+  CURL_ERR="$(my_curl --tls-max 1.2 "https://${LXD_ADDR}" -w "%{errormsg}\n" || [ "${?}" = 35 ])"
+  echo "${CURL_ERR}" | grep -F "alert protocol version"
 }

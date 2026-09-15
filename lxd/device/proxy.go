@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -74,8 +75,8 @@ func (d *proxy) validateConfig(instConf instance.ConfigReader) error {
 	// Supported bind types are: "host" or "instance" (or "guest" or "container", legacy options equivalent to "instance").
 	// If an empty value is supplied the default behavior is to assume "host" bind mode.
 	validateBind := func(input string) error {
-		if !shared.ValueInSlice(d.config["bind"], []string{"host", "instance", "guest", "container"}) {
-			return fmt.Errorf("Invalid binding side given. Must be \"host\" or \"instance\"")
+		if !slices.Contains([]string{"host", "instance", "guest", "container"}, d.config["bind"]) {
+			return errors.New("Invalid binding side given. Must be \"host\" or \"instance\"")
 		}
 
 		return nil
@@ -168,7 +169,7 @@ func (d *proxy) validateConfig(instConf instance.ConfigReader) error {
 	}
 
 	if instConf.Type() == instancetype.VM && shared.IsFalseOrEmpty(d.config["nat"]) {
-		return fmt.Errorf("Only NAT mode is supported for proxies on VM instances")
+		return errors.New("Only NAT mode is supported for proxies on VM instances")
 	}
 
 	listenAddr, err := network.ProxyParseAddr(d.config["listen"])
@@ -188,16 +189,16 @@ func (d *proxy) validateConfig(instConf instance.ConfigReader) error {
 
 	if (listenAddr.ConnType != "unix" && len(connectAddr.Ports) > len(listenAddr.Ports)) || (listenAddr.ConnType == "unix" && len(connectAddr.Ports) > 1) {
 		// Cannot support single address (or port) -> multiple port.
-		return fmt.Errorf("Mismatch between listen port(s) and connect port(s) count")
+		return errors.New("Mismatch between listen port(s) and connect port(s) count")
 	}
 
 	if shared.IsTrue(d.config["proxy_protocol"]) && (!strings.HasPrefix(d.config["connect"], "tcp") || shared.IsTrue(d.config["nat"])) {
-		return fmt.Errorf("The PROXY header can only be sent to tcp servers in non-nat mode")
+		return errors.New("The PROXY header can only be sent to tcp servers in non-nat mode")
 	}
 
 	if (!strings.HasPrefix(d.config["listen"], "unix:") || strings.HasPrefix(d.config["listen"], "unix:@")) &&
 		(d.config["uid"] != "" || d.config["gid"] != "" || d.config["mode"] != "") {
-		return fmt.Errorf("Only proxy devices for non-abstract unix sockets can carry uid, gid, or mode properties")
+		return errors.New("Only proxy devices for non-abstract unix sockets can carry uid, gid, or mode properties")
 	}
 
 	if shared.IsTrue(d.config["nat"]) {
@@ -209,12 +210,12 @@ func (d *proxy) validateConfig(instConf instance.ConfigReader) error {
 				// Prevent use of NAT mode on non-default projects with networks feature.
 				// This is because OVN networks don't allow the host to communicate directly with
 				// instance NICs and so DNAT rules on the host won't work.
-				return fmt.Errorf("NAT mode cannot be used in projects that have the networks feature")
+				return errors.New("NAT mode cannot be used in projects that have the networks feature")
 			}
 		}
 
 		if d.config["bind"] != "" && d.config["bind"] != "host" {
-			return fmt.Errorf("Only host-bound proxies can use NAT")
+			return errors.New("Only host-bound proxies can use NAT")
 		}
 
 		// Support TCP <-> TCP and UDP <-> UDP only.
@@ -242,7 +243,7 @@ func (d *proxy) validateConfig(instConf instance.ConfigReader) error {
 		}
 
 		if listenIPVersion != connectIPVersion {
-			return fmt.Errorf("Cannot mix IP versions between listen and connect in nat mode")
+			return errors.New("Cannot mix IP versions between listen and connect in nat mode")
 		}
 	}
 
@@ -252,7 +253,7 @@ func (d *proxy) validateConfig(instConf instance.ConfigReader) error {
 // validateEnvironment checks the runtime environment for correctness.
 func (d *proxy) validateEnvironment() error {
 	if d.name == "" {
-		return fmt.Errorf("Device name cannot be empty")
+		return errors.New("Device name cannot be empty")
 	}
 
 	return nil
@@ -296,7 +297,7 @@ func (d *proxy) Start() (*deviceConfig.RunConfig, error) {
 			if shared.IsTrue(d.config["nat"]) {
 				err = d.setupNAT()
 				if err != nil {
-					return fmt.Errorf("Failed to start device %q: %w", d.name, err)
+					return fmt.Errorf("Failed starting device %q: %w", d.name, err)
 				}
 
 				return nil // Don't proceed with forkproxy setup.
@@ -307,7 +308,7 @@ func (d *proxy) Start() (*deviceConfig.RunConfig, error) {
 				return err
 			}
 
-			devFileName := fmt.Sprintf("proxy.%s", d.name)
+			devFileName := "proxy." + d.name
 			pidPath := filepath.Join(d.inst.DevicesPath(), devFileName)
 			logFileName := fmt.Sprintf("proxy.%s.log", d.name)
 			logPath := filepath.Join(d.inst.LogPath(), logFileName)
@@ -315,7 +316,7 @@ func (d *proxy) Start() (*deviceConfig.RunConfig, error) {
 			// Load the apparmor profile
 			err = apparmor.ForkproxyLoad(d.state.OS, d.inst, d)
 			if err != nil {
-				return fmt.Errorf("Failed to start device %q: %w", d.name, err)
+				return fmt.Errorf("Failed starting device %q: %w", d.name, err)
 			}
 
 			// Spawn the daemon using subprocess
@@ -338,14 +339,14 @@ func (d *proxy) Start() (*deviceConfig.RunConfig, error) {
 
 			p, err := subprocess.NewProcess(command, forkproxyargs, logPath, logPath)
 			if err != nil {
-				return fmt.Errorf("Failed to start device %q: Failed to creating subprocess: %w", d.name, err)
+				return fmt.Errorf("Failed starting device %q: Failed creatinging subprocess: %w", d.name, err)
 			}
 
 			p.SetApparmor(apparmor.ForkproxyProfileName(d.inst, d))
 
 			err = p.StartWithFiles(context.Background(), proxyValues.inheritFds)
 			if err != nil {
-				return fmt.Errorf("Failed to start device %q: Failed running: %s %s: %w", d.name, command, strings.Join(forkproxyargs, " "), err)
+				return fmt.Errorf("Failed starting device %q: Failed running: %s %s: %w", d.name, command, strings.Join(forkproxyargs, " "), err)
 			}
 
 			for _, file := range proxyValues.inheritFds {
@@ -353,7 +354,7 @@ func (d *proxy) Start() (*deviceConfig.RunConfig, error) {
 			}
 
 			// Poll log file a few times until we see "Started" to indicate successful start.
-			for i := 0; i < 10; i++ {
+			for range 10 {
 				started, err := d.checkProcStarted(logPath)
 				if err != nil {
 					_ = p.Stop()
@@ -369,7 +370,7 @@ func (d *proxy) Start() (*deviceConfig.RunConfig, error) {
 							return fmt.Errorf("Could not kill subprocess while handling saving error: %s: %s", err, err2)
 						}
 
-						return fmt.Errorf("Failed to start device %q: Failed saving subprocess details: %w", d.name, err)
+						return fmt.Errorf("Failed starting device %q: Failed saving subprocess details: %w", d.name, err)
 					}
 
 					return nil
@@ -379,7 +380,7 @@ func (d *proxy) Start() (*deviceConfig.RunConfig, error) {
 			}
 
 			_ = p.Stop()
-			return fmt.Errorf("Failed to start device %q: Please look in %s", d.name, logPath)
+			return fmt.Errorf("Failed starting device %q: Please look in %s", d.name, logPath)
 		},
 	}
 
@@ -397,6 +398,7 @@ func (d *proxy) checkProcStarted(logPath string) (bool, error) {
 	defer func() { _ = file.Close() }()
 
 	scanner := bufio.NewScanner(file)
+	var firstError string
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 
@@ -405,13 +407,23 @@ func (d *proxy) checkProcStarted(logPath string) (bool, error) {
 		}
 
 		if strings.HasPrefix(line, "Error:") {
-			return false, errors.New(line)
+			if strings.Contains(line, "Failed listening on") {
+				return false, errors.New(line)
+			}
+
+			if firstError == "" {
+				firstError = line
+			}
 		}
 	}
 
 	err = scanner.Err()
 	if err != nil {
 		return false, err
+	}
+
+	if firstError != "" {
+		return false, errors.New(firstError)
 	}
 
 	return false, nil
@@ -422,10 +434,10 @@ func (d *proxy) Stop() (*deviceConfig.RunConfig, error) {
 	// Remove possible iptables entries
 	err := d.state.Firewall.InstanceClearProxyNAT(d.inst.Project().Name, d.inst.Name(), d.name)
 	if err != nil {
-		logger.Errorf("Failed to remove proxy NAT filters: %v", err)
+		logger.Errorf("Failed removing proxy NAT filters: %v", err)
 	}
 
-	devFileName := fmt.Sprintf("proxy.%s", d.name)
+	devFileName := "proxy." + d.name
 	devPath := filepath.Join(d.inst.DevicesPath(), devFileName)
 
 	if !shared.PathExists(devPath) {
@@ -477,7 +489,7 @@ func (d *proxy) setupNAT() error {
 		}
 
 		// Check if the instance has a NIC with a static IP that is reachable from the host.
-		if !shared.ValueInSlice(nicType, []string{"bridged", "routed"}) {
+		if !slices.Contains([]string{"bridged", "routed"}, nicType) {
 			continue
 		}
 
@@ -520,16 +532,16 @@ func (d *proxy) setupNAT() error {
 			return tx.UpsertWarningLocalNode(ctx, d.inst.Project().Name, entity.TypeInstance, d.inst.ID(), warningtype.ProxyBridgeNetfilterNotEnabled, fmt.Sprintf("%s: %v", msg, err))
 		})
 		if err != nil {
-			logger.Warn("Failed to create warning", logger.Ctx{"err": err})
+			logger.Warn("Failed creating warning", logger.Ctx{"err": err})
 		}
 	} else {
 		err = warnings.ResolveWarningsByLocalNodeAndProjectAndTypeAndEntity(d.state.DB.Cluster, d.inst.Project().Name, warningtype.ProxyBridgeNetfilterNotEnabled, entity.TypeInstance, d.inst.ID())
 		if err != nil {
-			logger.Warn("Failed to resolve warning", logger.Ctx{"err": err})
+			logger.Warn("Failed resolving warning", logger.Ctx{"err": err})
 		}
 
 		if hostName == "" {
-			return fmt.Errorf("Proxy cannot find bridge port host_name to enable hairpin mode")
+			return errors.New("Proxy cannot find bridge port host_name to enable hairpin mode")
 		}
 
 		// br_netfilter is enabled, so we need to enable hairpin mode on instance's bridge port otherwise
@@ -560,16 +572,14 @@ func (d *proxy) setupNAT() error {
 }
 
 func (d *proxy) rewriteHostAddr(addr string) string {
-	fields := strings.SplitN(addr, ":", 2)
-	proto := fields[0]
-	addr = fields[1]
+	proto, addr, _ := strings.Cut(addr, ":")
 	if proto == "unix" && !strings.HasPrefix(addr, "@") {
 		// Unix non-abstract sockets need to be addressed to the host
 		// filesystem, not be scoped inside the LXD snap.
 		addr = shared.HostPath(addr)
 	}
 
-	return fmt.Sprintf("%s:%s", proto, addr)
+	return proto + ":" + addr
 }
 
 func (d *proxy) setupProxyProcInfo() (*proxyProcInfo, error) {
@@ -587,7 +597,7 @@ func (d *proxy) setupProxyProcInfo() (*proxyProcInfo, error) {
 	containerPidFd := -1
 	lxdPidFd := -1
 	var inheritFd []*os.File
-	if d.state.OS.PidFds {
+	if d.state.OS.PidFds.Load() {
 		cPidFd, err := cc.InitPidFd()
 		if err == nil {
 			dPidFd, err := linux.PidFdOpen(os.Getpid(), 0)
@@ -607,22 +617,22 @@ func (d *proxy) setupProxyProcInfo() (*proxyProcInfo, error) {
 	switch d.config["bind"] {
 	case "host", "":
 		listenPid = lxdPid
-		listenPidFd = fmt.Sprintf("%d", lxdPidFd)
+		listenPidFd = strconv.Itoa(lxdPidFd)
 
 		connectPid = containerPid
-		connectPidFd = fmt.Sprintf("%d", containerPidFd)
+		connectPidFd = strconv.Itoa(containerPidFd)
 
 		listenAddr = d.rewriteHostAddr(listenAddr)
 	case "instance", "guest", "container":
 		listenPid = containerPid
-		listenPidFd = fmt.Sprintf("%d", containerPidFd)
+		listenPidFd = strconv.Itoa(containerPidFd)
 
 		connectPid = lxdPid
-		connectPidFd = fmt.Sprintf("%d", lxdPidFd)
+		connectPidFd = strconv.Itoa(lxdPidFd)
 
 		connectAddr = d.rewriteHostAddr(connectAddr)
 	default:
-		return nil, fmt.Errorf("Invalid binding side given. Must be \"host\" or \"instance\"")
+		return nil, errors.New("Invalid binding side given. Must be \"host\" or \"instance\"")
 	}
 
 	listenAddrMode := "0644"
@@ -651,21 +661,37 @@ func (d *proxy) setupProxyProcInfo() (*proxyProcInfo, error) {
 
 func (d *proxy) killProxyProc(pidPath string) error {
 	// If the pid file doesn't exist, there is no process to kill.
-	if !shared.PathExists(pidPath) {
-		return nil
+	if shared.PathExists(pidPath) {
+		p, err := subprocess.ImportProcess(pidPath)
+		if err != nil {
+			return fmt.Errorf("Could not read pid file %q: %w", pidPath, err)
+		}
+
+		err = p.Stop()
+		if err != nil && err != subprocess.ErrNotRunning {
+			return fmt.Errorf("Cannot kill forkproxy: %w", err)
+		}
+
+		err = os.Remove(pidPath)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("Failed removing pid file %q: %w", pidPath, err)
+		}
 	}
 
-	p, err := subprocess.ImportProcess(pidPath)
+	listenAddr, err := network.ProxyParseAddr(d.config["listen"])
 	if err != nil {
-		return fmt.Errorf("Could not read pid file: %s", err)
+		return err
 	}
 
-	err = p.Stop()
-	if err != nil && err != subprocess.ErrNotRunning {
-		return fmt.Errorf("Unable to kill forkproxy: %s", err)
+	// Remove socket file if needed.
+	// Unix non-abstract sockets are addressed to the host filesystem, not scoped inside the LXD snap.
+	if listenAddr.ConnType == "unix" && !listenAddr.Abstract && d.config["bind"] == "host" {
+		err = os.Remove(shared.HostPath(listenAddr.Address))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("Failed removing socket file: %w", err)
+		}
 	}
 
-	_ = os.Remove(pidPath)
 	return nil
 }
 
@@ -673,7 +699,7 @@ func (d *proxy) killProxyProc(pidPath string) error {
 func (d *proxy) Remove() error {
 	err := warnings.DeleteWarningsByLocalNodeAndProjectAndTypeAndEntity(d.state.DB.Cluster, d.inst.Project().Name, warningtype.ProxyBridgeNetfilterNotEnabled, entity.TypeInstance, d.inst.ID())
 	if err != nil {
-		logger.Warn("Failed to delete warning", logger.Ctx{"err": err})
+		logger.Warn("Failed deleting warning", logger.Ctx{"err": err})
 	}
 
 	// Delete apparmor profile.

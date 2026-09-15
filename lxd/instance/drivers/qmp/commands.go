@@ -3,6 +3,7 @@ package qmp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -70,7 +71,7 @@ func (m *Monitor) QueryCPUs() ([]CPU, error) {
 
 	err := m.run("query-cpus-fast", nil, &resp)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to query CPUs: %w", err)
+		return nil, fmt.Errorf("Failed querying CPUs: %w", err)
 	}
 
 	return resp.Return, nil
@@ -85,7 +86,7 @@ func (m *Monitor) QueryHotpluggableCPUs() ([]HotpluggableCPU, error) {
 
 	err := m.run("query-hotpluggable-cpus", nil, &resp)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to query hotpluggable CPUs: %w", err)
+		return nil, fmt.Errorf("Failed querying hotpluggable CPUs: %w", err)
 	}
 
 	return resp.Return, nil
@@ -112,19 +113,16 @@ func (m *Monitor) Status() (string, error) {
 // SendFile adds a new file descriptor to the QMP fd table associated to name.
 func (m *Monitor) SendFile(name string, file *os.File) error {
 	// Check if disconnected.
-	if m.disconnected {
+	if m.disconnected || m.qmp == nil {
 		return ErrMonitorDisconnect
 	}
 
-	var req struct {
-		Execute   string `json:"execute"`
-		Arguments struct {
-			FDName string `json:"fdname"`
-		} `json:"arguments"`
+	id := m.qmp.qmpIncreaseID()
+	req := &qmpCommand{
+		ID:        id,
+		Execute:   "getfd",
+		Arguments: map[string]any{"fdname": name},
 	}
-
-	req.Execute = "getfd"
-	req.Arguments.FDName = name
 
 	reqJSON, err := json.Marshal(req)
 	if err != nil {
@@ -132,7 +130,7 @@ func (m *Monitor) SendFile(name string, file *os.File) error {
 	}
 
 	// Query the status.
-	_, err = m.qmp.RunWithFile(reqJSON, file)
+	_, err = m.qmp.runWithFile(reqJSON, file, id)
 	if err != nil {
 		// Confirm the daemon didn't die.
 		errPing := m.ping()
@@ -165,15 +163,8 @@ func (m *Monitor) CloseFile(name string) error {
 // SendFileWithFDSet adds a new file descriptor to an FD set.
 func (m *Monitor) SendFileWithFDSet(name string, file *os.File, readonly bool) (*AddFdInfo, error) {
 	// Check if disconnected.
-	if m.disconnected {
+	if m.disconnected || m.qmp == nil {
 		return nil, ErrMonitorDisconnect
-	}
-
-	var req struct {
-		Execute   string `json:"execute"`
-		Arguments struct {
-			Opaque string `json:"opaque"`
-		} `json:"arguments"`
 	}
 
 	permissions := "rdwr"
@@ -181,15 +172,21 @@ func (m *Monitor) SendFileWithFDSet(name string, file *os.File, readonly bool) (
 		permissions = "rdonly"
 	}
 
-	req.Execute = "add-fd"
-	req.Arguments.Opaque = fmt.Sprintf("%s:%s", permissions, name)
+	id := m.qmp.qmpIncreaseID()
+	req := &qmpCommand{
+		ID:      id,
+		Execute: "add-fd",
+		Arguments: map[string]any{
+			"opaque": permissions + ":" + name,
+		},
+	}
 
 	reqJSON, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
 
-	ret, err := m.qmp.RunWithFile(reqJSON, file)
+	ret, err := m.qmp.runWithFile(reqJSON, file, id)
 	if err != nil {
 		// Confirm the daemon didn't die.
 		errPing := m.ping()
@@ -222,7 +219,7 @@ func (m *Monitor) RemoveFDFromFDSet(name string) error {
 
 	err := m.run("query-fdsets", nil, &resp)
 	if err != nil {
-		return fmt.Errorf("Failed to query fd sets: %w", err)
+		return fmt.Errorf("Failed querying fd sets: %w", err)
 	}
 
 	for _, fdSet := range resp.Return {
@@ -243,7 +240,7 @@ func (m *Monitor) RemoveFDFromFDSet(name string) error {
 
 				err = m.run("remove-fd", args, nil)
 				if err != nil {
-					return fmt.Errorf("Failed to remove fd from fd set: %w", err)
+					return fmt.Errorf("Failed removing fd from fd set: %w", err)
 				}
 			}
 		}
@@ -310,7 +307,7 @@ func (m *Monitor) MigrateWait(state string) error {
 		}
 
 		if resp.Return.Status == "failed" {
-			return fmt.Errorf("Migrate call failed")
+			return errors.New("Migrate call failed")
 		}
 
 		if resp.Return.Status == state {
@@ -361,7 +358,7 @@ func (m *Monitor) MigrateIncoming(ctx context.Context, uri string) error {
 		}
 
 		if resp.Return.Status == "failed" {
-			return fmt.Errorf("Migrate incoming call failed")
+			return errors.New("Migrate incoming call failed")
 		}
 
 		if resp.Return.Status == "completed" {
@@ -466,13 +463,13 @@ func (m *Monitor) SetMemoryBalloonSizeBytes(sizeBytes int64) error {
 }
 
 // AddBlockDevice adds a block device.
-func (m *Monitor) AddBlockDevice(blockDev map[string]any, device map[string]string) error {
+func (m *Monitor) AddBlockDevice(blockDev map[string]any, device map[string]any) error {
 	revert := revert.New()
 	defer revert.Fail()
 
 	nodeName, ok := blockDev["node-name"].(string)
 	if !ok {
-		return fmt.Errorf("Device node name must be a string")
+		return errors.New("Device node name must be a string")
 	}
 
 	if blockDev != nil {
@@ -508,7 +505,7 @@ func (m *Monitor) RemoveBlockDevice(blockDevName string) error {
 				return api.StatusErrorf(http.StatusLocked, "%w", err)
 			}
 
-			if strings.Contains(err.Error(), "Failed to find") {
+			if strings.Contains(err.Error(), "Failed finding") {
 				return nil
 			}
 
@@ -552,7 +549,7 @@ func (m *Monitor) RemoveCharDevice(deviceID string) error {
 }
 
 // AddDevice adds a new device.
-func (m *Monitor) AddDevice(device map[string]string) error {
+func (m *Monitor) AddDevice(device map[string]any) error {
 	if device != nil {
 		err := m.run("device_add", device, nil)
 		if err != nil {
@@ -584,7 +581,7 @@ func (m *Monitor) RemoveDevice(deviceID string) error {
 }
 
 // AddNIC adds a NIC device.
-func (m *Monitor) AddNIC(netDev map[string]any, device map[string]string) error {
+func (m *Monitor) AddNIC(netDev map[string]any, device map[string]any) error {
 	revert := revert.New()
 	defer revert.Fail()
 
@@ -897,7 +894,7 @@ func (m *Monitor) blockJobWaitReady(jobID string) error {
 		}
 
 		if !found {
-			return fmt.Errorf("Specified block job not found")
+			return errors.New("Specified block job not found")
 		}
 
 		time.Sleep(1 * time.Second)
@@ -1040,4 +1037,22 @@ func (m *Monitor) SetBlockThrottle(id string, bytesRead int, bytesWrite int, iop
 	}
 
 	return nil
+}
+
+// CheckPCIDevice checks if the deviceID exists as a bridged PCI device.
+func (m *Monitor) CheckPCIDevice(deviceID string) (bool, error) {
+	pciDevs, err := m.QueryPCI()
+	if err != nil {
+		return false, err
+	}
+
+	for _, pciDev := range pciDevs {
+		for _, bridgeDev := range pciDev.Bridge.Devices {
+			if bridgeDev.DevID == deviceID {
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
 }

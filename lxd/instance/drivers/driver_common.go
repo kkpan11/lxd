@@ -2,11 +2,15 @@ package drivers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,25 +19,31 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/sys/unix"
 
+	agentAPI "github.com/canonical/lxd/lxd-agent/api"
 	"github.com/canonical/lxd/lxd/backup"
+	backupConfig "github.com/canonical/lxd/lxd/backup/config"
 	"github.com/canonical/lxd/lxd/db"
 	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/device"
 	deviceConfig "github.com/canonical/lxd/lxd/device/config"
+	"github.com/canonical/lxd/lxd/device/filters"
 	"github.com/canonical/lxd/lxd/device/nictype"
 	"github.com/canonical/lxd/lxd/instance"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/instance/operationlock"
 	"github.com/canonical/lxd/lxd/lifecycle"
 	"github.com/canonical/lxd/lxd/locking"
-	"github.com/canonical/lxd/lxd/maas"
-	"github.com/canonical/lxd/lxd/operations"
+	"github.com/canonical/lxd/lxd/migration"
 	"github.com/canonical/lxd/lxd/project"
+	"github.com/canonical/lxd/lxd/project/limits"
+	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/lxd/state"
 	storagePools "github.com/canonical/lxd/lxd/storage"
+	storageDrivers "github.com/canonical/lxd/lxd/storage/drivers"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/entity"
+	"github.com/canonical/lxd/shared/ioprogress"
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/revert"
 )
@@ -45,7 +55,7 @@ var ErrExecCommandNotFound = api.StatusErrorf(http.StatusBadRequest, "Command no
 var ErrExecCommandNotExecutable = api.StatusErrorf(http.StatusBadRequest, "Command not executable")
 
 // ErrInstanceIsStopped indicates that the instance is stopped.
-var ErrInstanceIsStopped error = api.StatusErrorf(http.StatusBadRequest, "The instance is already stopped")
+var ErrInstanceIsStopped = api.StatusErrorf(http.StatusBadRequest, "The instance is already stopped")
 
 // deviceManager is an interface that allows managing device lifecycle.
 type deviceManager interface {
@@ -57,7 +67,6 @@ type deviceManager interface {
 
 // common provides structure common to all instance types.
 type common struct {
-	op    *operations.Operation
 	state *state.State
 
 	architecture    int
@@ -89,6 +98,13 @@ type common struct {
 	volatileSetPersistDisable bool
 }
 
+var rebuildConfigResetPolicy = api.ConfigKeyPolicy{
+	Remove: []string{
+		"volatile.idmap.next",
+		"volatile.last_state.idmap",
+	},
+}
+
 //
 // SECTION: property getters
 //
@@ -113,7 +129,7 @@ func (d *common) Description() string {
 	return d.description
 }
 
-// IsEphemeral returns whether the instanc is ephemeral or not.
+// IsEphemeral returns whether the instance is ephemeral or not.
 func (d *common) IsEphemeral() bool {
 	return d.ephemeral
 }
@@ -198,11 +214,6 @@ func (d *common) IsStateful() bool {
 	return d.stateful
 }
 
-// Operation returns the instance's current operation.
-func (d *common) Operation() *operations.Operation {
-	return d.op
-}
-
 //
 // SECTION: general functions
 //
@@ -242,17 +253,13 @@ func (d *common) DeferTemplateApply(trigger instance.TemplateTrigger) error {
 		return nil
 	}
 
-	err := d.VolatileSet(map[string]string{"volatile.apply_template": string(trigger)})
+	volatileKey := "volatile.apply_template"
+	err := d.VolatileSet(map[string]string{volatileKey: string(trigger)})
 	if err != nil {
-		return fmt.Errorf("Failed to set apply_template volatile key: %w", err)
+		return fmt.Errorf("Failed setting config key %q: %w", volatileKey, err)
 	}
 
 	return nil
-}
-
-// SetOperation sets the current operation.
-func (d *common) SetOperation(op *operations.Operation) {
-	d.op = op
 }
 
 // Snapshots returns a list of snapshots.
@@ -329,7 +336,7 @@ func (d *common) VolatileSet(changes map[string]string) error {
 	// Quick check.
 	for key := range changes {
 		if !strings.HasPrefix(key, instancetype.ConfigVolatilePrefix) {
-			return fmt.Errorf("Only volatile keys can be modified with VolatileSet")
+			return errors.New("Only volatile keys can be modified with VolatileSet")
 		}
 	}
 
@@ -337,17 +344,17 @@ func (d *common) VolatileSet(changes map[string]string) error {
 	if !d.volatileSetPersistDisable {
 		var err error
 		if d.isSnapshot {
-			err = d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+			err = d.state.DB.Cluster.Transaction(context.TODO(), func(_ context.Context, tx *db.ClusterTx) error {
 				return tx.UpdateInstanceSnapshotConfig(d.id, changes)
 			})
 		} else {
-			err = d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+			err = d.state.DB.Cluster.Transaction(context.TODO(), func(_ context.Context, tx *db.ClusterTx) error {
 				return tx.UpdateInstanceConfig(d.id, changes)
 			})
 		}
 
 		if err != nil {
-			return fmt.Errorf("Failed to set volatile config: %w", err)
+			return fmt.Errorf("Failed setting volatile config: %w", err)
 		}
 	}
 
@@ -392,14 +399,72 @@ func (d *common) Path() string {
 	return storagePools.InstancePath(d.dbType, d.project.Name, d.name, d.isSnapshot)
 }
 
-// ExecOutputPath returns the instance's exec output path.
-func (d *common) ExecOutputPath() string {
-	return filepath.Join(d.Path(), "exec-output")
+// openSubPath opens name as a confined [os.Root] beneath [common.Path], rejecting any attempt to
+// escape the instance path.
+func (d *common) openSubPath(name string) (*os.Root, error) {
+	parent, err := os.OpenRoot(d.Path())
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() { _ = parent.Close() }()
+
+	root, err := parent.OpenRoot(name)
+	if err != nil {
+		return nil, fmt.Errorf("Failed opening %q for instance %q (path %s): %w", name, d.Name(), d.Path(), err)
+	}
+
+	return root, nil
 }
 
-// RootfsPath returns the instance's rootfs path.
-func (d *common) RootfsPath() string {
-	return filepath.Join(d.Path(), "rootfs")
+// openOrCreateSubPath is like openSubPath but also creates the name if it does not exist.
+func (d *common) openOrCreateSubPath(name string, mode os.FileMode) (*os.Root, error) {
+	parent, err := os.OpenRoot(d.Path())
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() { _ = parent.Close() }()
+
+	err = parent.Mkdir(name, mode)
+	if err != nil && !errors.Is(err, fs.ErrExist) {
+		return nil, fmt.Errorf("Failed creating %q for instance %q (path %s): %w", name, d.Name(), d.Path(), err)
+	}
+
+	root, err := parent.OpenRoot(name)
+	if err != nil {
+		return nil, fmt.Errorf("Failed opening %q for instance %q (path %s): %w", name, d.Name(), d.Path(), err)
+	}
+
+	return root, nil
+}
+
+// OpenRootfs opens the instance's rootfs directory as a confined *os.Root.
+// Caller must close the returned Root.
+func (d *common) OpenRootfs() (*os.Root, error) {
+	return d.openSubPath("rootfs")
+}
+
+// OpenExecOutput opens the instance's exec-output directory as a confined *os.Root, creating it if absent.
+// Caller must close the returned Root.
+func (d *common) OpenExecOutput() (*os.Root, error) {
+	return d.openOrCreateSubPath("exec-output", 0700)
+}
+
+// OpenTemplates opens the instance's templates directory as a confined *os.Root, creating it if absent.
+// Caller must close the returned Root.
+func (d *common) OpenTemplates() (*os.Root, error) {
+	return d.openOrCreateSubPath("templates", 0700)
+}
+
+// OpenRoot opens the instance's root directory as a confined *os.Root.
+func (d *common) OpenRoot() (*os.Root, error) {
+	root, err := os.OpenRoot(d.Path())
+	if err != nil {
+		return nil, err
+	}
+
+	return root, nil
 }
 
 // ShmountsPath returns the instance's shared mounts path.
@@ -411,11 +476,6 @@ func (d *common) ShmountsPath() string {
 // StatePath returns the instance's state path.
 func (d *common) StatePath() string {
 	return filepath.Join(d.Path(), "state")
-}
-
-// TemplatesPath returns the instance's templates path.
-func (d *common) TemplatesPath() string {
-	return filepath.Join(d.Path(), "templates")
 }
 
 // StoragePool returns the storage pool name.
@@ -436,7 +496,7 @@ func (d *common) StoragePool() (string, error) {
 // that it is removed then added immediately afterwards.
 func (d *common) deviceVolatileReset(devName string, oldConfig, newConfig deviceConfig.Device) error {
 	volatileClear := make(map[string]string)
-	devicePrefix := fmt.Sprintf("volatile.%s.", devName)
+	devicePrefix := "volatile." + devName + "."
 
 	newNICType, err := nictype.NICType(d.state, d.project.Name, newConfig)
 	if err != nil {
@@ -467,12 +527,12 @@ func (d *common) deviceVolatileReset(devName string, oldConfig, newConfig device
 	// the same key name present in the new config (i.e the new config is replacing the
 	// old volatile key).
 	for k := range d.localConfig {
-		if !strings.HasPrefix(k, devicePrefix) {
+		devKey, found := strings.CutPrefix(k, devicePrefix)
+		if !found {
 			continue
 		}
 
-		devKey := strings.TrimPrefix(k, devicePrefix)
-		_, found := newConfig[devKey]
+		_, found = newConfig[devKey]
 		if found {
 			volatileClear[k] = ""
 		}
@@ -486,12 +546,14 @@ func (d *common) deviceVolatileReset(devName string, oldConfig, newConfig device
 func (d *common) deviceVolatileGetFunc(devName string) func() map[string]string {
 	return func() map[string]string {
 		volatile := make(map[string]string)
-		prefix := fmt.Sprintf("volatile.%s.", devName)
+		prefix := "volatile." + devName + "."
 		for k, v := range d.localConfig {
-			if strings.HasPrefix(k, prefix) {
-				volatile[strings.TrimPrefix(k, prefix)] = v
+			after, ok := strings.CutPrefix(k, prefix)
+			if ok {
+				volatile[after] = v
 			}
 		}
+
 		return volatile
 	}
 }
@@ -509,9 +571,29 @@ func (d *common) deviceVolatileSetFunc(devName string) func(save map[string]stri
 	}
 }
 
+// postMigrateSendCommon handles common instance post-migration steps.
+func (d *common) postMigrateSendCommon(inst instance.Instance, clusterMoveSourceName string) error {
+	// Perform post-migration device cleanup.
+	for devName, devConfig := range d.ExpandedDevices() {
+		dev, err := d.deviceLoad(inst, devName, devConfig)
+		if err != nil {
+			logger.Error("Failed loading device during post-migration steps on source", logger.Ctx{"devName": devName, "err": err})
+		}
+
+		if dev != nil {
+			err = dev.PostMigrateSend(clusterMoveSourceName)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
 // expandConfig applies the config of each profile in order, followed by the local config.
 func (d *common) expandConfig() error {
-	var globalConfigDump map[string]any
+	var globalConfigDump map[string]string
 	if d.state.GlobalConfig != nil {
 		globalConfigDump = d.state.GlobalConfig.Dump()
 	}
@@ -523,7 +605,7 @@ func (d *common) expandConfig() error {
 }
 
 // restartCommon handles the common part of instance restarts.
-func (d *common) restartCommon(inst instance.Instance, timeout time.Duration) error {
+func (d *common) restartCommon(ctx context.Context, inst instance.Instance, timeout time.Duration, progressReporter ioprogress.ProgressReporter) error {
 	// Setup a new operation for the stop/shutdown phase.
 	op, err := operationlock.Create(d.Project().Name, d.Name(), operationlock.ActionRestart, true, true)
 	if err != nil {
@@ -556,7 +638,7 @@ func (d *common) restartCommon(inst instance.Instance, timeout time.Duration) er
 			Snapshot:     inst.IsSnapshot(),
 		}
 
-		err := inst.Update(args, false)
+		err := inst.Update(ctx, args, instance.UpdateActionInternal)
 		if err != nil {
 			return err
 		}
@@ -564,24 +646,24 @@ func (d *common) restartCommon(inst instance.Instance, timeout time.Duration) er
 		// On function return, set the flag back on
 		defer func() {
 			args.Ephemeral = ephemeral
-			_ = inst.Update(args, false)
+			_ = inst.Update(ctx, args, instance.UpdateActionInternal)
 		}()
 	}
 
 	if timeout == 0 {
-		err := inst.Stop(false)
+		err := inst.Stop(ctx, false)
 		if err != nil {
 			op.Done(err)
 			return err
 		}
 	} else {
 		if inst.IsFrozen() {
-			err = fmt.Errorf("Instance is not running")
+			err = errors.New("Instance is not running")
 			op.Done(err)
 			return err
 		}
 
-		err := inst.Shutdown(timeout)
+		err := inst.Shutdown(ctx, timeout)
 		if err != nil {
 			op.Done(err)
 			return err
@@ -594,20 +676,20 @@ func (d *common) restartCommon(inst instance.Instance, timeout time.Duration) er
 		return fmt.Errorf("Create restart (for start) operation: %w", err)
 	}
 
-	err = inst.Start(false)
+	err = inst.Start(ctx, false, progressReporter)
 	if err != nil {
 		op.Done(err)
 		return err
 	}
 
 	d.logger.Info("Restarted instance", ctxMap)
-	d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceRestarted.Event(d, nil))
+	d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceRestarted.Event(ctx, d, nil))
 
 	return nil
 }
 
 // rebuildCommon handles the common part of instance rebuilds.
-func (d *common) rebuildCommon(inst instance.Instance, img *api.Image, op *operations.Operation) error {
+func (d *common) rebuildCommon(ctx context.Context, inst instance.Instance, img *api.Image, progressReporter ioprogress.ProgressReporter) error {
 	instLocalConfig := d.localConfig
 
 	// Reset the "image.*" keys.
@@ -620,7 +702,7 @@ func (d *common) rebuildCommon(inst instance.Instance, img *api.Image, op *opera
 	delete(instLocalConfig, "volatile.base_image")
 	if img != nil {
 		for k, v := range img.Properties {
-			instLocalConfig[fmt.Sprintf("image.%s", k)] = v
+			instLocalConfig["image."+k] = v
 		}
 
 		instLocalConfig["volatile.base_image"] = img.Fingerprint
@@ -628,15 +710,14 @@ func (d *common) rebuildCommon(inst instance.Instance, img *api.Image, op *opera
 	}
 
 	// Reset relevant volatile keys.
-	delete(instLocalConfig, "volatile.idmap.next")
-	delete(instLocalConfig, "volatile.last_state.idmap")
+	rebuildConfigResetPolicy.Apply(instLocalConfig, nil)
 
 	pool, err := d.getStoragePool()
 	if err != nil {
 		return err
 	}
 
-	err = pool.DeleteInstance(inst, op)
+	err = pool.DeleteInstance(inst, progressReporter)
 	if err != nil {
 		return err
 	}
@@ -648,7 +729,7 @@ func (d *common) rebuildCommon(inst instance.Instance, img *api.Image, op *opera
 			return err
 		}
 	} else {
-		err = pool.CreateInstanceFromImage(inst, img.Fingerprint, op)
+		err = pool.CreateInstanceFromImage(ctx, inst, img.Fingerprint, progressReporter)
 		if err != nil {
 			return err
 		}
@@ -677,6 +758,127 @@ func (d *common) rebuildCommon(inst instance.Instance, img *api.Image, op *opera
 	return nil
 }
 
+// deleteAttachedVolumeSnapshots deletes the attached volume snapshots for a snapshot instance.
+// When diskVolumesMode is "all-exclusive", it deletes the attached volume snapshots.
+func (d *common) deleteAttachedVolumeSnapshots(ctx context.Context, snapInst instance.Instance, diskVolumesMode string, progressReporter ioprogress.ProgressReporter) error {
+	// Get attached volume snapshot UUIDs from the snapshot instance.
+	attachedVolumeUUIDs, err := parseVolatileAttachedVolumes(snapInst)
+	if err != nil {
+		return err
+	}
+
+	if len(attachedVolumeUUIDs) == 0 {
+		return nil
+	}
+
+	// Get attached volume snapshots.
+	toDelete, err := d.getAttachedVolumeSnapshots(snapInst, attachedVolumeUUIDs)
+	if err != nil {
+		return fmt.Errorf("Failed getting attached volume snapshots: %w", err)
+	}
+
+	pool, err := d.getStoragePool()
+	if err != nil {
+		return err
+	}
+
+	// Delete the attached volume snapshots.
+	storageCache := storagePools.NewStorageCache(pool) // Create storage cache for pool lookups.
+	for _, vol := range toDelete {
+		pool, err := storageCache.GetPool(vol.Pool)
+		if err != nil {
+			return fmt.Errorf("Failed loading storage pool %q: %w", vol.Pool, err)
+		}
+
+		err = pool.DeleteCustomVolumeSnapshot(ctx, vol.Project, vol.Name, progressReporter)
+		if err != nil {
+			return fmt.Errorf("Failed deleting attached volume %q snapshot in storage pool %q: %w", vol.Name, vol.Pool, err)
+		}
+	}
+
+	return nil
+}
+
+// deleteCommon handles common delete logic for LXC and QEMU instances.
+//
+// It performs the following shared operations:
+// - Backup file lock management.
+// - Operation lock setup.
+// - Running state check.
+// - Calls driver-specific delete function.
+// - Attached volume snapshot deletion for snapshots (if diskVolumesMode is "all-exclusive").
+// - Parent backup file update for snapshots.
+func (d *common) deleteCommon(ctx context.Context, inst instance.Instance, force bool, diskVolumesMode string, progressReporter ioprogress.ProgressReporter) error {
+	isSnapshot := inst.IsSnapshot()
+
+	if isSnapshot {
+		unlock, err := d.updateBackupFileLock(context.Background())
+		if err != nil {
+			return fmt.Errorf("Failed acquiring update backup file lock: %w", err)
+		}
+
+		defer unlock()
+	}
+
+	// Setup a new operation.
+	op, err := operationlock.CreateWaitGet(d.Project().Name, d.Name(), operationlock.ActionDelete, nil, false, false)
+	if err != nil {
+		return fmt.Errorf("Failed creating instance delete operation: %w", err)
+	}
+
+	defer op.Done(nil)
+
+	if inst.IsRunning() {
+		return api.StatusErrorf(http.StatusBadRequest, "Instance is running")
+	}
+
+	var parent instance.Instance
+	if isSnapshot {
+		parentName, _, _ := api.GetParentAndSnapshotName(inst.Name())
+
+		// Load the parent for backup file refresh.
+		parent, err = instance.LoadByProjectAndName(d.state, d.project.Name, parentName)
+		if err != nil {
+			return fmt.Errorf("Invalid parent: %w", err)
+		}
+	}
+
+	switch s := inst.(type) {
+	case *lxc:
+		err = s.delete(ctx, force)
+		if err != nil {
+			return err
+		}
+
+	case *qemu:
+		err = s.delete(ctx, force)
+		if err != nil {
+			return err
+		}
+
+	default:
+		d.logger.Error("Failed deleting instance")
+	}
+
+	if isSnapshot {
+		// Delete attached volume snapshots (if requested).
+		if diskVolumesMode == api.DiskVolumesModeAllExclusive {
+			err = d.deleteAttachedVolumeSnapshots(ctx, inst, diskVolumesMode, progressReporter)
+			if err != nil {
+				return fmt.Errorf("Failed deleting attached volume snapshots: %w", err)
+			}
+		}
+
+		// Update the backup file.
+		err = parent.UpdateBackupFile()
+		if err != nil {
+			return fmt.Errorf("Failed updating parent backup file: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // runHooks executes the callback functions returned from a function.
 func (d *common) runHooks(hooks []func() error) error {
 	// Run any post start hooks.
@@ -690,10 +892,238 @@ func (d *common) runHooks(hooks []func() error) error {
 	return nil
 }
 
-// snapshot handles the common part of the snapshoting process.
-func (d *common) snapshotCommon(inst instance.Instance, name string, expiry time.Time, stateful bool) error {
+// parseVolatileAttachedVolumes returns the device name to snapshot UUID map an all-exclusive snapshot records.
+// A snapshot of an instance with no snapshottable attached volumes records nothing, so an absent key means
+// the snapshot captured the root volume alone rather than that a record was lost.
+func parseVolatileAttachedVolumes(snapInst instance.Instance) (map[string]string, error) {
+	value := snapInst.LocalConfig()["volatile.attached_volumes"]
+	if value == "" {
+		return nil, nil
+	}
+
+	var attachedVolumeUUIDs map[string]string
+	err := json.Unmarshal([]byte(value), &attachedVolumeUUIDs)
+	if err != nil {
+		return nil, fmt.Errorf(`Failed parsing "volatile.attached_volumes": %w`, err)
+	}
+
+	return attachedVolumeUUIDs, nil
+}
+
+// getAttachedVolumeSnapshots returns storage volume snapshots matching the snapshot UUIDs stored in "volatile.attached_volumes".
+// Used for multi-volume instance snapshot restores and deletes.
+func (d *common) getAttachedVolumeSnapshots(inst instance.Instance, volatileAttachedVolumes map[string]string) ([]*db.StorageVolume, error) {
+	// An empty record means the snapshot captured the root volume alone. Querying with no UUIDs would filter
+	// nothing and return every custom volume in the project.
+	if len(volatileAttachedVolumes) == 0 {
+		return nil, nil
+	}
+
+	// Convert map values to slice of snapshot UUIDs for database query (filter storage volumes by snapshot UUID).
+	uuids := make([]string, 0, len(volatileAttachedVolumes))
+	for _, uuid := range volatileAttachedVolumes {
+		uuids = append(uuids, uuid)
+	}
+
+	customType := dbCluster.StoragePoolVolumeTypeCustom
+	instanceProject := inst.Project()
+	effectiveProject := project.StorageVolumeProjectFromRecord(&instanceProject, dbCluster.StoragePoolVolumeTypeCustom)
+
+	filter := db.StorageVolumeFilter{
+		Type:    &customType,
+		Project: &effectiveProject,
+		UUIDs:   uuids,
+	}
+
+	var volumes []*db.StorageVolume
+	err := d.state.DB.Cluster.Transaction(d.state.ShutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+		var err error
+		volumes, err = tx.GetStorageVolumes(ctx, true, filter)
+		if err != nil {
+			return err
+		}
+
+		// Validate that all volumes are snapshots
+		for _, vol := range volumes {
+			_, _, isSnap := api.GetParentAndSnapshotName(vol.Name)
+			if !isSnap {
+				return fmt.Errorf("Volume %q with uuid %q is not a snapshot", vol.Name, vol.Config["volatile.uuid"])
+			}
+		}
+
+		return nil
+	})
+
+	return volumes, err
+}
+
+// getAttachedVolumes returns a map of device names to storage volumes that are attached to the instance.
+func (d *common) getAttachedVolumes(inst instance.Instance) (attachedVolumes map[string]db.StorageVolume, err error) {
+	// Retrieve the instance's root disk volume storage pool.
+	_, rootDiskDevice, err := d.getRootDiskDevice()
+	if err != nil {
+		return nil, fmt.Errorf("Failed getting root disk: %w", err)
+	}
+
+	if rootDiskDevice["pool"] == "" {
+		return nil, errors.New("The instance's root device is missing the pool property")
+	}
+
+	// Load the root disk volume's storage pool.
+	rootDiskPool, err := storagePools.LoadByName(d.state, rootDiskDevice["pool"])
+	if err != nil {
+		return nil, fmt.Errorf("Failed loading storage pool: %w", err)
+	}
+
+	// Create a storage cache for pool lookups.
+	storageCache := storagePools.NewStorageCache(rootDiskPool)
+
+	// Get attached storage volumes.
+	attachedVolumes = make(map[string]db.StorageVolume)
+	instanceProject := inst.Project()
+
+	// A project that does not own its custom volumes keeps them in the default project, which is where the
+	// device's source resolves.
+	storageProject := project.StorageVolumeProjectFromRecord(&instanceProject, dbCluster.StoragePoolVolumeTypeCustom)
+
+	for name, dev := range d.expandedDevices.Filter(filters.IsCustomVolumeDisk) {
+		// Storage cache lookup.
+		pool, err := storageCache.GetPool(dev["pool"])
+		if err != nil {
+			return nil, fmt.Errorf("Failed getting storage pool of device %q: %w", name, err)
+		}
+
+		volName, _, _ := api.GetParentAndSnapshotName(dev["source"])
+
+		err = d.state.DB.Cluster.Transaction(d.state.ShutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+			vol, err := tx.GetStoragePoolVolume(ctx, pool.ID(), storageProject, dbCluster.StoragePoolVolumeTypeCustom, volName, true)
+			if err != nil {
+				return err
+			}
+
+			attachedVolumes[name] = *vol
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return attachedVolumes, nil
+}
+
+// otherVolumeUsers reports the instances attaching each of the given custom volumes apart from inst itself,
+// keyed as pool/name, using a single scan of the instance list. Volumes no other instance attaches have no
+// entry, which is what makes them exclusive to inst.
+func (d *common) otherVolumeUsers(inst instance.Instance, vols []*db.StorageVolume) (map[string][]db.InstanceArgs, error) {
+	others := make(map[string][]db.InstanceArgs, len(vols))
+	if len(vols) == 0 {
+		return others, nil
+	}
+
+	instanceProject := inst.Project()
+	storageProject := project.StorageVolumeProjectFromRecord(&instanceProject, dbCluster.StoragePoolVolumeTypeCustom)
+
+	var users map[string][]db.InstanceArgs
+	err := d.state.DB.Cluster.Transaction(d.state.ShutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+		var err error
+		users, err = storagePools.VolumesUsedBy(ctx, tx, storageProject, vols)
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("Failed finding users of attached volumes: %w", err)
+	}
+
+	for volKey, volUsers := range users {
+		volUsers = slices.DeleteFunc(volUsers, func(user db.InstanceArgs) bool {
+			return instance.IsSameLogicalInstance(inst, &user)
+		})
+
+		if len(volUsers) > 0 {
+			others[volKey] = volUsers
+		}
+	}
+
+	return others, nil
+}
+
+// sharedAttachedVolumes returns the set of volumes in attachedVolumes that are also attached to at least one
+// other instance in the same project. Profile references do not count here: a volume only reachable through a
+// profile applied to this instance alone is still exclusive to it.
+func (d *common) sharedAttachedVolumes(inst instance.Instance, attachedVolumes map[string]db.StorageVolume) (map[string]struct{}, error) {
+	vols := make([]*db.StorageVolume, 0, len(attachedVolumes))
+	for _, vol := range attachedVolumes {
+		vols = append(vols, &vol)
+	}
+
+	others, err := d.otherVolumeUsers(inst, vols)
+	if err != nil {
+		return nil, err
+	}
+
+	sharedVols := make(map[string]struct{}, len(others))
+	for volKey := range others {
+		sharedVols[volKey] = struct{}{}
+	}
+
+	return sharedVols, nil
+}
+
+// snapshotCommon handles the common part of a snapshot.
+// It creates the DB record and snapshots the instance, derives expiry from
+// inst's "snapshots.expiry" if expiry is nil, mounts the instance to update
+// backup.yaml, and reverts on error. The snapshot is marked stateful when
+// stateful is true. When diskVolumesMode is set to [api.DiskVolumesModeAllExclusive],
+// the instance's attached exclusive volumes are included in a crash-consistent
+// snapshot.
+func (d *common) snapshotCommon(ctx context.Context, inst instance.Instance, name string, expiry *time.Time, stateful bool, diskVolumesMode string, progressReporter ioprogress.ProgressReporter) error {
 	revert := revert.New()
 	defer revert.Fail()
+
+	snapshotCreationDate := time.Now().UTC()
+
+	// If the expiry is unset, retrieve it from the instance's expanded config.
+	if expiry == nil {
+		// Use the snapshot creation date as reference for an exact expiry date.
+		instanceSnapshotExpiry, err := shared.GetExpiry(snapshotCreationDate, inst.ExpandedConfig()["snapshots.expiry"])
+		if err != nil {
+			return fmt.Errorf("Failed getting snapshot expiry: %w", err)
+		}
+
+		expiry = &instanceSnapshotExpiry
+	}
+
+	// Load attached volumes for multi-volume snapshot (if requested).
+	var attachedVolumes map[string]db.StorageVolume
+	if diskVolumesMode == api.DiskVolumesModeAllExclusive {
+		var err error
+		attachedVolumes, err = d.getAttachedVolumes(inst)
+		if err != nil {
+			return fmt.Errorf("Failed getting attached volumes: %w", err)
+		}
+	}
+
+	sharedVolumes, err := d.sharedAttachedVolumes(inst, attachedVolumes)
+	if err != nil {
+		return fmt.Errorf("Failed checking shared status of attached volumes: %w", err)
+	}
+
+	// Attached volumes to snapshot alongside the root, excluding ISO volumes whose
+	// snapshots are unsupported, and volumes shared with other instances. An ISO-only
+	// attachment does not need a crash-consistent freeze.
+	snapshottableVolumes := make(map[string]db.StorageVolume, len(attachedVolumes))
+	for deviceName, volume := range attachedVolumes {
+		if volume.ContentType == dbCluster.StoragePoolVolumeContentTypeNameISO {
+			continue
+		}
+
+		_, isShared := sharedVolumes[volume.Pool+"/"+volume.Name]
+		if isShared {
+			continue
+		}
+
+		snapshottableVolumes[deviceName] = volume
+	}
 
 	// Setup the arguments.
 	args := db.InstanceArgs{
@@ -707,11 +1137,13 @@ func (d *common) snapshotCommon(inst instance.Instance, name string, expiry time
 		Name:         inst.Name() + shared.SnapshotDelimiter + name,
 		Profiles:     inst.Profiles(),
 		Stateful:     stateful,
-		ExpiryDate:   expiry,
+		ExpiryDate:   *expiry,
+		CreationDate: snapshotCreationDate,
+		Description:  inst.Description(),
 	}
 
 	// Create the snapshot.
-	snap, snapInstOp, cleanup, err := instance.CreateInternal(d.state, args, true)
+	snap, snapInstOp, cleanup, err := instance.CreateInternal(ctx, d.state, args, true)
 	if err != nil {
 		return fmt.Errorf("Failed creating instance snapshot record %q: %w", name, err)
 	}
@@ -719,65 +1151,392 @@ func (d *common) snapshotCommon(inst instance.Instance, name string, expiry time
 	revert.Add(cleanup)
 	defer snapInstOp.Done(err)
 
-	pool, err := storagePools.LoadByInstance(d.state, snap)
+	pool, err := d.getStoragePool()
 	if err != nil {
 		return err
 	}
 
-	err = pool.CreateInstanceSnapshot(snap, inst, d.op)
+	// Freeze the instance if the driver requires it or if there are snapshottable attached volumes to ensure crash-consistent snapshots.
+	if (pool.Driver().Info().RunningCopyFreeze || len(snapshottableVolumes) > 0) && inst.IsRunning() && !inst.IsFrozen() {
+		if len(snapshottableVolumes) > 0 {
+			d.logger.Info("Freezing instance to ensure crash-consistent multi-volume snapshot", logger.Ctx{"snapshot": snap.Name()})
+		} else {
+			d.logger.Debug("Freezing instance as required by the storage driver", logger.Ctx{"snapshot": snap.Name()})
+		}
+
+		err = inst.Freeze(ctx)
+		if err != nil {
+			return err
+		}
+
+		defer func() {
+			if len(snapshottableVolumes) > 0 {
+				d.logger.Info("Unfreezing instance after crash-consistent multi-volume snapshot", logger.Ctx{"snapshot": snap.Name()})
+			} else {
+				d.logger.Debug("Unfreezing instance after storage driver freeze", logger.Ctx{"snapshot": snap.Name()})
+			}
+
+			err := inst.Unfreeze(ctx)
+			if err != nil {
+				d.logger.Warn("Failed unfreezing instance after snapshot", logger.Ctx{"err": err})
+			}
+		}()
+	}
+
+	// Snapshot root disk.
+	err = pool.CreateInstanceSnapshot(snap, inst, progressReporter)
 	if err != nil {
-		return fmt.Errorf("Create instance snapshot: %w", err)
+		return fmt.Errorf("Failed creating instance root volume snapshot: %w", err)
 	}
 
 	revert.Add(func() {
 		switch s := snap.(type) {
 		case *lxc:
-			_ = s.delete(true)
+			_ = s.delete(context.Background(), true)
 		case *qemu:
-			_ = s.delete(true)
+			_ = s.delete(context.Background(), true)
 		default:
-			logger.Error("Failed to delete snapshot during revert", logger.Ctx{"instance": inst.Name(), "snapshot": snap.Name()})
+			d.logger.Error("Failed deleting snapshot during revert", logger.Ctx{"snapshot": snap.Name()})
 		}
 	})
 
-	// Mount volume for backup.yaml writing.
-	_, err = pool.MountInstance(inst, d.op)
-	if err != nil {
-		return fmt.Errorf("Create instance snapshot (mount source): %w", err)
+	// Snapshot attached disk volumes. Nothing snapshottable means nothing to record, so the snapshot is left
+	// without the key rather than carrying an empty map that later reads as a lost record.
+	if len(snapshottableVolumes) > 0 {
+		// Snapshot attached custom volumes.
+		storageCache := storagePools.NewStorageCache(pool) // Create storage cache for pool lookups.
+		volatileAttachedVolumes := make(map[string]string)
+		instanceProject := inst.Project()
+		instanceType := inst.Type()
+		for deviceName, volume := range snapshottableVolumes {
+			d.logger.Info("Creating attached volume snapshot", logger.Ctx{"pool": volume.Pool, "volume": volume.Name, "project": volume.Project})
+
+			// Use shutdown context as we don't have access to the request context.
+			snapshotName, err := storagePools.VolumeDetermineNextSnapshotName(d.state.ShutdownCtx, d.state, volume.Pool, volume.Name, volume.Config)
+			if err != nil {
+				return fmt.Errorf("Failed determining next snapshot name for attached volume %q in storage pool %q: %w", volume.Name, volume.Pool, err)
+			}
+
+			// Attached volume snapshot description.
+			description := "Created alongside " + instanceType.String() + " " + snap.Name() + " snapshot in project " + instanceProject.Name
+
+			// Storage cache lookup.
+			pool, err := storageCache.GetPool(volume.Pool)
+			if err != nil {
+				return err
+			}
+
+			expiry := snap.ExpiryDate() // Attached volume snapshots inherit the expiry date of the instance snapshot.
+			snapshotUUID, err := pool.CreateCustomVolumeSnapshot(ctx, volume.Project, volume.Name, snapshotName, description, &expiry, progressReporter)
+			if err != nil {
+				return fmt.Errorf("Failed creating attached volume %q snapshot %q in storage pool %q: %w", volume.Name, snapshotName, volume.Pool, err)
+			}
+
+			// Map device name to snapshot UUID.
+			// This is used to identify the attached volume snapshots during restore.
+			volatileAttachedVolumes[deviceName] = snapshotUUID.String()
+
+			revert.Add(func() {
+				err := pool.DeleteCustomVolumeSnapshot(ctx, volume.Project, volume.Name+"/"+snapshotName, progressReporter)
+				if err != nil {
+					d.logger.Warn("Failed deleting attached volume snapshot", logger.Ctx{"pool": volume.Pool, "volume": volume.Name, "snapshot": snapshotName, "project": volume.Project, "err": err})
+				}
+			})
+		}
+
+		marshalled, err := json.Marshal(volatileAttachedVolumes)
+		if err != nil {
+			return err
+		}
+
+		// Set "volatile.attached_volumes" to map of device name to snapshot UUID on the snapshot instance.
+		err = snap.VolatileSet(map[string]string{
+			"volatile.attached_volumes": string(marshalled),
+		})
+		if err != nil {
+			return fmt.Errorf("Failed setting volatile.attached_volumes: %w", err)
+		}
 	}
 
-	defer func() { _ = pool.UnmountInstance(inst, d.op) }()
+	// Mount volume for backup.yaml writing.
+	_, err = pool.MountInstance(inst, progressReporter)
+	if err != nil {
+		return fmt.Errorf("Failed mounting instance root volume for backup file writing during snapshot: %w", err)
+	}
+
+	defer func() {
+		err := pool.UnmountInstance(inst, progressReporter)
+		// Unmounting volumes while an instance is running is expected to return [storageDrivers.ErrInUse].
+		if err != nil && !errors.Is(err, storageDrivers.ErrInUse) {
+			d.logger.Warn("Failed unmounting instance after snapshot", logger.Ctx{"err": err})
+		}
+	}()
 
 	// Attempt to update backup.yaml for instance.
 	err = inst.UpdateBackupFile()
 	if err != nil {
-		return err
+		return fmt.Errorf("Failed updating instance backup file after snapshot: %w", err)
 	}
 
 	revert.Success()
 	return nil
 }
 
-// updateProgress updates the operation metadata with a new progress string.
-func (d *common) updateProgress(progress string) {
-	if d.op == nil {
+func updateProgress(progressReporter ioprogress.ProgressReporter, progress string) {
+	if progressReporter == nil {
 		return
 	}
 
-	meta := d.op.Metadata()
-	if meta == nil {
-		meta = make(map[string]any)
+	handler := progressReporter.ProgressHandler("instance")
+	handler(ioprogress.ProgressData{
+		Text: progress,
+	})
+}
+
+// restoreCommon handles the common part of a restore.
+// It loads the instance's storage pool and creates a restore operation lock.
+// If the instance is running, it temporarily clears the ephemeral flag (if set),
+// stops the instance (which unmounts its storage), and then refreshes the restore
+// operation lock. The original ephemeral flag is restored on return.
+// It then applies the configuration from the source instance or snapshot to the
+// target instance and updates snapshot metadata.
+// When diskVolumesMode is set to [api.DiskVolumesModeAllExclusive], the instance's
+// attached exclusive volumes are also restored.
+//
+// Returns:
+// - wasRunning: whether the instance was running before restore.
+// - op: the restore operation lock.
+// - err: error, if any.
+func (d *common) restoreCommon(ctx context.Context, inst instance.Instance, source instance.Instance, diskVolumesMode string, progressReporter ioprogress.ProgressReporter) (wasRunning bool, op *operationlock.InstanceOperation, err error) {
+	// Load the storage driver.
+	pool, err := d.getStoragePool()
+	if err != nil {
+		return false, nil, err
 	}
 
-	if meta["container_progress"] != progress {
-		meta["container_progress"] = progress
-		_ = d.op.UpdateMetadata(meta)
+	// Get attached volume snapshots.
+	var restoreVolumes []*db.StorageVolume
+	if diskVolumesMode == api.DiskVolumesModeAllExclusive {
+		restoreVolumes, err = d.resolveRestoreSnapshots(inst, source)
+		if err != nil {
+			return false, nil, err
+		}
 	}
+
+	op, err = operationlock.Create(d.Project().Name, d.Name(), operationlock.ActionRestore, false, false)
+	if err != nil {
+		return false, nil, fmt.Errorf("Failed creating instance restore operation: %w", err)
+	}
+
+	// Stop the instance.
+	wasRunning = inst.IsRunning()
+	if wasRunning {
+		ephemeral := d.IsEphemeral()
+		if ephemeral {
+			// Unset ephemeral flag.
+			args := db.InstanceArgs{
+				Architecture: d.Architecture(),
+				Config:       d.LocalConfig(),
+				Description:  d.Description(),
+				Devices:      d.LocalDevices(),
+				Ephemeral:    false,
+				Profiles:     d.Profiles(),
+				Project:      d.Project().Name,
+				Type:         d.Type(),
+				Snapshot:     d.IsSnapshot(),
+			}
+
+			err := inst.Update(ctx, args, instance.UpdateActionInternal)
+			if err != nil {
+				op.Done(err)
+				return false, nil, err
+			}
+
+			// On function return, set the flag back on.
+			defer func() {
+				args.Ephemeral = ephemeral
+				err = inst.Update(ctx, args, instance.UpdateActionInternal)
+				if err != nil {
+					d.logger.Error("Failed restoring ephemeral flag after restore", logger.Ctx{"err": err})
+				}
+			}()
+		}
+
+		// This will unmount the instance storage.
+		err := inst.Stop(ctx, false)
+		if err != nil {
+			op.Done(err)
+			return false, nil, err
+		}
+
+		// Refresh the operation as that one is now complete.
+		op, err = operationlock.Create(d.Project().Name, d.Name(), operationlock.ActionRestore, false, false)
+		if err != nil {
+			return false, nil, fmt.Errorf("Failed creating instance restore operation: %w", err)
+		}
+	}
+
+	// Remove "volatile.attached_volumes" from instance config (only needed for multi-volume snapshot restore).
+	delete(source.LocalConfig(), "volatile.attached_volumes")
+
+	// Restore the configuration.
+	args := db.InstanceArgs{
+		Architecture: source.Architecture(),
+		Config:       source.LocalConfig(),
+		Description:  source.Description(),
+		Devices:      source.LocalDevices(),
+		Ephemeral:    source.IsEphemeral(),
+		Profiles:     source.Profiles(),
+		Project:      source.Project().Name,
+		Type:         source.Type(),
+		Snapshot:     source.IsSnapshot(),
+	}
+
+	// Don't pass as user-requested as there's no way to fix a bad config.
+	// This will call d.UpdateBackupFile() to ensure snapshot list is up to date.
+	err = inst.Update(ctx, args, instance.UpdateActionInternal)
+	if err != nil {
+		op.Done(err)
+		return false, nil, err
+	}
+
+	// Restore the rootfs.
+	err = pool.RestoreInstanceSnapshot(ctx, inst, source, nil)
+	if err != nil {
+		op.Done(err)
+		return false, nil, fmt.Errorf("Failed restoring snapshot rootfs: %w", err)
+	}
+
+	// Restore attached volume snapshots.
+	if len(restoreVolumes) > 0 {
+		storageCache := storagePools.NewStorageCache(pool) // Create storage cache for pool lookups.
+		for _, volume := range restoreVolumes {
+			volName, snapName, _ := api.GetParentAndSnapshotName(volume.Name)
+
+			d.logger.Debug("Restoring attached volume snapshot", logger.Ctx{"pool": volume.Pool, "volume": volName, "snapshot": snapName, "project": volume.Project})
+
+			pool, err := storageCache.GetPool(volume.Pool)
+			if err != nil {
+				return false, nil, fmt.Errorf("Failed loading storage pool %q: %w", volume.Pool, err)
+			}
+
+			// Check that restoring the volume snapshot doesn't exceed project limits.
+			err = d.state.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+				dbVolume, err := tx.GetStoragePoolVolume(ctx, pool.ID(), volume.Project, dbCluster.StoragePoolVolumeTypeCustom, volName, true)
+				if err != nil {
+					return err
+				}
+
+				return limits.AllowVolumeUpdate(ctx, d.state.GlobalConfig, tx, volume.Project, volName, api.StorageVolumePut{}, dbVolume.Config)
+			})
+			if err != nil {
+				return false, nil, fmt.Errorf("Failed checking if volume %q snapshot %q restore is allowed in storage pool %q: %w", volName, snapName, volume.Pool, err)
+			}
+
+			err = pool.RestoreCustomVolume(ctx, volume.Project, volName, snapName, progressReporter)
+			if err != nil {
+				return false, nil, fmt.Errorf("Failed restoring volume %q snapshot %q in storage pool %q: %w", volume.Name, snapName, volume.Pool, err)
+			}
+		}
+	}
+
+	return wasRunning, op, nil
+}
+
+// resolveRestoreSnapshots returns a list of snapshot volumes to include in an instance restore.
+func (d *common) resolveRestoreSnapshots(inst instance.Instance, source instance.Instance) (restoreSnapshots []*db.StorageVolume, err error) {
+	attachedVolumeUUIDs, err := parseVolatileAttachedVolumes(source)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get attached volumes (map of device name -> volume).
+	attachedVolumes, err := d.getAttachedVolumes(source)
+	if err != nil {
+		return nil, fmt.Errorf("Failed getting attached volumes: %w", err)
+	}
+
+	// Get attached volume snapshots.
+	attachedVolumeSnapshots, err := d.getAttachedVolumeSnapshots(source, attachedVolumeUUIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build map for fast lookups.
+	uuidToVolume := make(map[string]*db.StorageVolume)
+	for _, vol := range attachedVolumeSnapshots {
+		uuidToVolume[vol.Config["volatile.uuid"]] = vol
+	}
+
+	var missing []db.StorageVolume
+	var shared []db.StorageVolume
+
+	// Check which attached volumes have matching snapshots.
+	restoreSnapshots = make([]*db.StorageVolume, 0, len(attachedVolumeSnapshots))
+	for deviceName, snapshotUUID := range attachedVolumeUUIDs {
+		vol, ok := uuidToVolume[snapshotUUID]
+		if ok {
+			restoreSnapshots = append(restoreSnapshots, vol)
+		} else {
+			// Get volume details for logging.
+			v, ok := attachedVolumes[deviceName]
+			if ok {
+				missing = append(missing, v)
+			}
+		}
+	}
+
+	// Detect shared volumes.
+	// This is required because currently the only supported disk volumes mode is "all-exclusive".
+	sharedVolumeNames, err := d.sharedAttachedVolumes(inst, attachedVolumes)
+	if err != nil {
+		return nil, fmt.Errorf("Failed checking shared status of attached volumes: %w", err)
+	}
+
+	// Only the volumes the snapshot recorded are restored, so only those have to be exclusive now. A
+	// volume the snapshot skipped as shared is left alone either way.
+	for deviceName := range attachedVolumeUUIDs {
+		v, ok := attachedVolumes[deviceName]
+		if !ok {
+			continue
+		}
+
+		_, isShared := sharedVolumeNames[v.Pool+"/"+v.Name]
+		if isShared {
+			shared = append(shared, v)
+		}
+	}
+
+	// Log warnings for missing snapshots.
+	for _, v := range missing {
+		d.logger.Warn("Missing snapshot for attached volume", logger.Ctx{"pool": v.Pool, "volume": v.Name, "project": v.Project})
+	}
+
+	// Return error if any of the volumes are shared.
+	if len(shared) > 0 {
+		var errMsg strings.Builder
+		errMsg.WriteString("Cannot restore source volumes for the following devices:\n")
+		for _, v := range shared {
+			errMsg.WriteString(v.Name)
+			errMsg.WriteString(" (volume is shared)\n")
+		}
+
+		return nil, errors.New(errMsg.String())
+	}
+
+	// A snapshot records nothing when it was taken in root mode, and also when none of the attached volumes
+	// could be captured, so the state here cannot tell the two apart. Report it the same way a partially
+	// missing record is reported rather than refusing a restore the snapshot can still satisfy.
+	if len(attachedVolumeUUIDs) == 0 && len(attachedVolumes) > 0 {
+		d.logger.Warn("Snapshot holds no record of attached volumes, restoring the root volume alone", logger.Ctx{"snapshot": source.Name()})
+	}
+
+	return restoreSnapshots, nil
 }
 
 // insertConfigkey function attempts to insert the instance config key into the database. If the insert fails
 // then the database is queried to check whether another query inserted the same key. If the key is still
-// unpopulated then the insert querty is retried until it succeeds or a retry limit is reached.
+// unpopulated then the insert query is retried until it succeeds or a retry limit is reached.
 // If the insert succeeds or the key is found to have been populated then the value of the key is returned.
 func (d *common) insertConfigkey(key string, value string) (string, error) {
 	err := d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
@@ -811,7 +1570,7 @@ func (d *common) isRunningStatusCode(statusCode api.StatusCode) bool {
 // isStartableStatusCode returns an error if the status code means the instance cannot be started currently.
 func (d *common) isStartableStatusCode(statusCode api.StatusCode) error {
 	if d.isRunningStatusCode(statusCode) {
-		return fmt.Errorf("The instance is already running")
+		return errors.New("The instance is already running")
 	}
 
 	// If the instance process exists but is crashed, don't allow starting until its been cleaned up, as it
@@ -823,6 +1582,11 @@ func (d *common) isStartableStatusCode(statusCode api.StatusCode) error {
 	return nil
 }
 
+// isUserRequested returns whether the update action is user-requested.
+func (d *common) isUserRequested(actionType instance.UpdateAction) bool {
+	return actionType == instance.UpdateActionUser || actionType == instance.UpdateActionUserRefresh
+}
+
 // getStartupSnapNameAndExpiry returns the name and expiry for a snapshot to be taken at startup.
 func (d *common) getStartupSnapNameAndExpiry(inst instance.Instance) (string, *time.Time, error) {
 	schedule := strings.ToLower(d.expandedConfig["snapshots.schedule"])
@@ -831,7 +1595,7 @@ func (d *common) getStartupSnapNameAndExpiry(inst instance.Instance) (string, *t
 	}
 
 	triggers := strings.Split(schedule, ", ")
-	if !shared.ValueInSlice("@startup", triggers) {
+	if !slices.Contains(triggers, "@startup") {
 		return "", nil, nil
 	}
 
@@ -848,175 +1612,13 @@ func (d *common) getStartupSnapNameAndExpiry(inst instance.Instance) (string, *t
 	return name, &expiry, nil
 }
 
-// Internal MAAS handling.
-func (d *common) maasUpdate(inst instance.Instance, oldDevices map[string]map[string]string) error {
-	// Check if MAAS is configured
-	maasURL, _ := d.state.GlobalConfig.MAASController()
-
-	if maasURL == "" {
-		return nil
-	}
-
-	// Check if there's something that uses MAAS
-	interfaces, err := d.maasInterfaces(inst, d.expandedDevices.CloneNative())
-	if err != nil {
-		return err
-	}
-
-	var oldInterfaces []maas.ContainerInterface
-	if oldDevices != nil {
-		oldInterfaces, err = d.maasInterfaces(inst, oldDevices)
-		if err != nil {
-			return err
-		}
-	}
-
-	if len(interfaces) == 0 && len(oldInterfaces) == 0 {
-		return nil
-	}
-
-	// See if we're connected to MAAS
-	if d.state.MAAS == nil {
-		return fmt.Errorf("Can't perform the operation because MAAS is currently unavailable")
-	}
-
-	exists, err := d.state.MAAS.DefinedContainer(d)
-	if err != nil {
-		return err
-	}
-
-	if exists {
-		if len(interfaces) == 0 && len(oldInterfaces) > 0 {
-			return d.state.MAAS.DeleteContainer(d)
-		}
-
-		return d.state.MAAS.UpdateContainer(d, interfaces)
-	}
-
-	return d.state.MAAS.CreateContainer(d, interfaces)
-}
-
-func (d *common) maasInterfaces(inst instance.Instance, devices map[string]map[string]string) ([]maas.ContainerInterface, error) {
-	interfaces := []maas.ContainerInterface{}
-	for k, m := range devices {
-		if m["type"] != "nic" {
-			continue
-		}
-
-		if m["maas.subnet.ipv4"] == "" && m["maas.subnet.ipv6"] == "" {
-			continue
-		}
-
-		m, err := inst.FillNetworkDevice(k, m)
-		if err != nil {
-			return nil, err
-		}
-
-		subnets := []maas.ContainerInterfaceSubnet{}
-
-		// IPv4
-		if m["maas.subnet.ipv4"] != "" {
-			subnet := maas.ContainerInterfaceSubnet{
-				Name:    m["maas.subnet.ipv4"],
-				Address: m["ipv4.address"],
-			}
-
-			subnets = append(subnets, subnet)
-		}
-
-		// IPv6
-		if m["maas.subnet.ipv6"] != "" {
-			subnet := maas.ContainerInterfaceSubnet{
-				Name:    m["maas.subnet.ipv6"],
-				Address: m["ipv6.address"],
-			}
-
-			subnets = append(subnets, subnet)
-		}
-
-		iface := maas.ContainerInterface{
-			Name:       m["name"],
-			MACAddress: m["hwaddr"],
-			Subnets:    subnets,
-		}
-
-		interfaces = append(interfaces, iface)
-	}
-
-	return interfaces, nil
-}
-
-func (d *common) maasRename(inst instance.Instance, newName string) error {
-	maasURL, _ := d.state.GlobalConfig.MAASController()
-
-	if maasURL == "" {
-		return nil
-	}
-
-	interfaces, err := d.maasInterfaces(inst, d.expandedDevices.CloneNative())
-	if err != nil {
-		return err
-	}
-
-	if len(interfaces) == 0 {
-		return nil
-	}
-
-	if d.state.MAAS == nil {
-		return fmt.Errorf("Can't perform the operation because MAAS is currently unavailable")
-	}
-
-	exists, err := d.state.MAAS.DefinedContainer(d)
-	if err != nil {
-		return err
-	}
-
-	if !exists {
-		return d.maasUpdate(inst, nil)
-	}
-
-	return d.state.MAAS.RenameContainer(d, newName)
-}
-
-func (d *common) maasDelete(inst instance.Instance) error {
-	maasURL, _ := d.state.GlobalConfig.MAASController()
-
-	if maasURL == "" {
-		return nil
-	}
-
-	interfaces, err := d.maasInterfaces(inst, d.expandedDevices.CloneNative())
-	if err != nil {
-		return err
-	}
-
-	if len(interfaces) == 0 {
-		return nil
-	}
-
-	if d.state.MAAS == nil {
-		return fmt.Errorf("Can't perform the operation because MAAS is currently unavailable")
-	}
-
-	exists, err := d.state.MAAS.DefinedContainer(d)
-	if err != nil {
-		return err
-	}
-
-	if !exists {
-		return nil
-	}
-
-	return d.state.MAAS.DeleteContainer(d)
-}
-
 // validateStartup checks any constraints that would prevent start up from succeeding under normal circumstances.
 func (d *common) validateStartup(statusCode api.StatusCode) error {
 	// Because the root disk is special and is mounted before the root disk device is setup we duplicate the
 	// pre-start check here before the isStartableStatusCode check below so that if there is a problem loading
 	// the instance status because the storage pool isn't available we don't mask the StatusServiceUnavailable
 	// error with an ERROR status code from the instance check instead.
-	_, rootDiskConf, err := instancetype.GetRootDiskDevice(d.expandedDevices.CloneNative())
+	_, rootDiskConf, err := api.GetRootDiskDevice(d.expandedDevices.CloneNative())
 	if err != nil {
 		return err
 	}
@@ -1035,6 +1637,30 @@ func (d *common) validateStartup(statusCode api.StatusCode) error {
 	return nil
 }
 
+// Returns an api status code for any ongoing instance operations, or nil if no
+// operation is ongoing.
+func (d *common) operationStatusCode() *api.StatusCode {
+	op := operationlock.Get(d.Project().Name, d.Name())
+	if op != nil {
+		if op.Action() == operationlock.ActionStart {
+			stopped := api.Stopped
+			return &stopped
+		}
+
+		if op.Action() == operationlock.ActionStop {
+			if shared.IsTrue(d.LocalConfig()["volatile.last_state.ready"]) {
+				ready := api.Ready
+				return &ready
+			}
+
+			running := api.Running
+			return &running
+		}
+	}
+
+	return nil
+}
+
 // onStopOperationSetup creates or picks up the relevant operation. This is used in the stopns and stop hooks to
 // ensure that a lock on their activities is held before the instance process is stopped. This prevents a start
 // request run at the same time from overlapping with the stop process.
@@ -1046,7 +1672,7 @@ func (d *common) onStopOperationSetup(target string) (*operationlock.InstanceOpe
 	// If there is another ongoing operation that isn't in our inheritable list, wait until that has finished
 	// before proceeding to run the hook.
 	op := operationlock.Get(d.Project().Name, d.Name())
-	if op != nil && !op.ActionMatch(operationlock.ActionStart, operationlock.ActionRestart, operationlock.ActionStop, operationlock.ActionRestore) {
+	if op != nil && !op.ActionMatch(operationlock.ActionStart, operationlock.ActionRestart, operationlock.ActionStop, operationlock.ActionRestore, operationlock.ActionMigrate) {
 		d.logger.Debug("Waiting for existing operation lock to finish before running hook", logger.Ctx{"action": op.Action()})
 		_ = op.Wait(context.Background())
 		op = nil
@@ -1093,18 +1719,18 @@ func (d *common) canMigrate(inst instance.Instance) (migrate bool, live bool) {
 	config := d.ExpandedConfig()
 	val, ok := config["cluster.evacuate"]
 	if !ok {
-		val = "auto"
+		val = api.ClusterEvacuateModeAuto
 	}
 
-	if val == "migrate" {
+	if val == api.ClusterEvacuateModeMigrate {
 		return true, false
 	}
 
-	if val == "live-migrate" {
+	if val == api.ClusterEvacuateModeLiveMigrate {
 		return true, true
 	}
 
-	if val == "stop" {
+	if val == api.ClusterEvacuateModeStop {
 		return false, false
 	}
 
@@ -1144,7 +1770,7 @@ func (d *common) recordLastState() error {
 	d.expandedConfig["volatile.last_state.power"] = instance.PowerStateRunning
 
 	// Database updates
-	return d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	return d.state.DB.Cluster.Transaction(context.TODO(), func(_ context.Context, tx *db.ClusterTx) error {
 		// Record power state.
 		err = tx.UpdateInstancePowerState(d.id, instance.PowerStateRunning)
 		if err != nil {
@@ -1164,20 +1790,19 @@ func (d *common) recordLastState() error {
 }
 
 func (d *common) setCoreSched(pids []int) error {
-	if !d.state.OS.CoreScheduling {
+	if !d.state.OS.CoreScheduling.Load() {
 		return nil
 	}
 
 	args := []string{
 		"forkcoresched",
-		"0",
 	}
 
 	for _, pid := range pids {
 		args = append(args, strconv.Itoa(pid))
 	}
 
-	_, err := shared.RunCommand(d.state.OS.ExecPath, args...)
+	_, err := shared.RunCommand(context.Background(), d.state.OS.ExecPath, args...)
 	return err
 }
 
@@ -1197,7 +1822,7 @@ func (d *common) getRootDiskDevice() (string, map[string]string, error) {
 	}
 
 	// Retrieve the instance's storage pool.
-	name, configuration, err := instancetype.GetRootDiskDevice(devices.CloneNative())
+	name, configuration, err := api.GetRootDiskDevice(devices.CloneNative())
 	if err != nil {
 		return "", nil, err
 	}
@@ -1209,7 +1834,7 @@ func (d *common) getRootDiskDevice() (string, map[string]string, error) {
 func (d *common) resetInstanceID() error {
 	err := d.VolatileSet(map[string]string{"volatile.cloud-init.instance-id": uuid.New().String()})
 	if err != nil {
-		return fmt.Errorf("Failed to set volatile.cloud-init.instance-id: %w", err)
+		return fmt.Errorf("Failed setting volatile.cloud-init.instance-id: %w", err)
 	}
 
 	return nil
@@ -1226,7 +1851,14 @@ func (d *common) needsNewInstanceID(changedConfig []string, oldExpandedDevices d
 		"user.user-data",
 		"user.network-config",
 	} {
-		if shared.ValueInSlice(key, changedConfig) {
+		if slices.Contains(changedConfig, key) {
+			return true
+		}
+	}
+
+	// Additional SSH keys should also trigger an ID reset.
+	for _, key := range changedConfig {
+		if strings.HasPrefix(key, "cloud-init.ssh-keys.") {
 			return true
 		}
 	}
@@ -1261,13 +1893,13 @@ func (d *common) needsNewInstanceID(changedConfig []string, oldExpandedDevices d
 	newNames := getNICNames(d.expandedDevices)
 
 	for _, entry := range oldNames {
-		if !shared.ValueInSlice(entry, newNames) {
+		if !slices.Contains(newNames, entry) {
 			return true
 		}
 	}
 
 	for _, entry := range newNames {
-		if !shared.ValueInSlice(entry, oldNames) {
+		if !slices.Contains(oldNames, entry) {
 			return true
 		}
 	}
@@ -1311,13 +1943,13 @@ func (d *common) getStoragePool() (storagePools.Pool, error) {
 // getParentStoragePool retrieves the root disk device from the expanded devices.
 func (d *common) getParentStoragePool() (string, error) {
 	parentStoragePool := ""
-	parentLocalRootDiskDeviceKey, parentLocalRootDiskDevice, _ := instancetype.GetRootDiskDevice(d.ExpandedDevices().CloneNative())
+	parentLocalRootDiskDeviceKey, parentLocalRootDiskDevice, _ := api.GetRootDiskDevice(d.ExpandedDevices().CloneNative())
 	if parentLocalRootDiskDeviceKey != "" {
 		parentStoragePool = parentLocalRootDiskDevice["pool"]
 	}
 
 	if parentStoragePool == "" {
-		return "", fmt.Errorf("Instance's root device is missing the pool property")
+		return "", errors.New("Instance's root device is missing the pool property")
 	}
 
 	return parentStoragePool, nil
@@ -1329,20 +1961,20 @@ func (d *common) deviceLoad(inst instance.Instance, deviceName string, rawConfig
 	var err error
 
 	// Create copy of config and load some fields from volatile if device is nic or infiniband.
-	if shared.ValueInSlice(rawConfig["type"], []string{"nic", "infiniband"}) {
+	if slices.Contains([]string{"nic", "infiniband"}, rawConfig["type"]) {
 		configCopy, err = inst.FillNetworkDevice(deviceName, rawConfig)
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		// Othewise copy the config so it cannot be modified by device.
+		// Otherwise copy the config so it cannot be modified by device.
 		configCopy = rawConfig.Clone()
 	}
 
 	dev, err := device.New(inst, d.state, deviceName, configCopy, d.deviceVolatileGetFunc(deviceName), d.deviceVolatileSetFunc(deviceName))
 
 	// If validation fails with unsupported device type then don't return the device for use.
-	if errors.Is(err, device.ErrUnsupportedDevType) {
+	if err != nil && errors.Is(err, device.ErrUnsupportedDevType) {
 		return nil, err
 	}
 
@@ -1356,7 +1988,7 @@ func (d *common) deviceAdd(dev device.Device, instanceRunning bool) error {
 	l.Debug("Adding device")
 
 	if instanceRunning && !dev.CanHotPlug() {
-		return fmt.Errorf("Device cannot be added when instance is running")
+		return errors.New("Device cannot be added when instance is running")
 	}
 
 	return dev.Add()
@@ -1368,13 +2000,13 @@ func (d *common) deviceRemove(dev device.Device, instanceRunning bool) error {
 	l.Debug("Removing device")
 
 	if instanceRunning && !dev.CanHotPlug() {
-		return fmt.Errorf("Device cannot be removed when instance is running")
+		return errors.New("Device cannot be removed when instance is running")
 	}
 
 	return dev.Remove()
 }
 
-// devicesAdd adds devices to instance and registers with MAAS.
+// devicesAdd adds devices to instance.
 func (d *common) devicesAdd(inst instance.Instance, instanceRunning bool) (revert.Hook, error) {
 	revert := revert.New()
 	defer revert.Fail()
@@ -1403,19 +2035,11 @@ func (d *common) devicesAdd(inst instance.Instance, instanceRunning bool) (rever
 
 		err = d.deviceAdd(dev, instanceRunning)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to add device %q: %w", dev.Name(), err)
+			return nil, fmt.Errorf("Failed adding device %q: %w", dev.Name(), err)
 		}
 
 		revert.Add(func() { _ = d.deviceRemove(dev, instanceRunning) })
 	}
-
-	// Update MAAS (must run after the MAC addresses have been generated).
-	err := d.maasUpdate(inst, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	revert.Add(func() { _ = d.maasDelete(inst) })
 
 	cleanup := revert.Clone().Fail
 	revert.Success()
@@ -1438,7 +2062,7 @@ func (d *common) devicesRegister(inst instance.Instance) {
 		// Check whether device wants to register for any events.
 		err = dev.Register()
 		if err != nil {
-			d.logger.Error("Failed to register device", logger.Ctx{"err": err, "device": entry.Name})
+			d.logger.Error("Failed registering device", logger.Ctx{"err": err, "device": entry.Name})
 			continue
 		}
 	}
@@ -1451,7 +2075,7 @@ func (d *common) devicesUpdate(inst instance.Instance, removeDevices deviceConfi
 
 	dm, ok := inst.(deviceManager)
 	if !ok {
-		return nil, fmt.Errorf("Instance is not compatible with deviceManager interface")
+		return nil, errors.New("Instance is not compatible with deviceManager interface")
 	}
 
 	// Remove devices in reverse order to how they were added.
@@ -1469,14 +2093,19 @@ func (d *common) devicesUpdate(inst instance.Instance, removeDevices deviceConfi
 
 		// If a device was returned from deviceLoad even if validation fails, then try to stop and remove.
 		if dev != nil {
+			err = dev.PreRemoveCheck()
+			if err != nil {
+				return nil, fmt.Errorf("Failed pre-remove check for device %q: %w", dev.Name(), err)
+			}
+
 			if instanceRunning {
 				err = dm.deviceStop(dev, instanceRunning, "")
 				if err != nil {
-					return nil, fmt.Errorf("Failed to stop device %q: %w", dev.Name(), err)
+					return nil, fmt.Errorf("Failed stopping device %q: %w", dev.Name(), err)
 				}
 
 				devlxdEvents = append(devlxdEvents, map[string]any{
-					"action": "removed",
+					"action": agentAPI.DeviceRemoved,
 					"name":   entry.Name,
 					"config": entry.Config,
 				})
@@ -1484,7 +2113,7 @@ func (d *common) devicesUpdate(inst instance.Instance, removeDevices deviceConfi
 
 			err = d.deviceRemove(dev, instanceRunning)
 			if err != nil && err != device.ErrUnsupportedDevType {
-				return nil, fmt.Errorf("Failed to remove device %q: %w", dev.Name(), err)
+				return nil, fmt.Errorf("Failed removing device %q: %w", dev.Name(), err)
 			}
 		}
 
@@ -1493,7 +2122,7 @@ func (d *common) devicesUpdate(inst instance.Instance, removeDevices deviceConfi
 		// this device (as its an actual removal or a device type change).
 		err = d.deviceVolatileReset(entry.Name, entry.Config, addDevices[entry.Name])
 		if err != nil {
-			return nil, fmt.Errorf("Failed to reset volatile data for device %q: %w", entry.Name, err)
+			return nil, fmt.Errorf("Failed resetting volatile data for device %q: %w", entry.Name, err)
 		}
 	}
 
@@ -1520,12 +2149,12 @@ func (d *common) devicesUpdate(inst instance.Instance, removeDevices deviceConfi
 		err = d.deviceAdd(dev, instanceRunning)
 		if err != nil {
 			if userRequested {
-				return nil, fmt.Errorf("Failed to add device %q: %w", dev.Name(), err)
+				return nil, fmt.Errorf("Failed adding device %q: %w", dev.Name(), err)
 			}
 
 			// If update is non-user requested (i.e from a snapshot restore), there's nothing we can
 			// do to fix the config and we don't want to prevent the snapshot restore so log and allow.
-			l.Error("Failed to add device, skipping as non-user requested", logger.Ctx{"err": err})
+			l.Error("Failed adding device, skipping as non-user requested", logger.Ctx{"err": err})
 		}
 
 		revert.Add(func() { _ = d.deviceRemove(dev, instanceRunning) })
@@ -1538,25 +2167,38 @@ func (d *common) devicesUpdate(inst instance.Instance, removeDevices deviceConfi
 
 			runConf, err := dm.deviceStart(dev, instanceRunning)
 			if err != nil && err != device.ErrUnsupportedDevType {
-				return nil, fmt.Errorf("Failed to start device %q: %w", dev.Name(), err)
+				return nil, fmt.Errorf("Failed starting device %q: %w", dev.Name(), err)
 			}
 
 			revert.Add(func() { _ = dm.deviceStop(dev, instanceRunning, "") })
 
 			event := map[string]any{
-				"action": "added",
+				"action": agentAPI.DeviceAdded,
 				"name":   entry.Name,
 				"config": entry.Config,
 			}
 
 			if runConf != nil && len(runConf.Mounts) > 0 {
 				for _, opt := range runConf.Mounts[0].Opts {
-					if strings.HasPrefix(opt, "mountTag=") {
-						parts := strings.SplitN(opt, "=", 2)
-						event["mount"] = instancetype.VMAgentMount{
-							Source: parts[1],
-						}
+					key, value, _ := strings.Cut(opt, "=")
+					if key != "mountTag" {
+						continue
 					}
+
+					if value == "" {
+						return nil, errors.New(`Empty "mountTag" on device's mount options`)
+					}
+
+					agentMount := instancetype.VMAgentMount{
+						Source: value,
+					}
+
+					if shared.IsTrue(dev.Config()["readonly"]) {
+						// Tell the agent to mount with "ro" option for consistency.
+						agentMount.Options = []string{"ro"}
+					}
+
+					event["mount"] = agentMount
 				}
 			}
 
@@ -1591,11 +2233,11 @@ func (d *common) devicesUpdate(inst instance.Instance, removeDevices deviceConfi
 				if instanceRunning {
 					err = dm.deviceStop(dev, instanceRunning, "")
 					if err != nil {
-						l.Error("Failed to stop device after update validation failed", logger.Ctx{"err": err})
+						l.Error("Failed stopping device after update validation failed", logger.Ctx{"err": err})
 					}
 
 					devlxdEvents = append(devlxdEvents, map[string]any{
-						"action": "updated",
+						"action": agentAPI.DeviceUpdated,
 						"name":   entry.Name,
 						"config": entry.Config,
 					})
@@ -1603,7 +2245,7 @@ func (d *common) devicesUpdate(inst instance.Instance, removeDevices deviceConfi
 
 				err = d.deviceRemove(dev, instanceRunning)
 				if err != nil && err != device.ErrUnsupportedDevType {
-					l.Error("Failed to remove device after update validation failed", logger.Ctx{"err": err})
+					l.Error("Failed removing device after update validation failed", logger.Ctx{"err": err})
 				}
 			}
 
@@ -1612,7 +2254,7 @@ func (d *common) devicesUpdate(inst instance.Instance, removeDevices deviceConfi
 
 		err = dev.Update(oldExpandedDevices, instanceRunning)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to update device %q: %w", dev.Name(), err)
+			return nil, fmt.Errorf("Failed updating device %q: %w", dev.Name(), err)
 		}
 	}
 
@@ -1640,7 +2282,7 @@ func (d *common) devicesRemove(inst instance.Instance) {
 		if dev != nil {
 			err = d.deviceRemove(dev, false)
 			if err != nil {
-				d.logger.Error("Failed to remove device", logger.Ctx{"device": dev.Name(), "err": err})
+				d.logger.Error("Failed removing device", logger.Ctx{"device": dev.Name(), "err": err})
 			}
 		}
 	}
@@ -1673,16 +2315,64 @@ func (d *common) deleteSnapshots(deleteFunc func(snapInst instance.Instance) err
 	return nil
 }
 
-// removeUnixDevices reads the devices path and remove all unix devices.
-func (d *common) removeUnixDevices() error {
-	// Check that we indeed have devices to remove
-	if !shared.PathExists(d.DevicesPath()) {
-		return nil
+// checkRootVolumeNotInUse fails if the instance's root volume is in use on
+// another instance.
+func (d *common) checkRootVolumeNotInUse() error {
+	// Make sure that the instance's root volume is not attached to another instance
+	storagePool, err := d.getStoragePool()
+	if err != nil {
+		return err
 	}
 
+	rootVolumeType, err := storagePools.InstanceTypeToVolumeType(d.Type())
+	if err != nil {
+		return err
+	}
+
+	rootVolumeDBType, err := storagePools.VolumeTypeToDBType(rootVolumeType)
+	if err != nil {
+		return err
+	}
+
+	var rootVolume *db.StorageVolume
+	err = d.state.DB.Cluster.Transaction(d.state.ShutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+		rootVolume, err = tx.GetStoragePoolVolume(ctx, storagePool.ID(), d.Project().Name, rootVolumeDBType, d.Name(), true)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+
+	err = storagePools.VolumeUsedByProfileDevices(d.state, storagePool.Name(), d.Project().Name, &rootVolume.StorageVolume, func(_ int64, _ api.Profile, _ api.Project, _ []string) error {
+		return fmt.Errorf(`"%s/%s" is attached to a profile`, rootVolume.Type, rootVolume.Name)
+	})
+	if err != nil {
+		return err
+	}
+
+	err = storagePools.VolumeUsedByInstanceDevices(d.state, storagePool.Name(), d.Project().Name, &rootVolume.StorageVolume, false, func(inst db.InstanceArgs, _ api.Project, _ []string) error {
+		if inst.Name == d.Name() && inst.Project == d.Project().Name {
+			return nil
+		}
+
+		return fmt.Errorf(`"%s/%s" is attached to another instance`, rootVolume.Type, rootVolume.Name)
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// removeUnixDevices reads the devices path and remove all unix devices.
+func (d *common) removeUnixDevices() error {
 	// Load the directory listing
 	dents, err := os.ReadDir(d.DevicesPath())
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+
 		return err
 	}
 
@@ -1705,14 +2395,13 @@ func (d *common) removeUnixDevices() error {
 }
 
 func (d *common) removeDiskDevices() error {
-	// Check that we indeed have devices to remove
-	if !shared.PathExists(d.DevicesPath()) {
-		return nil
-	}
-
 	// Load the directory listing
 	dents, err := os.ReadDir(d.DevicesPath())
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+
 		return err
 	}
 
@@ -1730,7 +2419,431 @@ func (d *common) removeDiskDevices() error {
 		diskPath := filepath.Join(d.DevicesPath(), f.Name())
 		err := os.Remove(diskPath)
 		if err != nil {
-			d.logger.Error("Failed to remove disk device path", logger.Ctx{"err": err, "path": diskPath})
+			d.logger.Error("Failed removing disk device path", logger.Ctx{"err": err, "path": diskPath})
+		}
+	}
+
+	return nil
+}
+
+// validateConfig validates the configuration.
+func (d *common) validateConfig(allUpdatedDeviceKeys []string, addDevices deviceConfig.Devices, removeDevices deviceConfig.Devices, oldExpandedDevices deviceConfig.Devices, changedConfigKeys []string, oldExpandedConfig map[string]string, actionType instance.UpdateAction) error {
+	if shared.StringPrefixInSlice(deviceConfig.ConfigInitialPrefix, allUpdatedDeviceKeys) {
+		for devName, newDev := range addDevices {
+			for k, newVal := range newDev {
+				if !strings.HasPrefix(k, deviceConfig.ConfigInitialPrefix) {
+					continue
+				}
+
+				oldDev, ok := removeDevices[devName]
+				if !ok {
+					return fmt.Errorf("New device %q with initial configuration %q cannot be added once the instance is created", devName, k)
+				}
+
+				if actionType == instance.UpdateActionUserRefresh && k == deviceConfig.ConfigInitialPrefix+"zfs.promote" {
+					// Allow zfs.promote to be added only during refresh as this is needed for volume promotion.
+					continue
+				}
+
+				oldVal, ok := oldDev[k]
+				if !ok {
+					return fmt.Errorf("Device %q initial configuration %q cannot be added once the instance is created", devName, k)
+				}
+
+				// If newVal is an empty string it means the initial configuration has been removed.
+				if newVal != "" && newVal != oldVal {
+					return fmt.Errorf("Device %q initial configuration %q cannot be modified once the instance is created", devName, k)
+				}
+			}
+		}
+	}
+
+	userRequested := d.isUserRequested(actionType)
+
+	if userRequested {
+		// Look for deleted protected keys.
+		protectedKeys := map[string]struct{}{
+			"volatile.idmap.base":       {},
+			"volatile.idmap.current":    {},
+			"volatile.idmap.next":       {},
+			"volatile.last_state.idmap": {},
+			"volatile.uuid":             {},
+		}
+
+		for _, k := range changedConfigKeys {
+			_, protected := protectedKeys[k]
+			if !protected {
+				continue
+			}
+
+			if d.expandedConfig[k] == "" {
+				return fmt.Errorf("The protected %q config key cannot be deleted", k)
+			}
+		}
+
+		// Do some validation of the config diff (allows mixed instance types for profiles).
+		err := instance.ValidConfig(d.state.OS, d.expandedConfig, true, instancetype.Any)
+		if err != nil {
+			return fmt.Errorf("Invalid expanded config: %w", err)
+		}
+
+		// Do full expanded validation of the devices diff.
+		err = instance.ValidDevices(d.state, d.project, d.Type(), d.localDevices, d.expandedDevices)
+		if err != nil {
+			return fmt.Errorf("Invalid expanded devices: %w", err)
+		}
+
+		// Validate root device
+		_, oldRootDev, oldErr := api.GetRootDiskDevice(oldExpandedDevices.CloneNative())
+		_, newRootDev, newErr := api.GetRootDiskDevice(d.expandedDevices.CloneNative())
+		if oldErr == nil && newErr == nil && oldRootDev["pool"] != newRootDev["pool"] {
+			return fmt.Errorf("Cannot update root disk device pool name to %q", newRootDev["pool"])
+		}
+
+		// Ensure the instance has a root disk.
+		if newErr != nil {
+			return fmt.Errorf("Invalid root disk device: %w", newErr)
+		}
+
+		// If security.protection.start is being removed, we need to make sure that
+		// our root disk device is not attached to another instance.
+		if shared.IsTrue(oldExpandedConfig["security.protection.start"]) && shared.IsFalseOrEmpty(d.expandedConfig["security.protection.start"]) {
+			var dbVolType dbCluster.StoragePoolVolumeType
+			switch d.dbType {
+			case instancetype.Container:
+				dbVolType = dbCluster.StoragePoolVolumeTypeContainer
+			case instancetype.VM:
+				dbVolType = dbCluster.StoragePoolVolumeTypeVM
+			default:
+				return fmt.Errorf(`Unknown instance type %q for checking "security.protection.start" removal`, d.dbType)
+			}
+
+			// Proceed to allow removing security.protection.start.
+			err := allowRemoveSecurityProtectionStart(d.state, newRootDev["pool"], dbVolType, d.name, &d.project)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// migrateReceiveCustomVolumes receives the custom volumes attached to the instance from the migration source.
+// The index header frame is always sent by a source at index header version 3 or higher, even when the instance has
+// no attached custom volumes, so this never blocks waiting for a frame that is not coming. Snapshots follow the
+// same setting as the instance's own snapshots.
+func (d *common) migrateReceiveCustomVolumes(ctx context.Context, inst instance.Instance, conn io.ReadWriteCloser, indexHeaderVersion uint32, snapshots bool, attachedVolumes map[string]struct{}, reverter *revert.Reverter, progressReporter ioprogress.ProgressReporter) error {
+	buf, err := io.ReadAll(conn)
+	if err != nil {
+		return fmt.Errorf("Failed reading custom volume index header: %w", err)
+	}
+
+	info := migration.Info{}
+
+	err = json.Unmarshal(buf, &info)
+	if err != nil {
+		return fmt.Errorf("Failed decoding custom volume index header: %w", err)
+	}
+
+	if info.Config == nil {
+		return errors.New("Missing custom volume index header")
+	}
+
+	if len(info.Config.Volumes) == 0 {
+		return nil
+	}
+
+	storageProject := project.StorageVolumeProjectFromRecord(&d.project, dbCluster.StoragePoolVolumeTypeCustom)
+
+	// The index frame was already checked against the target's devices, but the source chooses this list
+	// separately, so the whole of it is validated before anything is received. One pass also keeps the
+	// users of the announced volumes to a single scan of the instance list. Each entry lines up with the
+	// volume of the same index, so the transfer loop reuses what was resolved here.
+	type announcedVolume struct {
+		pool   storagePools.Pool
+		exists bool
+	}
+
+	announced := make([]announcedVolume, 0, len(info.Config.Volumes))
+	existingVols := make([]*db.StorageVolume, 0, len(info.Config.Volumes))
+
+	for i, vol := range info.Config.Volumes {
+		if vol == nil {
+			return fmt.Errorf("Invalid custom volume index header entry at index %d", i)
+		}
+
+		if vol.Type != dbCluster.StoragePoolVolumeTypeNameCustom || vol.Name == "" || vol.Pool == "" || shared.IsSnapshot(vol.Name) {
+			return fmt.Errorf("Invalid custom volume %q at index header entry %d", vol.Name, i)
+		}
+
+		// The source picks what to send, so without this a source could create a volume the instance
+		// never used or overwrite an unrelated one that already exists on the target.
+		_, attached := attachedVolumes[vol.Pool+"/"+vol.Name]
+		if !attached {
+			return fmt.Errorf("Custom volume %q in pool %q is not attached to instance %q", vol.Name, vol.Pool, inst.Name())
+		}
+
+		volPool, err := storagePools.LoadByName(d.state, vol.Pool)
+		if err != nil {
+			return fmt.Errorf("Failed loading storage pool %q for custom volume %q: %w", vol.Pool, vol.Name, err)
+		}
+
+		dbVol, err := storagePools.VolumeDBGet(volPool, storageProject, vol.Name, storageDrivers.VolumeTypeCustom)
+		if err != nil && !response.IsNotFoundError(err) {
+			return fmt.Errorf("Failed checking for custom volume %q in pool %q: %w", vol.Name, vol.Pool, err)
+		}
+
+		if dbVol != nil {
+			// A refresh writes into the volume that is already here, which only works when both sides
+			// agree on what kind of volume it is.
+			if dbVol.ContentType != vol.ContentType {
+				return fmt.Errorf("Custom volume %q in pool %q has content type %q on the target but %q on the source", vol.Name, vol.Pool, dbVol.ContentType, vol.ContentType)
+			}
+
+			existingVols = append(existingVols, dbVol)
+		}
+
+		announced = append(announced, announcedVolume{pool: volPool, exists: dbVol != nil})
+	}
+
+	// A volume another instance here attaches must never be overwritten by a migration.
+	others, err := d.otherVolumeUsers(inst, existingVols)
+	if err != nil {
+		return err
+	}
+
+	for _, vol := range info.Config.Volumes {
+		if len(others[vol.Pool+"/"+vol.Name]) > 0 {
+			return fmt.Errorf("Custom volume %q in pool %q is attached to another instance on the target", vol.Name, vol.Pool)
+		}
+	}
+
+	for i, vol := range info.Config.Volumes {
+		volPool := announced[i].pool
+		exists := announced[i].exists
+
+		offer := &migration.MigrationHeader{}
+
+		err = migration.ProtoRecvFrame(conn, offer)
+		if err != nil {
+			return fmt.Errorf("Failed reading migration offer for custom volume %q: %w", vol.Name, err)
+		}
+
+		contentType := storageDrivers.ContentType(vol.ContentType)
+
+		// The source never sets Refresh in the offer header, but MatchTypes needs it to pick the right types.
+		offer.Refresh = &exists
+
+		respTypes, err := migration.MatchTypes(offer, storagePools.FallbackMigrationType(contentType), volPool.MigrationTypes(contentType, exists, snapshots))
+		if err != nil {
+			return fmt.Errorf("Failed negotiating migration options for custom volume %q: %w", vol.Name, err)
+		}
+
+		respHeader := migration.TypesToHeader(respTypes...)
+		respHeader.Refresh = &exists
+		respHeader.IndexHeaderVersion = &indexHeaderVersion
+		respHeader.Snapshots = offer.Snapshots
+		respHeader.SnapshotNames = offer.SnapshotNames
+
+		// On a refresh only the snapshots the target is missing are requested, and target snapshots the
+		// source no longer has are deleted first, matching the root volume.
+		if exists && snapshots {
+			respHeader.Snapshots, respHeader.SnapshotNames, err = storagePools.CustomVolumeSnapshotsToSync(ctx, volPool, storageProject, vol.Name, offer.GetSnapshots(), progressReporter)
+			if err != nil {
+				return fmt.Errorf("Failed comparing snapshots of custom volume %q in pool %q: %w", vol.Name, vol.Pool, err)
+			}
+		}
+
+		err = migration.ProtoSendFrame(conn, respHeader)
+		if err != nil {
+			return fmt.Errorf("Failed sending migration response for custom volume %q: %w", vol.Name, err)
+		}
+
+		volTargetArgs := migration.VolumeTargetArgs{
+			IndexHeaderVersion: indexHeaderVersion,
+			Name:               vol.Name,
+			Description:        vol.Description,
+			Config:             vol.Config,
+			MigrationType:      respTypes[0],
+			TrackProgress:      true,
+			Refresh:            exists,
+			ContentType:        vol.ContentType,
+			VolumeOnly:         !snapshots,
+		}
+
+		// A zero length Snapshots slice indicates volume only migration in VolumeTargetArgs, so it is only
+		// populated when snapshots were requested.
+		if snapshots {
+			volTargetArgs.Snapshots = respHeader.SnapshotNames
+		}
+
+		err = volPool.CreateCustomVolumeFromMigration(ctx, storageProject, conn, volTargetArgs, progressReporter)
+		if err != nil {
+			return fmt.Errorf("Failed receiving custom volume %q into pool %q: %w", vol.Name, vol.Pool, err)
+		}
+
+		// Only volumes created by this transfer are removed on failure, refreshed volumes keep their partial
+		// state like the root volume does.
+		if !exists {
+			reverter.Add(func() {
+				// The errgroup context is already cancelled when reverts run.
+				_ = volPool.DeleteCustomVolume(context.Background(), storageProject, vol.Name, nil)
+			})
+		}
+	}
+
+	return nil
+}
+
+// migrationCustomVolumes returns the backup config of the custom volumes that travel with the instance. Snapshots are
+// included when requested, matching the instance's own snapshots.
+func (d *common) migrationCustomVolumes(inst instance.Instance, pool storagePools.Pool, diskVolumesMode string, snapshots bool, progressReporter ioprogress.ProgressReporter) (*backupConfig.Config, error) {
+	// The section is opt in. The frame still goes out for any other mode so that both sides stay in step
+	// at index header version 3, but it lists nothing.
+	if diskVolumesMode != api.DiskVolumesModeAllExclusive {
+		return &backupConfig.Config{Version: api.BackupMetadataVersion2}, nil
+	}
+
+	// A project that inherits its volumes owns none of them, and the snapshot and restore APIs already
+	// refuse to act on them from the instance. Migration follows the same rule, so those volumes stay
+	// where they are and must exist on the target beforehand.
+	instProject := inst.Project()
+	if project.StorageVolumeProjectFromRecord(&instProject, dbCluster.StoragePoolVolumeTypeCustom) != instProject.Name {
+		return &backupConfig.Config{Version: api.BackupMetadataVersion2}, nil
+	}
+
+	instConfig, err := pool.GenerateInstanceCustomVolumeBackupConfig(inst, nil, snapshots, progressReporter)
+	if err != nil {
+		return nil, fmt.Errorf("Failed generating custom volume index header: %w", err)
+	}
+
+	vols := make([]*db.StorageVolume, 0, len(instConfig.Volumes))
+	for i, vol := range instConfig.Volumes {
+		if vol == nil {
+			return nil, fmt.Errorf("Custom volume index header contains nil volume at index %d", i)
+		}
+
+		vols = append(vols, &db.StorageVolume{StorageVolume: vol.StorageVolume})
+	}
+
+	// Only volumes used by this instance alone travel with it, counted over effective devices the way the
+	// all-exclusive snapshot counts them: another instance makes a volume shared, a profile reference on its
+	// own does not. Shared volumes need group placement, which is out of scope. A profile device that is
+	// missing on the target is caught there, when the index header is checked against the effective config.
+	others, err := d.otherVolumeUsers(inst, vols)
+	if err != nil {
+		return nil, err
+	}
+
+	volsConfig := &backupConfig.Config{Version: api.BackupMetadataVersion2}
+
+	for _, vol := range instConfig.Volumes {
+		if len(others[vol.Pool+"/"+vol.Name]) > 0 {
+			continue
+		}
+
+		volsConfig.Volumes = append(volsConfig.Volumes, vol)
+	}
+
+	// The target only reads Volumes and always uses its own pool of the same name, so the pool config the
+	// generator produces for backup.yaml is left out of the frames.
+	return volsConfig, nil
+}
+
+// migrateSendCustomVolumes sends the instance's exclusively attached custom volumes to the migration target.
+// The index header frame is sent even when there is no volume to send, so the target never blocks on it.
+func (d *common) migrateSendCustomVolumes(conn io.ReadWriteCloser, indexHeaderVersion uint32, snapshots bool, volsConfig *backupConfig.Config, progressReporter ioprogress.ProgressReporter) error {
+	headerJSON, err := json.Marshal(migration.Info{Config: volsConfig})
+	if err != nil {
+		return fmt.Errorf("Failed encoding custom volume index header: %w", err)
+	}
+
+	err = shared.WriteAll(conn, headerJSON)
+	if err != nil {
+		return fmt.Errorf("Failed sending custom volume index header: %w", err)
+	}
+
+	err = conn.Close() // End the frame.
+	if err != nil {
+		return fmt.Errorf("Failed closing custom volume index header frame: %w", err)
+	}
+
+	storageProject := project.StorageVolumeProjectFromRecord(&d.project, dbCluster.StoragePoolVolumeTypeCustom)
+
+	for _, vol := range volsConfig.Volumes {
+		volPool, err := storagePools.LoadByName(d.state, vol.Pool)
+		if err != nil {
+			return fmt.Errorf("Failed loading storage pool %q for custom volume %q: %w", vol.Pool, vol.Name, err)
+		}
+
+		contentType := storageDrivers.ContentType(vol.ContentType)
+
+		types := volPool.MigrationTypes(contentType, false, snapshots)
+		if len(types) == 0 {
+			return fmt.Errorf("No source migration types available for custom volume %q", vol.Name)
+		}
+
+		offer := migration.TypesToHeader(types...)
+		offer.IndexHeaderVersion = &indexHeaderVersion
+		offer.SnapshotNames = make([]string, 0, len(vol.Snapshots))
+		offer.Snapshots = make([]*migration.Snapshot, 0, len(vol.Snapshots))
+		for _, snap := range vol.Snapshots {
+			offer.SnapshotNames = append(offer.SnapshotNames, snap.Name)
+			offer.Snapshots = append(offer.Snapshots, migration.VolumeSnapshotToProtobuf(snap))
+		}
+
+		err = migration.ProtoSendFrame(conn, offer)
+		if err != nil {
+			return fmt.Errorf("Failed sending migration offer for custom volume %q: %w", vol.Name, err)
+		}
+
+		resp := &migration.MigrationHeader{}
+
+		err = migration.ProtoRecvFrame(conn, resp)
+		if err != nil {
+			return fmt.Errorf("Failed reading migration response for custom volume %q: %w", vol.Name, err)
+		}
+
+		matched, err := migration.MatchTypes(resp, storagePools.FallbackMigrationType(contentType), types)
+		if err != nil {
+			return fmt.Errorf("Failed negotiating migration options for custom volume %q: %w", vol.Name, err)
+		}
+
+		// On a refresh the target replies with only the snapshots it is missing, so the per volume index
+		// frame and the transfer are trimmed to that set.
+		snapshotNames := offer.SnapshotNames
+		volSnapshots := vol.Snapshots
+		if resp.GetRefresh() {
+			snapshotNames = resp.GetSnapshotNames()
+			volSnapshots = make([]*api.StorageVolumeSnapshot, 0, len(snapshotNames))
+			for _, snap := range vol.Snapshots {
+				if slices.Contains(snapshotNames, snap.Name) {
+					volSnapshots = append(volSnapshots, snap)
+				}
+			}
+		}
+
+		// The per volume index frame describes a single custom volume, so it carries only that volume.
+		volCopy := *vol
+		volCopy.Snapshots = volSnapshots
+		volConfig := &backupConfig.Config{Version: api.BackupMetadataVersion2, Volumes: []*backupConfig.Volume{&volCopy}}
+
+		volSourceArgs := &migration.VolumeSourceArgs{
+			IndexHeaderVersion: indexHeaderVersion,
+			Name:               vol.Name,
+			Snapshots:          snapshotNames,
+			MigrationType:      matched[0],
+			TrackProgress:      true,
+			ContentType:        vol.ContentType,
+			Refresh:            resp.GetRefresh(),
+			VolumeOnly:         !snapshots,
+			Info:               &migration.Info{Config: volConfig},
+		}
+
+		err = volPool.MigrateCustomVolume(storageProject, conn, volSourceArgs, progressReporter)
+		if err != nil {
+			return fmt.Errorf("Failed sending custom volume %q from pool %q: %w", vol.Name, vol.Pool, err)
 		}
 	}
 

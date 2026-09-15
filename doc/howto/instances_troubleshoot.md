@@ -1,5 +1,5 @@
 ---
-discourse: 7362
+discourse: lxc:[How&#32;to&#32;best&#32;ask&#32;questions&#32;on&#32;Discourse](7362)
 ---
 
 (instances-troubleshoot)=
@@ -56,7 +56,7 @@ To troubleshoot the problem, complete the following steps:
 1. Try starting your instance again.
    If the error occurs again, compare the logs to check if it is the same error.
 
-   If it is, and if you cannot figure out the source of the error from the log information, open a question in the [forum](https://discourse.ubuntu.com/c/lxd/126).
+   If it is, and if you cannot figure out the source of the error from the log information, open a question in the [forum](https://discourse.ubuntu.com/c/project/lxd/126).
    Make sure to include the log files you collected.
 
 ## Troubleshooting examples
@@ -65,7 +65,7 @@ See the following sections for some typical methods of troubleshooting an instan
 
 ### Debug `systemd` `init`
 
-Here is how to enable `systemd` [debug level messages](https://www.freedesktop.org/wiki/Software/systemd/Debugging/) for the `c1` container:
+Here is how to enable `systemd` [debug level messages](https://systemd.io/DEBUGGING/) for the `c1` container:
 
 ```sh
 lxc config set c1 raw.lxc 'lxc.init.cmd = /sbin/init systemd.log_level=debug'
@@ -100,7 +100,7 @@ lxc console c1
 In this example, let's investigate a RHEL 7 system in which `systemd` cannot start.
 
 ```{terminal}
-:input: lxc console --show-log rhel7
+lxc console --show-log rhel7
 
 Console log:
 
@@ -126,10 +126,15 @@ This is equivalent to setting `init=/bin/bash` on the Linux kernel command line.
 Here is what it looks like:
 
 ```{terminal}
-:input: lxc config set rhel7 raw.lxc 'lxc.init.cmd = /bin/bash'
+lxc config set rhel7 raw.lxc 'lxc.init.cmd = /bin/bash'
+```
 
-:input: lxc start rhel7
-:input: lxc console --show-log rhel7
+```{terminal}
+lxc start rhel7
+```
+
+```{terminal}
+lxc console --show-log rhel7
 
 Console log:
 
@@ -139,7 +144,7 @@ Console log:
 Now that the container has started, you can check it and see that things are not running as well as expected:
 
 ```{terminal}
-:input: lxc exec rhel7 -- bash
+lxc exec rhel7 -- bash
 
 [root@rhel7 ~]# ls
 [root@rhel7 ~]# mount

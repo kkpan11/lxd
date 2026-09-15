@@ -3,12 +3,15 @@ package schema
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"net/http"
+	"slices"
 	"sort"
 	"strings"
 
 	"github.com/canonical/lxd/lxd/db/query"
-	"github.com/canonical/lxd/shared"
+	"github.com/canonical/lxd/shared/api"
 )
 
 // Schema captures the schema of a database in terms of a series of ordered
@@ -54,7 +57,7 @@ func New(updates []Update) *Schema {
 // see also PR #3704.
 func NewFromMap(versionsToUpdates map[int]Update) *Schema {
 	// Collect all version keys.
-	versions := []int{}
+	versions := make([]int, 0, len(versionsToUpdates))
 	for version := range versionsToUpdates {
 		versions = append(versions, version)
 	}
@@ -63,7 +66,7 @@ func NewFromMap(versionsToUpdates map[int]Update) *Schema {
 	sort.Ints(versions)
 
 	// Build the updates slice.
-	updates := []Update{}
+	updates := make([]Update, 0, len(versions))
 	for i, version := range versions {
 		// Assert that we start from 1 and there are no gaps.
 		if version != i+1 {
@@ -137,11 +140,11 @@ func (s *Schema) File(path string) {
 // initial version that the schema has been upgraded from.
 func (s *Schema) Ensure(db *sql.DB) (int, error) {
 	var current int
-	aborted := false
+	var gracefulAbortErr error
 	err := query.Transaction(context.TODO(), db, func(ctx context.Context, tx *sql.Tx) error {
 		err := execFromFile(ctx, tx, s.path, s.hook)
 		if err != nil {
-			return fmt.Errorf("failed to execute queries from %s: %w", s.path, err)
+			return fmt.Errorf("failed executing queries from %s: %w", s.path, err)
 		}
 
 		err = ensureSchemaTableExists(ctx, tx)
@@ -156,14 +159,13 @@ func (s *Schema) Ensure(db *sql.DB) (int, error) {
 
 		if s.check != nil {
 			err := s.check(ctx, current, tx)
-			if err == ErrGracefulAbort {
-				// Abort the update gracefully, committing what
-				// we've done so far.
-				aborted = true
-				return nil
-			}
-
 			if err != nil {
+				if api.StatusErrorCheck(err, http.StatusPreconditionFailed) {
+					// Abort the update gracefully, committing what we've done so far.
+					gracefulAbortErr = err
+					return nil
+				}
+
 				return err
 			}
 		}
@@ -188,8 +190,8 @@ func (s *Schema) Ensure(db *sql.DB) (int, error) {
 		return -1, err
 	}
 
-	if aborted {
-		return current, ErrGracefulAbort
+	if gracefulAbortErr != nil {
+		return current, gracefulAbortErr
 	}
 
 	return current, nil
@@ -202,6 +204,7 @@ func (s *Schema) Ensure(db *sql.DB) (int, error) {
 // It requires that all patches in this schema have been applied, otherwise an
 // error will be returned.
 func (s *Schema) Dump(db *sql.DB) (string, error) {
+	//nolint:prealloc
 	var statements []string
 	err := query.Transaction(context.TODO(), db, func(ctx context.Context, tx *sql.Tx) error {
 		err := checkAllUpdatesAreApplied(ctx, tx, s.updates)
@@ -252,14 +255,14 @@ func (s *Schema) ExerciseUpdate(version int, hook func(*sql.DB)) (*sql.DB, error
 	// Create an in-memory database.
 	db, err := sql.Open("sqlite3", ":memory:?_foreign_keys=1")
 	if err != nil {
-		return nil, fmt.Errorf("failed to open memory database: %w", err)
+		return nil, fmt.Errorf("failed opening memory database: %w", err)
 	}
 
 	// Apply all updates to the given version, excluded.
 	trimmed := s.Trim(version - 1)
 	_, err = s.Ensure(db)
 	if err != nil {
-		return nil, fmt.Errorf("failed to apply previous updates: %w", err)
+		return nil, fmt.Errorf("failed applying previous updates: %w", err)
 	}
 
 	// Execute the optional hook.
@@ -271,7 +274,7 @@ func (s *Schema) ExerciseUpdate(version int, hook func(*sql.DB)) (*sql.DB, error
 	s.Add(trimmed[0])
 	_, err = s.Ensure(db)
 	if err != nil {
-		return nil, fmt.Errorf("failed to apply given update: %w", err)
+		return nil, fmt.Errorf("failed applying given update: %w", err)
 	}
 
 	return db, nil
@@ -281,13 +284,13 @@ func (s *Schema) ExerciseUpdate(version int, hook func(*sql.DB)) (*sql.DB, error
 func ensureSchemaTableExists(ctx context.Context, tx *sql.Tx) error {
 	exists, err := DoesSchemaTableExist(ctx, tx)
 	if err != nil {
-		return fmt.Errorf("failed to check if schema table is there: %w", err)
+		return fmt.Errorf("failed checking if schema table is there: %w", err)
 	}
 
 	if !exists {
 		err := createSchemaTable(tx)
 		if err != nil {
-			return fmt.Errorf("failed to create schema table: %w", err)
+			return fmt.Errorf("failed creating schema table: %w", err)
 		}
 	}
 	return nil
@@ -298,20 +301,20 @@ func ensureSchemaTableExists(ctx context.Context, tx *sql.Tx) error {
 func queryCurrentVersion(ctx context.Context, tx *sql.Tx) (int, error) {
 	versions, err := selectSchemaVersions(ctx, tx)
 	if err != nil {
-		return -1, fmt.Errorf("failed to fetch update versions: %w", err)
+		return -1, fmt.Errorf("failed fetching update versions: %w", err)
 	}
 
 	// Fix bad upgrade code between 30 and 32
-	hasVersion := func(v int) bool { return shared.ValueInSlice(v, versions) }
+	hasVersion := func(v int) bool { return slices.Contains(versions, v) }
 	if hasVersion(30) && hasVersion(32) && !hasVersion(31) {
 		err = insertSchemaVersion(tx, 31)
 		if err != nil {
-			return -1, fmt.Errorf("failed to insert missing schema version 31")
+			return -1, errors.New("failed inserting missing schema version 31")
 		}
 
 		versions, err = selectSchemaVersions(ctx, tx)
 		if err != nil {
-			return -1, fmt.Errorf("failed to fetch update versions: %w", err)
+			return -1, fmt.Errorf("failed fetching update versions: %w", err)
 		}
 	}
 
@@ -319,14 +322,14 @@ func queryCurrentVersion(ctx context.Context, tx *sql.Tx) (int, error) {
 	if hasVersion(37) && !hasVersion(38) {
 		count, err := query.Count(ctx, tx, "config", "key = 'cluster.https_address'")
 		if err != nil {
-			return -1, fmt.Errorf("Failed to check if cluster.https_address is set: %w", err)
+			return -1, fmt.Errorf("Failed checking if cluster.https_address is set: %w", err)
 		}
 
 		if count == 1 {
 			// Insert the missing version.
 			err := insertSchemaVersion(tx, 38)
 			if err != nil {
-				return -1, fmt.Errorf("Failed to insert missing schema version 38")
+				return -1, errors.New("Failed inserting missing schema version 38")
 			}
 
 			versions = append(versions, 38)
@@ -365,19 +368,19 @@ func ensureUpdatesAreApplied(ctx context.Context, tx *sql.Tx, current int, updat
 			err := hook(ctx, current, tx)
 			if err != nil {
 				return fmt.Errorf(
-					"failed to execute hook (version %d): %v", current, err)
+					"failed executing hook (version %d): %v", current, err)
 			}
 		}
 		err := update(ctx, tx)
 		if err != nil {
-			return fmt.Errorf("failed to apply update %d: %w", current, err)
+			return fmt.Errorf("failed applying update %d: %w", current, err)
 		}
 
 		current++
 
 		err = insertSchemaVersion(tx, current)
 		if err != nil {
-			return fmt.Errorf("failed to insert version %d", current)
+			return fmt.Errorf("failed inserting version %d", current)
 		}
 	}
 
@@ -400,11 +403,11 @@ func checkSchemaVersionsHaveNoHoles(versions []int) error {
 func checkAllUpdatesAreApplied(ctx context.Context, tx *sql.Tx, updates []Update) error {
 	versions, err := selectSchemaVersions(ctx, tx)
 	if err != nil {
-		return fmt.Errorf("failed to fetch update versions: %w", err)
+		return fmt.Errorf("failed fetching update versions: %w", err)
 	}
 
 	if len(versions) == 0 {
-		return fmt.Errorf("expected schema table to contain at least one row")
+		return errors.New("expected schema table to contain at least one row")
 	}
 
 	err = checkSchemaVersionsHaveNoHoles(versions)
@@ -433,7 +436,7 @@ func formatSQL(statement string) string {
 			continue
 		}
 
-		lines[i] = strings.Replace(line, ", ", ",\n    ", -1)
+		lines[i] = strings.ReplaceAll(line, ", ", ",\n    ")
 	}
 
 	return strings.Join(lines, "\n")

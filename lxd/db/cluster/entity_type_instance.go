@@ -2,10 +2,14 @@ package cluster
 
 import (
 	"fmt"
+
+	"github.com/canonical/lxd/lxd/db/query"
 )
 
 // entityTypeInstance implements entityTypeDBInfo for an Instance.
-type entityTypeInstance struct{}
+type entityTypeInstance struct {
+	entityTypeCommon
+}
 
 func (e entityTypeInstance) code() int64 {
 	return entityTypeCodeInstance
@@ -19,35 +23,17 @@ JOIN projects ON instances.project_id = projects.id`, e.code())
 }
 
 func (e entityTypeInstance) urlsByProjectQuery() string {
-	return fmt.Sprintf(`%s WHERE projects.name = ?`, e.allURLsQuery())
+	return e.allURLsQuery() + " WHERE projects.name = ?"
 }
 
-func (e entityTypeInstance) urlByIDQuery() string {
-	return fmt.Sprintf(`%s WHERE instances.id = ?`, e.allURLsQuery())
+func (e entityTypeInstance) urlsByIDsQuery(ids ...int64) string {
+	return e.allURLsQuery() + " WHERE instances.id IN " + query.IntParams(ids...)
 }
 
 func (e entityTypeInstance) idFromURLQuery() string {
-	return `
-SELECT ?, instances.id 
-FROM instances 
-JOIN projects ON instances.project_id = projects.id 
-WHERE projects.name = ? 
-	AND '' = ? 
-	AND instances.name = ?`
+	return projectEntityIDFromURLQuery("instances")
 }
 
 func (e entityTypeInstance) onDeleteTriggerSQL() (name string, sql string) {
-	name = "on_instance_delete"
-	return name, fmt.Sprintf(`
-CREATE TRIGGER %s
-	AFTER DELETE ON instances
-	BEGIN
-	DELETE FROM auth_groups_permissions 
-		WHERE entity_type = %d 
-		AND entity_id = OLD.id;
-	DELETE FROM warnings
-		WHERE entity_type_code = %d
-		AND entity_id = OLD.id;
-	END
-`, name, e.code(), e.code())
+	return standardOnDeleteTriggerSQL("on_instance_delete", "instances", e.code())
 }

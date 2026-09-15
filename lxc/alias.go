@@ -1,13 +1,18 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"sort"
 
 	"github.com/spf13/cobra"
+	"go.yaml.in/yaml/v2"
 
+	"github.com/canonical/lxd/shared"
 	cli "github.com/canonical/lxd/shared/cmd"
-	"github.com/canonical/lxd/shared/i18n"
+	"github.com/canonical/lxd/shared/termios"
 )
 
 type cmdAlias struct {
@@ -19,9 +24,8 @@ type cmdAlias struct {
 func (c *cmdAlias) command() *cobra.Command {
 	cmd := &cobra.Command{}
 	cmd.Use = usage("alias")
-	cmd.Short = i18n.G("Manage command aliases")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Manage command aliases`))
+	cmd.Short = "Manage command aliases"
+	cmd.Long = cli.FormatSection("Description", cmd.Short)
 
 	// Add
 	aliasAddCmd := cmdAliasAdd{global: c.global, alias: c}
@@ -39,6 +43,14 @@ func (c *cmdAlias) command() *cobra.Command {
 	aliasRemoveCmd := cmdAliasRemove{global: c.global, alias: c}
 	cmd.AddCommand(aliasRemoveCmd.command())
 
+	// Show
+	aliasShowCmd := cmdAliasShow{global: c.global, alias: c}
+	cmd.AddCommand(aliasShowCmd.command())
+
+	// Edit
+	aliasEditCmd := cmdAliasEdit{global: c.global, alias: c}
+	cmd.AddCommand(aliasEditCmd.command())
+
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
 	cmd.Args = cobra.NoArgs
 	cmd.Run = func(cmd *cobra.Command, args []string) { _ = cmd.Usage() }
@@ -55,13 +67,11 @@ type cmdAliasAdd struct {
 // It specifies the command usage, description, and examples, and links it to the RunE method for execution logic.
 func (c *cmdAliasAdd) command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("add", i18n.G("<alias> <target>"))
-	cmd.Short = i18n.G("Add new aliases")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Add new aliases`))
-	cmd.Example = cli.FormatSection("", i18n.G(
-		`lxc alias add list "list -c ns46S"
-    Overwrite the "list" command to pass -c ns46S.`))
+	cmd.Use = usage("add", "<alias> <target>")
+	cmd.Short = "Add new alias"
+	cmd.Long = cli.FormatSection("Description", cmd.Short)
+	cmd.Example = cli.FormatSection("", `lxc alias add list "list -c ns46S"
+    Overwrite the "list" command to pass -c ns46S.`)
 
 	cmd.RunE = c.run
 
@@ -82,7 +92,7 @@ func (c *cmdAliasAdd) run(cmd *cobra.Command, args []string) error {
 	// Look for an existing alias
 	_, ok := conf.Aliases[args[0]]
 	if ok {
-		return fmt.Errorf(i18n.G("Alias %s already exists"), args[0])
+		return fmt.Errorf("Alias %s already exists", args[0])
 	}
 
 	// Add the new alias
@@ -93,11 +103,26 @@ func (c *cmdAliasAdd) run(cmd *cobra.Command, args []string) error {
 }
 
 // List.
+// aliasListEntry represents a row in the alias list output, combining an alias name with its target.
+type aliasListEntry struct {
+	name   string
+	target string
+}
+
 type cmdAliasList struct {
 	global *cmdGlobal
 	alias  *cmdAlias
 
-	flagFormat string
+	flagFormat  string
+	flagColumns string
+}
+
+// columns returns the ordered column definitions for alias list.
+func (c *cmdAliasList) columns() []cli.ShorthandColumn[aliasListEntry] {
+	return []cli.ShorthandColumn[aliasListEntry]{
+		{Shorthand: 'a', Name: "ALIAS", Data: c.aliasColumnData},
+		{Shorthand: 't', Name: "TARGET", Data: c.targetColumnData},
+	}
 }
 
 // Command is a method of the cmdAliasList structure that returns a new cobra Command for listing command aliases.
@@ -106,10 +131,10 @@ func (c *cmdAliasList) command() *cobra.Command {
 	cmd := &cobra.Command{}
 	cmd.Use = usage("list")
 	cmd.Aliases = []string{"ls"}
-	cmd.Short = i18n.G("List aliases")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`List aliases`))
-	cmd.Flags().StringVarP(&c.flagFormat, "format", "f", "table", i18n.G("Format (csv|json|table|yaml|compact)")+"``")
+	cmd.Short = "List aliases"
+	cmd.Long = cli.FormatSection("Description", cmd.Short)
+	cmd.Flags().StringVarP(&c.flagFormat, "format", "f", "table", cli.FormatStringFlagLabel("Format (csv|json|table|yaml|compact)"))
+	cmd.Flags().StringVarP(&c.flagColumns, "columns", "c", cli.DefaultColumnString(c.columns()), cli.FormatStringFlagLabel("Columns"))
 
 	cmd.RunE = c.run
 
@@ -127,20 +152,31 @@ func (c *cmdAliasList) run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// List the aliases
-	data := [][]string{}
+	// Parse column flags.
+	columns, err := cli.ParseShorthandColumns(c.flagColumns, c.columns())
+	if err != nil {
+		return err
+	}
+
+	// List the aliases.
+	entries := make([]aliasListEntry, 0, len(conf.Aliases))
 	for k, v := range conf.Aliases {
-		data = append(data, []string{k, v})
+		entries = append(entries, aliasListEntry{name: k, target: v})
 	}
 
+	data := cli.ColumnData(columns, entries)
 	sort.Sort(cli.SortColumnsNaturally(data))
-
-	header := []string{
-		i18n.G("ALIAS"),
-		i18n.G("TARGET"),
-	}
+	header := cli.ColumnHeaders(columns)
 
 	return cli.RenderTable(c.flagFormat, header, data, conf.Aliases)
+}
+
+func (c *cmdAliasList) aliasColumnData(entry aliasListEntry) string {
+	return entry.name
+}
+
+func (c *cmdAliasList) targetColumnData(entry aliasListEntry) string {
+	return entry.target
 }
 
 // Rename.
@@ -153,14 +189,12 @@ type cmdAliasRename struct {
 // This command allows a user to rename existing aliases in the CLI application.
 func (c *cmdAliasRename) command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("rename", i18n.G("<old alias> <new alias>"))
+	cmd.Use = usage("rename", "<old alias> <new alias>")
 	cmd.Aliases = []string{"mv"}
-	cmd.Short = i18n.G("Rename aliases")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Rename aliases`))
-	cmd.Example = cli.FormatSection("", i18n.G(
-		`lxc alias rename list my-list
-    Rename existing alias "list" to "my-list".`))
+	cmd.Short = "Rename alias"
+	cmd.Long = cli.FormatSection("Description", cmd.Short)
+	cmd.Example = cli.FormatSection("", `lxc alias rename list my-list
+    Rename existing alias "list" to "my-list".`)
 
 	cmd.RunE = c.run
 
@@ -181,13 +215,13 @@ func (c *cmdAliasRename) run(cmd *cobra.Command, args []string) error {
 	// Check for the existing alias
 	target, ok := conf.Aliases[args[0]]
 	if !ok {
-		return fmt.Errorf(i18n.G("Alias %s doesn't exist"), args[0])
+		return fmt.Errorf("Alias %s does not exist", args[0])
 	}
 
 	// Check for the new alias
 	_, ok = conf.Aliases[args[1]]
 	if ok {
-		return fmt.Errorf(i18n.G("Alias %s already exists"), args[1])
+		return fmt.Errorf("Alias %s already exists", args[1])
 	}
 
 	// Rename the alias
@@ -208,14 +242,12 @@ type cmdAliasRemove struct {
 // This command enables the removal of a given alias from the command line interface.
 func (c *cmdAliasRemove) command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("remove", i18n.G("<alias>"))
+	cmd.Use = usage("remove", "<alias>")
 	cmd.Aliases = []string{"rm"}
-	cmd.Short = i18n.G("Remove aliases")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Remove aliases`))
-	cmd.Example = cli.FormatSection("", i18n.G(
-		`lxc alias remove my-list
-    Remove the "my-list" alias.`))
+	cmd.Short = "Remove alias"
+	cmd.Long = cli.FormatSection("Description", cmd.Short)
+	cmd.Example = cli.FormatSection("", `lxc alias remove my-list
+    Remove the "my-list" alias.`)
 
 	cmd.RunE = c.run
 
@@ -236,7 +268,7 @@ func (c *cmdAliasRemove) run(cmd *cobra.Command, args []string) error {
 	// Look for the alias
 	_, ok := conf.Aliases[args[0]]
 	if !ok {
-		return fmt.Errorf(i18n.G("Alias %s doesn't exist"), args[0])
+		return fmt.Errorf("Alias %s does not exist", args[0])
 	}
 
 	// Delete the alias
@@ -244,4 +276,168 @@ func (c *cmdAliasRemove) run(cmd *cobra.Command, args []string) error {
 
 	// Save the config
 	return conf.SaveConfig(c.global.confPath)
+}
+
+// Show.
+type cmdAliasShow struct {
+	global *cmdGlobal
+	alias  *cmdAlias
+}
+
+// Command creates a Cobra command to show all aliases in YAML format.
+func (c *cmdAliasShow) command() *cobra.Command {
+	cmd := &cobra.Command{}
+	cmd.Use = usage("show")
+	cmd.Short = "Show aliases in YAML format"
+	cmd.Long = cli.FormatSection("Description", cmd.Short)
+	cmd.RunE = c.run
+
+	return cmd
+}
+
+// Run executes the show command to display all aliases in YAML format.
+func (c *cmdAliasShow) run(cmd *cobra.Command, args []string) error {
+	conf := c.global.conf
+
+	// Quick checks
+	exit, err := c.global.CheckArgs(cmd, args, 0, 0)
+	if exit {
+		return err
+	}
+
+	cmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		if len(args) == 0 {
+			return nil, cobra.ShellCompDirectiveDefault
+		}
+
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+
+	// Convert aliases to YAML and print
+	data, err := yaml.Marshal(&conf.Aliases)
+	if err != nil {
+		return err
+	}
+
+	fmt.Print(string(data))
+	return nil
+}
+
+// Edit.
+type cmdAliasEdit struct {
+	global *cmdGlobal
+	alias  *cmdAlias
+}
+
+// Command creates a Cobra command to edit aliases either via interactive editor or via pipe to stdin.
+func (c *cmdAliasEdit) command() *cobra.Command {
+	cmd := &cobra.Command{}
+	cmd.Use = usage("edit")
+	cmd.Short = "Edit aliases"
+
+	cmd.Example = cli.FormatSection("", `lxc alias edit
+	Edit the aliases via interactive terminal.
+
+lxc alias edit < aliases.yaml
+	Edit the aliases from "aliases.yaml".`)
+
+	cmd.RunE = c.run
+
+	return cmd
+}
+
+// HelpTemplate returns a sample YAML representation of aliases and guidelines for editing.
+func (c *cmdAliasEdit) helpTemplate() string {
+	return `### This is a YAML representation of the aliases.
+### Any line starting with a '#' will be ignored.
+###
+### A sample aliases configuration looks like:
+### list: "list -c ns46S"
+### my-list: "list -c ns46S"
+### start-all: "start --all"
+###
+### Note that aliases are key-value pairs.`
+}
+
+// Run executes the alias edit command, allowing users to edit aliases via an interactive YAML editor.
+func (c *cmdAliasEdit) run(cmd *cobra.Command, args []string) error {
+	conf := c.global.conf
+
+	// Quick checks.
+	exit, err := c.global.CheckArgs(cmd, args, 0, 0)
+	if exit {
+		return err
+	}
+
+	cmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		if len(args) == 0 {
+			return nil, cobra.ShellCompDirectiveDefault
+		}
+
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+
+	// If stdin isn't a terminal, read text from it.
+	if !termios.IsTerminal(getStdinFd()) {
+		contents, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return err
+		}
+
+		newAliases := make(map[string]string)
+		err = yaml.Unmarshal(contents, &newAliases)
+		if err != nil {
+			return err
+		}
+
+		importedCount := len(newAliases)
+		// Prevent clearing all aliases if input is empty.
+		if importedCount == 0 {
+			return errors.New("No aliases found in input.")
+		}
+
+		// Update aliases and save config.
+		conf.Aliases = newAliases
+
+		fmt.Printf("Imported: %d alias(es)\n", importedCount)
+		return conf.SaveConfig(c.global.confPath)
+	}
+
+	// Extract the current aliases.
+	data, err := yaml.Marshal(&conf.Aliases)
+	if err != nil {
+		return err
+	}
+
+	// Spawn the editor.
+	content, err := shared.TextEditor("", []byte(c.helpTemplate()+"\n\n"+string(data)))
+	if err != nil {
+		return err
+	}
+
+	for {
+		// Parse the text received from the editor.
+		newAliases := make(map[string]string)
+		err = yaml.Unmarshal(content, &newAliases)
+
+		// Respawn the editor if there was an error.
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Alias parsing error: %v\n", err)
+			fmt.Println("Press enter to open the editor again or ctrl+c to abort change")
+			_, err := os.Stdin.Read(make([]byte, 1))
+			if err != nil {
+				return err
+			}
+
+			content, err = shared.TextEditor("", content)
+			if err != nil {
+				return err
+			}
+
+			continue
+		}
+		// Update aliases and save config.
+		conf.Aliases = newAliases
+		return conf.SaveConfig(c.global.confPath)
+	}
 }

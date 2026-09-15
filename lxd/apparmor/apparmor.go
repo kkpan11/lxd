@@ -1,7 +1,10 @@
 package apparmor
 
 import (
+	"context"
 	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,13 +13,12 @@ import (
 
 	"github.com/canonical/lxd/lxd/sys"
 	"github.com/canonical/lxd/shared"
-	"github.com/canonical/lxd/shared/version"
 )
 
 const (
-	cmdLoad   = "r"
-	cmdUnload = "R"
-	cmdParse  = "Q"
+	cmdLoad   = "--replace"
+	cmdUnload = "--remove"
+	cmdParse  = "--skip-kernel-load"
 )
 
 var aaPath = shared.VarPath("security", "apparmor")
@@ -27,9 +29,9 @@ func runApparmor(sysOS *sys.OS, command string, name string) error {
 		return nil
 	}
 
-	_, err := shared.RunCommand("apparmor_parser", []string{
-		fmt.Sprintf("-%sWL", command),
-		filepath.Join(aaPath, "cache"),
+	_, err := shared.RunCommand(context.TODO(), "apparmor_parser", []string{
+		command,
+		"--write-cache", "--cache-loc", sysOS.AppArmorCacheLoc,
 		filepath.Join(aaPath, "profiles", name),
 	}...)
 
@@ -52,7 +54,7 @@ func createNamespace(sysOS *sys.OS, name string) error {
 
 	p := filepath.Join("/sys/kernel/security/apparmor/policy/namespaces", name)
 	err := os.Mkdir(p, 0755)
-	if err != nil && !os.IsExist(err) {
+	if err != nil && !errors.Is(err, os.ErrExist) {
 		return err
 	}
 
@@ -71,7 +73,7 @@ func deleteNamespace(sysOS *sys.OS, name string) error {
 
 	p := filepath.Join("/sys/kernel/security/apparmor/policy/namespaces", name)
 	err := os.Remove(p)
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 
@@ -80,20 +82,22 @@ func deleteNamespace(sysOS *sys.OS, name string) error {
 
 // hasProfile checks if the profile is already loaded.
 func hasProfile(name string) (bool, error) {
-	mangled := strings.Replace(strings.Replace(strings.Replace(name, "/", ".", -1), "<", "", -1), ">", "", -1)
-
 	profilesPath := "/sys/kernel/security/apparmor/policy/profiles"
-	if shared.PathExists(profilesPath) {
-		entries, err := os.ReadDir(profilesPath)
-		if err != nil {
-			return false, err
+	entries, err := os.ReadDir(profilesPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
 		}
 
-		for _, entry := range entries {
-			fields := strings.Split(entry.Name(), ".")
-			if mangled == strings.Join(fields[0:len(fields)-1], ".") {
-				return true, nil
-			}
+		return false, err
+	}
+
+	mangled := strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(name, "/", "."), "<", ""), ">", "")
+	for _, entry := range entries {
+		entryName := entry.Name()
+		idx := strings.LastIndex(entryName, ".")
+		if idx >= 0 && mangled == entryName[:idx] {
+			return true, nil
 		}
 	}
 
@@ -102,10 +106,6 @@ func hasProfile(name string) (bool, error) {
 
 // parseProfile parses the profile without loading it into the kernel.
 func parseProfile(sysOS *sys.OS, name string) error {
-	if !sysOS.AppArmorAvailable {
-		return nil
-	}
-
 	return runApparmor(sysOS, cmdParse, name)
 }
 
@@ -142,24 +142,26 @@ func deleteProfile(sysOS *sys.OS, fullName string, name string) error {
 		return nil
 	}
 
-	cacheDir, err := getCacheDir(sysOS)
+	// Defend against path traversal attacks.
+	if !shared.IsFileName(name) {
+		return fmt.Errorf("Invalid profile name %q", name)
+	}
+
+	err := unloadProfile(sysOS, fullName, name)
 	if err != nil {
 		return err
 	}
 
-	err = unloadProfile(sysOS, fullName, name)
-	if err != nil {
-		return err
+	cachePath := filepath.Join(sysOS.AppArmorCacheDir, name)
+	err = os.Remove(cachePath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("Failed removing %q: %w", cachePath, err)
 	}
 
-	err = os.Remove(filepath.Join(cacheDir, name))
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("Failed to remove %s: %w", filepath.Join(cacheDir, name), err)
-	}
-
-	err = os.Remove(filepath.Join(aaPath, "profiles", name))
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("Failed to remove %s: %w", filepath.Join(aaPath, "profiles", name), err)
+	profilePath := filepath.Join(aaPath, "profiles", name)
+	err = os.Remove(profilePath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("Failed removing %q: %w", profilePath, err)
 	}
 
 	return nil
@@ -171,25 +173,12 @@ func parserSupports(sysOS *sys.OS, feature string) (bool, error) {
 		return false, nil
 	}
 
-	ver, err := getVersion(sysOS)
-	if err != nil {
-		return false, err
-	}
-
-	if feature == "unix" {
-		minVer, err := version.NewDottedVersion("2.10.95")
-		if err != nil {
-			return false, err
-		}
-
-		return ver.Compare(minVer) >= 0, nil
-	}
-
 	if feature == "mount_nosymfollow" || feature == "userns_rule" {
 		sysOS.AppArmorFeatures.Lock()
 		defer sysOS.AppArmorFeatures.Unlock()
 		supported, ok := sysOS.AppArmorFeatures.Map[feature]
 		if !ok {
+			var err error
 			supported, err = FeatureCheck(sysOS, feature)
 			if err != nil {
 				return false, nil
@@ -204,52 +193,6 @@ func parserSupports(sysOS *sys.OS, feature string) (bool, error) {
 	return false, nil
 }
 
-// getVersion reads and parses the AppArmor version.
-func getVersion(sysOS *sys.OS) (*version.DottedVersion, error) {
-	if !sysOS.AppArmorAvailable {
-		return version.NewDottedVersion("0.0")
-	}
-
-	out, err := shared.RunCommand("apparmor_parser", "--version")
-	if err != nil {
-		return nil, err
-	}
-
-	fields := strings.Fields(strings.Split(out, "\n")[0])
-	return version.Parse(fields[len(fields)-1])
-}
-
-// getCacheDir returns the applicable AppArmor cache directory.
-func getCacheDir(sysOS *sys.OS) (string, error) {
-	basePath := filepath.Join(aaPath, "cache")
-
-	if !sysOS.AppArmorAvailable {
-		return basePath, nil
-	}
-
-	ver, err := getVersion(sysOS)
-	if err != nil {
-		return "", err
-	}
-
-	// Multiple policy cache directories were only added in v2.13.
-	minVer, err := version.NewDottedVersion("2.13")
-	if err != nil {
-		return "", err
-	}
-
-	if ver.Compare(minVer) < 0 {
-		return basePath, nil
-	}
-
-	output, err := shared.RunCommand("apparmor_parser", "-L", basePath, "--print-cache-dir")
-	if err != nil {
-		return "", err
-	}
-
-	return strings.TrimSpace(output), nil
-}
-
 // profileName handles generating valid profile names.
 func profileName(prefix string, name string) string {
 	separators := 1
@@ -261,12 +204,12 @@ func profileName(prefix string, name string) string {
 	if len(name)+len(prefix)+3+separators >= 253 {
 		hash := sha256.New()
 		_, _ = io.WriteString(hash, name)
-		name = fmt.Sprintf("%x", hash.Sum(nil))
+		name = hex.EncodeToString(hash.Sum(nil))
 	}
 
 	if len(prefix) > 0 {
-		return fmt.Sprintf("lxd_%s-%s", prefix, name)
+		return "lxd_" + prefix + "-" + name
 	}
 
-	return fmt.Sprintf("lxd-%s", name)
+	return "lxd-" + name
 }

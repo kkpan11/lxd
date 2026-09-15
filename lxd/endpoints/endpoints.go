@@ -1,6 +1,7 @@
 package endpoints
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -63,9 +64,6 @@ type Config struct {
 	// HTTP server handling requests for the LXD metrics API.
 	MetricsServer *http.Server
 
-	// HTTP server handling requests for the LXD storage buckets API.
-	StorageBucketsServer *http.Server
-
 	// HTTP server handling requests from VMs via the vsock.
 	VsockServer *http.Server
 
@@ -119,23 +117,23 @@ type Config struct {
 // config.RestServer to it.
 func Up(config *Config) (*Endpoints, error) {
 	if config.Dir == "" {
-		return nil, fmt.Errorf("No directory configured")
+		return nil, errors.New("No directory configured")
 	}
 
 	if config.UnixSocket == "" {
-		return nil, fmt.Errorf("No unix socket configured")
+		return nil, errors.New("No unix socket configured")
 	}
 
 	if config.RestServer == nil {
-		return nil, fmt.Errorf("No REST server configured")
+		return nil, errors.New("No REST server configured")
 	}
 
 	if config.DevLxdServer == nil {
-		return nil, fmt.Errorf("No devlxd server configured")
+		return nil, errors.New("No devlxd server configured")
 	}
 
 	if config.Cert == nil {
-		return nil, fmt.Errorf("No TLS certificate configured")
+		return nil, errors.New("No TLS certificate configured")
 	}
 
 	endpoints := &Endpoints{
@@ -174,14 +172,13 @@ func (e *Endpoints) up(config *Config) error {
 	defer e.mu.Unlock()
 
 	e.servers = map[kind]*http.Server{
-		devlxd:         config.DevLxdServer,
-		local:          config.RestServer,
-		network:        config.RestServer,
-		cluster:        config.RestServer,
-		pprof:          pprofCreateServer(),
-		metrics:        config.MetricsServer,
-		storageBuckets: config.StorageBucketsServer,
-		vmvsock:        config.VsockServer,
+		cluster: config.RestServer,
+		devlxd:  config.DevLxdServer,
+		local:   config.RestServer,
+		metrics: config.MetricsServer,
+		network: config.RestServer,
+		pprof:   pprofCreateServer(),
+		vmvsock: config.VsockServer,
 	}
 
 	e.cert = config.Cert
@@ -227,7 +224,7 @@ func (e *Endpoints) up(config *Config) error {
 	if config.NetworkAddress != "" {
 		listener, ok := e.listeners[network]
 		if ok {
-			logger.Infof("Replacing inherited TCP socket with configured one")
+			logger.Info("Replacing inherited TCP socket with configured one")
 			_ = listener.Close()
 			e.inherited[network] = false
 		}
@@ -244,7 +241,7 @@ func (e *Endpoints) up(config *Config) error {
 				// In case of clustering we fail if we can't bind the network address.
 				if networkAddressErr != nil {
 					if attempts == 0 {
-						logger.Infof("Unable to bind https address %q, re-trying for a minute", config.NetworkAddress)
+						logger.Infof("Cannot bind https address %q, re-trying for a minute", config.NetworkAddress)
 					}
 
 					attempts++
@@ -265,7 +262,7 @@ func (e *Endpoints) up(config *Config) error {
 				time.Sleep(30 * time.Second)
 				err := e.NetworkUpdateAddress(config.NetworkAddress)
 				if err != nil {
-					logger.Error("Still unable to listen on https socket", logger.Ctx{"err": err})
+					logger.Error("Still cannot listen on https socket", logger.Ctx{"err": err})
 				}
 			}()
 		}
@@ -282,7 +279,7 @@ func (e *Endpoints) up(config *Config) error {
 		e.listeners[cluster], err = networkCreateListener(config.ClusterAddress, e.cert)
 		if err != nil {
 			if attempts == 0 {
-				logger.Infof("Unable to bind cluster address %q, re-trying for a minute", config.ClusterAddress)
+				logger.Infof("Cannot bind cluster address %q, re-trying for a minute", config.ClusterAddress)
 			}
 
 			attempts++
@@ -315,6 +312,9 @@ func (e *Endpoints) up(config *Config) error {
 
 // UpMetrics brings up metrics listener on specified address.
 func (e *Endpoints) UpMetrics(listenAddress string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	var err error
 	e.listeners[metrics], err = metricsCreateListener(listenAddress, e.cert)
 	if err != nil {
@@ -322,19 +322,6 @@ func (e *Endpoints) UpMetrics(listenAddress string) error {
 	}
 
 	e.serve(metrics)
-
-	return nil
-}
-
-// UpStorageBuckets brings up storage buvkets listener on specified address.
-func (e *Endpoints) UpStorageBuckets(listenAddress string) error {
-	var err error
-	e.listeners[storageBuckets], err = storageBucketsCreateListener(listenAddress, e.cert)
-	if err != nil {
-		return fmt.Errorf("Failed starting storage buckets listener: %w", err)
-	}
-
-	e.serve(storageBuckets)
 
 	return nil
 }
@@ -379,13 +366,6 @@ func (e *Endpoints) Down() error {
 
 	if e.listeners[metrics] != nil {
 		err := e.closeListener(metrics)
-		if err != nil {
-			return err
-		}
-	}
-
-	if e.listeners[storageBuckets] != nil {
-		err := e.closeListener(storageBuckets)
 		if err != nil {
 			return err
 		}
@@ -488,17 +468,15 @@ const (
 	cluster
 	metrics
 	vmvsock
-	storageBuckets
 )
 
 // Human-readable descriptions of the various kinds of endpoints.
 var descriptions = map[kind]string{
-	local:          "REST API Unix socket",
-	devlxd:         "devlxd socket",
-	network:        "REST API TCP socket",
-	pprof:          "pprof socket",
-	cluster:        "cluster socket",
-	metrics:        "metrics socket",
-	vmvsock:        "VM socket",
-	storageBuckets: "Storage buckets socket",
+	local:   "REST API Unix socket",
+	devlxd:  "devlxd socket",
+	network: "REST API TCP socket",
+	pprof:   "pprof socket",
+	cluster: "cluster socket",
+	metrics: "metrics socket",
+	vmvsock: "VM socket",
 }

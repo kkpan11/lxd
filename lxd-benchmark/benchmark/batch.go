@@ -1,24 +1,17 @@
 package benchmark
 
 import (
-	"os"
+	"runtime"
 	"sync"
 	"time"
 )
 
-func getBatchSize(parallel int) (int, error) {
-	batchSize := parallel
-	if batchSize < 1 {
-		// Detect the number of parallel actions
-		cpus, err := os.ReadDir("/sys/bus/cpu/devices")
-		if err != nil {
-			return -1, err
-		}
-
-		batchSize = len(cpus)
+func getBatchSize(parallel int) int {
+	if parallel > 0 {
+		return parallel
 	}
 
-	return batchSize, nil
+	return runtime.NumCPU()
 }
 
 func processBatch(count int, batchSize int, process func(index int, wg *sync.WaitGroup)) time.Duration {
@@ -31,8 +24,8 @@ func processBatch(count int, batchSize int, process func(index int, wg *sync.Wai
 	logf("Batch processing start")
 	timeStart := time.Now()
 
-	for i := 0; i < batches; i++ {
-		for j := 0; j < batchSize; j++ {
+	for range batches {
+		for range batchSize {
 			wg.Add(1)
 			go process(processed, &wg)
 			processed++
@@ -47,7 +40,7 @@ func processBatch(count int, batchSize int, process func(index int, wg *sync.Wai
 		}
 	}
 
-	for k := 0; k < remainder; k++ {
+	for range remainder {
 		wg.Add(1)
 		go process(processed, &wg)
 		processed++

@@ -88,24 +88,24 @@ func (d *fanotify) load(ctx context.Context) error {
 
 	d.fd, err = unix.FanotifyInit(unix.FAN_CLOEXEC|unix.FAN_REPORT_DFID_NAME, unix.O_CLOEXEC)
 	if err != nil {
-		return fmt.Errorf("Failed to initialize fanotify: %w", err)
+		return fmt.Errorf("Failed initializing fanotify: %w", err)
 	}
 
 	mask, err := d.eventMask()
 	if err != nil {
-		return fmt.Errorf("Failed to get a fanotify event mask: %w", err)
+		return fmt.Errorf("Failed getting a fanotify event mask: %w", err)
 	}
 
 	err = unix.FanotifyMark(d.fd, unix.FAN_MARK_ADD|unix.FAN_MARK_FILESYSTEM, mask, unix.AT_FDCWD, d.prefixPath)
 	if err != nil {
 		_ = unix.Close(d.fd)
-		return fmt.Errorf("Failed to watch directory %q: %w", d.prefixPath, err)
+		return fmt.Errorf("Failed watching directory %q: %w", d.prefixPath, err)
 	}
 
 	fd, err := unix.Open(d.prefixPath, unix.O_DIRECTORY|unix.O_RDONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		_ = unix.Close(d.fd)
-		return fmt.Errorf("Failed to open directory %q: %w", d.prefixPath, err)
+		return fmt.Errorf("Failed opening directory %q: %w", d.prefixPath, err)
 	}
 
 	go func() {
@@ -134,7 +134,7 @@ func (d *fanotify) getEvents(ctx context.Context, mountFd int) {
 				return
 			}
 
-			d.logger.Error("Failed to read event", logger.Ctx{"err": err})
+			d.logger.Error("Failed reading event", logger.Ctx{"err": err})
 			continue
 		}
 
@@ -144,7 +144,7 @@ func (d *fanotify) getEvents(ctx context.Context, mountFd int) {
 
 		err = binary.Read(rd, binary.LittleEndian, &event)
 		if err != nil {
-			d.logger.Error("Failed to read event metadata", logger.Ctx{"err": err})
+			d.logger.Error("Failed reading event metadata", logger.Ctx{"err": err})
 			continue
 		}
 
@@ -153,7 +153,7 @@ func (d *fanotify) getEvents(ctx context.Context, mountFd int) {
 
 		err = binary.Read(rd, binary.LittleEndian, &fid)
 		if err != nil {
-			d.logger.Error("Failed to read event fid", logger.Ctx{"err": err})
+			d.logger.Error("Failed reading event fid", logger.Ctx{"err": err})
 			continue
 		}
 
@@ -169,7 +169,7 @@ func (d *fanotify) getEvents(ctx context.Context, mountFd int) {
 
 		err = binary.Read(rd, binary.LittleEndian, &fhInfo)
 		if err != nil {
-			d.logger.Error("Failed to read file handle info", logger.Ctx{"err": err})
+			d.logger.Error("Failed reading file handle info", logger.Ctx{"err": err})
 			continue
 		}
 
@@ -178,42 +178,16 @@ func (d *fanotify) getEvents(ctx context.Context, mountFd int) {
 
 		err = binary.Read(rd, binary.LittleEndian, fileHandle)
 		if err != nil {
-			d.logger.Error("Failed to read file handle", logger.Ctx{"err": err})
+			d.logger.Error("Failed reading file handle", logger.Ctx{"err": err})
 			continue
 		}
 
 		fh := unix.NewFileHandle(fhInfo.Type, fileHandle)
 
-		fd, err := unix.OpenByHandleAt(mountFd, fh, 0)
-		if err != nil {
-			errno, ok := err.(unix.Errno)
-			if ctx.Err() == nil && ok && errno != unix.ESTALE {
-				d.logger.Error("Failed to open file", logger.Ctx{"err": err})
-			}
-
-			continue
-		}
-
-		unix.CloseOnExec(fd)
-
-		// Determine the directory of the created or deleted file.
-		target, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
-		if err != nil {
-			d.logger.Error("Failed to read symlink", logger.Ctx{"err": err})
-			continue
-		}
-
-		_ = unix.Close(fd)
-
-		// If the target file has been deleted, the returned value might contain a " (deleted)" suffix.
-		// This needs to be removed.
-		target = strings.TrimSuffix(target, " (deleted)")
-
 		// The file handle is followed by a null terminated string that identifies the
 		// created/deleted directory entry name.
+		// Read it now so we can use it whether or not [OpenByHandleAt] succeeds.
 		sb := strings.Builder{}
-		sb.WriteString(target + "/")
-
 		for {
 			b, err := rd.ReadByte()
 			if err != nil || b == 0 {
@@ -226,7 +200,65 @@ func (d *fanotify) getEvents(ctx context.Context, mountFd int) {
 			}
 		}
 
-		eventPath := filepath.Clean(sb.String())
+		name := sb.String()
+
+		fd, err := unix.OpenByHandleAt(mountFd, fh, 0)
+		if err != nil {
+			// If the handle can't be opened (e.g. ESTALE because the fs entry was removed),
+			// attempt a dispatch using the entry name.
+			errno, ok := err.(unix.Errno)
+			if ctx.Err() == nil && ok && errno != unix.ESTALE {
+				d.logger.Error("Failed opening file", logger.Ctx{"err": err})
+			}
+
+			action, err := d.toFSMonitorEvent(event.Mask)
+			if err != nil {
+				d.logger.Warn("Failed matching fanotify event, skipping", logger.Ctx{"err": err})
+				continue
+			}
+
+			candidate := filepath.Clean(filepath.Join(d.prefixPath, name))
+
+			d.mu.Lock()
+			for path := range d.watches {
+				if path != candidate && filepath.Base(path) != name {
+					continue
+				}
+
+				for identifier, f := range d.watches[path] {
+					ret := f(path, action)
+					if !ret {
+						delete(d.watches[path], identifier)
+
+						if len(d.watches[path]) == 0 {
+							delete(d.watches, path)
+						}
+					}
+				}
+			}
+			d.mu.Unlock()
+
+			continue
+		}
+
+		unix.CloseOnExec(fd)
+
+		// Determine the directory of the created or deleted file.
+		target, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
+		if err != nil {
+			d.logger.Error("Failed reading symlink", logger.Ctx{"err": err})
+			_ = unix.Close(fd)
+			continue
+		}
+
+		_ = unix.Close(fd)
+
+		// If the target file has been deleted, the returned value might contain a " (deleted)" suffix.
+		// This needs to be removed.
+		target = strings.TrimSuffix(target, " (deleted)")
+
+		// Build the full event path from the resolved directory and the entry name.
+		eventPath := filepath.Clean(filepath.Join(target, name))
 
 		// Check whether there's a watch on a specific file or directory.
 		d.mu.Lock()
@@ -237,7 +269,7 @@ func (d *fanotify) getEvents(ctx context.Context, mountFd int) {
 
 			action, err := d.toFSMonitorEvent(event.Mask)
 			if err != nil {
-				logger.Warn("Failed to match fanotify event, skipping", logger.Ctx{"err": err})
+				logger.Warn("Failed matching fanotify event, skipping", logger.Ctx{"err": err})
 				continue
 			}
 

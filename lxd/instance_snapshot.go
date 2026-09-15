@@ -4,19 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"time"
 
-	"github.com/gorilla/mux"
-
+	"github.com/canonical/lxd/lxd/auth"
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/db/operationtype"
 	"github.com/canonical/lxd/lxd/instance"
-	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/project/limits"
 	"github.com/canonical/lxd/lxd/request"
@@ -26,6 +23,7 @@ import (
 	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
+	"github.com/canonical/lxd/shared/entity"
 	"github.com/canonical/lxd/shared/validate"
 	"github.com/canonical/lxd/shared/version"
 )
@@ -131,17 +129,13 @@ func instanceSnapshotsGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := request.ProjectParam(r)
-	cname, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	cname := r.PathValue("name")
 	if shared.IsSnapshot(cname) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+		return response.BadRequest(errors.New("Invalid instance name"))
 	}
 
 	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(s, r, projectName, cname, instanceType)
+	resp, err := forwardedResponseIfInstanceIsRemote(r.Context(), s, projectName, cname, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -150,11 +144,16 @@ func instanceSnapshotsGet(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	recursion := util.IsRecursionRequest(r)
+	canView, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeInstanceSnapshot)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	recursion, _ := util.IsRecursionRequest(r)
 	resultString := []string{}
 	resultMap := []*api.InstanceSnapshot{}
 
-	if !recursion {
+	if recursion == 0 {
 		var snaps []string
 
 		err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
@@ -170,12 +169,15 @@ func instanceSnapshotsGet(d *Daemon, r *http.Request) response.Response {
 
 		for _, snap := range snaps {
 			_, snapName, _ := api.GetParentAndSnapshotName(snap)
+
+			if !canView(entity.InstanceSnapshotURL(projectName, cname, snapName)) {
+				continue
+			}
+
 			if projectName == api.ProjectDefaultName {
-				url := fmt.Sprintf("/%s/instances/%s/snapshots/%s", version.APIVersion, cname, snapName)
-				resultString = append(resultString, url)
+				resultString = append(resultString, api.NewURL().Path(version.APIVersion, "instances", cname, "snapshots", snapName).String())
 			} else {
-				url := fmt.Sprintf("/%s/instances/%s/snapshots/%s?project=%s", version.APIVersion, cname, snapName, projectName)
-				resultString = append(resultString, url)
+				resultString = append(resultString, api.NewURL().Path(version.APIVersion, "instances", cname, "snapshots", snapName).Project(projectName).String())
 			}
 		}
 	} else {
@@ -190,16 +192,27 @@ func instanceSnapshotsGet(d *Daemon, r *http.Request) response.Response {
 		}
 
 		for _, snap := range snaps {
+			_, snapName, _ := api.GetParentAndSnapshotName(snap.Name())
+
+			if !canView(entity.InstanceSnapshotURL(projectName, cname, snapName)) {
+				continue
+			}
+
 			render, _, err := snap.Render(storagePools.RenderSnapshotUsage(s, snap))
 			if err != nil {
 				continue
 			}
 
-			resultMap = append(resultMap, render.(*api.InstanceSnapshot))
+			renderedSnap, ok := render.(*api.InstanceSnapshot)
+			if !ok {
+				return response.InternalError(errors.New("Render did not return a snapshot"))
+			}
+
+			resultMap = append(resultMap, renderedSnap)
 		}
 	}
 
-	if !recursion {
+	if recursion == 0 {
 		return response.SyncResponse(true, resultString)
 	}
 
@@ -247,22 +260,19 @@ func instanceSnapshotsPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	name := r.PathValue("name")
 	if shared.IsSnapshot(name) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+		return response.BadRequest(errors.New("Invalid instance name"))
 	}
 
-	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	var p *api.Project
+	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
 		dbProject, err := cluster.GetProject(context.Background(), tx.Tx(), projectName)
 		if err != nil {
 			return err
 		}
 
-		p, err := dbProject.ToAPI(ctx, tx.Tx())
+		p, err = dbProject.ToAPI(ctx, tx.Tx())
 		if err != nil {
 			return err
 		}
@@ -279,7 +289,7 @@ func instanceSnapshotsPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(s, r, projectName, name, instanceType)
+	resp, err := forwardedResponseIfInstanceIsRemote(r.Context(), s, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -305,6 +315,12 @@ func instanceSnapshotsPost(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
+	// A project that does not own its custom volumes has none to snapshot, so only allow the root disk.
+	// This is the rule the storage layer applies, so an unset key counts as inheriting.
+	if shared.IsFalseOrEmpty(p.Config["features.storage.volumes"]) && req.DiskVolumesMode == api.DiskVolumesModeAllExclusive {
+		return response.BadRequest(errors.New("Project does not have features.storage.volumes enabled"))
+	}
+
 	if req.Name == "" {
 		req.Name, err = instance.NextSnapshotName(s, inst, "snap%d")
 		if err != nil {
@@ -318,35 +334,28 @@ func instanceSnapshotsPost(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(fmt.Errorf("Invalid snapshot name: %w", err))
 	}
 
-	var expiry time.Time
-	if req.ExpiresAt != nil {
-		expiry = *req.ExpiresAt
-	} else {
-		expiry, err = shared.GetExpiry(time.Now(), inst.ExpandedConfig()["snapshots.expiry"])
-		if err != nil {
-			return response.BadRequest(err)
-		}
+	snapshot := func(ctx context.Context, op *operations.Operation) error {
+		return inst.Snapshot(ctx, req.Name, req.ExpiresAt, req.Stateful, req.DiskVolumesMode, op)
 	}
 
-	snapshot := func(op *operations.Operation) error {
-		inst.SetOperation(op)
-		return inst.Snapshot(req.Name, expiry, req.Stateful)
+	instanceURL := api.NewURL().Path(version.APIVersion, "instances", name).Project(projectName)
+	args := operations.OperationArgs{
+		ProjectName: projectName,
+		EntityURL:   instanceURL,
+		Type:        operationtype.SnapshotCreate,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     snapshot,
+		Metadata: map[string]any{
+			api.MetadataEntityURL: api.NewURL().Path(version.APIVersion, "instances", name, "snapshots", req.Name).Project(projectName).String(),
+		},
 	}
 
-	resources := map[string][]api.URL{}
-	resources["instances"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", name)}
-	resources["instances_snapshots"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", name, "snapshots", req.Name)}
-
-	if inst.Type() == instancetype.Container {
-		resources["containers"] = resources["instances"]
-	}
-
-	op, err := operations.OperationCreate(s, projectName, operations.OperationClassTask, operationtype.SnapshotCreate, resources, nil, snapshot, nil, nil, r)
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 func instanceSnapshotHandler(d *Daemon, r *http.Request) response.Response {
@@ -358,28 +367,15 @@ func instanceSnapshotHandler(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := request.ProjectParam(r)
-	instName, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	snapshotName, err := url.PathUnescape(mux.Vars(r)["snapshotName"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	resp, err := forwardedResponseIfInstanceIsRemote(s, r, projectName, instName, instanceType)
+	instName := r.PathValue("name")
+	snapshotName := r.PathValue("snapshotName")
+	resp, err := forwardedResponseIfInstanceIsRemote(r.Context(), s, projectName, instName, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	if resp != nil {
 		return resp
-	}
-
-	snapshotName, err = url.QueryUnescape(snapshotName)
-	if err != nil {
-		return response.SmartError(err)
 	}
 
 	snapInst, err := instance.LoadByProjectAndName(s, projectName, instName+shared.SnapshotDelimiter+snapshotName)
@@ -389,7 +385,7 @@ func instanceSnapshotHandler(d *Daemon, r *http.Request) response.Response {
 
 	switch r.Method {
 	case "GET":
-		return snapshotGet(s, snapInst)
+		return snapshotGet(s, r, snapInst)
 	case "POST":
 		return snapshotPost(s, r, snapInst)
 	case "DELETE":
@@ -487,12 +483,12 @@ func snapshotPut(s *state.State, r *http.Request, snapInst instance.Instance) re
 		return response.InternalError(err)
 	}
 
-	var do func(op *operations.Operation) error
+	var do func(ctx context.Context, op *operations.Operation) error
 
 	_, err = rj.GetString("expires_at")
 	if err != nil {
 		// Skip updating the snapshot since the requested key wasn't provided
-		do = func(op *operations.Operation) error {
+		do = func(_ context.Context, _ *operations.Operation) error {
 			return nil
 		}
 	} else {
@@ -509,7 +505,7 @@ func snapshotPut(s *state.State, r *http.Request, snapInst instance.Instance) re
 		}
 
 		// Update instance configuration
-		do = func(op *operations.Operation) error {
+		do = func(ctx context.Context, _ *operations.Operation) error {
 			args := db.InstanceArgs{
 				Architecture: snapInst.Architecture(),
 				Config:       snapInst.LocalConfig(),
@@ -523,7 +519,7 @@ func snapshotPut(s *state.State, r *http.Request, snapInst instance.Instance) re
 				Snapshot:     snapInst.IsSnapshot(),
 			}
 
-			err = snapInst.Update(args, false)
+			err = snapInst.Update(ctx, args, instance.UpdateActionInternal)
 			if err != nil {
 				return err
 			}
@@ -535,20 +531,20 @@ func snapshotPut(s *state.State, r *http.Request, snapInst instance.Instance) re
 	opType := operationtype.SnapshotUpdate
 	parentName, snapName, _ := api.GetParentAndSnapshotName(snapInst.Name())
 
-	resources := map[string][]api.URL{}
-	resources["instances"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", parentName)}
-	resources["instances_snapshots"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", parentName, "snapshots", snapName)}
-
-	if snapInst.Type() == instancetype.Container {
-		resources["containers"] = resources["instances"]
+	args := operations.OperationArgs{
+		ProjectName: snapInst.Project().Name,
+		EntityURL:   api.NewURL().Path(version.APIVersion, "instances", parentName, "snapshots", snapName).Project(snapInst.Project().Name),
+		Type:        opType,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     do,
 	}
 
-	op, err := operations.OperationCreate(s, snapInst.Project().Name, operations.OperationClassTask, opType, resources, nil, do, nil, nil, r)
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 // swagger:operation GET /1.0/instances/{name}/snapshots/{snapshot} instances instance_snapshot_get
@@ -591,14 +587,19 @@ func snapshotPut(s *state.State, r *http.Request, snapInst instance.Instance) re
 //	    $ref: "#/responses/Forbidden"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
-func snapshotGet(s *state.State, snapInst instance.Instance) response.Response {
+func snapshotGet(s *state.State, _ *http.Request, snapInst instance.Instance) response.Response {
 	render, _, err := snapInst.Render(storagePools.RenderSnapshotUsage(s, snapInst))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
+	renderedSnap, ok := render.(*api.InstanceSnapshot)
+	if !ok {
+		return response.InternalError(errors.New("Render did not return a snapshot"))
+	}
+
 	etag := []any{snapInst.ExpiryDate()}
-	return response.SyncResponseETag(true, render.(*api.InstanceSnapshot), etag)
+	return response.SyncResponseETag(true, renderedSnap, etag)
 }
 
 // swagger:operation POST /1.0/instances/{name}/snapshots/{snapshot} instances instance_snapshot_post
@@ -673,7 +674,7 @@ func snapshotPost(s *state.State, r *http.Request, snapInst instance.Instance) r
 		}
 
 		if reqNew.Name == "" {
-			return response.BadRequest(fmt.Errorf("A new name for the instance must be provided"))
+			return response.BadRequest(errors.New("A new name for the instance must be provided"))
 		}
 
 		if reqNew.Live {
@@ -682,40 +683,50 @@ func snapshotPost(s *state.State, r *http.Request, snapInst instance.Instance) r
 			}
 		}
 
-		ws, err := newMigrationSource(snapInst, reqNew.Live, true, false, "", req.Target)
+		ws, err := newMigrationSource(snapInst, reqNew.Live, true, false, "", "", req.Target)
 		if err != nil {
 			return response.SmartError(err)
 		}
 
-		resources := map[string][]api.URL{}
-		resources["instances"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", parentName)}
-		resources["instances_snapshots"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", parentName, "snapshots", snapName)}
-
-		if snapInst.Type() == instancetype.Container {
-			resources["containers"] = resources["instances"]
-		}
-
-		run := func(op *operations.Operation) error {
-			return ws.Do(s, op)
+		run := func(ctx context.Context, op *operations.Operation) error {
+			return ws.Do(ctx, s, op)
 		}
 
 		if req.Target != nil {
 			// Push mode.
-			op, err := operations.OperationCreate(s, snapInst.Project().Name, operations.OperationClassTask, operationtype.SnapshotTransfer, resources, nil, run, nil, nil, r)
+			args := operations.OperationArgs{
+				ProjectName: snapInst.Project().Name,
+				EntityURL:   api.NewURL().Path(version.APIVersion, "instances", parentName, "snapshots", snapName).Project(snapInst.Project().Name),
+				Type:        operationtype.SnapshotTransfer,
+				Class:       operationtype.OperationClassTask,
+				RunHook:     run,
+			}
+
+			op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 			if err != nil {
 				return response.InternalError(err)
 			}
 
-			return operations.OperationResponse(op)
+			return response.OperationResponse(op)
 		}
 
 		// Pull mode.
-		op, err := operations.OperationCreate(s, snapInst.Project().Name, operations.OperationClassWebsocket, operationtype.SnapshotTransfer, resources, ws.Metadata(), run, nil, ws.Connect, r)
+		args := operations.OperationArgs{
+			ProjectName: snapInst.Project().Name,
+			EntityURL:   api.NewURL().Path(version.APIVersion, "instances", parentName, "snapshots", snapName).Project(snapInst.Project().Name),
+			Type:        operationtype.SnapshotTransfer,
+			Class:       operationtype.OperationClassWebsocket,
+			Metadata:    ws.Metadata(),
+			RunHook:     run,
+			ConnectHook: ws.Connect,
+		}
+
+		op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 		if err != nil {
 			return response.InternalError(err)
 		}
 
-		return operations.OperationResponse(op)
+		return response.OperationResponse(op)
 	}
 
 	newName, err := raw.GetString("name")
@@ -731,11 +742,11 @@ func snapshotPost(s *state.State, r *http.Request, snapInst instance.Instance) r
 
 	fullName := parentName + shared.SnapshotDelimiter + newName
 
-	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
 		// Check that the name isn't already in use
 		id, _ := tx.GetInstanceSnapshotID(ctx, snapInst.Project().Name, parentName, newName)
 		if id > 0 {
-			return fmt.Errorf("Name '%s' already in use", fullName)
+			return fmt.Errorf("Name %q already in use", fullName)
 		}
 
 		return nil
@@ -744,24 +755,31 @@ func snapshotPost(s *state.State, r *http.Request, snapInst instance.Instance) r
 		return response.Conflict(err)
 	}
 
-	rename := func(op *operations.Operation) error {
-		return snapInst.Rename(fullName, false)
+	rename := func(ctx context.Context, _ *operations.Operation) error {
+		return snapInst.Rename(ctx, fullName, false)
 	}
 
-	resources := map[string][]api.URL{}
-	resources["instances"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", parentName)}
-	resources["instances_snapshots"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", parentName, "snapshots", snapName)}
-
-	if snapInst.Type() == instancetype.Container {
-		resources["containers"] = resources["instances"]
+	originalEntityURL := api.NewURL().Path(version.APIVersion, "instances", parentName, "snapshots", snapName).Project(snapInst.Project().Name)
+	metadata := map[string]any{
+		api.MetadataOriginalEntityURL: originalEntityURL.String(),
+		api.MetadataEntityURL:         api.NewURL().Path(version.APIVersion, "instances", parentName, "snapshots", newName).Project(snapInst.Project().Name).String(),
 	}
 
-	op, err := operations.OperationCreate(s, snapInst.Project().Name, operations.OperationClassTask, operationtype.SnapshotRename, resources, nil, rename, nil, nil, r)
+	args := operations.OperationArgs{
+		ProjectName: snapInst.Project().Name,
+		EntityURL:   originalEntityURL,
+		Type:        operationtype.SnapshotRename,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     rename,
+		Metadata:    metadata,
+	}
+
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 // swagger:operation DELETE /1.0/instances/{name}/snapshots/{snapshot} instances instance_snapshot_delete
@@ -781,6 +799,11 @@ func snapshotPost(s *state.State, r *http.Request, snapInst instance.Instance) r
 //	    description: Project name
 //	    type: string
 //	    example: default
+//	  - in: query
+//	    name: disk-volumes
+//	    description: Which disk volumes to include in instance snapshot deletion. Possible values are "root" or "all-exclusive".
+//	    type: string
+//	    example: all-exclusive
 //	responses:
 //	  "202":
 //	    $ref: "#/responses/Operation"
@@ -791,24 +814,28 @@ func snapshotPost(s *state.State, r *http.Request, snapInst instance.Instance) r
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func snapshotDelete(s *state.State, r *http.Request, snapInst instance.Instance) response.Response {
-	remove := func(op *operations.Operation) error {
-		return snapInst.Delete(false)
+	diskVolumesMode := request.QueryParam(r, "disk-volumes")
+	if diskVolumesMode == "" {
+		diskVolumesMode = api.DiskVolumesModeRoot
+	}
+
+	remove := func(ctx context.Context, op *operations.Operation) error {
+		return snapInst.Delete(ctx, false, diskVolumesMode, op)
 	}
 
 	parentName, snapName, _ := api.GetParentAndSnapshotName(snapInst.Name())
-
-	resources := map[string][]api.URL{}
-	resources["instances"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", parentName)}
-	resources["instances_snapshots"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", parentName, "snapshots", snapName)}
-
-	if snapInst.Type() == instancetype.Container {
-		resources["containers"] = resources["instances"]
+	args := operations.OperationArgs{
+		ProjectName: snapInst.Project().Name,
+		EntityURL:   api.NewURL().Path(version.APIVersion, "instances", parentName, "snapshots", snapName).Project(snapInst.Project().Name),
+		Type:        operationtype.SnapshotDelete,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     remove,
 	}
 
-	op, err := operations.OperationCreate(s, snapInst.Project().Name, operations.OperationClassTask, operationtype.SnapshotDelete, resources, nil, remove, nil, nil, r)
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		return response.InternalError(err)
 	}
 
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }

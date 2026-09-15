@@ -22,10 +22,14 @@ import (
 	"github.com/canonical/lxd/lxd/metrics"
 	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/shared/api"
+	"github.com/canonical/lxd/shared/ioprogress"
 )
 
 // HookStart hook used when instance has started.
 const HookStart = "onstart"
+
+// HookStartHost hook used when instance is fully ready to be started.
+const HookStartHost = "onstarthost"
 
 // HookStopNS hook used when instance has stopped but before namespaces have been destroyed.
 const HookStopNS = "onstopns"
@@ -41,6 +45,20 @@ const (
 
 // TemplateTrigger trigger name.
 type TemplateTrigger string
+
+// UpdateAction defines the trigger source for an instance update.
+type UpdateAction int
+
+const (
+	// UpdateActionUser indicates an update directly requested by users.
+	UpdateActionUser UpdateAction = iota
+
+	// UpdateActionUserRefresh indicates an update requested by user requested refresh workflows.
+	UpdateActionUserRefresh
+
+	// UpdateActionInternal indicates an internal update not directly user requested.
+	UpdateActionInternal
+)
 
 // TemplateTriggerCreate for when an instance is created.
 const TemplateTriggerCreate TemplateTrigger = "create"
@@ -75,31 +93,31 @@ type Instance interface {
 	ConfigReader
 
 	// Instance actions.
-	Freeze() error
-	Shutdown(timeout time.Duration) error
-	Start(stateful bool) error
-	Stop(stateful bool) error
-	Restart(timeout time.Duration) error
-	Rebuild(img *api.Image, op *operations.Operation) error
-	Unfreeze() error
+	Freeze(ctx context.Context) error
+	Shutdown(ctx context.Context, timeout time.Duration) error
+	Start(ctx context.Context, stateful bool, progressReporter ioprogress.ProgressReporter) error
+	Stop(ctx context.Context, stateful bool) error
+	Restart(ctx context.Context, timeout time.Duration, progressReporter ioprogress.ProgressReporter) error
+	Rebuild(ctx context.Context, img *api.Image, op *operations.Operation) error
+	Unfreeze(ctx context.Context) error
 	RegisterDevices()
 
 	Info() Info
 	IsPrivileged() bool
 
 	// Snapshots & migration & backups.
-	Restore(source Instance, stateful bool) error
-	Snapshot(name string, expiry time.Time, stateful bool) error
+	Restore(ctx context.Context, source Instance, stateful bool, diskVolumesMode string, progressReporter ioprogress.ProgressReporter) error
+	Snapshot(ctx context.Context, name string, expiry *time.Time, stateful bool, diskVolumesMode string, progressReporter ioprogress.ProgressReporter) error
 	Snapshots() ([]Instance, error)
 	Backups() ([]backup.InstanceBackup, error)
 	UpdateBackupFile() error
 
 	// Config handling.
-	Rename(newName string, applyTemplateTrigger bool) error
-	Update(newConfig db.InstanceArgs, userRequested bool) error
+	Rename(ctx context.Context, newName string, applyTemplateTrigger bool) error
+	Update(ctx context.Context, newConfig db.InstanceArgs, actionType UpdateAction) error
 
-	Delete(force bool) error
-	Export(w io.Writer, properties map[string]string, expiration time.Time) (api.ImageMetadata, error)
+	Delete(ctx context.Context, force bool, diskVolumesMode string, progressReporter ioprogress.ProgressReporter) error
+	Export(w io.Writer, properties map[string]string, expiration time.Time, tracker *ioprogress.ProgressTracker) (api.ImageMetadata, error)
 
 	// Live configuration.
 	CGroup() (*cgroup.CGroup, error)
@@ -111,13 +129,13 @@ type Instance interface {
 	FileSFTP() (*sftp.Client, error)
 
 	// Console - Allocate and run a console tty or a spice Unix socket.
-	Console(protocol string) (*os.File, chan error, error)
-	Exec(req api.InstanceExecPost, stdin *os.File, stdout *os.File, stderr *os.File) (Cmd, error)
+	Console(ctx context.Context, protocol string) (*os.File, chan error, error)
+	Exec(ctx context.Context, req api.InstanceExecPost, stdin *os.File, stdout *os.File, stderr *os.File) (Cmd, error)
 
 	// Status
 	Render(options ...func(response any) error) (any, any, error)
-	RenderFull(hostInterfaces []net.Interface) (*api.InstanceFull, any, error)
-	RenderState(hostInterfaces []net.Interface) (*api.InstanceState, error)
+	RenderFull(hostInterfaces []net.Interface, opts ...StateRenderOptions) (*api.InstanceFull, any, error)
+	RenderState(hostInterfaces []net.Interface, opts ...StateRenderOptions) (*api.InstanceState, error)
 	IsRunning() bool
 	IsFrozen() bool
 	IsEphemeral() bool
@@ -145,9 +163,10 @@ type Instance interface {
 
 	// Paths.
 	Path() string
-	ExecOutputPath() string
-	RootfsPath() string
-	TemplatesPath() string
+	OpenExecOutput() (*os.Root, error)
+	OpenRootfs() (*os.Root, error)
+	OpenTemplates() (*os.Root, error)
+	OpenRoot() (*os.Root, error)
 	StatePath() string
 	LogFilePath() string
 	ConsoleBufferLogPath() string
@@ -159,15 +178,11 @@ type Instance interface {
 
 	// Migration.
 	CanMigrate() (bool, bool)
-	MigrateSend(args MigrateSendArgs) error
-	MigrateReceive(args MigrateReceiveArgs) error
+	MigrateSend(ctx context.Context, args MigrateSendArgs, progressReporter ioprogress.ProgressReporter) error
+	MigrateReceive(ctx context.Context, args MigrateReceiveArgs, progressReporter ioprogress.ProgressReporter) error
 
 	// Conversion.
-	ConversionReceive(args ConversionReceiveArgs) error
-
-	// Progress reporting.
-	SetOperation(op *operations.Operation)
-	Operation() *operations.Operation
+	ConversionReceive(args ConversionReceiveArgs, progressReporter ioprogress.ProgressReporter) error
 
 	DeferTemplateApply(trigger TemplateTrigger) error
 
@@ -181,10 +196,14 @@ type Container interface {
 	CurrentIdmap() (*idmap.IdmapSet, error)
 	DiskIdmap() (*idmap.IdmapSet, error)
 	NextIdmap() (*idmap.IdmapSet, error)
-	ConsoleLog(opts liblxc.ConsoleLogOptions) (string, error)
+	ConsoleLog(ctx context.Context, opts liblxc.ConsoleLogOptions) (string, error)
 	InsertSeccompUnixDevice(prefix string, m deviceConfig.Device, pid int) error
 	DevptsFd() (*os.File, error)
+	FileSFTPNoLock() (*sftp.Client, error)
 	IdmappedStorage(path string, fstype string) idmap.IdmapStorageType
+	StopForkFile(force bool)
+	MoveMount(source string, target string, fstype string, flags int, idmapType idmap.IdmapStorageType) error
+	RemoveMount(mount string) error
 }
 
 // VM interface is for VM specific functions.
@@ -231,7 +250,7 @@ type MigrateArgs struct {
 	Snapshots             bool
 	Live                  bool
 	Disconnect            func()
-	ClusterMoveSourceName string // Will be empty if not a cluster move, othwise indicates the source instance.
+	ClusterMoveSourceName string // Will be empty if not a cluster move, otherwise indicates the source instance.
 }
 
 // MigrateSendArgs represent arguments for instance migration send.
@@ -239,6 +258,10 @@ type MigrateSendArgs struct {
 	MigrateArgs
 
 	AllowInconsistent bool
+
+	// DiskVolumesMode selects which disk volumes travel with the instance. Only all-exclusive sends the
+	// custom volumes attached to the instance alone; any other value sends the root disk only.
+	DiskVolumesMode string
 }
 
 // MigrateReceiveArgs represent arguments for instance migration receive.
@@ -247,6 +270,14 @@ type MigrateReceiveArgs struct {
 
 	InstanceOperation *operationlock.InstanceOperation
 	Refresh           bool
+
+	// AttachedVolumes holds "pool/name" for every custom volume the instance's devices refer to. A
+	// migration only ever creates or refreshes volumes from this set.
+	AttachedVolumes map[string]struct{}
+
+	// DeferredVolumes holds "pool/name" for the attached custom volumes whose device was masked because
+	// the volume is missing on the target. The source's index header must list each of them.
+	DeferredVolumes map[string]struct{}
 }
 
 // ConversionArgs represent arguments for instance conversion send and receive.

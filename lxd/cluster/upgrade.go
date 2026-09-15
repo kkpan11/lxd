@@ -2,13 +2,14 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
 	"os"
 	"time"
 
-	"github.com/canonical/go-dqlite/client"
+	"github.com/canonical/go-dqlite/v3/client"
 
 	"github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/lxd/db"
@@ -27,29 +28,29 @@ func NotifyUpgradeCompleted(state *state.State, networkCert *shared.CertInfo, se
 		return err
 	}
 
-	return notifier(func(client lxd.InstanceServer) error {
+	return notifier(func(member db.NodeInfo, client lxd.InstanceServer) error {
 		info, err := client.GetConnectionInfo()
 		if err != nil {
-			return fmt.Errorf("failed to get connection info: %w", err)
+			return fmt.Errorf("failed getting connection info: %w", err)
 		}
 
-		url := fmt.Sprintf("%s%s", info.Addresses[0], databaseEndpoint)
-		request, err := http.NewRequest("PATCH", url, nil)
+		url := info.Addresses[0] + databaseEndpoint
+		request, err := http.NewRequest(http.MethodPatch, url, nil)
 		if err != nil {
-			return fmt.Errorf("failed to create database notify upgrade request: %w", err)
+			return fmt.Errorf("failed creating database notify upgrade request: %w", err)
 		}
 
 		setDqliteVersionHeader(request)
 
 		httpClient, err := client.GetHTTPClient()
 		if err != nil {
-			return fmt.Errorf("failed to get HTTP client: %w", err)
+			return fmt.Errorf("failed getting HTTP client: %w", err)
 		}
 
 		httpClient.Timeout = 5 * time.Second
 		response, err := httpClient.Do(request)
 		if err != nil {
-			return fmt.Errorf("failed to notify node about completed upgrade: %w", err)
+			return fmt.Errorf("failed notifying node about completed upgrade: %w", err)
 		}
 
 		if response.StatusCode != http.StatusOK {
@@ -66,7 +67,7 @@ func MaybeUpdate(state *state.State) error {
 
 	enabled, err := Enabled(state.DB.Node)
 	if err != nil {
-		return fmt.Errorf("Failed to check clustering is enabled: %w", err)
+		return fmt.Errorf("Failed checking clustering is enabled: %w", err)
 	}
 
 	if !enabled {
@@ -74,7 +75,7 @@ func MaybeUpdate(state *state.State) error {
 	}
 
 	if state.DB.Cluster == nil {
-		return fmt.Errorf("Failed checking cluster update, state not initialised yet")
+		return errors.New("Failed checking cluster update, state not initialised yet")
 	}
 
 	err = state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
@@ -89,18 +90,18 @@ func MaybeUpdate(state *state.State) error {
 
 	if err != nil {
 		// Just log the error and return.
-		return fmt.Errorf("Failed to check if this node is out-of-date: %w", err)
+		return fmt.Errorf("Failed checking if this member is out-of-date: %w", err)
 	}
 
 	if !shouldUpdate {
-		logger.Debugf("Cluster node is up-to-date")
+		logger.Debug("Cluster member is up-to-date")
 		return nil
 	}
 
-	return triggerUpdate()
+	return runUpdate()
 }
 
-func triggerUpdate() error {
+func runUpdate() error {
 	logger.Warn("Member is out-of-date with respect to other cluster members")
 
 	updateExecutable := os.Getenv("LXD_CLUSTER_UPDATE")
@@ -109,7 +110,8 @@ func triggerUpdate() error {
 		return nil
 	}
 
-	// Wait a random amout of seconds (up to 30) in order to avoid
+	shared.SnapSetHealth(context.Background(), shared.SnapHealthWaiting, "Waiting for cluster snap refresh to complete")
+	// Wait a random amount of seconds (up to 30) in order to avoid
 	// restarting all cluster members at the same time, and make the
 	// upgrade more graceful.
 	wait := time.Duration(rand.Intn(30)) * time.Second
@@ -117,9 +119,10 @@ func triggerUpdate() error {
 	time.Sleep(wait)
 
 	logger.Info("Triggering cluster auto-update now")
-	_, err := shared.RunCommand(updateExecutable)
+	_, err := shared.RunCommand(context.TODO(), updateExecutable)
 	if err != nil {
 		logger.Error("Triggering cluster update failed", logger.Ctx{"err": err})
+		shared.SnapSetHealth(context.Background(), shared.SnapHealthError, "Cluster snap refresh failed")
 		return err
 	}
 
@@ -137,7 +140,7 @@ func UpgradeMembersWithoutRole(gateway *Gateway, members []db.NodeInfo) error {
 	}
 
 	if err != nil {
-		return fmt.Errorf("Failed to get current raft members: %w", err)
+		return fmt.Errorf("Failed getting current raft members: %w", err)
 	}
 
 	// Convert raft node list to map keyed on ID.
@@ -148,7 +151,7 @@ func UpgradeMembersWithoutRole(gateway *Gateway, members []db.NodeInfo) error {
 
 	dqliteClient, err := gateway.getClient()
 	if err != nil {
-		return fmt.Errorf("Failed to connect to local dqlite member: %w", err)
+		return fmt.Errorf("Failed connecting to local dqlite member: %w", err)
 	}
 
 	defer func() { _ = dqliteClient.Close() }()
@@ -202,7 +205,7 @@ func UpgradeMembersWithoutRole(gateway *Gateway, members []db.NodeInfo) error {
 		defer cancel()
 		err = dqliteClient.Add(ctx, info.NodeInfo)
 		if err != nil {
-			return fmt.Errorf("Failed to add dqlite member: %w", err)
+			return fmt.Errorf("Failed adding dqlite member: %w", err)
 		}
 	}
 

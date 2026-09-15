@@ -2,9 +2,11 @@ package db
 
 import (
 	"fmt"
-	"go/ast"
 	"net/url"
+	"slices"
 	"strings"
+
+	"golang.org/x/tools/go/packages"
 
 	"github.com/canonical/lxd/lxd/db/generate/lex"
 	"github.com/canonical/lxd/shared"
@@ -128,7 +130,7 @@ func (m *Mapping) ActiveFilters(kind string) []*Field {
 // prefixed with the entity's table name.
 func (m *Mapping) FieldColumnName(name string, table string) string {
 	field := m.FieldByName(name)
-	return fmt.Sprintf("%s.%s", table, field.Column())
+	return table + "." + field.Column()
 }
 
 // FilterFieldByName returns the field with the given name if that field can be
@@ -153,11 +155,7 @@ func (m *Mapping) ColumnFields(exclude ...string) []*Field {
 	fields := []*Field{}
 
 	for _, field := range m.Fields {
-		if shared.ValueInSlice(field.Name, exclude) {
-			continue
-		}
-
-		if field.Type.Code == TypeColumn {
+		if field.Type.Code == TypeColumn && !slices.Contains(exclude, field.Name) {
 			fields = append(fields, field)
 		}
 	}
@@ -196,7 +194,7 @@ func (m *Mapping) RefFields() []*Field {
 // FieldArgs converts the given fields to function arguments, rendering their
 // name and type.
 func (m *Mapping) FieldArgs(fields []*Field, extra ...string) string {
-	args := []string{}
+	args := make([]string, 0, len(fields)+len(extra))
 
 	for _, field := range fields {
 		name := lex.Minuscule(field.Name)
@@ -204,7 +202,7 @@ func (m *Mapping) FieldArgs(fields []*Field, extra ...string) string {
 			name = lex.Minuscule(m.Name) + field.Name
 		}
 
-		arg := fmt.Sprintf("%s %s", name, field.Type.Name)
+		arg := name + " " + field.Type.Name
 		args = append(args, arg)
 	}
 
@@ -240,7 +238,7 @@ func (m *Mapping) FieldParamsMarshal(fields []*Field) string {
 		}
 
 		if shared.IsTrue(field.Config.Get("marshal")) {
-			name = fmt.Sprintf("marshaled%s", field.Name)
+			name = "marshaled" + field.Name
 		}
 
 		args[i] = name
@@ -297,7 +295,7 @@ func (f *Field) Column() string {
 
 	join := f.JoinConfig()
 	if join != "" {
-		column = fmt.Sprintf("%s AS %s", join, column)
+		column = join + " AS " + column
 	}
 
 	return column
@@ -310,8 +308,8 @@ func (f *Field) SelectColumn(mapping *Mapping, primaryTable string) (string, err
 	// ReferenceTable and MapTable require specific fields, so parse those instead of checking tags.
 	if mapping.Type == ReferenceTable || mapping.Type == MapTable {
 		table := primaryTable
-		column := fmt.Sprintf("%s.%s", table, lex.Snake(f.Name))
-		column = strings.Replace(column, "reference", "%s", -1)
+		column := table + "." + lex.Snake(f.Name)
+		column = strings.ReplaceAll(column, "reference", "%s")
 
 		return column, nil
 	}
@@ -334,16 +332,16 @@ func (f *Field) SelectColumn(mapping *Mapping, primaryTable string) (string, err
 	if join != "" {
 		column = join
 	} else {
-		column = fmt.Sprintf("%s.%s", tableName, columnName)
+		column = tableName + "." + columnName
 	}
 
 	coalesce, ok := f.Config["coalesce"]
 	if ok {
-		column = fmt.Sprintf("coalesce(%s, %s)", column, coalesce[0])
+		column = "coalesce(" + column + ", " + coalesce[0] + ")"
 	}
 
 	if join != "" {
-		column = fmt.Sprintf("%s AS %s", column, columnName)
+		column = column + " AS " + columnName
 	}
 
 	return column, nil
@@ -354,8 +352,8 @@ func (f *Field) OrderBy(mapping *Mapping, primaryTable string) (string, error) {
 	// ReferenceTable and MapTable require specific fields, so parse those instead of checking tags.
 	if mapping.Type == ReferenceTable || mapping.Type == MapTable {
 		table := primaryTable
-		column := fmt.Sprintf("%s.%s", table, lex.Snake(f.Name))
-		column = strings.Replace(column, "reference", "%s", -1)
+		column := table + "." + lex.Snake(f.Name)
+		column = strings.ReplaceAll(column, "reference", "%s")
 
 		return column, nil
 	}
@@ -383,10 +381,10 @@ func (f *Field) OrderBy(mapping *Mapping, primaryTable string) (string, error) {
 	}
 
 	if tableName != "" {
-		return fmt.Sprintf("%s.%s", tableName, columnName), nil
+		return tableName + "." + columnName, nil
 	}
 
-	return fmt.Sprintf("%s.%s", entityTable(mapping.Name, tableName), columnName), nil
+	return entityTable(mapping.Name, tableName) + "." + columnName, nil
 }
 
 // JoinClause returns an SQL 'JOIN' clause using the 'join'  and 'joinon' tags, if present.
@@ -398,7 +396,7 @@ func (f *Field) JoinClause(mapping *Mapping, table string) (string, error) {
 
 	join := f.JoinConfig()
 	if f.Config.Get("leftjoin") != "" {
-		joinTemplate = strings.Replace(joinTemplate, "JOIN", "LEFT JOIN", -1)
+		joinTemplate = strings.ReplaceAll(joinTemplate, "JOIN", "LEFT JOIN")
 	}
 
 	joinTable, _, ok := strings.Cut(join, ".")
@@ -414,9 +412,9 @@ func (f *Field) JoinClause(mapping *Mapping, table string) (string, error) {
 		}
 
 		if tableName != "" && columnName != "" {
-			joinOn = fmt.Sprintf("%s.%s", tableName, columnName)
+			joinOn = tableName + "." + columnName
 		} else {
-			joinOn = fmt.Sprintf("%s.%s_id", table, lex.Singular(joinTable))
+			joinOn = table + "." + lex.Singular(joinTable) + "_id"
 		}
 	}
 
@@ -433,10 +431,7 @@ func (f *Field) JoinClause(mapping *Mapping, table string) (string, error) {
 // to select the ID to insert into this table.
 // - If a 'joinon' tag is present, but this table is not among the conditions, then the join will be considered indirect,
 // and an empty string will be returned.
-func (f *Field) InsertColumn(pkg *ast.Package, dbPkg *ast.Package, mapping *Mapping, primaryTable string) (string, string, error) {
-	var column string
-	var value string
-	var err error
+func (f *Field) InsertColumn(pkg *packages.Package, dbPkg *packages.Package, mapping *Mapping, primaryTable string) (column string, value string, err error) {
 	if f.IsScalar() {
 		tableName, columnName, err := f.SQLConfig()
 		if err != nil {
@@ -475,11 +470,11 @@ func (f *Field) InsertColumn(pkg *ast.Package, dbPkg *ast.Package, mapping *Mapp
 		varName := stmtCodeVar(lex.Singular(table), "ID")
 		joinStmt, err := ParseStmt(pkg, dbPkg, varName)
 		if err != nil {
-			return "", "", fmt.Errorf("Failed to find registered statement %q for field %q of struct %q: %w", varName, f.Name, mapping.Name, err)
+			return "", "", fmt.Errorf("Failed finding registered statement %q for field %q of struct %q: %w", varName, f.Name, mapping.Name, err)
 		}
 
-		value = fmt.Sprintf("(%s)", strings.Replace(strings.Replace(joinStmt, "`", "", -1), "\n", "", -1))
-		value = strings.Replace(value, "  ", " ", -1)
+		value = "(" + strings.ReplaceAll(strings.ReplaceAll(joinStmt, "`", ""), "\n", "") + ")"
+		value = strings.ReplaceAll(value, "  ", " ")
 	} else {
 		column, err = f.SelectColumn(mapping, primaryTable)
 		if err != nil {
@@ -491,7 +486,7 @@ func (f *Field) InsertColumn(pkg *ast.Package, dbPkg *ast.Package, mapping *Mapp
 		column, _, _ = strings.Cut(column, ",")
 
 		if mapping.Type == ReferenceTable || mapping.Type == MapTable {
-			column = strings.Replace(column, "reference", "%s", -1)
+			column = strings.ReplaceAll(column, "reference", "%s")
 		}
 
 		value = "?"
@@ -500,6 +495,7 @@ func (f *Field) InsertColumn(pkg *ast.Package, dbPkg *ast.Package, mapping *Mapp
 	return column, value, nil
 }
 
+// JoinConfig returns the `join` or `leftjoin` tag values.
 func (f Field) JoinConfig() string {
 	join := f.Config.Get("join")
 	if join == "" {
@@ -510,7 +506,7 @@ func (f Field) JoinConfig() string {
 }
 
 // SQLConfig returns the table and column specified by the 'sql' config key, if present.
-func (f Field) SQLConfig() (string, string, error) {
+func (f Field) SQLConfig() (tableName string, columnName string, err error) {
 	where := f.Config.Get("sql")
 
 	if where == "" {
@@ -526,7 +522,7 @@ func (f Field) SQLConfig() (string, string, error) {
 }
 
 // ScalarTableColumn gets the table and column from the join configuration.
-func (f Field) ScalarTableColumn() (string, string, error) {
+func (f Field) ScalarTableColumn() (tableName string, columnName string, err error) {
 	join := f.JoinConfig()
 
 	if join == "" {
@@ -543,7 +539,7 @@ func (f Field) ScalarTableColumn() (string, string, error) {
 
 // FieldNames returns the names of the given fields.
 func FieldNames(fields []*Field) []string {
-	names := []string{}
+	names := make([]string, 0, len(fields))
 	for _, f := range fields {
 		names = append(names, f.Name)
 	}

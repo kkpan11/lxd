@@ -1,22 +1,20 @@
 # In case a cached image matching the desired alias is present, that
 # one is preferred, even if the its remote has a more recent one.
 test_image_prefer_cached() {
-
-  if lxc image alias list | grep -q "^| testimage\\s*|.*$"; then
+  if lxc image alias list testimage | grep -wF "testimage"; then
       lxc image delete testimage
   fi
 
   local LXD2_DIR LXD2_ADDR
   LXD2_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
-  chmod +x "${LXD2_DIR}"
   spawn_lxd "${LXD2_DIR}" true
-  LXD2_ADDR=$(cat "${LXD2_DIR}/lxd.addr")
+  LXD2_ADDR=$(< "${LXD2_DIR}/lxd.addr")
 
-  (LXD_DIR=${LXD2_DIR} deps/import-busybox --alias testimage --public)
+  LXD_DIR=${LXD2_DIR} deps/import-busybox --alias testimage --public
   fp1="$(LXD_DIR=${LXD2_DIR} lxc image info testimage | awk '/^Fingerprint/ {print $2}')"
 
   token="$(LXD_DIR=${LXD2_DIR} lxc config trust add --name foo -q)"
-  lxc remote add l2 "${LXD2_ADDR}" --accept-certificate --token "${token}"
+  lxc remote add l2 "${LXD2_ADDR}" --token "${token}"
   lxc init l2:testimage c1
 
   # Now the first image image is in the local store, since it was
@@ -27,8 +25,8 @@ test_image_prefer_cached() {
   # Delete the first image from the remote store and replace it with a
   # new one with a different fingerprint (passing "--template create"
   # will do that).
-  (LXD_DIR=${LXD2_DIR} lxc image delete testimage)
-  (LXD_DIR=${LXD2_DIR} deps/import-busybox --alias testimage --public --template create)
+  LXD_DIR=${LXD2_DIR} lxc image delete testimage
+  LXD_DIR=${LXD2_DIR} deps/import-busybox --alias testimage --public --template create
   fp2="$(LXD_DIR=${LXD2_DIR} lxc image info testimage | awk '/^Fingerprint/ {print $2}')"
   [ "${fp1}" != "${fp2}" ]
 
@@ -40,8 +38,7 @@ test_image_prefer_cached() {
       return 1
   fi
 
-  lxc delete c1
-  lxc delete c2
+  lxc delete c1 c2
   lxc remote remove l2
   lxc image delete "${fp1}"
 

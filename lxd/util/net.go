@@ -3,73 +3,22 @@ package util
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"fmt"
 	"net"
 	"os"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/logger"
 )
 
-// InMemoryNetwork creates a fully in-memory listener and dial function.
-//
-// Each time the dial function is invoked a new pair of net.Conn objects will
-// be created using net.Pipe: the listener's Accept method will unblock and
-// return one end of the pipe and the other end will be returned by the dial
-// function.
-func InMemoryNetwork() (net.Listener, func() net.Conn) {
-	listener := &inMemoryListener{
-		conns:  make(chan net.Conn, 16),
-		closed: make(chan struct{}),
-	}
-
-	dialer := func() net.Conn {
-		server, client := net.Pipe()
-		listener.conns <- server
-		return client
-	}
-
-	return listener, dialer
-}
-
-type inMemoryListener struct {
-	conns  chan net.Conn
-	closed chan struct{}
-}
-
-// Accept waits for and returns the next connection to the listener.
-func (l *inMemoryListener) Accept() (net.Conn, error) {
-	select {
-	case conn := <-l.conns:
-		return conn, nil
-	case <-l.closed:
-		return nil, fmt.Errorf("closed")
-	}
-}
-
-// Close closes the listener.
-// Any blocked Accept operations will be unblocked and return errors.
-func (l *inMemoryListener) Close() error {
-	close(l.closed)
-	return nil
-}
-
-// Addr returns the listener's network address.
-func (l *inMemoryListener) Addr() net.Addr {
-	return &inMemoryAddr{}
-}
-
-type inMemoryAddr struct {
-}
-
-// Network returns the name of the network.
-func (a *inMemoryAddr) Network() string {
-	return "memory"
-}
-
-func (a *inMemoryAddr) String() string {
-	return ""
-}
+// HTTPServerReadTimeout bounds how long LXD's HTTP servers wait to read request
+// headers, and, on servers that set ReadTimeout, the full request. It also bounds
+// the STARTTLS peek on the local unix socket. Legitimate clients send their first
+// bytes immediately.
+const HTTPServerReadTimeout = 3 * time.Second
 
 // CanonicalNetworkAddress parses the given network address and returns a string of the form "host:port",
 // possibly filling it with the default port if it's missing. It will also wrap a bare IPv6 address with square
@@ -81,15 +30,15 @@ func CanonicalNetworkAddress(address string, defaultPort int64) string {
 		if ip != nil {
 			// If the input address is a bare IP address, then convert it to a proper listen address
 			// using the canonical IP with default port and wrap IPv6 addresses in square brackets.
-			address = net.JoinHostPort(ip.String(), fmt.Sprintf("%d", defaultPort))
+			address = net.JoinHostPort(ip.String(), strconv.FormatInt(defaultPort, 10))
 		} else {
 			// Otherwise assume this is either a host name or a partial address (e.g `[::]`) without
 			// a port number, so append the default port.
-			address = fmt.Sprintf("%s:%d", address, defaultPort)
+			address = address + ":" + strconv.FormatInt(defaultPort, 10)
 		}
 	} else if port == "" && address[len(address)-1] == ':' {
 		// An address that ends with a trailing colon will be parsed as having an empty port.
-		address = net.JoinHostPort(host, fmt.Sprintf("%d", defaultPort))
+		address = net.JoinHostPort(host, strconv.FormatInt(defaultPort, 10))
 	}
 
 	return address
@@ -100,7 +49,7 @@ func CanonicalNetworkAddress(address string, defaultPort int64) string {
 func CanonicalNetworkAddressFromAddressAndPort(address string, port int64, defaultPort int64) string {
 	// Because we accept just the host part of an IPv6 listen address (e.g. `[::]`) don't use net.JoinHostPort.
 	// If a bare IP address is supplied then CanonicalNetworkAddress will use net.JoinHostPort if needed.
-	return CanonicalNetworkAddress(fmt.Sprintf("%s:%d", address, port), defaultPort)
+	return CanonicalNetworkAddress(address+":"+strconv.FormatInt(port, 10), defaultPort)
 }
 
 // ServerTLSConfig returns a new server-side tls.Config generated from the give
@@ -117,7 +66,7 @@ func ServerTLSConfig(cert *shared.CertInfo) *tls.Config {
 		config.RootCAs = pool
 		config.ClientCAs = pool
 
-		logger.Infof("LXD is in CA mode, only CA-signed client certificates will be allowed")
+		logger.Info("LXD is in CA mode, only CA-signed client certificates will be allowed")
 	}
 
 	return config
@@ -226,10 +175,8 @@ func IsAddressCovered(address1, address2 string) bool {
 	}
 
 	for _, a1 := range addresses1 {
-		for _, a2 := range addresses2 {
-			if a1.Equal(a2) {
-				return true
-			}
+		if slices.ContainsFunc(addresses2, a1.Equal) {
+			return true
 		}
 	}
 
@@ -272,37 +219,26 @@ func IsWildCardAddress(address string) bool {
 // SysctlGet retrieves the value of a sysctl file in /proc/sys.
 func SysctlGet(path string) (string, error) {
 	// Read the current content
-	content, err := os.ReadFile(fmt.Sprintf("/proc/sys/%s", path))
+	content, err := os.ReadFile("/proc/sys/" + path)
 	if err != nil {
 		return "", err
 	}
 
-	return string(content), nil
+	return strings.TrimRight(string(content), "\n"), nil
 }
 
 // SysctlSet writes a value to a sysctl file in /proc/sys.
-// Requires an even number of arguments as key/value pairs. E.g. SysctlSet("path1", "value1", "path2", "value2").
-func SysctlSet(parts ...string) error {
-	partsLen := len(parts)
-	if partsLen%2 != 0 {
-		return fmt.Errorf("Requires even number of arguments")
+func SysctlSet(path string, value string) error {
+	// Get current value.
+	currentValue, err := SysctlGet(path)
+	if err == nil && currentValue == value {
+		// Nothing to update.
+		return nil
 	}
 
-	for i := 0; i < partsLen; i = i + 2 {
-		path := parts[i]
-		newValue := parts[i+1]
-
-		// Get current value.
-		currentValue, err := SysctlGet(path)
-		if err == nil && currentValue == newValue {
-			// Nothing to update.
-			return nil
-		}
-
-		err = os.WriteFile(fmt.Sprintf("/proc/sys/%s", path), []byte(newValue), 0)
-		if err != nil {
-			return err
-		}
+	err = os.WriteFile("/proc/sys/"+path, []byte(value), 0)
+	if err != nil {
+		return err
 	}
 
 	return nil

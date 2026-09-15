@@ -1,52 +1,447 @@
 package main
 
 /*
- * An example of how to use lxd's golang /dev/lxd client. This is intended to
- * be run from inside a container.
+ * An example of how to use lxd's devLXD client.
+ * This is intended to be run from inside an instance.
  */
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"time"
 
-	"github.com/gorilla/websocket"
-	"gopkg.in/yaml.v2"
-
+	lxdClient "github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/shared/api"
 )
 
-type devLxdDialer struct {
-	Path string
+func main() {
+	err := run(os.Args)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
 }
 
-func (d devLxdDialer) devLxdDial(ctx context.Context, network, path string) (net.Conn, error) {
-	addr, err := net.ResolveUnixAddr("unix", d.Path)
+func run(args []string) error {
+	client, err := devLXDClient()
+	if err != nil {
+		return err
+	}
+
+	defer client.Disconnect()
+
+	if len(args) <= 1 {
+		fmt.Println("/dev/lxd ok")
+		return nil
+	}
+
+	command := args[1]
+
+	switch command {
+	case "get-state":
+		state, err := client.GetState()
+		if err != nil {
+			return err
+		}
+
+		return printPrettyJSON(state)
+	case "monitor-stream":
+		return devLXDMonitorStream()
+	case "monitor-websocket":
+		eventListener, err := client.GetEvents()
+		if err != nil {
+			return err
+		}
+
+		defer eventListener.Disconnect()
+
+		_, err = eventListener.AddHandler(nil, func(event api.Event) {
+			event.Timestamp = time.Time{}
+
+			err := printPrettyJSON(event)
+			if err != nil {
+				fmt.Printf("Failed printing event: %v\n", err)
+				return
+			}
+		})
+		if err != nil {
+			return err
+		}
+
+		return eventListener.Wait()
+	case "ready-state":
+		if len(args) != 3 {
+			return fmt.Errorf("Usage: %s ready-state <isReadyBool>", args[0])
+		}
+
+		ready, err := strconv.ParseBool(args[2])
+		if err != nil {
+			return err
+		}
+
+		req := api.DevLXDPut{
+			State: api.Started.String(),
+		}
+
+		if ready {
+			req.State = api.Ready.String()
+		}
+
+		return client.UpdateState(req)
+	case "devices":
+		devices, err := client.GetDevices()
+		if err != nil {
+			return err
+		}
+
+		return printPrettyJSON(devices)
+	case "image-export":
+		if len(args) != 3 {
+			return fmt.Errorf("Usage: %s image-export <fingerprint>", args[0])
+		}
+
+		fingerprint := args[2]
+
+		// Request image export, but disard the received image content.
+		req := lxdClient.ImageFileRequest{
+			MetaFile:   discardWriteSeeker{},
+			RootfsFile: discardWriteSeeker{},
+		}
+
+		_, err := client.GetImageFile(fingerprint, req)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	case "cloud-init":
+		if len(args) != 3 {
+			return fmt.Errorf("Usage: %s cloud-init <user-data|vendor-data|network-config>", args[0])
+		}
+
+		var config string
+		var err error
+		switch args[2] {
+		case "user-data":
+			config, err = client.GetConfigByKey("cloud-init.user-data")
+		case "vendor-data":
+			config, err = client.GetConfigByKey("cloud-init.vendor-data")
+		case "network-config":
+			config, err = client.GetConfigByKey("cloud-init.network-config")
+		default:
+			return fmt.Errorf("Usage: %s cloud-init <user-data|vendor-data|network-config>", args[0])
+		}
+
+		if err != nil {
+			return err
+		}
+
+		fmt.Println(config)
+
+		return nil
+	case "storage":
+		usageErr := fmt.Errorf("Usage: %s storage <get|volumes|get-volume|create-volume|update-volume|delete-volume>", args[0])
+
+		if len(args) < 3 {
+			return usageErr
+		}
+
+		subcmd := args[2]
+		switch subcmd {
+		case "get":
+			if len(args) != 4 {
+				return fmt.Errorf("Usage: %s storage get <poolName>", args[0])
+			}
+
+			poolName := args[3]
+
+			storage, _, err := client.GetStoragePool(poolName)
+			if err != nil {
+				return err
+			}
+
+			return printPrettyJSON(storage)
+		case "volumes":
+			if len(args) != 4 {
+				return fmt.Errorf("Usage: %s storage volumes <poolName>", args[0])
+			}
+
+			poolName := args[3]
+
+			vols, err := client.GetStoragePoolVolumes(poolName)
+			if err != nil {
+				return err
+			}
+
+			return printPrettyJSON(vols)
+		case "get-volume":
+			fallthrough
+		case "get-volume-etag":
+			if len(args) != 6 {
+				return fmt.Errorf("Usage: %s storage get-volume[-etag] <poolName> <volType> <volName>", args[0])
+			}
+
+			poolName := args[3]
+			volType := args[4]
+			volName := args[5]
+
+			vol, etag, err := client.GetStoragePoolVolume(poolName, volType, volName)
+			if err != nil {
+				return err
+			}
+
+			if subcmd == "get-volume" {
+				return printPrettyJSON(vol)
+			}
+
+			fmt.Print(etag)
+			return nil
+		case "create-volume":
+			if len(args) != 5 {
+				return fmt.Errorf("Usage: %s storage create-volume <poolName> <vol>", args[0])
+			}
+
+			poolName := args[3]
+			volData := args[4]
+
+			vol := api.DevLXDStorageVolumesPost{}
+			err := json.Unmarshal([]byte(volData), &vol)
+			if err != nil {
+				return err
+			}
+
+			op, err := client.CreateStoragePoolVolume(poolName, vol)
+			if err != nil {
+				return err
+			}
+
+			return op.WaitContext(context.Background())
+		case "update-volume":
+			if len(args) < 7 || len(args) > 8 {
+				return fmt.Errorf("Usage: %s storage update-volume <poolName> <volType> <volName> <vol> [<etag>]", args[0])
+			}
+
+			poolName := args[3]
+			volType := args[4]
+			volName := args[5]
+			volData := args[6]
+
+			etag := ""
+			if len(args) == 8 {
+				etag = args[7]
+			}
+
+			vol := api.DevLXDStorageVolumePut{}
+			err := json.Unmarshal([]byte(volData), &vol)
+			if err != nil {
+				return err
+			}
+
+			op, err := client.UpdateStoragePoolVolume(poolName, volType, volName, vol, etag)
+			if err != nil {
+				return err
+			}
+
+			return op.WaitContext(context.Background())
+		case "delete-volume":
+			if len(args) != 6 {
+				return fmt.Errorf("Usage: %s storage delete-volume <poolName> <volType> <volName>", args[0])
+			}
+
+			poolName := args[3]
+			volType := args[4]
+			volName := args[5]
+
+			op, err := client.DeleteStoragePoolVolume(poolName, volType, volName)
+			if err != nil {
+				return err
+			}
+
+			return op.WaitContext(context.Background())
+		case "snapshots":
+			if len(args) != 6 {
+				return fmt.Errorf("Usage: %s storage snapshots <poolName> <volType> <volName>", args[0])
+			}
+
+			poolName := args[3]
+			volType := args[4]
+			volName := args[5]
+
+			vols, err := client.GetStoragePoolVolumeSnapshots(poolName, volType, volName)
+			if err != nil {
+				return err
+			}
+
+			return printPrettyJSON(vols)
+		case "get-snapshot":
+			if len(args) != 7 {
+				return fmt.Errorf("Usage: %s storage get-snapshot <poolName> <volType> <volName> <snapName>", args[0])
+			}
+
+			poolName := args[3]
+			volType := args[4]
+			volName := args[5]
+			snapName := args[6]
+
+			vol, _, err := client.GetStoragePoolVolumeSnapshot(poolName, volType, volName, snapName)
+			if err != nil {
+				return err
+			}
+
+			return printPrettyJSON(vol)
+		case "create-snapshot":
+			if len(args) != 7 {
+				return fmt.Errorf("Usage: %s storage create-snapshot <poolName> <volType> <volName> <snapshot>", args[0])
+			}
+
+			poolName := args[3]
+			volType := args[4]
+			volName := args[5]
+			snapData := args[6]
+
+			snapshot := api.DevLXDStorageVolumeSnapshotsPost{}
+			err := json.Unmarshal([]byte(snapData), &snapshot)
+			if err != nil {
+				return err
+			}
+
+			op, err := client.CreateStoragePoolVolumeSnapshot(poolName, volType, volName, snapshot)
+			if err != nil {
+				return err
+			}
+
+			return op.WaitContext(context.Background())
+		case "delete-snapshot":
+			if len(args) != 7 {
+				return fmt.Errorf("Usage: %s storage delete-snapshot <poolName> <volType> <volName> <snapName>", args[0])
+			}
+
+			poolName := args[3]
+			volType := args[4]
+			volName := args[5]
+			snapName := args[6]
+
+			op, err := client.DeleteStoragePoolVolumeSnapshot(poolName, volType, volName, snapName)
+			if err != nil {
+				return err
+			}
+
+			return op.WaitContext(context.Background())
+		default:
+			return fmt.Errorf("Unknown subcommand: %q\n%w", subcmd, usageErr)
+		}
+
+	case "instance":
+		usageErr := fmt.Errorf("Usage: %s instance <get|update>", args[0])
+
+		if len(args) < 3 {
+			return usageErr
+		}
+
+		subcmd := args[2]
+		switch subcmd {
+		case "get":
+			fallthrough
+		case "get-etag":
+			if len(args) != 4 {
+				return fmt.Errorf("Usage: %s instance get[-etag] <instName>", args[0])
+			}
+
+			instName := args[3]
+
+			inst, etag, err := client.GetInstance(instName)
+			if err != nil {
+				return err
+			}
+
+			if subcmd == "get" {
+				return printPrettyJSON(inst)
+			}
+
+			fmt.Print(etag)
+			return nil
+		case "update":
+			if len(args) < 5 || len(args) > 6 {
+				return fmt.Errorf("Usage: %s instance update <instName> <inst> [<etag>]", args[0])
+			}
+
+			instName := args[3]
+			instData := args[4]
+
+			etag := ""
+			if len(args) == 6 {
+				etag = args[5]
+			}
+
+			var inst api.DevLXDInstancePut
+			err := json.Unmarshal([]byte(instData), &inst)
+			if err != nil {
+				return err
+			}
+
+			return client.UpdateInstance(instName, inst, etag)
+		default:
+			return fmt.Errorf("Unknown subcommand: %q\n%w", subcmd, usageErr)
+		}
+
+	case "query":
+		if len(args) < 4 || len(args) > 5 {
+			return fmt.Errorf("Usage: %s query <method> <path> [<body>]", args[0])
+		}
+
+		method := args[2]
+		path := args[3]
+
+		body := ""
+		if len(args) == 5 {
+			body = args[4]
+		}
+
+		resp, _, err := client.RawQuery(method, path, body, "")
+		if err != nil {
+			return err
+		}
+
+		fmt.Println(string(resp.Content))
+		return nil
+	default:
+		key, err := client.GetConfigByKey(os.Args[1])
+		if err != nil {
+			return err
+		}
+
+		fmt.Println(key)
+		return nil
+	}
+}
+
+// devLXDClient connects to the LXD socket and returns a devLXD client.
+func devLXDClient() (lxdClient.DevLXDServer, error) {
+	bearerToken := os.Getenv("DEVLXD_BEARER_TOKEN")
+	args := lxdClient.ConnectionArgs{
+		UserAgent:   "devlxd-client",
+		BearerToken: bearerToken,
+	}
+
+	client, err := lxdClient.ConnectDevLXD("/dev/lxd/sock", &args)
 	if err != nil {
 		return nil, err
 	}
 
-	conn, err := net.DialUnix("unix", nil, addr)
-	if err != nil {
-		return nil, err
-	}
-
-	return conn, err
+	return client, nil
 }
 
-var devLxdTransport = &http.Transport{
-	DialContext: devLxdDialer{"/dev/lxd/sock"}.devLxdDial,
-}
-
-func devlxdMonitorStream() {
+// devLXDMonitorStream connects to the LXD socket and listens for events over http stream.
+//
+// devLXD client supports event monitoring only over a websocket, therefore we use manual
+// approach to test the event stream.
+func devLXDMonitorStream() error {
 	client := http.Client{
 		Transport: &http.Transport{
 			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
@@ -57,179 +452,49 @@ func devlxdMonitorStream() {
 
 	resp, err := client.Get("http://unix/1.0/events")
 	if err != nil {
-		panic(err)
+		return err
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
 
 	for scanner.Scan() {
-		message := make(map[string]any)
-		err = json.Unmarshal(scanner.Bytes(), &message)
+		var event api.Event
+		err = json.Unmarshal(scanner.Bytes(), &event)
 		if err != nil {
-			return
+			return err
 		}
 
-		message["timestamp"] = nil
+		event.Timestamp = time.Time{}
 
-		msg, err := yaml.Marshal(&message)
+		err := printPrettyJSON(event)
 		if err != nil {
-			return
+			return err
 		}
-
-		fmt.Printf("%s\n", msg)
 	}
+
+	return nil
 }
 
-func devlxdMonitorWebsocket(c http.Client) {
-	dialer := websocket.Dialer{
-		NetDialContext:   devLxdTransport.DialContext,
-		HandshakeTimeout: time.Second * 5,
-	}
-
-	conn, _, err := dialer.Dial("ws://unix.socket/1.0/events", nil)
+// printPrettyJSON prints the given value as JSON to stdout.
+func printPrettyJSON(value any) error {
+	out, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
 
-	for {
-		_, data, err := conn.ReadMessage()
-		if err != nil {
-			return
-		}
-
-		message := make(map[string]any)
-		err = json.Unmarshal(data, &message)
-		if err != nil {
-			return
-		}
-
-		message["timestamp"] = nil
-
-		msg, err := yaml.Marshal(&message)
-		if err != nil {
-			return
-		}
-
-		fmt.Printf("%s\n", msg)
-	}
+	fmt.Println(string(out))
+	return nil
 }
 
-func devlxdState(ready bool) {
-	client := http.Client{
-		Transport: &http.Transport{
-			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-				return net.Dial("unix", "/dev/lxd/sock")
-			},
-		},
-	}
+// discardWriteSeeker is a no-op io.WriteSeeker implementation.
+type discardWriteSeeker struct{}
 
-	var body bytes.Buffer
-	payload := struct {
-		State string `json:"state"`
-	}{}
-
-	if ready {
-		payload.State = api.Ready.String()
-	} else {
-		payload.State = api.Started.String()
-	}
-
-	err := json.NewEncoder(&body).Encode(&payload)
-	if err != nil {
-		return
-	}
-
-	req, err := http.NewRequest("PATCH", "http://unix/1.0", &body)
-	if err != nil {
-		return
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	_, err = client.Do(req)
-	if err != nil {
-		return
-	}
+// Write discards the input data and returns its length with a nil error.
+func (d discardWriteSeeker) Write(p []byte) (int, error) {
+	return len(p), nil
 }
 
-func main() {
-	c := http.Client{Transport: devLxdTransport}
-	raw, err := c.Get("http://meshuggah-rocks/")
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-
-	if raw.StatusCode != http.StatusOK {
-		fmt.Println("http error", raw.StatusCode)
-		result, err := io.ReadAll(raw.Body)
-		if err != nil {
-			os.Exit(1)
-		}
-
-		fmt.Println(string(result))
-	}
-
-	result := []string{}
-	err = json.NewDecoder(raw.Body).Decode(&result)
-	if err != nil {
-		fmt.Println("err decoding response", err)
-		os.Exit(1)
-	}
-
-	if result[0] != "/1.0" {
-		fmt.Println("unknown response", result)
-		os.Exit(1)
-	}
-
-	if len(os.Args) > 1 {
-		var path string
-		switch os.Args[1] {
-		case "monitor-websocket":
-			devlxdMonitorWebsocket(c)
-			os.Exit(0)
-		case "monitor-stream":
-			devlxdMonitorStream()
-			os.Exit(0)
-		case "ready-state":
-			ready, err := strconv.ParseBool(os.Args[2])
-			if err != nil {
-				fmt.Println(err)
-				os.Exit(1)
-			}
-
-			devlxdState(ready)
-			os.Exit(0)
-		case "devices":
-			path = "devices"
-		case "image-export":
-			if len(os.Args) < 3 {
-				fmt.Println("Image fingerprint is needed as second argument")
-				os.Exit(1)
-			}
-
-			path = fmt.Sprintf("images/%s/export", os.Args[2])
-		default:
-			path = fmt.Sprintf("config/%s", os.Args[1])
-		}
-
-		raw, err := c.Get(fmt.Sprintf("http://meshuggah-rocks/1.0/%s", path))
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
-		}
-
-		// Avoid printing the entire image to stdout
-		if !(os.Args[1] == "image-export" && (raw.StatusCode == 0 || raw.StatusCode == http.StatusOK)) {
-			value, err := io.ReadAll(raw.Body)
-			if err != nil {
-				fmt.Println(err)
-				os.Exit(1)
-			}
-
-			fmt.Println(string(value))
-		}
-	} else {
-		fmt.Println("/dev/lxd ok")
-	}
+// Seek does nothing and always returns 0 with a nil error.
+func (d discardWriteSeeker) Seek(offset int64, whence int) (int64, error) {
+	return 0, nil
 }

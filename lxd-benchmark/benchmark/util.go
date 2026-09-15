@@ -2,11 +2,12 @@ package benchmark
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 )
 
 func getContainerName(count int, index int) string {
-	nameFormat := "benchmark-%." + fmt.Sprintf("%d", len(fmt.Sprintf("%d", count))) + "d"
+	nameFormat := "benchmark-%." + strconv.Itoa(len(strconv.Itoa(count))) + "d"
 	return fmt.Sprintf(nameFormat, index+1)
 }
 

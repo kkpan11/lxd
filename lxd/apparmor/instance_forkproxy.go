@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"text/template"
 
@@ -80,6 +81,7 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   # The binary itself (for nesting)
   /var/snap/lxd/common/lxd.debug      mr,
   /snap/lxd/*/bin/lxd                 mr,
+  /snap/lxd/*/sbin/lxd                mr,
 
   # Snap-specific libraries
   /snap/lxd/*/lib/**.so*              mr,
@@ -136,17 +138,17 @@ func forkproxyProfile(inst instance, dev device) (string, error) {
 
 	// AppArmor requires deref of all paths.
 	for k := range sockets {
-		// Skip non-existing because of the additional entry for the host side.
-		if !shared.PathExists(sockets[k]) {
-			continue
-		}
-
 		v, err := filepath.EvalSymlinks(sockets[k])
 		if err != nil {
+			// Skip non-existing because of the additional entry for the host side.
+			if os.IsNotExist(err) {
+				continue
+			}
+
 			return "", err
 		}
 
-		if !shared.ValueInSlice(v, sockets) {
+		if !slices.Contains(sockets, v) {
 			sockets = append(sockets, v)
 		}
 	}

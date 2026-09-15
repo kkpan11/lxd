@@ -4,9 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
@@ -40,9 +41,9 @@ func DebugJSON(title string, r *bytes.Buffer, l logger.Logger) {
 	l.Debug(fmt.Sprintf("%s\n\t%s", title, str[0:len(str)-1]))
 }
 
-// WriteJSON encodes the body as JSON and sends it back to the client
+// WriteJSON encodes the body as JSON and writes it to [io.Writer].
 // Accepts optional debugLogger that activates debug logging if non-nil.
-func WriteJSON(w http.ResponseWriter, body any, debugLogger logger.Logger) error {
+func WriteJSON(w io.Writer, body any, debugLogger logger.Logger) error {
 	var output io.Writer
 	var captured *bytes.Buffer
 
@@ -71,7 +72,7 @@ func EtagHash(data any) (string, error) {
 		return "", err
 	}
 
-	return fmt.Sprintf("%x", etag.Sum(nil)), nil
+	return hex.EncodeToString(etag.Sum(nil)), nil
 }
 
 // EtagCheck validates the hash of the current state with the hash
@@ -90,7 +91,7 @@ func EtagCheck(r *http.Request, data any) error {
 	}
 
 	if hash != match {
-		return api.StatusErrorf(http.StatusPreconditionFailed, "ETag doesn't match: %s vs %s", hash, match)
+		return api.StatusErrorf(http.StatusPreconditionFailed, "ETag does not match: %s vs %s. The configuration has been modified since this change began. Please retrieve the updated configuration before proceeding.", hash, match)
 	}
 
 	return nil
@@ -102,12 +103,7 @@ func HTTPClient(certificate string, proxy proxyFunc) (*http.Client, error) {
 	var cert *x509.Certificate
 
 	if certificate != "" {
-		certBlock, _ := pem.Decode([]byte(certificate))
-		if certBlock == nil {
-			return nil, fmt.Errorf("Invalid certificate")
-		}
-
-		cert, err = x509.ParseCertificate(certBlock.Bytes)
+		cert, err = shared.ParseCert([]byte(certificate))
 		if err != nil {
 			return nil, err
 		}
@@ -176,13 +172,13 @@ func CheckCASignature(cert x509.Certificate, networkCert *shared.CertInfo) (trus
 	}
 
 	if networkCert == nil {
-		logger.Error("Failed to check certificate has been signed by the CA, no network certificate provided")
+		logger.Error("Cannot verify whether the certificate was signed by the CA: no network certificate provided")
 		return false, false, ""
 	}
 
 	ca := networkCert.CA()
 	if ca == nil {
-		logger.Error("Failed to check certificate has been signed by the CA, no CA defined on network certificate")
+		logger.Error("Cannot verify whether the certificate was signed by the CA: no CA defined on network certificate")
 		return false, false, ""
 	}
 
@@ -225,7 +221,7 @@ func CheckMutualTLS(cert x509.Certificate, trustedCerts map[string]x509.Certific
 
 	// Check whether client certificate is in the map of trusted certs.
 	for fingerprint, v := range trustedCerts {
-		if bytes.Equal(cert.Raw, v.Raw) {
+		if subtle.ConstantTimeCompare(cert.Raw, v.Raw) == 1 {
 			logger.Debug("Matched trusted cert", logger.Ctx{"fingerprint": fingerprint, "subject": v.Subject})
 			return true, fingerprint
 		}
@@ -235,16 +231,46 @@ func CheckMutualTLS(cert x509.Certificate, trustedCerts map[string]x509.Certific
 }
 
 // IsRecursionRequest checks whether the given HTTP request is marked with the
-// "recursion" flag in its form values.
-func IsRecursionRequest(r *http.Request) bool {
+// "recursion" flag in its form values. It returns the recursion level and an
+// optional fields slice parsed from the request parameters.
+//
+// The fields slice can be specified either via semicolon-separated syntax in
+// the recursion parameter (e.g. "2;fields=state.disk") or as a separate
+// "fields" query parameter. Semicolon syntax takes priority.
+//
+// A nil fields slice means no fields were specified (default behavior).
+// An empty non-nil fields slice means no expensive fields should be fetched.
+func IsRecursionRequest(r *http.Request) (int, []string) {
 	recursionStr := r.FormValue("recursion")
+	if recursionStr == "" {
+		return 0, nil
+	}
+
+	// Check for separate fields query parameter.
+	fields := r.URL.Query()["fields"]
+
+	// Check if recursion string contains semicolon-separated fields (takes priority).
+	before, after, found := strings.Cut(recursionStr, ";")
+	if found {
+		recursionStr = before
+
+		fieldsStr, found := strings.CutPrefix(after, "fields=")
+		if found {
+			if fieldsStr != "" {
+				fields = strings.Split(fieldsStr, ",")
+			} else {
+				// Empty fields (recursion=2;fields=) means no expensive fields.
+				fields = []string{}
+			}
+		}
+	}
 
 	recursion, err := strconv.Atoi(recursionStr)
 	if err != nil {
-		return false
+		return 0, nil
 	}
 
-	return recursion != 0
+	return recursion, fields
 }
 
 // ListenAddresses returns a list of <host>:<port> combinations at which this machine can be reached.
@@ -267,7 +293,7 @@ func ListenAddresses(configListenAddress string) ([]string, error) {
 	listenIP := net.ParseIP(unwrappedConfigListenAddress)
 	if listenIP != nil || !strings.Contains(unwrappedConfigListenAddress, ":") {
 		// Use net.JoinHostPort so that IPv6 addresses are correctly wrapped ready for parsing below.
-		configListenAddress = net.JoinHostPort(unwrappedConfigListenAddress, fmt.Sprintf("%d", shared.HTTPSDefaultPort))
+		configListenAddress = net.JoinHostPort(unwrappedConfigListenAddress, strconv.Itoa(shared.HTTPSDefaultPort))
 	}
 
 	// By this point we should always have the configListenAddress in form <host>:<port>, so lets check that.
@@ -345,7 +371,7 @@ func GetListeners(start int) []net.Listener {
 	for i := start; i < start+fds; i++ {
 		unix.CloseOnExec(i)
 
-		file := os.NewFile(uintptr(i), fmt.Sprintf("inherited-fd%d", i))
+		file := os.NewFile(uintptr(i), "inherited-fd"+strconv.Itoa(i))
 		listener, err := net.FileListener(file)
 		if err != nil {
 			continue
@@ -367,8 +393,11 @@ const SystemdListenFDsStart = 3
 // IsJSONRequest returns true if the content type of the HTTP request is JSON.
 func IsJSONRequest(r *http.Request) bool {
 	for k, vs := range r.Header {
-		if strings.ToLower(k) == "content-type" &&
-			len(vs) == 1 && strings.ToLower(vs[0]) == "application/json" {
+		if len(vs) != 1 {
+			continue
+		}
+
+		if strings.ToLower(k) == "content-type" && strings.ToLower(vs[0]) == "application/json" {
 			return true
 		}
 	}

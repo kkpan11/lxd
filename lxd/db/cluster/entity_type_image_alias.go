@@ -2,10 +2,14 @@ package cluster
 
 import (
 	"fmt"
+
+	"github.com/canonical/lxd/lxd/db/query"
 )
 
 // entityTypeImageAlias implements entityTypeDBInfo for an ImageAlias.
-type entityTypeImageAlias struct{}
+type entityTypeImageAlias struct {
+	entityTypeCommon
+}
 
 func (e entityTypeImageAlias) code() int64 {
 	return entityTypeCodeImageAlias
@@ -19,35 +23,17 @@ JOIN projects ON images_aliases.project_id = projects.id`, e.code())
 }
 
 func (e entityTypeImageAlias) urlsByProjectQuery() string {
-	return fmt.Sprintf(`%s WHERE projects.name = ?`, e.allURLsQuery())
+	return e.allURLsQuery() + " WHERE projects.name = ?"
 }
 
-func (e entityTypeImageAlias) urlByIDQuery() string {
-	return fmt.Sprintf(`%s WHERE images_aliases.id = ?`, e.allURLsQuery())
+func (e entityTypeImageAlias) urlsByIDsQuery(ids ...int64) string {
+	return e.allURLsQuery() + " WHERE images_aliases.id IN " + query.IntParams(ids...)
 }
 
 func (e entityTypeImageAlias) idFromURLQuery() string {
-	return `
-SELECT ?, images_aliases.id 
-FROM images_aliases 
-JOIN projects ON images_aliases.project_id = projects.id 
-WHERE projects.name = ? 
-	AND '' = ? 
-	AND images_aliases.name = ? `
+	return projectEntityIDFromURLQuery("images_aliases")
 }
 
 func (e entityTypeImageAlias) onDeleteTriggerSQL() (name string, sql string) {
-	name = "on_image_alias_delete"
-	return name, fmt.Sprintf(`
-CREATE TRIGGER %s
-	AFTER DELETE ON images_aliases
-	BEGIN
-	DELETE FROM auth_groups_permissions 
-		WHERE entity_type = %d 
-		AND entity_id = OLD.id;
-	DELETE FROM warnings
-		WHERE entity_type_code = %d
-		AND entity_id = OLD.id;
-	END
-`, name, e.code(), e.code())
+	return standardOnDeleteTriggerSQL("on_image_alias_delete", "images_aliases", e.code())
 }

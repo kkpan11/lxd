@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 )
 
 // NewGenericStatusError returns a new StatusError with the given status code.
@@ -68,19 +69,16 @@ func (e StatusError) Status() int {
 // status code matches one of the supplied status codes in matchStatus.
 // Returns the matched StatusError status code and true if match criteria are met, otherwise false.
 func StatusErrorMatch(err error, matchStatusCodes ...int) (int, bool) {
-	var statusErr StatusError
-
-	if errors.As(err, &statusErr) {
+	statusErr, ok := errors.AsType[StatusError](err)
+	if ok {
 		statusCode := statusErr.Status()
 
 		if len(matchStatusCodes) <= 0 {
 			return statusCode, true
 		}
 
-		for _, s := range matchStatusCodes {
-			if statusCode == s {
-				return statusCode, true
-			}
+		if slices.Contains(matchStatusCodes, statusCode) {
+			return statusCode, true
 		}
 	}
 

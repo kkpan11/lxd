@@ -4,45 +4,47 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
+	"net/http"
 	"os"
-	"path"
 	"strings"
 
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/lxc/config"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	cli "github.com/canonical/lxd/shared/cmd"
-	"github.com/canonical/lxd/shared/i18n"
 	"github.com/canonical/lxd/shared/termios"
 )
 
 type cmdInit struct {
 	global *cmdGlobal
 
-	flagConfig     []string
-	flagDevice     []string
-	flagEphemeral  bool
-	flagNetwork    string
-	flagProfile    []string
-	flagStorage    string
-	flagTarget     string
-	flagType       string
-	flagNoProfiles bool
-	flagEmpty      bool
-	flagVM         bool
+	flagConfig        []string
+	flagDevice        []string
+	flagEphemeral     bool
+	flagNetwork       string
+	flagProfile       []string
+	flagStorage       string
+	flagTarget        string
+	flagTargetProject string
+	flagType          string
+	flagNoProfiles    bool
+	flagEmpty         bool
+	flagVM            bool
 }
 
 func (c *cmdInit) command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("init", i18n.G("[<remote>:]<image> [<remote>:][<name>]"))
-	cmd.Short = i18n.G("Create instances from images")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(`Create instances from images`))
-	cmd.Example = cli.FormatSection("", i18n.G(`lxc init ubuntu:24.04 u1
+	cmd.Use = usage("init", "[<registry|remote>:]<image> [<remote>:][<name>]")
+	cmd.Short = "Create instances from images"
+	cmd.Long = cli.FormatSection("Description", cmd.Short+`
+
+If the destination LXD remote supports image registries, the source image
+must be from an image registry or available locally on the destination remote.`)
+	cmd.Example = cli.FormatSection("", `lxc init ubuntu:24.04 u1
     Create a container (but do not start it)
 
 lxc init ubuntu:24.04 u1 < config.yaml
@@ -52,28 +54,43 @@ lxc init ubuntu:24.04 v1 --vm -c limits.cpu=4 -c limits.memory=4GiB
     Create a virtual machine with 4 vCPUs and 4GiB of RAM
 
 lxc init ubuntu:24.04 v1 --vm -c limits.cpu=2 -c limits.memory=8GiB -d root,size=32GiB
-    Create a virtual machine with 2 vCPUs, 8GiB of RAM and a root disk of 32GiB`))
+    Create a virtual machine with 2 vCPUs, 8GiB of RAM and a root disk of 32GiB
+
+Note: The --project flag sets the project for both the image remote and the instance remote.
+If the image remote is a public remote (e.g. simplestreams) then this project is ignored by the image remote.
+If the image remote is another LXD server, specify the source project for the image remote 
+with --project and the instance remote with --target-project (if different from --project).
+`)
 
 	cmd.RunE = c.run
-	cmd.Flags().StringArrayVarP(&c.flagConfig, "config", "c", nil, i18n.G("Config key/value to apply to the new instance")+"``")
-	cmd.Flags().StringArrayVarP(&c.flagProfile, "profile", "p", nil, i18n.G("Profile to apply to the new instance")+"``")
-	cmd.Flags().StringArrayVarP(&c.flagDevice, "device", "d", nil, i18n.G("New key/value to apply to a specific device")+"``")
-	cmd.Flags().BoolVarP(&c.flagEphemeral, "ephemeral", "e", false, i18n.G("Ephemeral instance"))
-	cmd.Flags().StringVarP(&c.flagNetwork, "network", "n", "", i18n.G("Network name")+"``")
-	cmd.Flags().StringVarP(&c.flagStorage, "storage", "s", "", i18n.G("Storage pool name")+"``")
-	cmd.Flags().StringVarP(&c.flagType, "type", "t", "", i18n.G("Instance type")+"``")
-	cmd.Flags().StringVar(&c.flagTarget, "target", "", i18n.G("Cluster member name")+"``")
-	cmd.Flags().BoolVar(&c.flagNoProfiles, "no-profiles", false, i18n.G("Create the instance with no profiles applied"))
-	cmd.Flags().BoolVar(&c.flagEmpty, "empty", false, i18n.G("Create an empty instance"))
-	cmd.Flags().BoolVar(&c.flagVM, "vm", false, i18n.G("Create a virtual machine"))
+	cmd.Flags().StringArrayVarP(&c.flagConfig, "config", "c", nil, cli.FormatStringFlagLabel("Config key/value to apply to the new instance"))
+	cmd.Flags().StringArrayVarP(&c.flagProfile, "profile", "p", nil, cli.FormatStringFlagLabel("Profile to apply to the new instance"))
+	cmd.Flags().StringArrayVarP(&c.flagDevice, "device", "d", nil, cli.FormatStringFlagLabel("New key/value to apply to a specific device"))
+	cmd.Flags().BoolVarP(&c.flagEphemeral, "ephemeral", "e", false, "Ephemeral instance")
+	cmd.Flags().StringVarP(&c.flagNetwork, "network", "n", "", cli.FormatStringFlagLabel("Network name"))
+	cmd.Flags().StringVarP(&c.flagStorage, "storage", "s", "", cli.FormatStringFlagLabel("Storage pool name"))
+	cmd.Flags().StringVarP(&c.flagType, "type", "t", "", cli.FormatStringFlagLabel("Instance type"))
+	cmd.Flags().StringVar(&c.flagTarget, "target", "", cli.FormatStringFlagLabel("Cluster member name"))
+	cmd.Flags().StringVar(&c.flagTargetProject, "target-project", "", cli.FormatStringFlagLabel("Project to create the instance in (if different from --project)"))
+	cmd.Flags().BoolVar(&c.flagNoProfiles, "no-profiles", false, "Create the instance with no profiles applied")
+	cmd.Flags().BoolVar(&c.flagEmpty, "empty", false, "Create an empty instance")
+	cmd.Flags().BoolVar(&c.flagVM, "vm", false, "Create a virtual machine")
 
 	cmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		if len(args) != 0 {
+		if len(args) > 1 {
 			return nil, cobra.ShellCompDirectiveNoFileComp
 		}
 
-		return c.global.cmpImages(toComplete)
+		if len(args) == 0 {
+			return c.global.cmpImages(toComplete, false)
+		}
+
+		return c.global.cmpRemotes(toComplete, ":", true, instanceServerRemoteCompletionFilters(*c.global.conf)...)
 	}
+
+	_ = cmd.RegisterFlagCompletionFunc("profile", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return c.global.cmpTopLevelResource("profile", toComplete)
+	})
 
 	return cmd
 }
@@ -105,7 +122,7 @@ func (c *cmdInit) create(conf *config.Config, args []string, launch bool) (lxd.I
 	var configMap map[string]string
 	var profiles []string
 
-	// If stdin isn't a terminal, read text from it
+	// If stdin isn't a terminal, read text from it.
 	if !termios.IsTerminal(getStdinFd()) {
 		contents, err := io.ReadAll(os.Stdin)
 		if err != nil {
@@ -119,10 +136,7 @@ func (c *cmdInit) create(conf *config.Config, args []string, launch bool) (lxd.I
 	}
 
 	if len(args) > 0 {
-		iremote, image, err = conf.ParseRemote(args[0])
-		if err != nil {
-			return nil, "", err
-		}
+		iremote, image = conf.ParseRemoteUnchecked(args[0])
 
 		if len(args) == 1 {
 			remote, name, err = conf.ParseRemote("")
@@ -139,7 +153,7 @@ func (c *cmdInit) create(conf *config.Config, args []string, launch bool) (lxd.I
 
 	if c.flagEmpty {
 		if len(args) > 1 {
-			return nil, "", errors.New(i18n.G("--empty cannot be combined with an image name"))
+			return nil, "", errors.New("--empty cannot be combined with an image name")
 		}
 
 		if len(args) == 0 {
@@ -148,9 +162,11 @@ func (c *cmdInit) create(conf *config.Config, args []string, launch bool) (lxd.I
 				return nil, "", err
 			}
 		} else if len(args) == 1 {
-			// Switch image / instance names
-			name = image
-			remote = iremote
+			remote, name, err = conf.ParseRemote(args[0])
+			if err != nil {
+				return nil, "", err
+			}
+
 			image = ""
 			iremote = ""
 		}
@@ -159,10 +175,6 @@ func (c *cmdInit) create(conf *config.Config, args []string, launch bool) (lxd.I
 	d, err := conf.GetInstanceServer(remote)
 	if err != nil {
 		return nil, "", err
-	}
-
-	if c.flagTarget != "" {
-		d = d.UseTarget(c.flagTarget)
 	}
 
 	// Overwrite profiles.
@@ -175,15 +187,15 @@ func (c *cmdInit) create(conf *config.Config, args []string, launch bool) (lxd.I
 	if !c.global.flagQuiet {
 		if d.HasExtension("instance_create_start") && launch {
 			if name == "" {
-				fmt.Print(i18n.G("Launching the instance") + "\n")
+				fmt.Print("Launching the instance\n")
 			} else {
-				fmt.Printf(i18n.G("Launching %s")+"\n", name)
+				fmt.Printf("Launching %s\n", name)
 			}
 		} else {
 			if name == "" {
-				fmt.Print(i18n.G("Creating the instance") + "\n")
+				fmt.Print("Creating the instance\n")
 			} else {
-				fmt.Printf(i18n.G("Creating %s")+"\n", name)
+				fmt.Printf("Creating %s\n", name)
 			}
 		}
 	}
@@ -238,7 +250,7 @@ func (c *cmdInit) create(conf *config.Config, args []string, launch bool) (lxd.I
 	for _, entry := range c.flagConfig {
 		key, value, found := strings.Cut(entry, "=")
 		if !found {
-			return nil, "", fmt.Errorf(i18n.G("Bad key=value pair: %q"), entry)
+			return nil, "", fmt.Errorf("Bad key=value pair: %q", entry)
 		}
 
 		configMap[key] = value
@@ -259,12 +271,22 @@ func (c *cmdInit) create(conf *config.Config, args []string, launch bool) (lxd.I
 	}
 
 	// Decide whether we are creating a container or a virtual machine.
-	instanceDBType := api.InstanceTypeContainer
+	var instanceDBType api.InstanceType
 	if c.flagVM {
 		instanceDBType = api.InstanceTypeVM
 	}
 
-	// Setup instance creation request
+	// Set the target if provided.
+	if c.flagTarget != "" {
+		d = d.UseTarget(c.flagTarget)
+	}
+
+	// Set the target project if provided.
+	if c.flagTargetProject != "" {
+		d = d.UseProject(c.flagTargetProject)
+	}
+
+	// Setup instance creation request.
 	req := api.InstancesPost{
 		Name:         name,
 		InstanceType: c.flagType,
@@ -324,36 +346,89 @@ func (c *cmdInit) create(conf *config.Config, args []string, launch bool) (lxd.I
 
 	var opInfo api.Operation
 	if !c.flagEmpty {
-		// Get the image server and image info
+		// Get the image server and image info.
 		iremote, image = guessImage(conf, d, remote, iremote, image)
 
-		// Deal with the default image
+		// Deal with the default image.
 		if image == "" {
 			image = "default"
 		}
 
-		imgRemote, imgInfo, err := getImgInfo(d, conf, iremote, remote, image, &req.Source)
-		if err != nil {
-			return nil, "", err
+		var imgRemoteServer lxd.ImageServer
+		var imgInfo *api.Image
+		var legacyRemote string
+		var err error
+
+		// If the server supports image registries, we can use server-side image resolution and download.
+		// This avoids resolving the image on the client side, and passes the registry name or source project
+		// to the server so it can handle the resolution directly.
+		if d.HasExtension("image_registries") {
+			var registryName string
+			imgInfo, registryName = resolveRegistryImageSource(conf.Remotes, iremote, image, remote, c.global.flagProject)
+
+			if registryName != "" {
+				// Remote image registry.
+				// Check if the server has an image registry with this name.
+				_, _, err := d.GetImageRegistry(registryName)
+				if err != nil {
+					// Only fall back for 404 (registry not found).
+					if !api.StatusErrorCheck(err, http.StatusNotFound) {
+						return nil, "", fmt.Errorf("Failed checking image registry %q: %w", registryName, err)
+					}
+
+					// Registry not found. If the local remote is a public remote,
+					// fall back to sending the deprecated Server and Protocol fields
+					// so the server can validate the URL and auto-create the registry if supported.
+					remoteConfig := conf.Remotes[iremote]
+					if !remoteConfig.Public {
+						return nil, "", fmt.Errorf("Image registry %q not found", registryName)
+					}
+
+					req.Source.Server = remoteConfig.Addr                        //nolint:staticcheck
+					req.Source.Protocol = api.ImageRegistryProtocolSimpleStreams //nolint:staticcheck
+				} else {
+					// Registry exists on the server, use it directly.
+					req.Source.ImageRegistry = registryName
+				}
+			}
+		} else {
+			// Fetch image info from the given remote (legacy client-side resolution path).
+			// Normalize empty remote to the default remote, since ParseRemoteUnchecked
+			// does not fill in the default.
+			legacyRemote = iremote
+			if legacyRemote == "" {
+				legacyRemote = conf.DefaultRemote
+			}
+
+			imgRemoteServer, imgInfo, err = getImgInfo(conf, legacyRemote, image, c.global.flagProject, &req.Source)
+			if err != nil {
+				return nil, "", err
+			}
 		}
 
-		if conf.Remotes[iremote].Protocol != "simplestreams" {
+		// Update the source project if it was determined by getImgInfo.
+		if imgRemoteServer == nil && imgInfo.Project != "" {
+			req.Source.Project = imgInfo.Project
+		}
+
+		// Only perform legacy type and protocol checks if we are NOT using an image registry.
+		if imgRemoteServer != nil && conf.Remotes[legacyRemote].Protocol != api.ImageRegistryProtocolSimpleStreams {
 			if imgInfo.Type != "virtual-machine" && c.flagVM {
-				return nil, "", errors.New(i18n.G("Asked for a VM but image is of type container"))
+				return nil, "", errors.New("Asked for a VM but image is of type container")
 			}
 
 			req.Type = api.InstanceType(imgInfo.Type)
 		}
 
-		// Create the instance
-		op, err := d.CreateInstanceFromImage(imgRemote, *imgInfo, req)
+		// Create the instance.
+		op, err := d.CreateInstanceFromImage(imgRemoteServer, *imgInfo, req)
 		if err != nil {
 			return nil, "", err
 		}
 
-		// Watch the background operation
+		// Watch the background operation.
 		progress := cli.ProgressRenderer{
-			Format: i18n.G("Retrieving image: %s"),
+			Format: "Retrieving image: %s",
 			Quiet:  c.global.flagQuiet,
 		}
 
@@ -371,7 +446,7 @@ func (c *cmdInit) create(conf *config.Config, args []string, launch bool) (lxd.I
 
 		progress.Done("")
 
-		// Extract the instance name
+		// Extract the instance name.
 		info, err := op.GetTarget()
 		if err != nil {
 			return nil, "", err
@@ -379,7 +454,7 @@ func (c *cmdInit) create(conf *config.Config, args []string, launch bool) (lxd.I
 
 		opInfo = *info
 	} else {
-		req.Source.Type = "none"
+		req.Source.Type = api.SourceTypeNone
 
 		op, err := d.CreateInstance(req)
 		if err != nil {
@@ -394,26 +469,23 @@ func (c *cmdInit) create(conf *config.Config, args []string, launch bool) (lxd.I
 		opInfo = op.Get()
 	}
 
-	instances, ok := opInfo.Resources["instances"]
-	if !ok || len(instances) == 0 {
-		// Try using the older "containers" field
-		instances, ok = opInfo.Resources["containers"]
-		if !ok || len(instances) == 0 {
-			return nil, "", errors.New(i18n.G("Didn't get any affected image, instance or snapshot from server"))
+	if name == "" {
+		if d.HasExtension("operation_metadata_entity_url") {
+			name, err = getEntityFromOperationMetadata(opInfo.Metadata)
+		} else {
+			// Use "instances"/"containers" here and not "entity.TypeInstance"/"entity.TypeContainer" because the change
+			// to use entity type names happened after the operation_metadata_entity_url extension.
+			name, err = getEntityFromOperationResources(opInfo.Resources, "instances", "containers")
 		}
-	}
 
-	if len(instances) == 1 && name == "" {
-		url, err := url.Parse(instances[0])
 		if err != nil {
-			return nil, "", err
+			return nil, "", fmt.Errorf("Failed getting instance name from operation: %w", err)
 		}
 
-		name = path.Base(url.Path)
-		fmt.Printf(i18n.G("Instance name is: %s")+"\n", name)
+		fmt.Printf("Instance name is: %s\n", name)
 	}
 
-	// Validate the network setup
+	// Validate the network setup.
 	c.checkNetwork(d, name)
 
 	return d, name, nil
@@ -431,7 +503,7 @@ func (c *cmdInit) checkNetwork(d lxd.InstanceServer, name string) {
 		}
 	}
 
-	fmt.Fprint(os.Stderr, "\n"+i18n.G("The instance you are starting doesn't have any network attached to it.")+"\n")
-	fmt.Fprint(os.Stderr, "  "+i18n.G("To create a new network, use: lxc network create")+"\n")
-	fmt.Fprint(os.Stderr, "  "+i18n.G("To attach a network to an instance, use: lxc network attach")+"\n\n")
+	fmt.Fprint(os.Stderr, "\n"+"The instance you are starting does not have any network attached to it.\n")
+	fmt.Fprint(os.Stderr, "  "+"To create a new network, use: lxc network create\n")
+	fmt.Fprint(os.Stderr, "  "+"To attach a network to an instance, use: lxc network attach\n\n")
 }

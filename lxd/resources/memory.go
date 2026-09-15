@@ -2,6 +2,7 @@ package resources
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -32,7 +33,7 @@ func parseMeminfo(path string) (*meminfo, error) {
 	// Open meminfo
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to open %q: %w", path, err)
+		return nil, fmt.Errorf("Failed opening %q: %w", path, err)
 	}
 
 	defer func() { _ = f.Close() }()
@@ -53,7 +54,7 @@ func parseMeminfo(path string) (*meminfo, error) {
 		if key == "MemTotal" {
 			bytes, err := units.ParseByteSizeString(value)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to parse MemTotal: %w", err)
+				return nil, fmt.Errorf("Failed parsing MemTotal: %w", err)
 			}
 
 			memory.Total = uint64(bytes)
@@ -63,7 +64,7 @@ func parseMeminfo(path string) (*meminfo, error) {
 		if key == "MemFree" {
 			bytes, err := units.ParseByteSizeString(value)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to parse MemFree: %w", err)
+				return nil, fmt.Errorf("Failed parsing MemFree: %w", err)
 			}
 
 			memory.Free = uint64(bytes)
@@ -73,7 +74,7 @@ func parseMeminfo(path string) (*meminfo, error) {
 		if key == "MemUsed" {
 			bytes, err := units.ParseByteSizeString(value)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to parse MemUsed: %w", err)
+				return nil, fmt.Errorf("Failed parsing MemUsed: %w", err)
 			}
 
 			memory.Used = uint64(bytes)
@@ -83,7 +84,7 @@ func parseMeminfo(path string) (*meminfo, error) {
 		if key == "Cached" {
 			bytes, err := units.ParseByteSizeString(value)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to parse Cached: %w", err)
+				return nil, fmt.Errorf("Failed parsing Cached: %w", err)
 			}
 
 			memory.Cached = uint64(bytes)
@@ -93,7 +94,7 @@ func parseMeminfo(path string) (*meminfo, error) {
 		if key == "Buffers" {
 			bytes, err := units.ParseByteSizeString(value)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to parse Buffers: %w", err)
+				return nil, fmt.Errorf("Failed parsing Buffers: %w", err)
 			}
 
 			memory.Buffers = uint64(bytes)
@@ -103,7 +104,7 @@ func parseMeminfo(path string) (*meminfo, error) {
 		if key == "HugePages_Total" {
 			bytes, err := units.ParseByteSizeString(value)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to parse HugePages_Total: %w", err)
+				return nil, fmt.Errorf("Failed parsing HugePages_Total: %w", err)
 			}
 
 			memory.HugepagesTotal = uint64(bytes)
@@ -113,7 +114,7 @@ func parseMeminfo(path string) (*meminfo, error) {
 		if key == "HugePages_Free" {
 			bytes, err := units.ParseByteSizeString(value)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to parse HugePages_Free: %w", err)
+				return nil, fmt.Errorf("Failed parsing HugePages_Free: %w", err)
 			}
 
 			memory.HugepagesFree = uint64(bytes)
@@ -123,12 +124,16 @@ func parseMeminfo(path string) (*meminfo, error) {
 		if key == "Hugepagesize" {
 			bytes, err := units.ParseByteSizeString(value)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to parse Hugepagesize: %w", err)
+				return nil, fmt.Errorf("Failed parsing Hugepagesize: %w", err)
 			}
 
 			memory.HugepagesSize = uint64(bytes)
 			continue
 		}
+	}
+
+	if memInfo.Err() != nil {
+		return nil, fmt.Errorf("Failed scanning %q: %w", path, memInfo.Err())
 	}
 
 	return &memory, nil
@@ -137,7 +142,7 @@ func parseMeminfo(path string) (*meminfo, error) {
 func getMemoryBlockSizeBytes() uint64 {
 	memoryBlockSizePath := filepath.Join(sysDevicesSystemMemory, "block_size_bytes")
 
-	if !sysfsExists(memoryBlockSizePath) {
+	if !pathExists(memoryBlockSizePath) {
 		return 0
 	}
 
@@ -170,20 +175,19 @@ func getTotalMemory(sysDevicesBase string) uint64 {
 	var count uint64
 	for _, entry := range entries {
 		entryName := entry.Name()
-		entryPath := filepath.Join(sysDevicesBase, entryName)
 
 		// Ignore directories not starting with "memory"
 		if !strings.HasPrefix(entryName, "memory") {
 			continue
 		}
 
-		// Ignore invalid entries.
-		if !sysfsExists(filepath.Join(entryPath, "online")) {
-			continue
-		}
-
-		content, err := os.ReadFile(filepath.Join(entryPath, "online"))
+		onlinePath := filepath.Join(sysDevicesBase, entryName, "online")
+		content, err := os.ReadFile(onlinePath)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+
 			return 0
 		}
 
@@ -203,7 +207,7 @@ func GetMemory() (*api.ResourcesMemory, error) {
 	// Parse main meminfo
 	info, err := parseMeminfo("/proc/meminfo")
 	if err != nil {
-		return nil, fmt.Errorf("Failed to parse /proc/meminfo: %w", err)
+		return nil, fmt.Errorf("Failed parsing /proc/meminfo: %w", err)
 	}
 
 	// Calculate the total memory from /sys/devices/system/memory, as the previously determined
@@ -223,13 +227,13 @@ func GetMemory() (*api.ResourcesMemory, error) {
 	memory.Total = info.Total
 
 	// Get NUMA information
-	if sysfsExists(sysDevicesNode) {
+	if pathExists(sysDevicesNode) {
 		memory.Nodes = []api.ResourcesMemoryNode{}
 
 		// List all the nodes
 		entries, err := os.ReadDir(sysDevicesNode)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to list %q: %w", sysDevicesNode, err)
+			return nil, fmt.Errorf("Failed listing %q: %w", sysDevicesNode, err)
 		}
 
 		// Iterate and add to our list
@@ -237,7 +241,7 @@ func GetMemory() (*api.ResourcesMemory, error) {
 			entryName := entry.Name()
 			entryPath := filepath.Join(sysDevicesNode, entryName)
 
-			if !sysfsExists(filepath.Join(entryPath, "meminfo")) {
+			if !pathExists(filepath.Join(entryPath, "meminfo")) {
 				continue
 			}
 
@@ -245,13 +249,14 @@ func GetMemory() (*api.ResourcesMemory, error) {
 			nodeName := strings.TrimPrefix(entryName, "node")
 			nodeNumber, err := strconv.ParseUint(nodeName, 10, 64)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to find NUMA node: %w", err)
+				return nil, fmt.Errorf("Failed finding NUMA node: %w", err)
 			}
 
 			// Parse NUMA meminfo
-			info, err := parseMeminfo(filepath.Join(entryPath, "meminfo"))
+			meminfoPath := filepath.Join(entryPath, "meminfo")
+			info, err := parseMeminfo(meminfoPath)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to parse %q: %w", filepath.Join(entryPath, "meminfo"), err)
+				return nil, fmt.Errorf("Failed parsing %q: %w", meminfoPath, err)
 			}
 
 			// Setup the entry

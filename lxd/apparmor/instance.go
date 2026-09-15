@@ -1,6 +1,7 @@
 package apparmor
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -35,15 +36,15 @@ type instanceVM interface {
 // InstanceProfileName returns the instance's AppArmor profile name.
 func InstanceProfileName(inst instance) string {
 	path := shared.VarPath("")
-	name := fmt.Sprintf("%s_<%s>", project.Instance(inst.Project().Name, inst.Name()), path)
+	name := project.Instance(inst.Project().Name, inst.Name()) + "_<" + path + ">"
 	return profileName("", name)
 }
 
 // InstanceNamespaceName returns the instance's AppArmor namespace.
 func InstanceNamespaceName(inst instance) string {
 	// Unlike in profile names, / isn't an allowed character so replace with a -.
-	path := strings.Replace(strings.Trim(shared.VarPath(""), "/"), "/", "-", -1)
-	name := fmt.Sprintf("%s_<%s>", project.Instance(inst.Project().Name, inst.Name()), path)
+	path := strings.ReplaceAll(strings.Trim(shared.VarPath(""), "/"), "/", "-")
+	name := project.Instance(inst.Project().Name, inst.Name()) + "_<" + path + ">"
 	return profileName("", name)
 }
 
@@ -145,18 +146,14 @@ func instanceProfileGenerate(sysOS *sys.OS, inst instance) error {
 // instanceProfile generates the AppArmor profile template from the given instance.
 func instanceProfile(sysOS *sys.OS, inst instance) (string, error) {
 	// Prepare raw.apparmor.
-	rawContent := ""
+	var rawContent strings.Builder
 	rawApparmor, ok := inst.ExpandedConfig()["raw.apparmor"]
 	if ok {
-		for _, line := range strings.Split(strings.Trim(rawApparmor, "\n"), "\n") {
-			rawContent += fmt.Sprintf("  %s\n", line)
+		for line := range strings.SplitSeq(strings.Trim(rawApparmor, "\n"), "\n") {
+			rawContent.WriteString("  ")
+			rawContent.WriteString(line)
+			rawContent.WriteString("\n")
 		}
-	}
-
-	// Check for features.
-	unixSupported, err := parserSupports(sysOS, "unix")
-	if err != nil {
-		return "", err
 	}
 
 	// Render the profile.
@@ -176,14 +173,13 @@ func instanceProfile(sysOS *sys.OS, inst instance) (string, error) {
 			"feature_cgns":              sysOS.CGInfo.Namespacing,
 			"feature_cgroup2":           sysOS.CGInfo.Layout == cgroup.CgroupsUnified || sysOS.CGInfo.Layout == cgroup.CgroupsHybrid,
 			"feature_stacking":          sysOS.AppArmorStacking && !sysOS.AppArmorStacked,
-			"feature_unix":              unixSupported,
 			"kernel_binfmt":             shared.IsFalseOrEmpty(inst.ExpandedConfig()["security.privileged"]) && sysOS.UnprivBinfmt,
 			"feature_mount_nosymfollow": mountNosymfollowSupported,
 			"feature_userns_rule":       usernsRuleSupported,
 			"name":                      InstanceProfileName(inst),
 			"namespace":                 InstanceNamespaceName(inst),
 			"nesting":                   shared.IsTrue(inst.ExpandedConfig()["security.nesting"]),
-			"raw":                       rawContent,
+			"raw":                       rawContent.String(),
 			"unprivileged":              shared.IsFalseOrEmpty(inst.ExpandedConfig()["security.privileged"]) || sysOS.RunningInUserNS,
 		})
 		if err != nil {
@@ -203,7 +199,7 @@ func instanceProfile(sysOS *sys.OS, inst instance) (string, error) {
 
 		vmInst, ok := inst.(instanceVM)
 		if !ok {
-			return "", fmt.Errorf("Instance is not VM type")
+			return "", errors.New("Instance is not VM type")
 		}
 
 		// Get start time firmware path to allow access to it.
@@ -221,14 +217,29 @@ func instanceProfile(sysOS *sys.OS, inst instance) (string, error) {
 			execPath = execPathFull
 		}
 
+		// Extra (read-only) config paths.
+		extraConfig := []string{}
+		if shared.PathExists("/etc/ceph") {
+			extraConfig = append(extraConfig, "/etc/ceph")
+
+			// See if default config points to another path.
+			if shared.PathExists("/etc/ceph/ceph.conf") {
+				target, err := filepath.EvalSymlinks("/etc/ceph/ceph.conf")
+				if err == nil && target != "/etc/ceph/ceph.conf" {
+					extraConfig = append(extraConfig, filepath.Dir(target))
+				}
+			}
+		}
+
 		err = qemuProfileTpl.Execute(sb, map[string]any{
 			"devicesPath":       inst.DevicesPath(),
 			"exePath":           execPath,
+			"extra_config":      extraConfig,
 			"libraryPath":       strings.Split(os.Getenv("LD_LIBRARY_PATH"), ":"),
 			"logPath":           inst.LogPath(),
 			"name":              InstanceProfileName(inst),
 			"path":              path,
-			"raw":               rawContent,
+			"raw":               rawContent.String(),
 			"rootPath":          rootPath,
 			"snap":              shared.InSnap(),
 			"userns":            sysOS.RunningInUserNS,

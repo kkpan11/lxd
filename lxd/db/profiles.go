@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/canonical/lxd/lxd/db/cluster"
+	"github.com/canonical/lxd/lxd/db/query"
 	"github.com/canonical/lxd/shared/api"
 )
 
@@ -18,8 +19,6 @@ SELECT profiles.name
  JOIN projects ON projects.id = profiles.project_id
 WHERE projects.name = ?
 `
-	var result [][]any
-
 	enabled, err := cluster.ProjectHasProfiles(context.Background(), c.tx, project)
 	if err != nil {
 		return nil, fmt.Errorf("Check if project has profiles: %w", err)
@@ -29,21 +28,24 @@ WHERE projects.name = ?
 		project = "default"
 	}
 
-	inargs := []any{project}
-	var name string
-	outfmt := []any{name}
+	profileNames := []string{}
+	err = query.Scan(ctx, c.tx, q, func(scan func(dest ...any) error) error {
+		var profileName string
 
-	result, err = queryScan(ctx, c, q, inargs, outfmt)
+		err := scan(&profileName)
+		if err != nil {
+			return err
+		}
+
+		profileNames = append(profileNames, profileName)
+
+		return nil
+	}, project)
 	if err != nil {
 		return nil, err
 	}
 
-	response := []string{}
-	for _, r := range result {
-		response = append(response, r[0].(string))
-	}
-
-	return response, nil
+	return profileNames, nil
 }
 
 // GetProfile returns the profile with the given name.
@@ -60,7 +62,7 @@ func (c *ClusterTx) GetProfile(ctx context.Context, project, name string) (int64
 	profile := profiles[0]
 	id := int64(profile.ID)
 
-	result, err := profile.ToAPI(ctx, c.tx)
+	result, err := profile.ToAPI(ctx, c.tx, nil, nil)
 	if err != nil {
 		return -1, nil, err
 	}
@@ -77,8 +79,20 @@ func (c *ClusterTx) GetProfiles(ctx context.Context, projectName string, profile
 		return nil, err
 	}
 
+	// Get all the profile configs.
+	profileConfigs, err := cluster.GetConfig(ctx, c.Tx(), "profile")
+	if err != nil {
+		return nil, err
+	}
+
+	// Get all the profile devices.
+	profileDevices, err := cluster.GetDevices(ctx, c.Tx(), "profile")
+	if err != nil {
+		return nil, err
+	}
+
 	for i, profile := range dbProfiles {
-		apiProfile, err := profile.ToAPI(ctx, c.tx)
+		apiProfile, err := profile.ToAPI(ctx, c.tx, profileConfigs, profileDevices)
 		if err != nil {
 			return nil, err
 		}
@@ -101,7 +115,6 @@ func (c *ClusterTx) GetInstancesWithProfile(ctx context.Context, project, profil
 		   WHERE profiles.name=? AND projects.name=?)`
 
 	results := map[string][]string{}
-	var output [][]any
 
 	enabled, err := cluster.ProjectHasProfiles(context.Background(), c.tx, project)
 	if err != nil {
@@ -112,21 +125,25 @@ func (c *ClusterTx) GetInstancesWithProfile(ctx context.Context, project, profil
 		project = "default"
 	}
 
-	inargs := []any{profile, project}
-	var name string
-	outfmt := []any{name, name}
+	err = query.Scan(ctx, c.tx, q, func(scan func(dest ...any) error) error {
+		var instanceName string
+		var projectName string
 
-	output, err = queryScan(ctx, c, q, inargs, outfmt)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, r := range output {
-		if results[r[1].(string)] == nil {
-			results[r[1].(string)] = []string{}
+		err := scan(&instanceName, &projectName)
+		if err != nil {
+			return err
 		}
 
-		results[r[1].(string)] = append(results[r[1].(string)], r[0].(string))
+		if results[projectName] == nil {
+			results[projectName] = []string{}
+		}
+
+		results[projectName] = append(results[projectName], instanceName)
+
+		return nil
+	}, profile, project)
+	if err != nil {
+		return nil, err
 	}
 
 	return results, nil

@@ -1,6 +1,7 @@
 package device
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -81,11 +82,11 @@ func (d *infinibandPhysical) validateConfig(instConf instance.ConfigReader) erro
 // validateEnvironment checks the runtime environment for correctness.
 func (d *infinibandPhysical) validateEnvironment() error {
 	if d.inst.Type() == instancetype.Container && d.config["name"] == "" {
-		return fmt.Errorf("Requires name property to start")
+		return errors.New("Requires name property to start")
 	}
 
-	if !shared.PathExists(fmt.Sprintf("/sys/class/net/%s", d.config["parent"])) {
-		return fmt.Errorf("Parent device '%s' doesn't exist", d.config["parent"])
+	if !shared.PathExists("/sys/class/net/" + d.config["parent"]) {
+		return fmt.Errorf("Parent device %q does not exist", d.config["parent"])
 	}
 
 	return nil
@@ -139,7 +140,7 @@ func (d *infinibandPhysical) Start() (*deviceConfig.RunConfig, error) {
 		if d.config["hwaddr"] != "" {
 			err := infinibandSetDevMAC(saveData["host_name"], d.config["hwaddr"])
 			if err != nil {
-				return nil, fmt.Errorf("Failed to set the MAC address: %s", err)
+				return nil, fmt.Errorf("Failed setting the MAC address: %s", err)
 			}
 		}
 
@@ -167,7 +168,7 @@ func (d *infinibandPhysical) Start() (*deviceConfig.RunConfig, error) {
 		ueventPath := fmt.Sprintf("/sys/class/net/%s/device/uevent", saveData["host_name"])
 		pciDev, err := pcidev.ParseUeventFile(ueventPath)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to get PCI device info for %q: %w", saveData["host_name"], err)
+			return nil, fmt.Errorf("Failed getting PCI device info for %q: %w", saveData["host_name"], err)
 		}
 
 		saveData["last_state.pci.slot.name"] = pciDev.SlotName
@@ -204,7 +205,7 @@ func (d *infinibandPhysical) Start() (*deviceConfig.RunConfig, error) {
 			[]deviceConfig.RunConfigItem{
 				{Key: "devName", Value: d.name},
 				{Key: "pciSlotName", Value: saveData["last_state.pci.slot.name"]},
-				{Key: "pciIOMMUGroup", Value: fmt.Sprintf("%d", pciIOMMUGroup)},
+				{Key: "pciIOMMUGroup", Value: strconv.FormatUint(pciIOMMUGroup, 10)},
 			}...)
 	}
 
@@ -266,7 +267,7 @@ func (d *infinibandPhysical) postStop() error {
 		// Remove infiniband host files for this device.
 		err := unixDeviceDeleteFiles(d.state, d.inst.DevicesPath(), IBDevPrefix, d.name, "")
 		if err != nil {
-			return fmt.Errorf("Failed to delete files for device '%s': %w", d.name, err)
+			return fmt.Errorf("Failed deleting files for device %q: %w", d.name, err)
 		}
 	}
 

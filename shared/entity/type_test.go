@@ -25,15 +25,27 @@ func TestURL(t *testing.T) {
 		{
 			name:        "not a LXD URL",
 			rawURL:      "/1.0/not/a/url",
-			expectedErr: fmt.Errorf("Failed to match entity URL %q", "/1.0/not/a/url"),
+			expectedErr: fmt.Errorf("Failed matching entity URL %q", "/1.0/not/a/url"),
 		},
 		{
-			name:                  "containers",
-			rawURL:                "/1.0/containers/my-container?project=my-project",
-			expectedNormalisedURL: "/1.0/containers/my-container?project=my-project",
-			expectedEntityType:    TypeContainer,
+			name:                  "server",
+			rawURL:                "/1.0",
+			expectedNormalisedURL: "/1.0",
+			expectedEntityType:    TypeServer,
+		},
+		{
+			name:                  "server",
+			rawURL:                "/1.0?project=default",
+			expectedNormalisedURL: "/1.0",
+			expectedEntityType:    TypeServer,
+		},
+		{
+			name:                  "instances",
+			rawURL:                "/1.0/instances/my-instance?project=my-project",
+			expectedNormalisedURL: "/1.0/instances/my-instance?project=my-project",
+			expectedEntityType:    TypeInstance,
 			expectedProject:       "my-project",
-			expectedPathArgs:      []string{"my-container"},
+			expectedPathArgs:      []string{"my-instance"},
 			expectedErr:           nil,
 		},
 		{
@@ -73,10 +85,71 @@ func TestURL(t *testing.T) {
 			expectedErr:           nil,
 		},
 		{
+			name:                  "certificates",
+			rawURL:                "/1.0/certificates/foawienfoawnefkanwelfknsfl?project=default",
+			expectedNormalisedURL: "/1.0/certificates/foawienfoawnefkanwelfknsfl",
+			expectedEntityType:    TypeCertificate,
+			expectedProject:       "",
+			expectedPathArgs:      []string{"foawienfoawnefkanwelfknsfl"},
+			expectedErr:           nil,
+		},
+		{
+			name:                  "identities",
+			rawURL:                "/1.0/auth/identities/oidc/jane.doe@example.com",
+			expectedNormalisedURL: "/1.0/auth/identities/oidc/jane.doe@example.com",
+			expectedEntityType:    TypeIdentity,
+			expectedPathArgs:      []string{"oidc", "jane.doe@example.com"},
+		},
+		{
+			name:                  "identities",
+			rawURL:                "/1.0/auth/identities/oidc/jane.doe@example.com?project=my-project",
+			expectedNormalisedURL: "/1.0/auth/identities/oidc/jane.doe@example.com",
+			expectedEntityType:    TypeIdentity,
+			expectedPathArgs:      []string{"oidc", "jane.doe@example.com"},
+		},
+		{
+			name:                  "groups",
+			rawURL:                "/1.0/auth/groups/my-group",
+			expectedNormalisedURL: "/1.0/auth/groups/my-group",
+			expectedEntityType:    TypeAuthGroup,
+			expectedPathArgs:      []string{"my-group"},
+		},
+		{
+			name:                  "groups",
+			rawURL:                "/1.0/auth/groups/my-group?project=my-project",
+			expectedNormalisedURL: "/1.0/auth/groups/my-group",
+			expectedEntityType:    TypeAuthGroup,
+			expectedPathArgs:      []string{"my-group"},
+		},
+		{
+			name:                  "identity-provider-groups",
+			rawURL:                "/1.0/auth/identity-provider-groups/my-idp-group",
+			expectedNormalisedURL: "/1.0/auth/identity-provider-groups/my-idp-group",
+			expectedEntityType:    TypeIdentityProviderGroup,
+			expectedPathArgs:      []string{"my-idp-group"},
+		},
+		{
+			name:                  "identity-provider-groups",
+			rawURL:                "/1.0/auth/identity-provider-groups/my-idp-group?project=my-project",
+			expectedNormalisedURL: "/1.0/auth/identity-provider-groups/my-idp-group",
+			expectedEntityType:    TypeIdentityProviderGroup,
+			expectedPathArgs:      []string{"my-idp-group"},
+		},
+		{
 			name:                  "instances",
 			rawURL:                "/1.0/instances/my-instance",
 			expectedNormalisedURL: "/1.0/instances/my-instance?project=default",
 			expectedEntityType:    TypeInstance,
+			expectedProject:       api.ProjectDefaultName,
+			expectedPathArgs:      []string{"my-instance"},
+			expectedErr:           nil,
+		},
+		{
+			name:                  "instances",
+			rawURL:                "/1.0/instances/my-instance?target=member01",
+			expectedNormalisedURL: "/1.0/instances/my-instance?project=default",
+			expectedEntityType:    TypeInstance,
+			expectedLocation:      "member01",
 			expectedProject:       api.ProjectDefaultName,
 			expectedPathArgs:      []string{"my-instance"},
 			expectedErr:           nil,
@@ -127,17 +200,17 @@ func TestURL(t *testing.T) {
 			expectedErr:           nil,
 		},
 		{
-			name:                  "operation",
-			rawURL:                "/1.0/operations/3e75d1bf-30ed-45ce-9e02-267fa7338eb4",
-			expectedNormalisedURL: "/1.0/operations/3e75d1bf-30ed-45ce-9e02-267fa7338eb4",
-			expectedEntityType:    TypeOperation,
+			name:                  "storage pools",
+			rawURL:                "/1.0/storage-pools/my-storage-pool",
+			expectedNormalisedURL: "/1.0/storage-pools/my-storage-pool",
+			expectedEntityType:    TypeStoragePool,
 			expectedProject:       "",
-			expectedPathArgs:      []string{"3e75d1bf-30ed-45ce-9e02-267fa7338eb4"},
+			expectedPathArgs:      []string{"my-storage-pool"},
 			expectedErr:           nil,
 		},
 		{
 			name:                  "storage pools",
-			rawURL:                "/1.0/storage-pools/my-storage-pool",
+			rawURL:                "/1.0/storage-pools/my-storage-pool?project=my-project",
 			expectedNormalisedURL: "/1.0/storage-pools/my-storage-pool",
 			expectedEntityType:    TypeStoragePool,
 			expectedProject:       "",
@@ -182,17 +255,17 @@ func TestURL(t *testing.T) {
 			expectedErr:           nil,
 		},
 		{
-			name:                  "warnings",
-			rawURL:                "/1.0/warnings/3e75d1bf-30ed-45ce-9e02-267fa7338eb4",
-			expectedNormalisedURL: "/1.0/warnings/3e75d1bf-30ed-45ce-9e02-267fa7338eb4",
-			expectedEntityType:    TypeWarning,
+			name:                  "cluster groups",
+			rawURL:                "/1.0/cluster/groups/my-cluster-group",
+			expectedNormalisedURL: "/1.0/cluster/groups/my-cluster-group",
+			expectedEntityType:    TypeClusterGroup,
 			expectedProject:       "",
-			expectedPathArgs:      []string{"3e75d1bf-30ed-45ce-9e02-267fa7338eb4"},
+			expectedPathArgs:      []string{"my-cluster-group"},
 			expectedErr:           nil,
 		},
 		{
 			name:                  "cluster groups",
-			rawURL:                "/1.0/cluster/groups/my-cluster-group",
+			rawURL:                "/1.0/cluster/groups/my-cluster-group?project=my-project",
 			expectedNormalisedURL: "/1.0/cluster/groups/my-cluster-group",
 			expectedEntityType:    TypeClusterGroup,
 			expectedProject:       "",
@@ -220,132 +293,8 @@ func TestURL(t *testing.T) {
 			}
 
 			normalisedURL, err := actualEntityType.URL(actualProject, actualLocation, actualPathArgs...)
-			assert.Equal(t, normalisedURL.String(), tt.expectedNormalisedURL)
+			assert.Equal(t, tt.expectedNormalisedURL, normalisedURL.String())
 			assert.NoError(t, err)
-		})
-	}
-
-	endpointTests := []struct {
-		name               string
-		rawURL             string
-		expectedEntityType Type
-	}{
-		{
-			name:               "not a LXD endpoint",
-			rawURL:             "/1.0/not/a/url",
-			expectedEntityType: TypeServer,
-		},
-		{
-			name:               "containers endpoint",
-			rawURL:             "/1.0/containers/my-container",
-			expectedEntityType: TypeInstance,
-		},
-		{
-			name:               "images endpoint",
-			rawURL:             "/1.0/images/fwirnoaiwnerfoiawnef",
-			expectedEntityType: TypeImage,
-		},
-		{
-			name:               "profiles endpoint",
-			rawURL:             "/1.0/profiles/my-profile",
-			expectedEntityType: TypeProfile,
-		},
-		{
-			name:               "projects endpoint",
-			rawURL:             "/1.0/projects/my-project",
-			expectedEntityType: TypeProject,
-		},
-		{
-			name:               "certificates endpoint",
-			rawURL:             "/1.0/certificates/foawienfoawnefkanwelfknsfl",
-			expectedEntityType: TypeIdentity,
-		},
-		{
-			name:               "instances endpoint",
-			rawURL:             "/1.0/instances/my-instance",
-			expectedEntityType: TypeInstance,
-		},
-		{
-			name:               "instance backup endpoint",
-			rawURL:             "/1.0/instances/my-instance/backups/my-backup",
-			expectedEntityType: TypeInstance,
-		},
-		{
-			name:               "instance snapshot endpoint",
-			rawURL:             "/1.0/instances/my-instance/snapshots/my-snapshot",
-			expectedEntityType: TypeInstance,
-		},
-		{
-			name:               "networks endpoint",
-			rawURL:             "/1.0/networks/my-network?project=my-project",
-			expectedEntityType: TypeNetwork,
-		},
-		{
-			name:               "network acls endpoint",
-			rawURL:             "/1.0/network-acls/my-network-acl",
-			expectedEntityType: TypeNetwork,
-		},
-		{
-			name:               "cluster members endpoint",
-			rawURL:             "/1.0/cluster/members/node01",
-			expectedEntityType: TypeClusterMember,
-		},
-		{
-			name:               "operation endpoint",
-			rawURL:             "/1.0/operations/3e75d1bf-30ed-45ce-9e02-267fa7338eb4",
-			expectedEntityType: TypeOperation,
-		},
-		{
-			name:               "storage pools endpoint",
-			rawURL:             "/1.0/storage-pools/my-storage-pool",
-			expectedEntityType: TypeStoragePool,
-		},
-		{
-			name:               "storage volumes endpoint",
-			rawURL:             "/1.0/storage-pools/my-storage-pool/volumes/custom/my-storage-volume",
-			expectedEntityType: TypeStoragePool,
-		},
-		{
-			name:               "storage volume backups endpoint",
-			rawURL:             "/1.0/storage-pools/my-storage-pool/volumes/custom/my-storage-volume/backups",
-			expectedEntityType: TypeStoragePool,
-		},
-		{
-			name:               "storage volume snapshots endpoint",
-			rawURL:             "/1.0/storage-pools/my-storage-pool/volumes/custom/my-storage-volume/snapshots",
-			expectedEntityType: TypeStoragePool,
-		},
-		{
-			name:               "list storage volumes endpoint",
-			rawURL:             "/1.0/storage-volumes",
-			expectedEntityType: TypeStoragePool,
-		},
-		{
-			name:               "storage buckets endpoint",
-			rawURL:             "/1.0/storage-pools/my-storage-pool/buckets/my-bucket",
-			expectedEntityType: TypeStoragePool,
-		},
-		{
-			name:               "warnings endpoint",
-			rawURL:             "/1.0/warnings/3e75d1bf-30ed-45ce-9e02-267fa7338eb4",
-			expectedEntityType: TypeWarning,
-		},
-		{
-			name:               "cluster groups endpoint",
-			rawURL:             "/1.0/cluster/groups/my-cluster-group",
-			expectedEntityType: TypeClusterMember,
-		},
-	}
-
-	apiMetricsEntityTypes := APIMetricsEntityTypes()
-	for _, tt := range endpointTests {
-		t.Run(tt.name, func(t *testing.T) {
-			u, err := url.Parse(tt.rawURL)
-			require.NoError(t, err)
-			actualEntityType := EndpointEntityType(*u)
-
-			assert.Equal(t, tt.expectedEntityType, actualEntityType)
-			assert.Contains(t, apiMetricsEntityTypes, actualEntityType)
 		})
 	}
 }

@@ -1,11 +1,10 @@
 package filter
 
 import (
-	"fmt"
+	"errors"
 	"regexp"
+	"slices"
 	"strings"
-
-	"github.com/canonical/lxd/shared"
 )
 
 // Clause is a single filter clause in a filter string.
@@ -34,7 +33,7 @@ type ClauseSet struct {
 // Parse a user-provided filter string.
 func Parse(s string, op OperatorSet) (*ClauseSet, error) {
 	if !op.isValid() {
-		return nil, fmt.Errorf("Invalid operator set")
+		return nil, errors.New("Invalid operator set")
 	}
 
 	clauses := []Clause{}
@@ -51,7 +50,7 @@ func Parse(s string, op OperatorSet) (*ClauseSet, error) {
 			clause.Not = true
 			index++
 			if index == len(parts) {
-				return nil, fmt.Errorf("incomplete not clause")
+				return nil, errors.New("incomplete not clause")
 			}
 		} else {
 			clause.Not = false
@@ -61,53 +60,57 @@ func Parse(s string, op OperatorSet) (*ClauseSet, error) {
 
 		index++
 		if index == len(parts) {
-			return nil, fmt.Errorf("clause has no operator")
+			return nil, errors.New("clause has no operator")
 		}
 
 		clause.Operator = parts[index]
 
 		index++
 		if index == len(parts) {
-			return nil, fmt.Errorf("clause has no value")
+			return nil, errors.New("clause has no value")
 		}
 
-		value := parts[index]
+		var value strings.Builder
+		value.WriteString(parts[index])
 
 		// support strings with spaces that are quoted
 		for _, symbol := range op.Quote {
-			if strings.HasPrefix(value, symbol) {
-				value = value[1:]
+			if strings.HasPrefix(parts[index], symbol) {
+				value.Reset()
+				value.WriteString(parts[index][1:])
 				for {
 					index++
 					if index == len(parts) {
-						return nil, fmt.Errorf("unterminated quote")
+						return nil, errors.New("unterminated quote")
 					}
 
 					if strings.HasSuffix(parts[index], symbol) {
 						break
 					}
 
-					value += " " + parts[index]
+					value.WriteString(" ")
+					value.WriteString(parts[index])
 				}
 
 				end := parts[index]
-				value += " " + end[0:len(end)-1]
+				value.WriteString(" ")
+				value.WriteString(end[0 : len(end)-1])
 			}
 		}
 
-		clause.Value = value
+		clause.Value = value.String()
 		index++
 
 		clause.PrevLogical = prevLogical
 		if index < len(parts) {
 			prevLogical = parts[index]
-			if !shared.ValueInSlice(prevLogical, []string{op.And, op.Or}) {
-				return nil, fmt.Errorf("invalid clause composition")
+			if !slices.Contains([]string{op.And, op.Or}, prevLogical) {
+				return nil, errors.New("invalid clause composition")
 			}
 
 			index++
 			if index == len(parts) {
-				return nil, fmt.Errorf("unterminated compound clause")
+				return nil, errors.New("unterminated compound clause")
 			}
 		}
 

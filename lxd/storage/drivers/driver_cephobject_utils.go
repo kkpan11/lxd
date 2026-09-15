@@ -2,9 +2,20 @@ package drivers
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"os"
+	"path"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,14 +30,15 @@ func (d *cephobject) radosgwadmin(ctx context.Context, args ...string) (string, 
 	if !ok {
 		// Set default timeout of 30s if no deadline context provided.
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(30*time.Second))
+		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 	}
 
-	cmd := []string{"radosgw-admin", "--cluster", d.config["cephobject.cluster_name"], "--id", d.config["cephobject.user.name"]}
+	cmd := make([]string, 0, 5+len(args))
+	cmd = append(cmd, "radosgw-admin", "--cluster", d.config["cephobject.cluster_name"], "--id", d.config["cephobject.user.name"])
 	cmd = append(cmd, args...)
 
-	return shared.RunCommandContext(ctx, cmd[0], cmd[1:]...)
+	return shared.RunCommand(ctx, cmd[0], cmd[1:]...)
 }
 
 // radosgwadminGetUser returns credentials for an existing radosgw user (and its sub users).
@@ -61,7 +73,7 @@ func (d *cephobject) radosgwadminGetUser(ctx context.Context, user string) (*S3C
 	// Get list of sub user names and store them without the main user prefix.
 	subUsers := make(map[string]S3Credentials, len(resp.SubUsers))
 	for _, subUser := range resp.SubUsers {
-		subUserName := strings.TrimPrefix(subUser.ID, fmt.Sprintf("%s:", user))
+		subUserName := strings.TrimPrefix(subUser.ID, user+":")
 		subUsers[subUserName] = S3Credentials{}
 	}
 
@@ -76,7 +88,7 @@ func (d *cephobject) radosgwadminGetUser(ctx context.Context, user string) (*S3C
 			}
 		} else {
 			for subUserName := range subUsers {
-				if strings.TrimPrefix(key.User, fmt.Sprintf("%s:", user)) == subUserName {
+				if strings.TrimPrefix(key.User, user+":") == subUserName {
 					subUser := subUsers[subUserName]
 					subUser.AccessKey = key.AccessKey
 					subUser.SecretKey = key.SecretKey
@@ -98,7 +110,7 @@ func (d *cephobject) radosgwadminUserAdd(ctx context.Context, user string, maxBu
 	revert := revert.New()
 	defer revert.Fail()
 
-	out, err := d.radosgwadmin(ctx, "user", "create", "--max-buckets", fmt.Sprintf("%d", maxBuckets), "--display-name", user, "--uid", user)
+	out, err := d.radosgwadmin(ctx, "user", "create", "--max-buckets", strconv.FormatInt(int64(maxBuckets), 10), "--display-name", user, "--uid", user)
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +185,7 @@ func (d *cephobject) radosgwadminSubUserAdd(ctx context.Context, user string, su
 		return nil, err
 	}
 
-	keyUser := fmt.Sprintf("%s:%s", user, subuser)
+	keyUser := user + ":" + subuser
 
 	for _, key := range creds.Keys {
 		if key.User == keyUser {
@@ -193,11 +205,133 @@ func (d *cephobject) radosgwadminSubUserDelete(ctx context.Context, user string,
 	return err
 }
 
+// s3CreateBucket creates a bucket via the S3 API using an HTTP PUT request with AWS Signature V4 authentication.
+func (d *cephobject) s3CreateBucket(ctx context.Context, creds S3Credentials, bucket string) error {
+	u, err := url.ParseRequestURI(d.config["cephobject.radosgw.endpoint"])
+	if err != nil {
+		return fmt.Errorf("Failed parsing cephobject.radosgw.endpoint: %w", err)
+	}
+
+	u.Path = path.Join(u.Path, url.PathEscape(bucket))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), nil)
+	if err != nil {
+		return err
+	}
+
+	s3SignRequest(req, creds, "")
+
+	transport, err := d.s3Transport()
+	if err != nil {
+		return err
+	}
+
+	client := &http.Client{Transport: transport}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("Failed sending S3 create bucket request: %w", err)
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Failed creating S3 bucket (HTTP %d)", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// s3Transport returns an HTTP transport configured for the radosgw endpoint.
+func (d *cephobject) s3Transport() (http.RoundTripper, error) {
+	u, err := url.ParseRequestURI(d.config["cephobject.radosgw.endpoint"])
+	if err != nil {
+		return nil, fmt.Errorf("Failed parsing cephobject.radosgw.endpoint: %w", err)
+	}
+
+	certFilePath := d.config["cephobject.radosgw.endpoint_cert_file"]
+	if u.Scheme == "https" && certFilePath != "" {
+		certFilePath = shared.HostPath(certFilePath)
+
+		certs, err := os.ReadFile(certFilePath)
+		if err != nil {
+			return nil, fmt.Errorf("Failed reading %q: %w", certFilePath, err)
+		}
+
+		rootCAs := x509.NewCertPool()
+		if !rootCAs.AppendCertsFromPEM(certs) {
+			return nil, errors.New("Failed adding S3 client certificates")
+		}
+
+		return &http.Transport{TLSClientConfig: &tls.Config{RootCAs: rootCAs}}, nil
+	}
+
+	return http.DefaultTransport, nil
+}
+
+// s3SignRequest signs an HTTP request using AWS Signature V4.
+func s3SignRequest(req *http.Request, creds S3Credentials, payloadHash string) {
+	if payloadHash == "" {
+		payloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" // SHA-256 of empty string.
+	}
+
+	now := time.Now().UTC()
+	datestamp := now.Format("20060102")
+	amzDate := now.Format("20060102T150405Z")
+	region := "us-east-1"
+	service := "s3"
+	credentialScope := datestamp + "/" + region + "/" + service + "/aws4_request"
+
+	req.Header.Set("x-amz-date", amzDate)
+	req.Header.Set("x-amz-content-sha256", payloadHash)
+	req.Header.Set("Host", req.URL.Host)
+
+	// Build canonical request.
+	canonicalURI := req.URL.Path
+	if canonicalURI == "" {
+		canonicalURI = "/"
+	}
+
+	canonicalQueryString := req.URL.Query().Encode()
+	signedHeaders := "host;x-amz-content-sha256;x-amz-date"
+	canonicalHeaders := "host:" + req.URL.Host + "\n" + "x-amz-content-sha256:" + payloadHash + "\n" + "x-amz-date:" + amzDate + "\n"
+
+	canonicalRequest := req.Method + "\n" + canonicalURI + "\n" + canonicalQueryString + "\n" + canonicalHeaders + "\n" + signedHeaders + "\n" + payloadHash
+
+	// Build string to sign.
+	canonicalRequestHash := sha256.Sum256([]byte(canonicalRequest))
+	stringToSign := "AWS4-HMAC-SHA256\n" + amzDate + "\n" + credentialScope + "\n" + hex.EncodeToString(canonicalRequestHash[:])
+
+	// Calculate signature.
+	signingKey := hmacSHA256(hmacSHA256(hmacSHA256(hmacSHA256([]byte("AWS4"+creds.SecretKey), datestamp), region), service), "aws4_request")
+	signature := hex.EncodeToString(hmacSHA256(signingKey, stringToSign))
+
+	// Set Authorization header.
+	req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential="+creds.AccessKey+"/"+credentialScope+", SignedHeaders="+signedHeaders+", Signature="+signature)
+}
+
+// hmacSHA256 returns the HMAC-SHA256 of the data using the given key.
+func hmacSHA256(key []byte, data string) []byte {
+	h := hmac.New(sha256.New, key)
+	h.Write([]byte(data))
+	return h.Sum(nil)
+}
+
 // radosgwadminBucketDelete deletes radosgw bucket.
 func (d *cephobject) radosgwadminBucketDelete(ctx context.Context, bucket string) error {
 	_, err := d.radosgwadmin(ctx, "bucket", "rm", "--bucket", bucket, "--purge-objects")
 
 	return err
+}
+
+// radosgwadminBucketExists checks if a radosgw bucket exists.
+func (d *cephobject) radosgwadminBucketExists(ctx context.Context, bucket string) (bool, error) {
+	buckets, err := d.radosgwadminBucketList(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	return slices.Contains(buckets, bucket), nil
 }
 
 // radosgwadminBucketLink links a bucket to a user.
@@ -215,7 +349,7 @@ func (d *cephobject) radosgwadminBucketSetQuota(ctx context.Context, user string
 			return err
 		}
 
-		_, err = d.radosgwadmin(ctx, "quota", "set", "--quota-scope=bucket", "--uid", user, "--max-size", fmt.Sprintf("%d", size))
+		_, err = d.radosgwadmin(ctx, "quota", "set", "--quota-scope=bucket", "--uid", user, "--max-size", strconv.FormatInt(size, 10))
 		if err != nil {
 			return err
 		}
@@ -253,5 +387,5 @@ func (d *cephobject) radosgwadminBucketList(ctx context.Context) ([]string, erro
 
 // radosgwBucketName returns the bucket name to use for the actual radosgw bucket.
 func (d *cephobject) radosgwBucketName(bucketName string) string {
-	return fmt.Sprintf("%s%s", d.config["cephobject.bucket.name_prefix"], bucketName)
+	return d.config["cephobject.bucket.name_prefix"] + bucketName
 }

@@ -7,15 +7,22 @@ version: 2
 
 # Set the version of Python and other tools you might need
 build:
-  os: ubuntu-22.04
+  os: ubuntu-24.04
   tools:
-    golang: "1.22"
+    golang: "1.25"
     python: "3.12"
   jobs:
-    pre_install:
-      - pip install gitpython pyyaml
-      - cd doc && python3 .sphinx/build_requirements.py
+    post_checkout:
       - git fetch --unshallow || true
+      # Cancel building pull requests when there are no changes in the doc directory.
+      # If there are no changes (git diff exits with 0), we force the command to return with 183.
+      # This is a special exit code on Read the Docs that will cancel the build immediately.
+      # https://docs.readthedocs.io/en/stable/build-customization.html#cancel-build-based-on-a-condition
+      - |
+        if [ "$READTHEDOCS_VERSION_TYPE" = "external" ] && git diff --quiet origin/main -- 'doc/' '.readthedocs.yaml';
+        then
+          exit 183;
+        fi
     pre_build:
       - go build -ldflags "-s -w" -o trimpath -o lxc.bin ./lxc
 
@@ -32,4 +39,4 @@ formats:
 # Optionally declare the Python requirements required to build your docs
 python:
    install:
-   - requirements: doc/.sphinx/requirements.txt
+   - requirements: doc/requirements.txt

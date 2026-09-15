@@ -2,6 +2,7 @@
 # Type: `gpu`
 
 ```{youtube} https://www.youtube.com/watch?v=T0aV2LsMpoA
+:title: LXD and the NVIDIA A100
 ```
 
 GPU devices make the specified GPU device or devices appear in the instance.
@@ -15,7 +16,7 @@ The following types of GPUs can be added using the `gputype` device option:
 
 - [`physical`](gpu-physical) (container and VM): Passes an entire GPU through into the instance.
   This value is the default if `gputype` is unspecified.
-- [`mdev`](gpu-mdev) (VM only): Creates and passes a virtual GPU through into the instance.
+- [`mdev`](gpu-mdev) (VM only): Creates and passes a virtual GPU (vGPU) through into the instance.
 - [`mig`](gpu-mig) (container only): Creates and passes a MIG (Multi-Instance GPU) through into the instance.
 - [`sriov`](gpu-sriov) (VM only): Passes a virtual function of an SR-IOV-enabled GPU into the instance.
 
@@ -53,6 +54,7 @@ Add a specific GPU from the host system as a `physical` GPU device to an instanc
 
 See {ref}`instances-configure-devices` for more information.
 
+(gpu-physical-cdi)=
 #### CDI mode
 
 ```{note}
@@ -71,6 +73,14 @@ If your machine has an NVIDIA iGPU (integrated GPU) located at index 0, you can 
 
     lxc config device add <instance_name> <device_name> gpu gputype=physical id=nvidia.com/igpu=0
 
+Similarly, for AMD GPUs using CDI, you can add the first available discrete GPU or all GPUs:
+
+    lxc config device add <instance_name> <device_name> gpu gputype=physical id=amd.com/gpu=0
+
+Or pass all AMD GPUs from the host:
+
+    lxc config device add <instance_name> <device_name> gpu gputype=physical id=amd.com/gpu=all
+
 For a complete example on how to use a GPU CDI pass-through, see {ref}`container-gpu-passthrough-with-docker`.
 
 (gpu-mdev)=
@@ -81,7 +91,7 @@ The `mdev` GPU type is supported only for VMs.
 It does not support hotplugging.
 ```
 
-An `mdev` GPU device creates and passes a virtual GPU through into the instance.
+An `mdev` GPU device creates and passes a virtual GPU (vGPU) through into the instance.
 You can check the list of available `mdev` profiles by running [`lxc info --resources`](lxc_info.md).
 
 ### Device options
@@ -123,13 +133,45 @@ GPU devices of type `mig` have the following device options:
     :end-before: <!-- config group device-gpu-mig-device-conf end -->
 ```
 
-You must set either {config:option}`device-gpu-mig-device-conf:mig.uuid` (NVIDIA drivers 470+) or both {config:option}`device-gpu-mig-device-conf:mig.ci` and {config:option}`device-gpu-mig-device-conf:mig.gi` (old NVIDIA drivers).
+You must use one of the following options to specify the MIG device to pass through:
+
+- {config:option}`device-gpu-mig-device-conf:mig.uuid`: Specify the MIG device UUID directly.
+  The `MIG-` prefix is optional.
+  The UUID uniquely identifies the MIG device, so no parent GPU selector is required.
+  You may optionally provide `pci`, `id` (as a DRM card ID), or both `vendorid` and `productid` to validate that the expected parent GPU is present.
+
+- {config:option}`device-gpu-mig-device-conf:mig.gi` and {config:option}`device-gpu-mig-device-conf:mig.ci`: Specify both the GPU instance ID and compute instance ID.
+  LXD resolves these to a MIG UUID via NVML.
+  On systems with multiple NVIDIA GPUs, also provide `pci`, `id` (as a DRM card ID), or both `vendorid` and `productid` to identify the parent GPU.
+
+- {config:option}`device-gpu-mig-device-conf:id` (CDI identifier only): Use CDI notation to pass the MIG device through directly.
+  Supported formats: `nvidia.com/mig=<uuid>` and `nvidia.com/mig=<dev_idx>:<mig_idx>`.
+  The CDI identifier is self-contained.
+  If you set `id` to a CDI identifier, then you cannot set `pci`, `vendorid`, `productid`, or a non-CDI `id` (DRM card ID).
+
+These three methods are mutually exclusive. All three use CDI internally to configure the device in the container.
 
 ### Configuration examples
 
-Add a `mig` GPU device to an instance by specifying its UUID and the PCI address of the GPU:
+Add a `mig` GPU device by specifying a UUID:
+
+    lxc config device add <instance_name> <device_name> gpu gputype=mig mig.uuid=<mig_uuid>
+
+Add a `mig` GPU device by specifying a UUID as well as a PCI address to validate the parent GPU:
 
     lxc config device add <instance_name> <device_name> gpu gputype=mig mig.uuid=<mig_uuid> pci=<pci_address>
+
+Add a `mig` GPU device by specifying GPU instance and compute instance IDs:
+
+    lxc config device add <instance_name> <device_name> gpu gputype=mig mig.gi=<gi_id> mig.ci=<ci_id> pci=<pci_address>
+
+Add a `mig` GPU device by specifying a CDI identifier (UUID):
+
+    lxc config device add <instance_name> <device_name> gpu gputype=mig id=nvidia.com/mig=<mig_uuid>
+
+Add a `mig` GPU device by specifying a CDI identifier (index):
+
+    lxc config device add <instance_name> <device_name> gpu gputype=mig id=nvidia.com/mig=<dev_idx>:<mig_idx>
 
 See {ref}`instances-configure-devices` for more information.
 
@@ -160,3 +202,8 @@ Add a `sriov` GPU device to an instance by specifying the PCI address of the par
     lxc config device add <instance_name> <device_name> gpu gputype=sriov pci=<pci_address>
 
 See {ref}`instances-configure-devices` for more information.
+
+## Related topics
+
+- {ref}`container-gpu-passthrough-with-docker`
+- {ref}`faq-gpu-passthrough-stop`

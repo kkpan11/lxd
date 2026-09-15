@@ -1,20 +1,19 @@
 package config
 
 import (
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 
 	"github.com/canonical/lxd/client"
+	"github.com/canonical/lxd/lxc/cookiejar"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 )
@@ -32,9 +31,9 @@ type Remote struct {
 
 // ParseRemote splits remote and object.
 func (c *Config) ParseRemote(raw string) (remoteName string, resourceName string, err error) {
-	remote, object, found := strings.Cut(raw, ":")
-	if !found {
-		return c.DefaultRemote, raw, nil
+	remote, object := c.ParseRemoteUnchecked(raw)
+	if remote == "" {
+		remote = c.DefaultRemote
 	}
 
 	_, ok := c.Remotes[remote]
@@ -44,14 +43,30 @@ func (c *Config) ParseRemote(raw string) (remoteName string, resourceName string
 			return c.DefaultRemote, raw, nil
 		}
 
-		return "", "", fmt.Errorf("The remote \"%s\" doesn't exist", remote)
+		return "", "", fmt.Errorf("The remote \"%s\" does not exist", remote)
 	}
 
 	return remote, object, nil
 }
 
+// ParseRemoteUnchecked splits remote and object but does not verify if the remote exists.
+func (c *Config) ParseRemoteUnchecked(raw string) (remoteName string, resourceName string) {
+	remote, object, found := strings.Cut(raw, ":")
+	if !found {
+		return "", raw
+	}
+
+	return remote, object
+}
+
 // GetInstanceServer returns a lxd.InstanceServer for the remote with the given name.
 func (c *Config) GetInstanceServer(name string) (lxd.InstanceServer, error) {
+	return c.GetInstanceServerWithConnectionArgs(name, nil)
+}
+
+// GetInstanceServerWithConnectionArgs returns a lxd.InstanceServer for the remote with the given name. Any
+// populated fields of the given connection arguments override the default connection arguments for the remote.
+func (c *Config) GetInstanceServerWithConnectionArgs(name string, inArgs *lxd.ConnectionArgs) (lxd.InstanceServer, error) {
 	remote, err := c.getPrivateRemoteByName(name)
 	if err != nil {
 		return nil, err
@@ -63,7 +78,80 @@ func (c *Config) GetInstanceServer(name string) (lxd.InstanceServer, error) {
 		return nil, err
 	}
 
+	if inArgs != nil {
+		args = mergeConnectionArgs(*args, *inArgs)
+	}
+
 	return c.connectRemote(*remote, args)
+}
+
+// mergeConnectionArgs returns a copy of baseArgs where each field is overwritten with fields from additionalArgs (if
+// non-zero). This is useful for when the CLI needs the base connection arguments for a remote, but also needs to set
+// a transport wrapper for extracting headers, or to skip calling GET /1.0 on each API call.
+func mergeConnectionArgs(baseArgs lxd.ConnectionArgs, additionalArgs lxd.ConnectionArgs) *lxd.ConnectionArgs {
+	args := baseArgs
+
+	if additionalArgs.TLSServerCert != "" {
+		args.TLSServerCert = additionalArgs.TLSServerCert
+	}
+
+	if additionalArgs.TLSClientCert != "" {
+		args.TLSClientCert = additionalArgs.TLSClientCert
+	}
+
+	if additionalArgs.TLSClientKey != "" {
+		args.TLSClientKey = additionalArgs.TLSClientKey
+	}
+
+	if additionalArgs.TLSCA != "" {
+		args.TLSCA = additionalArgs.TLSCA
+	}
+
+	if additionalArgs.UserAgent != "" {
+		args.UserAgent = additionalArgs.UserAgent
+	}
+
+	if additionalArgs.AuthType != "" {
+		args.AuthType = additionalArgs.AuthType
+	}
+
+	if additionalArgs.Proxy != nil {
+		args.Proxy = additionalArgs.Proxy
+	}
+
+	if additionalArgs.HTTPClient != nil {
+		args.HTTPClient = additionalArgs.HTTPClient
+	}
+
+	if additionalArgs.TransportWrapper != nil {
+		args.TransportWrapper = additionalArgs.TransportWrapper
+	}
+
+	if additionalArgs.InsecureSkipVerify {
+		args.InsecureSkipVerify = additionalArgs.InsecureSkipVerify
+	}
+
+	if additionalArgs.CookieJar != nil {
+		args.CookieJar = additionalArgs.CookieJar
+	}
+
+	if additionalArgs.OIDCTokens != nil {
+		args.OIDCTokens = additionalArgs.OIDCTokens
+	}
+
+	if additionalArgs.SkipGetServer {
+		args.SkipGetServer = additionalArgs.SkipGetServer
+	}
+
+	if additionalArgs.CachePath != "" {
+		args.CachePath = additionalArgs.CachePath
+	}
+
+	if additionalArgs.CacheExpiry != 0 {
+		args.CacheExpiry = additionalArgs.CacheExpiry
+	}
+
+	return &args
 }
 
 // getPrivateRemoteByName returns the Remote with the given name and ensures that the remote is not public.
@@ -75,7 +163,7 @@ func (c *Config) getPrivateRemoteByName(name string) (*Remote, error) {
 
 	// Check the remote is private.
 	if remote.Public || remote.Protocol == "simplestreams" {
-		return nil, fmt.Errorf("The remote isn't a private LXD server")
+		return nil, errors.New("The remote is not a private LXD server")
 	}
 
 	return remote, nil
@@ -91,7 +179,7 @@ func (c *Config) getPublicRemoteByName(name string) (*Remote, error) {
 	// Get the remote
 	remote, ok := c.Remotes[name]
 	if !ok {
-		return nil, fmt.Errorf("The remote \"%s\" doesn't exist", name)
+		return nil, fmt.Errorf("The remote \"%s\" does not exist", name)
 	}
 
 	return &remote, nil
@@ -100,12 +188,12 @@ func (c *Config) getPublicRemoteByName(name string) (*Remote, error) {
 // connectRemote returns a lxd.InstanceServer for the given Remote and configures it with the given lxd.ConnectionArgs.
 func (c *Config) connectRemote(remote Remote, args *lxd.ConnectionArgs) (lxd.InstanceServer, error) {
 	// Unix socket
-	if strings.HasPrefix(remote.Addr, "unix:") {
-		d, err := lxd.ConnectLXDUnix(strings.TrimPrefix(strings.TrimPrefix(remote.Addr, "unix:"), "//"), args)
+	after, ok := strings.CutPrefix(remote.Addr, "unix:")
+	if ok {
+		d, err := lxd.ConnectLXDUnix(strings.TrimPrefix(after, "//"), args)
 		if err != nil {
-			var netErr *net.OpError
-
-			if errors.As(err, &netErr) {
+			netErr, ok := errors.AsType[*net.OpError](err)
+			if ok {
 				if errors.Is(err, os.ErrNotExist) {
 					return nil, fmt.Errorf("LXD unix socket %q not found: Please check LXD is running", netErr.Addr)
 				}
@@ -132,8 +220,11 @@ func (c *Config) connectRemote(remote Remote, args *lxd.ConnectionArgs) (lxd.Ins
 	}
 
 	// HTTPS
-	if !shared.ValueInSlice(remote.AuthType, []string{api.AuthenticationMethodOIDC}) && (args.TLSClientCert == "" || args.TLSClientKey == "") {
-		return nil, fmt.Errorf("Missing TLS client certificate and key")
+	// If bearer token is provided, we don't need TLS client certificate and key.
+	// However, do not advertise that bearer token can be configured.
+	// The support for bearer token in LXC is purely for testing purposes.
+	if !slices.Contains([]string{api.AuthenticationMethodOIDC}, remote.AuthType) && (args.TLSClientCert == "" || args.TLSClientKey == "") && args.BearerToken == "" {
+		return nil, errors.New("Missing TLS client certificate and key")
 	}
 
 	d, err := lxd.ConnectLXD(remote.Addr, args)
@@ -152,25 +243,6 @@ func (c *Config) connectRemote(remote Remote, args *lxd.ConnectionArgs) (lxd.Ins
 	return d, nil
 }
 
-// GetInstanceServerWithTransportWrapper returns a lxd.InstanceServer for the remote with the given name and adds the
-// given transport wrapper to the lxd.ConnectionArgs.
-func (c *Config) GetInstanceServerWithTransportWrapper(name string, wrapper func(*http.Transport) lxd.HTTPTransporter) (lxd.InstanceServer, error) {
-	remote, err := c.getPrivateRemoteByName(name)
-	if err != nil {
-		return nil, err
-	}
-
-	// Get connection arguments
-	args, err := c.getConnectionArgs(name)
-	if err != nil {
-		return nil, err
-	}
-
-	args.TransportWrapper = wrapper
-
-	return c.connectRemote(*remote, args)
-}
-
 // GetImageServer returns a ImageServer struct for the remote.
 func (c *Config) GetImageServer(name string) (lxd.ImageServer, error) {
 	remote, err := c.getPublicRemoteByName(name)
@@ -185,8 +257,9 @@ func (c *Config) GetImageServer(name string) (lxd.ImageServer, error) {
 	}
 
 	// Unix socket
-	if strings.HasPrefix(remote.Addr, "unix:") {
-		d, err := lxd.ConnectLXDUnix(strings.TrimPrefix(strings.TrimPrefix(remote.Addr, "unix:"), "//"), args)
+	after, ok := strings.CutPrefix(remote.Addr, "unix:")
+	if ok {
+		d, err := lxd.ConnectLXDUnix(strings.TrimPrefix(after, "//"), args)
 		if err != nil {
 			return nil, err
 		}
@@ -258,12 +331,8 @@ func (c *Config) getConnectionArgs(name string) (*lxd.ConnectionArgs, error) {
 		tokenPath := c.OIDCTokenPath(name)
 
 		if c.oidcTokens[name] == nil {
-			if shared.PathExists(tokenPath) {
-				content, err := os.ReadFile(tokenPath)
-				if err != nil {
-					return nil, err
-				}
-
+			content, err := os.ReadFile(tokenPath)
+			if err == nil {
 				var tokens oidc.Tokens[*oidc.IDTokenClaims]
 
 				err = json.Unmarshal(content, &tokens)
@@ -272,12 +341,45 @@ func (c *Config) getConnectionArgs(name string) (*lxd.ConnectionArgs, error) {
 				}
 
 				c.oidcTokens[name] = &tokens
-			} else {
+			} else if os.IsNotExist(err) {
 				c.oidcTokens[name] = &oidc.Tokens[*oidc.IDTokenClaims]{}
+			} else {
+				return nil, err
 			}
 		}
 
 		args.OIDCTokens = c.oidcTokens[name]
+
+		if c.cookieJars == nil || c.cookieJars[name] == nil {
+			err := os.MkdirAll(c.ConfigPath("jars"), 0700)
+			if err != nil {
+				return nil, err
+			}
+
+			_, err = os.Stat(c.CookiesPath(name))
+			if err != nil && os.IsNotExist(err) {
+				// Migrate legacy cookies file if it exists.
+				err = shared.FileCopy(c.ConfigPath("cookies"), c.CookiesPath(name))
+				if err != nil && !os.IsNotExist(err) {
+					return nil, err
+				}
+			} else if err != nil {
+				return nil, err
+			}
+
+			jar, err := cookiejar.Open(c.CookiesPath(name), remote.Addr)
+			if err != nil {
+				return nil, err
+			}
+
+			if c.cookieJars == nil {
+				c.cookieJars = map[string]*cookiejar.Jar{}
+			}
+
+			c.cookieJars[name] = jar
+		}
+
+		args.CookieJar = c.cookieJars[name]
 	}
 
 	// Stop here if no TLS involved
@@ -286,70 +388,48 @@ func (c *Config) getConnectionArgs(name string) (*lxd.ConnectionArgs, error) {
 	}
 
 	// Server certificate
-	if shared.PathExists(c.ServerCertPath(name)) {
-		content, err := os.ReadFile(c.ServerCertPath(name))
-		if err != nil {
-			return nil, err
-		}
-
+	content, err := os.ReadFile(c.ServerCertPath(name))
+	if err == nil {
 		args.TLSServerCert = string(content)
+	} else if !os.IsNotExist(err) {
+		return nil, err
 	}
 
 	// Stop here if no client certificate involved
-	if remote.Protocol == "simplestreams" || shared.ValueInSlice(remote.AuthType, []string{api.AuthenticationMethodOIDC}) {
+	if remote.Protocol == "simplestreams" || slices.Contains([]string{api.AuthenticationMethodOIDC}, remote.AuthType) {
+		return &args, nil
+	}
+
+	// Check for LXD_AUTH_BEARER_TOKEN environment variable
+	// Stop here if bearer token is used. It takes precedence over the TLS client certificate and key.
+	token, ok := os.LookupEnv("LXD_AUTH_BEARER_TOKEN")
+	if ok && token != "" {
+		args.BearerToken = token
 		return &args, nil
 	}
 
 	// Client certificate
-	if shared.PathExists(c.ConfigPath("client.crt")) {
-		content, err := os.ReadFile(c.ConfigPath("client.crt"))
-		if err != nil {
-			return nil, err
-		}
-
+	content, err = os.ReadFile(c.ConfigPath("client.crt"))
+	if err == nil {
 		args.TLSClientCert = string(content)
+	} else if !os.IsNotExist(err) {
+		return nil, err
 	}
 
 	// Client CA
-	if shared.PathExists(c.ConfigPath("client.ca")) {
-		content, err := os.ReadFile(c.ConfigPath("client.ca"))
-		if err != nil {
-			return nil, err
-		}
-
+	content, err = os.ReadFile(c.ConfigPath("client.ca"))
+	if err == nil {
 		args.TLSCA = string(content)
+	} else if !os.IsNotExist(err) {
+		return nil, err
 	}
 
 	// Client key
-	if shared.PathExists(c.ConfigPath("client.key")) {
-		content, err := os.ReadFile(c.ConfigPath("client.key"))
-		if err != nil {
-			return nil, err
-		}
-
-		pemKey, _ := pem.Decode(content)
-		// Golang has deprecated all methods relating to PEM encryption due to a vulnerability.
-		// However, the weakness does not make PEM unsafe for our purposes as it pertains to password protection on the
-		// key file (client.key is only readable to the user in any case), so we'll ignore deprecation.
-		if x509.IsEncryptedPEMBlock(pemKey) { //nolint:staticcheck
-			if c.PromptPassword == nil {
-				return nil, fmt.Errorf("Private key is password protected and no helper was configured")
-			}
-
-			password, err := c.PromptPassword("client.crt")
-			if err != nil {
-				return nil, err
-			}
-
-			derKey, err := x509.DecryptPEMBlock(pemKey, []byte(password)) //nolint:staticcheck
-			if err != nil {
-				return nil, err
-			}
-
-			content = pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: derKey})
-		}
-
+	content, err = os.ReadFile(c.ConfigPath("client.key"))
+	if err == nil {
 		args.TLSClientKey = string(content)
+	} else if !os.IsNotExist(err) {
+		return nil, err
 	}
 
 	return &args, nil

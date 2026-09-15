@@ -87,42 +87,21 @@ DELETE FROM profiles WHERE project_id = (SELECT projects.id FROM projects WHERE 
 func GetProfileID(ctx context.Context, tx *sql.Tx, project string, name string) (int64, error) {
 	stmt, err := Stmt(tx, profileID)
 	if err != nil {
-		return -1, fmt.Errorf("Failed to get \"profileID\" prepared statement: %w", err)
+		return -1, fmt.Errorf("Failed getting \"profileID\" prepared statement: %w", err)
 	}
 
 	row := stmt.QueryRowContext(ctx, project, name)
 	var id int64
 	err = row.Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return -1, api.StatusErrorf(http.StatusNotFound, "Profile not found")
-	}
-
 	if err != nil {
-		return -1, fmt.Errorf("Failed to get \"profiles\" ID: %w", err)
+		if errors.Is(err, sql.ErrNoRows) {
+			return -1, api.StatusErrorf(http.StatusNotFound, "Profile not found")
+		}
+
+		return -1, fmt.Errorf("Failed getting \"profiles\" ID: %w", err)
 	}
 
 	return id, nil
-}
-
-// ProfileExists checks if a profile with the given key exists.
-// generator: profile Exists
-func ProfileExists(ctx context.Context, tx *sql.Tx, project string, name string) (bool, error) {
-	_, err := GetProfileID(ctx, tx, project, name)
-	if err != nil {
-		if api.StatusErrorCheck(err, http.StatusNotFound) {
-			return false, nil
-		}
-
-		return false, err
-	}
-
-	return true, nil
-}
-
-// profileColumns returns a string of column names to be used with a SELECT statement for the entity.
-// Use this function when building statements to retrieve database entries matching the Profile entity.
-func profileColumns() string {
-	return "profiles.id, profiles.project_id, projects.name AS project, profiles.name, coalesce(profiles.description, '')"
 }
 
 // getProfiles can be used to run handwritten sql.Stmts to return a slice of objects.
@@ -143,7 +122,7 @@ func getProfiles(ctx context.Context, stmt *sql.Stmt, args ...any) ([]Profile, e
 
 	err := query.SelectObjects(ctx, stmt, dest, args...)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch from \"profiles\" table: %w", err)
+		return nil, fmt.Errorf("Failed fetching from \"profiles\" table: %w", err)
 	}
 
 	return objects, nil
@@ -167,7 +146,7 @@ func getProfilesRaw(ctx context.Context, tx *sql.Tx, sql string, args ...any) ([
 
 	err := query.Scan(ctx, tx, sql, dest, args...)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch from \"profiles\" table: %w", err)
+		return nil, fmt.Errorf("Failed fetching from \"profiles\" table: %w", err)
 	}
 
 	return objects, nil
@@ -179,7 +158,7 @@ func GetProfiles(ctx context.Context, tx *sql.Tx, filters ...ProfileFilter) ([]P
 	var err error
 
 	// Result slice.
-	objects := make([]Profile, 0)
+	var objects []Profile
 
 	// Pick the prepared statement and arguments to use based on active criteria.
 	var sqlStmt *sql.Stmt
@@ -189,7 +168,7 @@ func GetProfiles(ctx context.Context, tx *sql.Tx, filters ...ProfileFilter) ([]P
 	if len(filters) == 0 {
 		sqlStmt, err = Stmt(tx, profileObjects)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to get \"profileObjects\" prepared statement: %w", err)
+			return nil, fmt.Errorf("Failed getting \"profileObjects\" prepared statement: %w", err)
 		}
 	}
 
@@ -199,7 +178,7 @@ func GetProfiles(ctx context.Context, tx *sql.Tx, filters ...ProfileFilter) ([]P
 			if len(filters) == 1 {
 				sqlStmt, err = Stmt(tx, profileObjectsByProjectAndName)
 				if err != nil {
-					return nil, fmt.Errorf("Failed to get \"profileObjectsByProjectAndName\" prepared statement: %w", err)
+					return nil, fmt.Errorf("Failed getting \"profileObjectsByProjectAndName\" prepared statement: %w", err)
 				}
 
 				break
@@ -207,7 +186,7 @@ func GetProfiles(ctx context.Context, tx *sql.Tx, filters ...ProfileFilter) ([]P
 
 			query, err := StmtString(profileObjectsByProjectAndName)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to get \"profileObjects\" prepared statement: %w", err)
+				return nil, fmt.Errorf("Failed getting \"profileObjects\" prepared statement: %w", err)
 			}
 
 			parts := strings.SplitN(query, "ORDER BY", 2)
@@ -223,7 +202,7 @@ func GetProfiles(ctx context.Context, tx *sql.Tx, filters ...ProfileFilter) ([]P
 			if len(filters) == 1 {
 				sqlStmt, err = Stmt(tx, profileObjectsByProject)
 				if err != nil {
-					return nil, fmt.Errorf("Failed to get \"profileObjectsByProject\" prepared statement: %w", err)
+					return nil, fmt.Errorf("Failed getting \"profileObjectsByProject\" prepared statement: %w", err)
 				}
 
 				break
@@ -231,7 +210,7 @@ func GetProfiles(ctx context.Context, tx *sql.Tx, filters ...ProfileFilter) ([]P
 
 			query, err := StmtString(profileObjectsByProject)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to get \"profileObjects\" prepared statement: %w", err)
+				return nil, fmt.Errorf("Failed getting \"profileObjects\" prepared statement: %w", err)
 			}
 
 			parts := strings.SplitN(query, "ORDER BY", 2)
@@ -247,7 +226,7 @@ func GetProfiles(ctx context.Context, tx *sql.Tx, filters ...ProfileFilter) ([]P
 			if len(filters) == 1 {
 				sqlStmt, err = Stmt(tx, profileObjectsByName)
 				if err != nil {
-					return nil, fmt.Errorf("Failed to get \"profileObjectsByName\" prepared statement: %w", err)
+					return nil, fmt.Errorf("Failed getting \"profileObjectsByName\" prepared statement: %w", err)
 				}
 
 				break
@@ -255,7 +234,7 @@ func GetProfiles(ctx context.Context, tx *sql.Tx, filters ...ProfileFilter) ([]P
 
 			query, err := StmtString(profileObjectsByName)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to get \"profileObjects\" prepared statement: %w", err)
+				return nil, fmt.Errorf("Failed getting \"profileObjects\" prepared statement: %w", err)
 			}
 
 			parts := strings.SplitN(query, "ORDER BY", 2)
@@ -271,7 +250,7 @@ func GetProfiles(ctx context.Context, tx *sql.Tx, filters ...ProfileFilter) ([]P
 			if len(filters) == 1 {
 				sqlStmt, err = Stmt(tx, profileObjectsByID)
 				if err != nil {
-					return nil, fmt.Errorf("Failed to get \"profileObjectsByID\" prepared statement: %w", err)
+					return nil, fmt.Errorf("Failed getting \"profileObjectsByID\" prepared statement: %w", err)
 				}
 
 				break
@@ -279,7 +258,7 @@ func GetProfiles(ctx context.Context, tx *sql.Tx, filters ...ProfileFilter) ([]P
 
 			query, err := StmtString(profileObjectsByID)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to get \"profileObjects\" prepared statement: %w", err)
+				return nil, fmt.Errorf("Failed getting \"profileObjects\" prepared statement: %w", err)
 			}
 
 			parts := strings.SplitN(query, "ORDER BY", 2)
@@ -291,9 +270,9 @@ func GetProfiles(ctx context.Context, tx *sql.Tx, filters ...ProfileFilter) ([]P
 			_, where, _ := strings.Cut(parts[0], "WHERE")
 			queryParts[0] += "OR" + where
 		} else if filter.ID == nil && filter.Project == nil && filter.Name == nil {
-			return nil, fmt.Errorf("Cannot filter on empty ProfileFilter")
+			return nil, errors.New("Cannot filter on empty ProfileFilter")
 		} else {
-			return nil, fmt.Errorf("No statement exists for the given Filter")
+			return nil, errors.New("No statement exists for the given Filter")
 		}
 	}
 
@@ -306,7 +285,7 @@ func GetProfiles(ctx context.Context, tx *sql.Tx, filters ...ProfileFilter) ([]P
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch from \"profiles\" table: %w", err)
+		return nil, fmt.Errorf("Failed fetching from \"profiles\" table: %w", err)
 	}
 
 	return objects, nil
@@ -358,7 +337,7 @@ func GetProfile(ctx context.Context, tx *sql.Tx, project string, name string) (*
 
 	objects, err := GetProfiles(ctx, tx, filter)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch from \"profiles\" table: %w", err)
+		return nil, fmt.Errorf("Failed fetching from \"profiles\" table: %w", err)
 	}
 
 	switch len(objects) {
@@ -367,23 +346,13 @@ func GetProfile(ctx context.Context, tx *sql.Tx, project string, name string) (*
 	case 1:
 		return &objects[0], nil
 	default:
-		return nil, fmt.Errorf("More than one \"profiles\" entry matches")
+		return nil, errors.New("More than one \"profiles\" entry matches")
 	}
 }
 
 // CreateProfile adds a new profile to the database.
 // generator: profile Create
 func CreateProfile(ctx context.Context, tx *sql.Tx, object Profile) (int64, error) {
-	// Check if a profile with the same key exists.
-	exists, err := ProfileExists(ctx, tx, object.Project, object.Name)
-	if err != nil {
-		return -1, fmt.Errorf("Failed to check for duplicates: %w", err)
-	}
-
-	if exists {
-		return -1, api.StatusErrorf(http.StatusConflict, "This \"profiles\" entry already exists")
-	}
-
 	args := make([]any, 3)
 
 	// Populate the statement arguments.
@@ -394,18 +363,22 @@ func CreateProfile(ctx context.Context, tx *sql.Tx, object Profile) (int64, erro
 	// Prepared statement to use.
 	stmt, err := Stmt(tx, profileCreate)
 	if err != nil {
-		return -1, fmt.Errorf("Failed to get \"profileCreate\" prepared statement: %w", err)
+		return -1, fmt.Errorf("Failed getting \"profileCreate\" prepared statement: %w", err)
 	}
 
 	// Execute the statement.
-	result, err := stmt.Exec(args...)
+	result, err := stmt.ExecContext(ctx, args...)
 	if err != nil {
-		return -1, fmt.Errorf("Failed to create \"profiles\" entry: %w", err)
+		if query.IsConflictErr(err) {
+			return -1, api.NewStatusError(http.StatusConflict, "This \"profiles\" entry already exists")
+		}
+
+		return -1, fmt.Errorf("Failed creating \"profiles\" entry: %w", err)
 	}
 
 	id, err := result.LastInsertId()
 	if err != nil {
-		return -1, fmt.Errorf("Failed to fetch \"profiles\" entry ID: %w", err)
+		return -1, fmt.Errorf("Failed fetching \"profiles\" entry ID: %w", err)
 	}
 
 	return id, nil
@@ -453,11 +426,15 @@ func CreateProfileConfig(ctx context.Context, tx *sql.Tx, profileID int64, confi
 func RenameProfile(ctx context.Context, tx *sql.Tx, project string, name string, to string) error {
 	stmt, err := Stmt(tx, profileRename)
 	if err != nil {
-		return fmt.Errorf("Failed to get \"profileRename\" prepared statement: %w", err)
+		return fmt.Errorf("Failed getting \"profileRename\" prepared statement: %w", err)
 	}
 
-	result, err := stmt.Exec(to, project, name)
+	result, err := stmt.ExecContext(ctx, to, project, name)
 	if err != nil {
+		if query.IsConflictErr(err) {
+			return api.NewStatusError(http.StatusConflict, "A \"profiles\" entry already exists with this name")
+		}
+
 		return fmt.Errorf("Rename Profile failed: %w", err)
 	}
 
@@ -483,11 +460,15 @@ func UpdateProfile(ctx context.Context, tx *sql.Tx, project string, name string,
 
 	stmt, err := Stmt(tx, profileUpdate)
 	if err != nil {
-		return fmt.Errorf("Failed to get \"profileUpdate\" prepared statement: %w", err)
+		return fmt.Errorf("Failed getting \"profileUpdate\" prepared statement: %w", err)
 	}
 
-	result, err := stmt.Exec(object.Project, object.Name, object.Description, id)
+	result, err := stmt.ExecContext(ctx, object.Project, object.Name, object.Description, id)
 	if err != nil {
+		if query.IsConflictErr(err) {
+			return api.NewStatusError(http.StatusConflict, "A \"profiles\" entry already exists with these properties")
+		}
+
 		return fmt.Errorf("Update \"profiles\" entry failed: %w", err)
 	}
 
@@ -530,10 +511,10 @@ func UpdateProfileConfig(ctx context.Context, tx *sql.Tx, profileID int64, confi
 func DeleteProfile(ctx context.Context, tx *sql.Tx, project string, name string) error {
 	stmt, err := Stmt(tx, profileDeleteByProjectAndName)
 	if err != nil {
-		return fmt.Errorf("Failed to get \"profileDeleteByProjectAndName\" prepared statement: %w", err)
+		return fmt.Errorf("Failed getting \"profileDeleteByProjectAndName\" prepared statement: %w", err)
 	}
 
-	result, err := stmt.Exec(project, name)
+	result, err := stmt.ExecContext(ctx, project, name)
 	if err != nil {
 		return fmt.Errorf("Delete \"profiles\": %w", err)
 	}

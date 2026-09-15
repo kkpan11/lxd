@@ -1,19 +1,23 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/lxc/config"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
-	"github.com/canonical/lxd/shared/i18n"
 	"github.com/canonical/lxd/shared/termios"
 )
 
@@ -32,7 +36,7 @@ func runBatch(names []string, action func(name string) error) []batchResult {
 		}(name)
 	}
 
-	results := []batchResult{}
+	results := make([]batchResult, 0, len(names))
 	for range names {
 		results = append(results, <-chResult)
 	}
@@ -57,12 +61,10 @@ func getProfileDevices(destRemote lxd.InstanceServer, serverSideProfiles []strin
 	for _, profileName := range profiles {
 		profile, _, err := destRemote.GetProfile(profileName)
 		if err != nil {
-			return nil, fmt.Errorf(i18n.G("Failed loading profile %q: %w"), profileName, err)
+			return nil, fmt.Errorf("Failed loading profile %q: %w", profileName, err)
 		}
 
-		for deviceName, device := range profile.Devices {
-			profileDevices[deviceName] = device
-		}
+		maps.Copy(profileDevices, profile.Devices)
 	}
 
 	return profileDevices, nil
@@ -79,7 +81,7 @@ func instanceDeviceAdd(client lxd.InstanceServer, name string, devName string, d
 	// Check if the device already exists
 	_, ok := inst.Devices[devName]
 	if ok {
-		return fmt.Errorf(i18n.G("Device already exists: %s"), devName)
+		return fmt.Errorf("Device already exists: %s", devName)
 	}
 
 	inst.Devices[devName] = dev
@@ -103,18 +105,18 @@ func profileDeviceAdd(client lxd.InstanceServer, name string, devName string, de
 	// Check if the device already exists
 	_, ok := profile.Devices[devName]
 	if ok {
-		return fmt.Errorf(i18n.G("Device already exists: %s"), devName)
+		return fmt.Errorf("Device already exists: %s", devName)
 	}
 
 	// Add the device to the instance
 	profile.Devices[devName] = dev
 
-	err = client.UpdateProfile(name, profile.Writable(), profileEtag)
+	op, err := client.UpdateProfile(name, profile.Writable(), profileEtag)
 	if err != nil {
 		return err
 	}
 
-	return nil
+	return op.Wait()
 }
 
 // parseDeviceOverrides parses device overrides of the form "<deviceName>,<key>=<value>" into a device map.
@@ -123,17 +125,17 @@ func parseDeviceOverrides(deviceOverrideArgs []string) (map[string]map[string]st
 	deviceMap := map[string]map[string]string{}
 	for _, entry := range deviceOverrideArgs {
 		if !strings.Contains(entry, "=") || !strings.Contains(entry, ",") {
-			return nil, fmt.Errorf(i18n.G("Bad device override syntax, expecting <device>,<key>=<value>: %s"), entry)
+			return nil, fmt.Errorf("Bad device override syntax, expecting <device>,<key>=<value>: %s", entry)
 		}
 
-		deviceFields := strings.SplitN(entry, ",", 2)
-		keyFields := strings.SplitN(deviceFields[1], "=", 2)
+		deviceName, deviceOverride, _ := strings.Cut(entry, ",")
 
-		if deviceMap[deviceFields[0]] == nil {
-			deviceMap[deviceFields[0]] = map[string]string{}
+		if deviceMap[deviceName] == nil {
+			deviceMap[deviceName] = map[string]string{}
 		}
 
-		deviceMap[deviceFields[0]][keyFields[0]] = keyFields[1]
+		key, value, _ := strings.Cut(deviceOverride, "=")
+		deviceMap[deviceName][key] = value
 	}
 
 	return deviceMap, nil
@@ -141,7 +143,7 @@ func parseDeviceOverrides(deviceOverrideArgs []string) (map[string]map[string]st
 
 // IsAliasesSubset returns true if the first array is completely contained in the second array.
 func IsAliasesSubset(a1 []api.ImageAlias, a2 []api.ImageAlias) bool {
-	set := make(map[string]interface{})
+	set := make(map[string]any)
 	for _, alias := range a2 {
 		set[alias.Name] = nil
 	}
@@ -200,7 +202,7 @@ func ensureImageAliases(client lxd.InstanceServer, aliases []api.ImageAlias, fin
 	for _, alias := range GetExistingAliases(names, resp) {
 		err := client.DeleteImageAlias(alias.Name)
 		if err != nil {
-			return fmt.Errorf(i18n.G("Failed to remove alias %s: %w"), alias.Name, err)
+			return fmt.Errorf("Failed removing alias %s: %w", alias.Name, err)
 		}
 	}
 
@@ -211,7 +213,7 @@ func ensureImageAliases(client lxd.InstanceServer, aliases []api.ImageAlias, fin
 		aliasPost.Target = fingerprint
 		err := client.CreateImageAlias(aliasPost)
 		if err != nil {
-			return fmt.Errorf(i18n.G("Failed to create alias %s: %w"), alias.Name, err)
+			return fmt.Errorf("Failed creating alias %s: %w", alias.Name, err)
 		}
 	}
 
@@ -236,7 +238,7 @@ func getConfig(args ...string) (map[string]string, error) {
 		if args[1] == "-" && !termios.IsTerminal(getStdinFd()) {
 			buf, err := io.ReadAll(os.Stdin)
 			if err != nil {
-				return nil, fmt.Errorf(i18n.G("Can't read from stdin: %w"), err)
+				return nil, fmt.Errorf("Cannot read from stdin: %w", err)
 			}
 
 			args[1] = string(buf[:])
@@ -248,21 +250,21 @@ func getConfig(args ...string) (map[string]string, error) {
 	values := map[string]string{}
 
 	for _, arg := range args {
-		fields := strings.SplitN(arg, "=", 2)
-		if len(fields) != 2 {
-			return nil, fmt.Errorf(i18n.G("Invalid key=value configuration: %s"), arg)
+		key, value, found := strings.Cut(arg, "=")
+		if !found {
+			return nil, fmt.Errorf("Invalid key=value configuration: %s", arg)
 		}
 
-		if fields[1] == "-" && !termios.IsTerminal(getStdinFd()) {
+		if value == "-" && !termios.IsTerminal(getStdinFd()) {
 			buf, err := io.ReadAll(os.Stdin)
 			if err != nil {
-				return nil, fmt.Errorf(i18n.G("Can't read from stdin: %w"), err)
+				return nil, fmt.Errorf("Cannot read from stdin: %w", err)
 			}
 
-			fields[1] = string(buf[:])
+			value = string(buf[:])
 		}
 
-		values[fields[0]] = fields[1]
+		values[key] = value
 	}
 
 	return values, nil
@@ -285,7 +287,7 @@ func instancesExist(resources []remoteResource) error {
 
 			_, _, err := resource.server.GetInstanceSnapshot(parent, snap)
 			if err != nil {
-				return fmt.Errorf(i18n.G("Failed checking instance snapshot exists \"%s:%s\": %w"), resource.remote, resource.name, err)
+				return fmt.Errorf("Failed checking instance snapshot exists \"%s:%s\": %w", resource.remote, resource.name, err)
 			}
 
 			continue
@@ -293,7 +295,7 @@ func instancesExist(resources []remoteResource) error {
 
 		_, _, err := resource.server.GetInstance(resource.name)
 		if err != nil {
-			return fmt.Errorf(i18n.G("Failed checking instance exists \"%s:%s\": %w"), resource.remote, resource.name, err)
+			return fmt.Errorf("Failed checking instance exists \"%s:%s\": %w", resource.remote, resource.name, err)
 		}
 	}
 
@@ -304,8 +306,7 @@ func instancesExist(resources []remoteResource) error {
 func structHasField(typ reflect.Type, field string) bool {
 	var parent reflect.Type
 
-	for i := 0; i < typ.NumField(); i++ {
-		fieldType := typ.Field(i)
+	for fieldType := range typ.Fields() {
 		yaml := fieldType.Tag.Get("yaml")
 
 		if yaml == ",inline" {
@@ -325,9 +326,9 @@ func structHasField(typ reflect.Type, field string) bool {
 }
 
 // getServerSupportedFilters returns two lists: one with filters supported by server and second one with not supported.
-func getServerSupportedFilters(filters []string, i interface{}) ([]string, []string) {
-	supportedFilters := []string{}
-	unsupportedFilters := []string{}
+func getServerSupportedFilters(filters []string, i any) (supportedFilters []string, unsupportedFilters []string) {
+	supportedFilters = []string{}
+	unsupportedFilters = []string{}
 
 	for _, filter := range filters {
 		membs := strings.SplitN(filter, "=", 2)
@@ -347,8 +348,13 @@ func getServerSupportedFilters(filters []string, i interface{}) ([]string, []str
 }
 
 // guessImage checks that the image name (provided by the user) is correct given an instance remote and image remote.
-func guessImage(conf *config.Config, d lxd.InstanceServer, instRemote string, imgRemote string, imageRef string) (string, string) {
-	if instRemote != imgRemote {
+func guessImage(conf *config.Config, d lxd.InstanceServer, instRemote string, imgRemote string, imageRef string) (imageRemote string, image string) {
+	impliedImgRemote := imgRemote
+	if impliedImgRemote == "" {
+		impliedImgRemote = conf.DefaultRemote
+	}
+
+	if instRemote != impliedImgRemote {
 		return imgRemote, imageRef
 	}
 
@@ -369,53 +375,133 @@ func guessImage(conf *config.Config, d lxd.InstanceServer, instRemote string, im
 	}
 
 	if len(fields) == 1 {
-		fmt.Fprintf(os.Stderr, i18n.G("The local image '%q' couldn't be found, trying '%q:' instead.")+"\n", imageRef, fields[0])
+		fmt.Fprintf(os.Stderr, "The local image '%s' could not be found, trying '%s:' instead.\n", imageRef, fields[0])
 		return fields[0], "default"
 	}
 
-	fmt.Fprintf(os.Stderr, i18n.G("The local image '%q' couldn't be found, trying '%q:%q' instead.")+"\n", imageRef, fields[0], fields[1])
+	fmt.Fprintf(os.Stderr, "The local image '%s' could not be found, trying '%s:%s' instead.\n", imageRef, fields[0], fields[1])
 	return fields[0], fields[1]
 }
 
-// getImgInfo returns an image server and image info for the given image name (given by a user)
-// an image remote and an instance remote.
-func getImgInfo(d lxd.InstanceServer, conf *config.Config, imgRemote string, instRemote string, imageRef string, source *api.InstanceSource) (lxd.ImageServer, *api.Image, error) {
-	var imgRemoteServer lxd.ImageServer
-	var imgInfo *api.Image
+// resolveRegistryImageSource determines the image source when the target server supports image registries.
+// For local copies (same server), it resolves the source project and returns an empty registry name.
+// For remote copies, it returns the image remote as the registry name.
+func resolveRegistryImageSource(confRemotes map[string]config.Remote, imgRemote string, imgRef string, instRemote string, projectOverride string) (imgInfo *api.Image, registryName string) {
+	sourceRemote := imgRemote
+	if sourceRemote == "" {
+		sourceRemote = instRemote
+	}
+
+	if sourceRemote == instRemote {
+		// Local image, determine the source project.
+		imageProject := projectOverride
+		if imageProject == "" {
+			imageProject = confRemotes[sourceRemote].Project
+		}
+
+		if imageProject == "" {
+			imageProject = api.ProjectDefaultName
+		}
+
+		return &api.Image{
+			Fingerprint: imgRef,
+			Project:     imageProject,
+		}, ""
+	}
+
+	// Remote image registry.
+	return &api.Image{Fingerprint: imgRef}, imgRemote
+}
+
+// getImgInfo returns an image server and image info for the given image name, image remote, and image project.
+// It also populates the passed in InstanceSource struct with the information about the image.
+// If imageProject is provided and the remote is a LXD server, it will be used to locate the image.
+func getImgInfo(conf *config.Config, imageRemote string, imageRef string, imageProject string, source *api.InstanceSource) (lxd.ImageServer, *api.Image, error) {
+	var imageRemoteServer lxd.ImageServer
+	var imageInfo *api.Image
 	var err error
 
-	// Connect to the image server
-	if imgRemote == instRemote {
-		imgRemoteServer = d
-	} else {
-		imgRemoteServer, err = conf.GetImageServer(imgRemote)
-		if err != nil {
-			return nil, nil, err
-		}
+	// Connect to the image server.
+	imageRemoteServer, err = conf.GetImageServer(imageRemote)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	// Optimisation for simplestreams
-	if conf.Remotes[imgRemote].Protocol == "simplestreams" {
-		imgInfo = &api.Image{}
-		imgInfo.Fingerprint = imageRef
-		imgInfo.Public = true
+	if conf.Remotes[imageRemote].Protocol == "simplestreams" {
+		imageInfo = &api.Image{}
+		imageInfo.Fingerprint = imageRef
+		imageInfo.Public = true
 		source.Alias = imageRef
 	} else {
+		server, ok := imageRemoteServer.(lxd.InstanceServer)
+		if ok && imageProject != "" {
+			// Use the given project for the image source.
+			imageRemoteServer = server.UseProject(imageProject)
+		}
+
+		// Get the connection info to fetch the currently used project.
+		connInfo, err := imageRemoteServer.GetConnectionInfo()
+		if err != nil {
+			return nil, nil, fmt.Errorf("Failed getting connection information for remote %q: %w", imageRemote, err)
+		}
+
+		// Set the currently used project for the instance source struct.
+		source.Project = connInfo.Project
+
 		// Attempt to resolve an image alias
-		alias, _, err := imgRemoteServer.GetImageAlias(imageRef)
+		alias, _, err := imageRemoteServer.GetImageAlias(imageRef)
 		if err == nil {
 			source.Alias = imageRef
 			imageRef = alias.Target
 		}
 
 		// Get the image info
-		imgInfo, _, err = imgRemoteServer.GetImage(imageRef)
+		imageInfo, _, err = imageRemoteServer.GetImage(imageRef)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("Failed finding image %q on remote %q", imageRef, imageRemote)
 		}
 	}
 
-	return imgRemoteServer, imgInfo, nil
+	return imageRemoteServer, imageInfo, nil
+}
+
+// getExportVersion returns the version sent to the server when exporting instances and custom storage volumes.
+func getExportVersion(d lxd.InstanceServer, flag string) (uint32, error) {
+	backupVersionSupported := d.HasExtension("backup_metadata_version")
+
+	// Don't allow explicitly setting 0 as it will implicitly create a backup using version 1.
+	if flag == "0" {
+		return 0, errors.New(`Invalid export version "0"`)
+	}
+
+	// In case no version is set, default to 0 so we can convert it to an uint32.
+	if flag == "" {
+		flag = "0"
+	}
+
+	versionUint, err := strconv.ParseUint(flag, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("Invalid export version %q: %w", flag, err)
+	}
+
+	versionUint32 := uint32(versionUint)
+
+	// If the server supports setting the backup version, set the selected version.
+	// If supported but the version is not set, the server picks its default version.
+	// If unsupported but the version is set to 1, the field isn't set so its up to the server to pick the old version.
+	if backupVersionSupported {
+		if versionUint32 != 0 {
+			return versionUint32, nil
+		}
+	} else if !backupVersionSupported && versionUint32 > api.BackupMetadataVersion1 {
+		// Any version beyond 1 isn't supported by an older server without the backup_metadata_version extension.
+		return 0, errors.New("The server does not support setting the metadata format version")
+	}
+
+	// No export version was provided.
+	// Return 0 as it indicates the version is unset and it's up to the server to decide the version.
+	return 0, nil
 }
 
 // newLocationHeaderTransportWrapper returns a new transport wrapper that can be used to inspect the `Location` header
@@ -451,4 +537,68 @@ func (c *locationHeaderTransport) RoundTrip(r *http.Request) (*http.Response, er
 // Transport returns the underlying transport of cloudInstanceServerTransport (to implement lxd.HTTPTransporter).
 func (c *locationHeaderTransport) Transport() *http.Transport {
 	return c.transport
+}
+
+// getEntityFromOperationMetadata inspects and parses the given operation metadata "entity_url" to return an entity name
+// or an error.
+func getEntityFromOperationMetadata(operationMetadata map[string]any) (string, error) {
+	if operationMetadata == nil {
+		return "", errors.New("Operation does not contain any metadata")
+	}
+
+	entityURLAny, ok := operationMetadata["entity_url"]
+	if !ok {
+		return "", errors.New("Operation did not return an entity URL")
+	}
+
+	entityURL, ok := entityURLAny.(string)
+	if !ok {
+		return "", fmt.Errorf("Expected a string entity URL but got %v (%T)", entityURLAny, entityURLAny)
+	}
+
+	return entityNameFromURL(entityURL)
+}
+
+// getEntityFromOperationResources inspects and parses the given operation resources to return an entity name.
+// It expects the operation resource map to contain a key with one of the given resource types matching a value that is
+// an array with only one value.
+//
+// This function should only be used to retrieve the name of a newly created resource if the server does not have the
+// `operation_metadata_entity_url` API extension. Otherwise, the getEntityFromOperationMetadata function should be used.
+func getEntityFromOperationResources(operationResources map[string][]string, resourceTypes ...string) (string, error) {
+	if len(resourceTypes) == 0 {
+		return "", errors.New("Must specify a resource type")
+	}
+
+	if operationResources == nil {
+		return "", errors.New("Operation does not contain any resources")
+	}
+
+	for _, t := range resourceTypes {
+		if len(operationResources[t]) == 1 {
+			return entityNameFromURL(operationResources[t][0])
+		}
+	}
+
+	if len(resourceTypes) == 1 {
+		return "", fmt.Errorf("Operation did not return a specific resource of type %q", resourceTypes[0])
+	}
+
+	return "", fmt.Errorf("Operation has no specific resource with type (%q)", strings.Join(resourceTypes, ", "))
+}
+
+// entityNameFromURL parses a string URL and returns the last path element as the name.
+func entityNameFromURL(urlStr string) (string, error) {
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return "", fmt.Errorf("Failed parsing entity URL %q: %w", urlStr, err)
+	}
+
+	// Always expect the entity name to be the last element of the URL.
+	name, err := url.PathUnescape(path.Base(u.EscapedPath()))
+	if err != nil {
+		return "", fmt.Errorf("Invalid segment in entity URL %q: %w", urlStr, err)
+	}
+
+	return name, nil
 }

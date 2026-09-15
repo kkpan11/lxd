@@ -2,10 +2,14 @@ package cluster
 
 import (
 	"fmt"
+
+	"github.com/canonical/lxd/lxd/db/query"
 )
 
 // entityTypeClusterGroup implements entityTypeDBInfo for a ClusterGroup.
-type entityTypeClusterGroup struct{}
+type entityTypeClusterGroup struct {
+	entityTypeCommon
+}
 
 func (e entityTypeClusterGroup) code() int64 {
 	return entityTypeCodeClusterGroup
@@ -15,12 +19,8 @@ func (e entityTypeClusterGroup) allURLsQuery() string {
 	return fmt.Sprintf(`SELECT %d, cluster_groups.id, '', '', json_array(cluster_groups.name) FROM cluster_groups`, e.code())
 }
 
-func (e entityTypeClusterGroup) urlsByProjectQuery() string {
-	return ""
-}
-
-func (e entityTypeClusterGroup) urlByIDQuery() string {
-	return fmt.Sprintf(`%s WHERE cluster_groups.id = ?`, e.allURLsQuery())
+func (e entityTypeClusterGroup) urlsByIDsQuery(ids ...int64) string {
+	return e.allURLsQuery() + " WHERE cluster_groups.id IN " + query.IntParams(ids...)
 }
 
 func (e entityTypeClusterGroup) idFromURLQuery() string {
@@ -33,17 +33,5 @@ WHERE '' = ?
 }
 
 func (e entityTypeClusterGroup) onDeleteTriggerSQL() (name string, sql string) {
-	name = "on_cluster_group_delete"
-	return name, fmt.Sprintf(`
-CREATE TRIGGER %s
-	AFTER DELETE ON cluster_groups
-	BEGIN
-	DELETE FROM auth_groups_permissions 
-		WHERE entity_type = %d 
-		AND entity_id = OLD.id;
-	DELETE FROM warnings
-		WHERE entity_type_code = %d
-		AND entity_id = OLD.id;
-	END
-`, name, e.code(), e.code())
+	return standardOnDeleteTriggerSQL("on_cluster_group_delete", "cluster_groups", e.code())
 }

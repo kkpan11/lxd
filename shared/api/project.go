@@ -14,6 +14,14 @@ type ProjectsPost struct {
 	// The name of the new project
 	// Example: foo
 	Name string `json:"name" yaml:"name"`
+
+	// Add a root disk device using the specified storage pool to the default profile
+	// Example: default
+	StoragePool string `json:"storage" yaml:"storage"`
+
+	// Add a network device connected to the specified network to the default profile
+	// Example: lxdbr0
+	Network string `json:"network" yaml:"network"`
 }
 
 // ProjectPost represents the fields required to rename a LXD project
@@ -48,6 +56,8 @@ type ProjectPut struct {
 //
 // API extension: projects.
 type Project struct {
+	WithEntitlements `yaml:",inline"`
+
 	// The project name
 	// Read only: true
 	// Example: foo
@@ -65,6 +75,14 @@ type Project struct {
 	// Read only: true
 	// Example: ["/1.0/images/0e60015346f06627f10580d56ac7fffd9ea775f6d4f25987217d5eed94910a20", "/1.0/instances/c1", "/1.0/networks/lxdbr0", "/1.0/profiles/default", "/1.0/storage-pools/default/volumes/custom/blah"]
 	UsedBy []string `json:"used_by" yaml:"used_by"`
+
+	// Replica mode for the project (leader, standby, or empty)
+	// Read only: true
+	// This field is updated via PUT /1.0/projects/<name>/state
+	// Example: leader
+	//
+	// API extension: project_replica_mode
+	ReplicaMode string `json:"replica_mode" yaml:"replica_mode"`
 }
 
 // Writable converts a full Project struct into a ProjectPut struct (filters read-only fields)
@@ -113,4 +131,15 @@ type ProjectStateResource struct {
 	// Current usage for the resource
 	// Example: 4
 	Usage int64
+}
+
+// ProjectStatePut represents the fields for updating project replica state
+//
+// swagger:model
+//
+// API extension: project_replica_mode.
+type ProjectStatePut struct {
+	// Replica mode to set: "leader", "standby", or "" to clear the replica mode
+	// Example: leader
+	ReplicaMode string `json:"replica_mode" yaml:"replica_mode"`
 }

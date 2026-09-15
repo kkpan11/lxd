@@ -8,42 +8,49 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	cli "github.com/canonical/lxd/shared/cmd"
-	"github.com/canonical/lxd/shared/i18n"
 	"github.com/canonical/lxd/shared/termios"
 )
 
 type cmdSnapshot struct {
 	global *cmdGlobal
 
-	flagStateful bool
-	flagNoExpiry bool
-	flagReuse    bool
+	flagStateful    bool
+	flagNoExpiry    bool
+	flagReuse       bool
+	flagDiskVolumes string
 }
 
 func (c *cmdSnapshot) command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("snapshot", i18n.G("[<remote>:]<instance> [<snapshot name>]"))
-	cmd.Short = i18n.G("Create instance snapshots")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Create instance snapshots
+	cmd.Use = usage("snapshot", "[<remote>:]<instance> [<snapshot name>]")
+	cmd.Short = "Create instance snapshot"
+	cmd.Long = cli.FormatSection("Description", cmd.Short+`
 
 When --stateful is used, LXD attempts to checkpoint the instance's
-running state, including process memory state, TCP connections, ...`))
-	cmd.Example = cli.FormatSection("", i18n.G(`lxc snapshot create u1 snap0
+running state, including process memory state, TCP connections, ...`)
+	cmd.Example = cli.FormatSection("", `lxc snapshot u1 snap0
 	Create a snapshot of "u1" called "snap0".
 
-	lxc snapshot create u1 snap0 < config.yaml
-		Create a snapshot of "u1" called "snap0" with the configuration from "config.yaml".`))
+	lxc snapshot u1 snap0 < config.yaml
+		Create a snapshot of "u1" called "snap0" with the configuration from "config.yaml".`)
 
 	cmd.RunE = c.run
-	cmd.Flags().BoolVar(&c.flagStateful, "stateful", false, i18n.G("Whether or not to snapshot the instance's running state"))
-	cmd.Flags().BoolVar(&c.flagNoExpiry, "no-expiry", false, i18n.G("Ignore any configured auto-expiry for the instance"))
-	cmd.Flags().BoolVar(&c.flagReuse, "reuse", false, i18n.G("If the snapshot name already exists, delete and create a new one"))
+	cmd.Flags().BoolVar(&c.flagStateful, "stateful", false, "Whether or not to snapshot the instance's running state")
+	cmd.Flags().BoolVar(&c.flagNoExpiry, "no-expiry", false, "Ignore any configured auto-expiry for the instance")
+	cmd.Flags().BoolVar(&c.flagReuse, "reuse", false, "If the snapshot name already exists, delete and create a new one")
+	cmd.Flags().StringVar(&c.flagDiskVolumes, "disk-volumes", "", cli.FormatStringFlagLabel(`Disk volumes mode. Possible values are "root" (default) and "all-exclusive". "root" only snapshots the instance's root disk volume. "all-exclusive" snapshots the instance's root disk and any exclusively attached volumes (non-shared).`))
+	cmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]cobra.Completion, cobra.ShellCompDirective) {
+		if len(args) > 0 {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+
+		return c.global.cmpTopLevelResource("instance", toComplete)
+	}
 
 	return cmd
 }
@@ -85,12 +92,10 @@ func (c *cmdSnapshot) run(cmd *cobra.Command, args []string) error {
 
 	if shared.IsSnapshot(name) {
 		if snapname != "" {
-			return fmt.Errorf(i18n.G("Invalid instance name: %s"), name)
+			return fmt.Errorf("Invalid instance name: %s", name)
 		}
 
-		fields := strings.SplitN(name, shared.SnapshotDelimiter, 2)
-		name = fields[0]
-		snapname = fields[1]
+		name, snapname, _ = strings.Cut(name, shared.SnapshotDelimiter)
 	}
 
 	d, err := conf.GetInstanceServer(remote)
@@ -101,7 +106,7 @@ func (c *cmdSnapshot) run(cmd *cobra.Command, args []string) error {
 	if c.flagReuse && snapname != "" {
 		snap, _, _ := d.GetInstanceSnapshot(name, snapname)
 		if snap != nil {
-			op, err := d.DeleteInstanceSnapshot(name, snapname)
+			op, err := d.DeleteInstanceSnapshot(name, snapname, c.flagDiskVolumes)
 			if err != nil {
 				return err
 			}
@@ -114,8 +119,9 @@ func (c *cmdSnapshot) run(cmd *cobra.Command, args []string) error {
 	}
 
 	req := api.InstanceSnapshotsPost{
-		Name:     snapname,
-		Stateful: c.flagStateful,
+		Name:            snapname,
+		Stateful:        c.flagStateful,
+		DiskVolumesMode: c.flagDiskVolumes,
 	}
 
 	if !stdinData.ExpiresAt.IsZero() {

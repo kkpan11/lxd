@@ -1,53 +1,49 @@
 ---
-discourse: 7735
+discourse: lxc:[Share&#32;folders&#32;and&#32;volumes&#32;between&#32;host&#32;and&#32;containers](7735)
+myst:
+  html_meta:
+    description: An index of how-to guides for LXD storage operations, including managing pools, volumes, and buckets, and using storage with Kubernetes.
 ---
 
 (storage)=
 # Storage
 
-```{only} diataxis
-The following how-to guides cover common operations related to storage.
+These how-to guides cover common operations related to storage in LXD.
 
-How to create, manage, and use storage:
-```
+## Create and manage storage
 
-```{filtered-toctree}
+LXD storage pools contain instance volumes and custom volumes, as well as buckets accessible via the S3 protocol.
+
+```{toctree}
 :titlesonly:
 
-:diataxis:Manage pools </howto/storage_pools>
-:diataxis:Manage volumes </howto/storage_volumes>
-:diataxis:Manage buckets </howto/storage_buckets>
-:diataxis:Create an instance in a pool </howto/storage_create_instance>
+Manage pools </howto/storage_pools>
+Manage volumes </howto/storage_volumes>
+Manage buckets </howto/storage_buckets>
 ```
 
-```{only} diataxis
-How to export and move custom storage volumes:
-```
+## Extend storage use
 
-```{filtered-toctree}
+Instance volumes can be created directly in a specific storage pool. Custom volumes can also be moved, copied, and backed up.
+
+```{toctree}
 :titlesonly:
+Create or move an instance in a pool </howto/storage_create_instance>
+Back up a custom volume </howto/storage_backup_volume>
+Move or copy a custom volume </howto/storage_move_volume>
+```
 
-:diataxis:Back up a volume </howto/storage_backup_volume>
-:diataxis:Move or copy a volume </howto/storage_move_volume>
+## Use storage with Kubernetes
+
+The LXD CSI driver integrates LXD storage backends with Kubernetes.
+
+```{toctree}
+:titlesonly:
+Use the LXD CSI driver with Kubernetes </howto/storage_csi>
 ```
 
 ## Related topics
 
-```{only} diataxis
 {{storage_exp}}
 
 {{storage_ref}}
-```
-
-```{filtered-toctree}
-:titlesonly:
-
-:topical:About storage </explanation/storage>
-:topical:Manage pools </howto/storage_pools>
-:topical:Create an instance in a pool </howto/storage_create_instance>
-:topical:Manage volumes </howto/storage_volumes>
-:topical:Move or copy a volume </howto/storage_move_volume>
-:topical:Back up a volume </howto/storage_backup_volume>
-:topical:Manage buckets </howto/storage_buckets>
-:topical:/reference/storage_drivers
-```

@@ -43,7 +43,7 @@ type Device interface {
 	// PreStartCheck indicates if the device is available for starting.
 	PreStartCheck() error
 
-	// Start peforms any host-side configuration required to start the device for the instance.
+	// Start performs any host-side configuration required to start the device for the instance.
 	// This can be when a device is plugged into a running instance or the instance is starting.
 	// Returns run-time configuration needed for configuring the instance with the new device.
 	Start() (*deviceConfig.RunConfig, error)
@@ -63,8 +63,15 @@ type Device interface {
 	// Returns run-time configuration needed for detaching the device from the instance.
 	Stop() (*deviceConfig.RunConfig, error)
 
+	// PreRemoveCheck indicates if the device is available for removal.
+	// Performing this check before calling Remove() is necessary as the device gets stopped beforehand.
+	PreRemoveCheck() error
+
 	// Remove performs any host-side cleanup when a device is removed from an instance.
 	Remove() error
+
+	// PostMigrateSend performs any device cleanup required after an instance has been migrated to another cluster member.
+	PostMigrateSend(clusterMoveSourceName string) error
 }
 
 // device represents a sealed interface that implements Device, but also contains some internal

@@ -60,7 +60,7 @@ func snakeToPascal(str string) string {
 
 	s := b.String()
 	for wrong, right := range knownAcronyms {
-		s = strings.Replace(s, wrong, right, -1)
+		s = strings.ReplaceAll(s, wrong, right)
 	}
 
 	return s
@@ -78,7 +78,7 @@ func main() {
 		err := func() error {
 			f, err := os.Open("drivers/openfga_model.openfga")
 			if err != nil {
-				return fmt.Errorf("Failed to open OpenFGA model file: %w", err)
+				return fmt.Errorf("Failed opening OpenFGA model file: %w", err)
 			}
 
 			defer f.Close()
@@ -90,7 +90,7 @@ func main() {
 
 			err = f.Close()
 			if err != nil {
-				return fmt.Errorf("Failed to close OpenFGA model file: %w", err)
+				return fmt.Errorf("Failed closing OpenFGA model file: %w", err)
 			}
 
 			metadata := make(map[string]api.MetadataConfigurationEntity)
@@ -113,13 +113,13 @@ func main() {
 
 			err = json.NewEncoder(os.Stdout).Encode(metadata)
 			if err != nil {
-				return fmt.Errorf("Failed to write entitlement json to stdout: %w", err)
+				return fmt.Errorf("Failed writing entitlement json to stdout: %w", err)
 			}
 
 			return nil
 		}()
 		if err != nil {
-			fmt.Printf("Failed to generate entitlements from OpenFGA model (dry run): %v\n", err)
+			fmt.Printf("Failed generating entitlements from OpenFGA model (dry run): %v\n", err)
 			os.Exit(1)
 		}
 	}
@@ -127,7 +127,7 @@ func main() {
 	err := func() error {
 		f, err := os.Open("drivers/openfga_model.openfga")
 		if err != nil {
-			return fmt.Errorf("Failed to open OpenFGA model file: %w", err)
+			return fmt.Errorf("Failed opening OpenFGA model file: %w", err)
 		}
 
 		defer f.Close()
@@ -139,12 +139,12 @@ func main() {
 
 		err = f.Close()
 		if err != nil {
-			return fmt.Errorf("Failed to close OpenFGA model file: %w", err)
+			return fmt.Errorf("Failed closing OpenFGA model file: %w", err)
 		}
 
 		outfile, err := os.Create("entitlements_generated.go")
 		if err != nil {
-			return fmt.Errorf("Failed to open output file: %w", err)
+			return fmt.Errorf("Failed opening output file: %w", err)
 		}
 
 		defer outfile.Close()
@@ -156,13 +156,13 @@ func main() {
 
 		err = outfile.Close()
 		if err != nil {
-			return fmt.Errorf("Failed to close output file: %w", err)
+			return fmt.Errorf("Failed closing output file: %w", err)
 		}
 
 		return nil
 	}()
 	if err != nil {
-		fmt.Printf("Failed to generate entitlements from OpenFGA model: %v\n", err)
+		fmt.Printf("Failed generating entitlements from OpenFGA model: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -199,24 +199,24 @@ func writeOutput(w io.Writer, entityToEntitlements map[entity.Type][]entitlement
 		}
 
 		for i := range entityTypes {
-			entityTypes[i] = fmt.Sprintf("entity.Type%s", snakeToPascal(entityTypes[i]))
+			entityTypes[i] = "entity.Type" + snakeToPascal(entityTypes[i])
 		}
 
 		sort.Strings(entityTypes)
 
-		builder.WriteString(fmt.Sprintf("\t// Entitlement%s is the \"%s\" entitlement. It applies to the following entities: %s.\n", snakeToPascal(entitlement.Relation), entitlement.Relation, strings.Join(entityTypes, ", ")))
+		fmt.Fprintf(&builder, "\t// Entitlement%s is the \"%s\" entitlement. It applies to the following entities: %s.\n", snakeToPascal(entitlement.Relation), entitlement.Relation, strings.Join(entityTypes, ", "))
 
 		if i == len(allEntitlements)-1 {
-			builder.WriteString(fmt.Sprintf("\tEntitlement%s Entitlement = \"%s\"\n", snakeToPascal(entitlement.Relation), entitlement.Relation))
+			fmt.Fprintf(&builder, "\tEntitlement%s Entitlement = \"%s\"\n", snakeToPascal(entitlement.Relation), entitlement.Relation)
 		} else {
-			builder.WriteString(fmt.Sprintf("\tEntitlement%s Entitlement = \"%s\"\n\n", snakeToPascal(entitlement.Relation), entitlement.Relation))
+			fmt.Fprintf(&builder, "\tEntitlement%s Entitlement = \"%s\"\n\n", snakeToPascal(entitlement.Relation), entitlement.Relation)
 		}
 	}
 
 	builder.WriteString(")\n\n")
 
 	// To ensure the entity to entitlement map is always in the same order, get a list of entity types and sort it alphabetically.
-	var entityTypes []string
+	entityTypes := make([]string, 0, len(entityToEntitlements))
 	for entityType := range entityToEntitlements {
 		entityTypes = append(entityTypes, string(entityType))
 	}
@@ -227,11 +227,11 @@ func writeOutput(w io.Writer, entityToEntitlements map[entity.Type][]entitlement
 	builder.WriteString("var EntityTypeToEntitlements = map[entity.Type][]Entitlement{\n")
 	for _, entityType := range entityTypes {
 		entitlements := entityToEntitlements[entity.Type(entityType)]
-		builder.WriteString(fmt.Sprintf("\tentity.Type%s: {\n", snakeToPascal(entityType)))
+		fmt.Fprintf(&builder, "\tentity.Type%s: {\n", snakeToPascal(entityType))
 		for _, entitlement := range entitlements {
 			// Here we can add the comment from the OpenFGA model.
-			builder.WriteString(fmt.Sprintf("\t\t// %s\n", entitlement.Description))
-			builder.WriteString(fmt.Sprintf("\t\tEntitlement%s,\n", snakeToPascal(entitlement.Relation)))
+			fmt.Fprintf(&builder, "\t\t// %s\n", entitlement.Description)
+			fmt.Fprintf(&builder, "\t\tEntitlement%s,\n", snakeToPascal(entitlement.Relation))
 		}
 
 		builder.WriteString("\t},\n")
@@ -243,11 +243,11 @@ func writeOutput(w io.Writer, entityToEntitlements map[entity.Type][]entitlement
 	// "group" could have many meanings so we don't have an `entity.TypeGroup`, instead we have `entity.TypeAuthGroup`.
 	// The Pascal cased "group" type will have led to adding `entity.TypeGroup` to the generated file erroneously, so we
 	// need to replace it with `entity.TypeAuthGroup`.
-	s := strings.Replace(builder.String(), "entity.TypeGroup", "entity.TypeAuthGroup", -1)
+	s := strings.ReplaceAll(builder.String(), "entity.TypeGroup", "entity.TypeAuthGroup")
 
 	_, err := w.Write([]byte(s))
 	if err != nil {
-		return fmt.Errorf("Failed to write output: %w", err)
+		return fmt.Errorf("Failed writing output: %w", err)
 	}
 
 	return nil
@@ -325,6 +325,11 @@ scan:
 		if len(submatch) == 2 {
 			curComment = append(curComment, submatch[1])
 		}
+	}
+
+	err := scanner.Err()
+	if err != nil {
+		return nil, nil, fmt.Errorf("Failed scanning OpenFGA model: %w", err)
 	}
 
 	return entityToEntitlements, allEntitlements, nil

@@ -1,6 +1,7 @@
 package device
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -72,7 +73,7 @@ func (d *gpuMdev) startVM() (*deviceConfig.RunConfig, error) {
 		}
 
 		if pciAddress != "" {
-			return nil, fmt.Errorf("VMs cannot match multiple GPUs per device")
+			return nil, errors.New("VMs cannot match multiple GPUs per device")
 		}
 
 		pciAddress = gpu.PCIAddress
@@ -132,31 +133,29 @@ func (d *gpuMdev) startVM() (*deviceConfig.RunConfig, error) {
 					return nil, fmt.Errorf("The requested profile %q does not exist", d.config["mdev"])
 				}
 
-				return nil, fmt.Errorf("Failed to create virtual gpu %q: %w", mdevUUID, err)
+				return nil, fmt.Errorf("Failed creating virtual gpu %q: %w", mdevUUID, err)
 			}
 
 			revert.Add(func() {
-				path := fmt.Sprintf("/sys/bus/mdev/devices/%s", mdevUUID)
+				path := "/sys/bus/mdev/devices/" + mdevUUID + "/remove"
 
-				if shared.PathExists(path) {
-					err := os.WriteFile(filepath.Join(path, "remove"), []byte("1\n"), 0200)
-					if err != nil {
-						d.logger.Error("Failed to remove vgpu", logger.Ctx{"device": mdevUUID, "err": err})
-					}
+				err := os.WriteFile(path, []byte("1\n"), 0200)
+				if err != nil && !os.IsNotExist(err) {
+					d.logger.Error("Failed removing vgpu", logger.Ctx{"device": mdevUUID, "err": err})
 				}
 			})
 		}
 	}
 
 	if pciAddress == "" {
-		return nil, fmt.Errorf("Failed to detect requested GPU device")
+		return nil, errors.New("Failed detecting requested GPU device")
 	}
 
 	// Get PCI information about the GPU device.
 	devicePath := filepath.Join("/sys/bus/pci/devices", pciAddress)
 	pciDev, err := pcidev.ParseUeventFile(filepath.Join(devicePath, "uevent"))
 	if err != nil {
-		return nil, fmt.Errorf("Failed to get PCI device info for GPU %q: %w", pciAddress, err)
+		return nil, fmt.Errorf("Failed getting PCI device info for GPU %q: %w", pciAddress, err)
 	}
 
 	// Prepare the new volatile keys.
@@ -195,13 +194,11 @@ func (d *gpuMdev) postStop() error {
 	v := d.volatileGet()
 
 	if v["vgpu.uuid"] != "" {
-		path := fmt.Sprintf("/sys/bus/mdev/devices/%s", v["vgpu.uuid"])
+		path := "/sys/bus/mdev/devices/" + v["vgpu.uuid"] + "/remove"
 
-		if shared.PathExists(path) {
-			err := os.WriteFile(filepath.Join(path, "remove"), []byte("1\n"), 0200)
-			if err != nil {
-				d.logger.Error("Failed to remove vgpu", logger.Ctx{"device": v["vgpu.uuid"], "err": err})
-			}
+		err := os.WriteFile(path, []byte("1\n"), 0200)
+		if err != nil && !os.IsNotExist(err) {
+			d.logger.Error("Failed removing vgpu", logger.Ctx{"device": v["vgpu.uuid"], "err": err})
 		}
 	}
 
@@ -254,7 +251,7 @@ func (d *gpuMdev) validateConfig(instConf instance.ConfigReader) error {
 // validateEnvironment checks the runtime environment for correctness.
 func (d *gpuMdev) validateEnvironment() error {
 	if d.inst.Type() == instancetype.VM && shared.IsTrue(d.inst.ExpandedConfig()["migration.stateful"]) {
-		return fmt.Errorf("GPU devices cannot be used when migration.stateful is enabled")
+		return errors.New("GPU devices cannot be used when migration.stateful is enabled")
 	}
 
 	return validatePCIDevice(d.config["pci"])

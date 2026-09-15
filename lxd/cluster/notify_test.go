@@ -2,9 +2,10 @@ package cluster_test
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -49,7 +50,7 @@ func TestNewNotifier(t *testing.T) {
 	require.NoError(t, err)
 
 	peers := make(chan string, 2)
-	hook := func(client lxd.InstanceServer) error {
+	hook := func(member db.NodeInfo, client lxd.InstanceServer) error {
 		server, _, err := client.GetServer()
 		require.NoError(t, err)
 		address, ok := server.Config["cluster.https_address"].(string)
@@ -69,7 +70,7 @@ func TestNewNotifier(t *testing.T) {
 	}
 	require.NoError(t, err)
 	for i := range addresses {
-		assert.True(t, shared.ValueInSlice(f.Address(i+1), addresses))
+		assert.True(t, slices.Contains(addresses, f.Address(i+1)))
 	}
 }
 
@@ -101,7 +102,7 @@ func TestNewNotify_NotifyAllError(t *testing.T) {
 	notifier, err := cluster.NewNotifier(state, cert, cert, cluster.NotifyAll)
 	assert.Nil(t, notifier)
 	require.Error(t, err)
-	assert.Regexp(t, "peer node .+ is down", err.Error())
+	assert.Regexp(t, "Peer cluster member .+ at .+ is down", err.Error())
 }
 
 // Creating a new notifier does not fail if the policy is set to NotifyAlive
@@ -133,7 +134,7 @@ func TestNewNotify_NotifyAlive(t *testing.T) {
 	assert.NoError(t, err)
 
 	i := 0
-	hook := func(client lxd.InstanceServer) error {
+	hook := func(member db.NodeInfo, client lxd.InstanceServer) error {
 		i++
 		return nil
 	}
@@ -154,7 +155,7 @@ func TestNewNotify_NotifyAliveShuttingDown(t *testing.T) {
 	cleanupF := f.Nodes(cert, 3)
 	defer cleanupF()
 
-	f.Unavailable(1, fmt.Errorf("LXD is shutting down"))
+	f.Unavailable(1, errors.New("LXD is shutting down"))
 
 	// Populate state.LocalConfig after nodes created above.
 	var err error
@@ -171,7 +172,7 @@ func TestNewNotify_NotifyAliveShuttingDown(t *testing.T) {
 	assert.NoError(t, err)
 
 	connections := 0
-	hook := func(client lxd.InstanceServer) error {
+	hook := func(member db.NodeInfo, client lxd.InstanceServer) error {
 		connections++
 		// Notifiers do not GetServer() when they set up the connection;
 		_, _, err := client.GetServer()
@@ -195,14 +196,19 @@ type notifyFixtures struct {
 // The address of the first node spawned will be saved as local
 // cluster.https_address.
 func (h *notifyFixtures) Nodes(cert *shared.CertInfo, n int) func() {
+	if n > 1 {
+		h.state.ServerClustered = true
+		h.state.ServerName = "0"
+	}
+
 	servers := make([]*httptest.Server, n)
-	for i := 0; i < n; i++ {
-		servers[i] = newRestServer(cert)
+	for i := range n {
+		servers[i] = newRestServer(strconv.Itoa(i), cert)
 	}
 
 	// Insert new entries in the nodes table of the cluster database.
 	err := h.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
-		for i := 0; i < n; i++ {
+		for i := range n {
 			name := strconv.Itoa(i)
 			address := servers[i].Listener.Addr().String()
 			var err error
@@ -224,7 +230,7 @@ func (h *notifyFixtures) Nodes(cert *shared.CertInfo, n int) func() {
 		config, err := node.ConfigLoad(ctx, tx)
 		require.NoError(h.t, err)
 		address := servers[0].Listener.Addr().String()
-		values := map[string]any{"cluster.https_address": address}
+		values := map[string]string{"cluster.https_address": address}
 		_, err = config.Patch(values)
 		require.NoError(h.t, err)
 		return nil
@@ -282,7 +288,7 @@ func (h *notifyFixtures) Unavailable(i int, err error) {
 
 // Returns a minimal stub for the LXD RESTful API server, just realistic
 // enough to make lxd.ConnectLXD succeed.
-func newRestServer(cert *shared.CertInfo) *httptest.Server {
+func newRestServer(name string, cert *shared.CertInfo) *httptest.Server {
 	mux := http.NewServeMux()
 
 	server := httptest.NewUnstartedServer(mux)
@@ -293,6 +299,17 @@ func newRestServer(cert *shared.CertInfo) *httptest.Server {
 		w.Header().Set("Content-Type", "application/json")
 		config := map[string]any{"cluster.https_address": server.Listener.Addr().String()}
 		metadata := api.ServerPut{Config: config}
+		_ = util.WriteJSON(w, api.ResponseRaw{Metadata: metadata}, nil)
+	})
+
+	mux.HandleFunc(api.NewURL().Path("1.0", "cluster", "members", name, "state").String(), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		metadata := api.ClusterMemberState{
+			SysInfo: api.ClusterMemberSysInfo{
+				LogicalCPUs: 24,
+			},
+		}
+
 		_ = util.WriteJSON(w, api.ResponseRaw{Metadata: metadata}, nil)
 	})
 

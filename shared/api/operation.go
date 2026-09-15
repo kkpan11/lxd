@@ -1,18 +1,40 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"time"
 )
 
-// OperationClassTask represents the Task OperationClass.
-const OperationClassTask = "task"
+const (
+	// OperationClassTask is shown in the [Operation.Class] field when the operation is an asynchronous background task.
+	// These are used in many places where an API request may take a long time.
+	OperationClassTask = "task"
 
-// OperationClassWebsocket represents the Websocket OperationClass.
-const OperationClassWebsocket = "websocket"
+	// OperationClassWebsocket is shown in the [Operation.Class] field when an operation websocket is available for connection.
+	// These are used for various bi-directional connections such as console.
+	OperationClassWebsocket = "websocket"
 
-// OperationClassToken represents the Token OperationClass.
-const OperationClassToken = "token"
+	// OperationClassToken is shown in the [Operation.Class] field for operations that track tokens that have been issued.
+	// These are used to authenticate later requests.
+	OperationClassToken = "token"
+
+	// OperationClassDurable is shown in the [Operation.Class] field for operations that are restarted on the cluster leader
+	// if the member that is running the operation is considered offline (did not respond to cluster heartbeats for longer than
+	// the offline threshold).
+	OperationClassDurable = "durable"
+)
+
+const (
+	// MetadataEntityURL is always set in operation metadata for operations whose associated entity type is not "server".
+	// It identifies the entity that the operation is acting on.
+	// The default value is the operation primary entity URL, but callers can override it to indicate the expected new URL.
+	MetadataEntityURL = "entity_url"
+
+	// MetadataOriginalEntityURL is set in operation metadata when renaming a resource.
+	// Callers are expected to set both MetadataOriginalEntityURL and MetadataEntityURL in operation metadata.
+	MetadataOriginalEntityURL = "original_entity_url"
+)
 
 // Operation represents a LXD background operation
 //
@@ -46,8 +68,8 @@ type Operation struct {
 	// Example: 103
 	StatusCode StatusCode `json:"status_code" yaml:"status_code"`
 
-	// Affected resourcs
-	// Example: {"containers": ["/1.0/containers/foo"], "instances": ["/1.0/instances/foo"]}
+	// Affected resources
+	// Example: {"instances": ["/1.0/instances/foo", "/1.0/instances/bar"]}
 	Resources map[string][]string `json:"resources" yaml:"resources"`
 
 	// Operation specific metadata
@@ -58,15 +80,61 @@ type Operation struct {
 	// Example: false
 	MayCancel bool `json:"may_cancel" yaml:"may_cancel"`
 
-	// Operation error mesage
+	// Operation error message
 	// Example: Some error message
 	Err string `json:"err" yaml:"err"`
 
-	// What cluster member this record was found on
+	// Operation error code
+	// Example: 404
+	//
+	// API extension: bulk_operations
+	ErrCode int64 `json:"err_code" yaml:"err_code"`
+
+	// Number of child operations.
+	// Example: 2
+	//
+	// API extension: operation_child_count
+	ChildCount int64 `json:"child_count" yaml:"child_count"`
+
+	// Which cluster member this record was found on
 	// Example: lxd01
 	//
 	// API extension: operation_location
 	Location string `json:"location" yaml:"location"`
+
+	// Requestor is a record of the original operation requestor.
+	//
+	// API extension: operation_requestor
+	Requestor *OperationRequestor `json:"requestor,omitempty" yaml:"requestor,omitempty"`
+}
+
+// OperationFull is an Operation with its child operations.
+//
+// swagger:model
+//
+// API extension: bulk_operations.
+type OperationFull struct {
+	Operation `yaml:",inline"`
+
+	// Children is a list of child operations, if any exist.
+	Children []Operation `json:"children,omitempty" yaml:"children,omitempty"`
+}
+
+// OperationRequestor represents the initial requestor of an operation
+//
+// API extension: operation_requestor.
+type OperationRequestor struct {
+	// Username is the username of the requestor. This is the identifier of the identity, or the username if using the unix socket.
+	// Example: jane.doe@example.com
+	Username string `yaml:"username" json:"username"`
+
+	// Protocol represents the method used to authenticate the requestor.
+	// Example: oidc
+	Protocol string `yaml:"protocol" json:"protocol"`
+
+	// Address is the origin address of the request.
+	// Example: 10.0.2.15
+	Address string `yaml:"address" json:"address"`
 }
 
 // ToCertificateAddToken creates a certificate add token from the operation metadata.
@@ -78,29 +146,19 @@ func (op *Operation) ToCertificateAddToken() (*CertificateAddToken, error) {
 
 	clientName, ok := req["name"].(string)
 	if !ok {
-		return nil, fmt.Errorf("Failed to get client name")
+		return nil, errors.New("Failed getting client name")
 	}
 
-	secret, ok := op.Metadata["secret"].(string)
-	if !ok {
-		return nil, fmt.Errorf("Operation secret is type %T not string", op.Metadata["secret"])
-	}
-
-	fingerprint, ok := op.Metadata["fingerprint"].(string)
-	if !ok {
-		return nil, fmt.Errorf("Operation fingerprint is type %T not string", op.Metadata["fingerprint"])
-	}
-
-	addresses, ok := op.Metadata["addresses"].([]any)
-	if !ok {
-		return nil, fmt.Errorf("Operation addresses is type %T not []any", op.Metadata["addresses"])
+	secret, fingerprint, addresses, err := op.parseCommonTokenFields()
+	if err != nil {
+		return nil, err
 	}
 
 	joinToken := CertificateAddToken{
 		ClientName:  clientName,
 		Secret:      secret,
 		Fingerprint: fingerprint,
-		Addresses:   make([]string, 0, len(addresses)),
+		Addresses:   addresses,
 	}
 
 	expiresAtStr, ok := op.Metadata["expiresAt"].(string)
@@ -113,15 +171,6 @@ func (op *Operation) ToCertificateAddToken() (*CertificateAddToken, error) {
 		joinToken.ExpiresAt = expiresAt
 	}
 
-	for i, address := range addresses {
-		addressString, ok := address.(string)
-		if !ok {
-			return nil, fmt.Errorf("Operation address index %d is type %T not string", i, address)
-		}
-
-		joinToken.Addresses = append(joinToken.Addresses, addressString)
-	}
-
 	return &joinToken, nil
 }
 
@@ -132,19 +181,9 @@ func (op *Operation) ToClusterJoinToken() (*ClusterMemberJoinToken, error) {
 		return nil, fmt.Errorf("Operation serverName is type %T not string", op.Metadata["serverName"])
 	}
 
-	secret, ok := op.Metadata["secret"].(string)
-	if !ok {
-		return nil, fmt.Errorf("Operation secret is type %T not string", op.Metadata["secret"])
-	}
-
-	fingerprint, ok := op.Metadata["fingerprint"].(string)
-	if !ok {
-		return nil, fmt.Errorf("Operation fingerprint is type %T not string", op.Metadata["fingerprint"])
-	}
-
-	addresses, ok := op.Metadata["addresses"].([]any)
-	if !ok {
-		return nil, fmt.Errorf("Operation addresses is type %T not []any", op.Metadata["addresses"])
+	secret, fingerprint, addresses, err := op.parseCommonTokenFields()
+	if err != nil {
+		return nil, err
 	}
 
 	expiresAtStr, ok := op.Metadata["expiresAt"].(string)
@@ -161,18 +200,61 @@ func (op *Operation) ToClusterJoinToken() (*ClusterMemberJoinToken, error) {
 		ServerName:  serverName,
 		Secret:      secret,
 		Fingerprint: fingerprint,
-		Addresses:   make([]string, 0, len(addresses)),
+		Addresses:   addresses,
 		ExpiresAt:   expiresAt,
 	}
 
-	for i, address := range addresses {
-		addressString, ok := address.(string)
-		if !ok {
-			return nil, fmt.Errorf("Operation address index %d is type %T not string", i, address)
-		}
+	return &joinToken, nil
+}
 
-		joinToken.Addresses = append(joinToken.Addresses, addressString)
+func (op *Operation) parseCommonTokenFields() (secret string, fingerprint string, addresses []string, err error) {
+	secret, ok := op.Metadata["secret"].(string)
+	if !ok {
+		return "", "", nil, fmt.Errorf("Operation secret is type %T not string", op.Metadata["secret"])
 	}
 
-	return &joinToken, nil
+	fingerprint, ok = op.Metadata["fingerprint"].(string)
+	if !ok {
+		return "", "", nil, fmt.Errorf("Operation fingerprint is type %T not string", op.Metadata["fingerprint"])
+	}
+
+	addressesRaw, ok := op.Metadata["addresses"].([]any)
+	if !ok {
+		return "", "", nil, fmt.Errorf("Operation addresses is type %T not []any", op.Metadata["addresses"])
+	}
+
+	addresses = make([]string, 0, len(addressesRaw))
+	for i, address := range addressesRaw {
+		addressString, ok := address.(string)
+		if !ok {
+			return "", "", nil, fmt.Errorf("Operation address index %d is type %T not string", i, address)
+		}
+
+		addresses = append(addresses, addressString)
+	}
+
+	return secret, fingerprint, addresses, nil
+}
+
+// WebsocketSecrets extracts the secrets for websockets from the operation's metadata.
+func (op *Operation) WebsocketSecrets() (secrets map[string]string, err error) {
+	if op.Class != OperationClassWebsocket {
+		return nil, errors.New("Operation is not a websocket operation")
+	}
+
+	secrets = map[string]string{}
+	for k, v := range op.Metadata {
+		if k == MetadataEntityURL { // This field is not used as a secret.
+			continue
+		}
+
+		vStr, ok := v.(string)
+		if !ok {
+			continue
+		}
+
+		secrets[k] = vStr
+	}
+
+	return secrets, nil
 }

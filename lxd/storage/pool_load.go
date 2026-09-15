@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/instance"
@@ -38,9 +39,10 @@ func volIDFuncMake(state *state.State, poolID int64) func(volType drivers.Volume
 		// Currently only Containers, VMs and custom volumes support project level volumes.
 		// This means that other volume types may have underscores in their names that don't
 		// indicate the project name.
-		if volType == drivers.VolumeTypeContainer || volType == drivers.VolumeTypeVM {
+		switch volType {
+		case drivers.VolumeTypeContainer, drivers.VolumeTypeVM:
 			projectName, volName = project.InstanceParts(volName)
-		} else if volType == drivers.VolumeTypeCustom {
+		case drivers.VolumeTypeCustom:
 			projectName, volName = project.StorageVolumeParts(volName)
 		}
 
@@ -61,8 +63,9 @@ func volIDFuncMake(state *state.State, poolID int64) func(volType drivers.Volume
 // commonRules returns a set of common validators.
 func commonRules() *drivers.Validators {
 	return &drivers.Validators{
-		PoolRules:   validatePoolCommonRules,
-		VolumeRules: validateVolumeCommonRules,
+		PoolRules:      validatePoolCommonRules,
+		LocalPoolRules: validateLocalPoolCommonRules,
+		VolumeRules:    validateVolumeCommonRules,
 	}
 }
 
@@ -219,10 +222,8 @@ func LoadByInstance(s *state.State, inst instance.Instance) (Pool, error) {
 		return nil, err
 	}
 
-	for _, supportedType := range pool.Driver().Info().VolumeTypes {
-		if supportedType == volType {
-			return pool, nil
-		}
+	if slices.Contains(pool.Driver().Info().VolumeTypes, volType) {
+		return pool, nil
 	}
 
 	// Return drivers not supported error for consistency with predefined errors returned by
@@ -239,23 +240,10 @@ func IsAvailable(poolName string) bool {
 	return !found
 }
 
-// Patch applies specified patch to all storage pools.
-// All storage pools must be available locally before any storage pools are patched.
+// Patch applies the specified patch to all storage pools.
+// Pools that are unavailable and have no implementation for the named patch are skipped with a
+// warning. Pools that are unavailable but do have an implementation are treated as an error.
 func Patch(s *state.State, patchName string) error {
-	unavailablePoolsMu.Lock()
-
-	if len(unavailablePools) > 0 {
-		unavailablePoolNames := make([]string, 0, len(unavailablePools))
-		for unavailablePoolName := range unavailablePools {
-			unavailablePoolNames = append(unavailablePoolNames, unavailablePoolName)
-		}
-
-		unavailablePoolsMu.Unlock()
-		return fmt.Errorf("Unvailable storage pools: %v", unavailablePoolNames)
-	}
-
-	unavailablePoolsMu.Unlock()
-
 	var pools []string
 
 	err := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
@@ -278,6 +266,21 @@ func Patch(s *state.State, patchName string) error {
 		pool, err := LoadByName(s, poolName)
 		if err != nil {
 			return fmt.Errorf("Failed loading storage pool %q: %w", poolName, err)
+		}
+
+		// For unavailable pools, skip those that have no implementation for this patch (no-op
+		// at both the backend and driver level). Only insist on availability for pools that
+		// actually need to do work.
+		if !IsAvailable(poolName) {
+			_, hasEarly := lxdEarlyPatches[patchName]
+			_, hasLate := lxdLatePatches[patchName]
+
+			if !hasEarly && !pool.Driver().HasPatch(patchName) && !hasLate {
+				logger.Warn("Skipping patch on unavailable pool with no implementation", logger.Ctx{"pool": poolName, "patch": patchName})
+				continue
+			}
+
+			return fmt.Errorf("Storage pool %q is unavailable and needs patch %q", poolName, patchName)
 		}
 
 		err = pool.ApplyPatch(patchName)

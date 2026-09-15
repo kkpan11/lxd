@@ -19,10 +19,42 @@ type RunConfigItem struct {
 	Value string
 }
 
+// DevSource is either:
+// - A path on the LXD host.
+// - A file descriptor held by the LXD process.
+// - A Ceph RBD Image description.
+type DevSource any
+
+// DevSourcePath is a path on the LXD host.
+// See `deviceConfig.DevSource`.
+type DevSourcePath struct {
+	Path string
+}
+
+// DevSourceFD is a file descriptor held by the LXD process.
+// See `deviceConfig.DevSource`.
+type DevSourceFD struct {
+	FD   uintptr
+	Path string
+}
+
+// DevSourceRBD describes an RBD image.
+// See `deviceConfig.DevSource`.
+//
+// This structure roughly corresponds to a qmp BlockdevOptionsRbd:
+// https://www.qemu.org/docs/master/interop/qemu-storage-daemon-qmp-ref.html#qapidoc-708
+type DevSourceRBD struct {
+	ClusterName string
+	UserName    string
+	PoolName    string
+	ImageName   string
+	Snapshot    string
+}
+
 // MountEntryItem represents a single mount entry item.
 type MountEntryItem struct {
 	DevName    string      // The internal name for the device.
-	DevPath    string      // Describes the block special device or remote filesystem to be mounted.
+	DevSource  DevSource   // Describes the block special device or remote filesystem to be mounted.
 	TargetPath string      // Describes the mount point (target) for the filesystem.
 	FSType     string      // Describes the type of the filesystem.
 	Opts       []string    // Describes the mount options associated with the filesystem.
@@ -54,6 +86,7 @@ type DiskLimits struct {
 
 // RunConfig represents run-time config used for device setup/cleanup.
 type RunConfig struct {
+	BusNum           uint8            // Allocated bus number for the device.
 	RootFS           RootFSEntryItem  // RootFS to setup.
 	NetworkInterface []RunConfigItem  // Network interface configuration settings.
 	CGroups          []RunConfigItem  // Cgroup rules to setup.

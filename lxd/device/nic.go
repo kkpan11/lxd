@@ -2,11 +2,11 @@ package device
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/canonical/lxd/lxd/instance"
 	"github.com/canonical/lxd/lxd/network/acl"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/validate"
 )
 
@@ -21,8 +21,18 @@ func nicValidationRules(requiredFields []string, optionalFields []string, instCo
 		//  type: string
 		//  defaultdesc: `none`
 		//  managed: no
-		//  shortdesc: Enable hardware offloading
+		//  shortdesc: Enable hardware acceleration
 		"acceleration": validate.Optional(validate.IsOneOf("none", "sriov", "vdpa")),
+		// lxdmeta:generate(entities=device-nic-ovn; group=device-conf; key=acceleration.parent)
+		// Comma separated list of physical function (PF) interfaces to allocate virtual functions (VFs) from for hardware acceleration when {config:option}`device-nic-ovn-device-conf:acceleration` is enabled.
+		// In {config:option}`project-restricted:restricted` projects, it can only be used when {config:option}`project-restricted:restricted.virtual-machines.lowlevel` or {config:option}`project-restricted:restricted.containers.lowlevel` is set to `allow`.
+		// If this is not specified, and {config:option}`device-nic-ovn-device-conf:acceleration` is enabled then all PFs connected to the OVS integration bridge are scanned for a free VF.
+		// See {ref}`devices-nic-hw-acceleration` for more information.
+		// ---
+		//  type: string
+		//  managed: yes
+		//  shortdesc: Physical function interfaces to allocate virtual functions from for hardware acceleration
+		"acceleration.parent": validate.Optional(validate.IsListOf(validate.IsInterfaceName)),
 		// lxdmeta:generate(entities=device-nic-{bridged+macvlan+sriov+physical+ovn}; group=device-conf; key=name)
 		//
 		// ---
@@ -97,6 +107,7 @@ func nicValidationRules(requiredFields []string, optionalFields []string, instCo
 		//  defaultdesc: parent MTU
 		//  managed: no
 		//  shortdesc: MTU of the new interface
+		//  condition: container
 
 		// lxdmeta:generate(entities=device-nic-{ipvlan+routed}; group=device-conf; key=mtu)
 		//
@@ -126,12 +137,20 @@ func nicValidationRules(requiredFields []string, optionalFields []string, instCo
 		//  managed: no
 		//  shortdesc: VLAN IDs or VLAN ranges to join for tagged traffic
 
-		// lxdmeta:generate(entities=device-nic-{macvlan+sriov+physical}; group=device-conf; key=vlan)
+		// lxdmeta:generate(entities=device-nic-{macvlan+sriov}; group=device-conf; key=vlan)
 		//
 		// ---
 		//  type: integer
 		//  managed: no
 		//  shortdesc: VLAN ID to attach to
+
+		// lxdmeta:generate(entities=device-nic-physical; group=device-conf; key=vlan)
+		//
+		// ---
+		//  type: integer
+		//  managed: no
+		//  shortdesc: VLAN ID to attach to
+		//  condition: container
 
 		// lxdmeta:generate(entities=device-nic-ovn; group=device-conf; key=vlan)
 		// See also {config:option}`device-nic-ovn-device-conf:nested`.
@@ -161,13 +180,22 @@ func nicValidationRules(requiredFields []string, optionalFields []string, instCo
 		//  defaultdesc: `false`
 		//  shortdesc: Whether to use GARP VLAN Registration Protocol
 		"gvrp": validate.Optional(validate.IsBool),
-		// lxdmeta:generate(entities=device-nic-{bridged+macvlan+sriov+physical+ovn}; group=device-conf; key=hwaddr)
+		// lxdmeta:generate(entities=device-nic-{bridged+macvlan+sriov+ovn}; group=device-conf; key=hwaddr)
 		//
 		// ---
 		//  type: string
 		//  defaultdesc: randomly assigned
 		//  managed: no
 		//  shortdesc: MAC address of the new interface
+
+		// lxdmeta:generate(entities=device-nic-physical; group=device-conf; key=hwaddr)
+		//
+		// ---
+		//  type: string
+		//  defaultdesc: parent MAC address
+		//  managed: no
+		//  shortdesc: MAC address of the new interface
+		//  condition: container
 
 		// lxdmeta:generate(entities=device-nic-{ipvlan+p2p+routed}; group=device-conf; key=hwaddr)
 		//
@@ -289,34 +317,6 @@ func nicValidationRules(requiredFields []string, optionalFields []string, instCo
 		//  managed: no
 		//  shortdesc: Whether to respect port isolation
 		"security.port_isolation": validate.Optional(validate.IsBool),
-		// lxdmeta:generate(entities=device-nic-{bridged+macvlan+sriov}; group=device-conf; key=maas.subnet.ipv4)
-		//
-		// ---
-		//  type: string
-		//  managed: yes
-		//  shortdesc: MAAS IPv4 subnet to register the instance in
-
-		// lxdmeta:generate(entities=device-nic-physical; group=device-conf; key=maas.subnet.ipv4)
-		//
-		// ---
-		//  type: string
-		//  managed: no
-		//  shortdesc: MAAS IPv4 subnet to register the instance in
-		"maas.subnet.ipv4": validate.IsAny,
-		// lxdmeta:generate(entities=device-nic-{bridged+macvlan+sriov}; group=device-conf; key=maas.subnet.ipv6)
-		//
-		// ---
-		//  type: string
-		//  managed: yes
-		//  shortdesc: MAAS IPv6 subnet to register the instance in
-
-		// lxdmeta:generate(entities=device-nic-physical; group=device-conf; key=maas.subnet.ipv6)
-		//
-		// ---
-		//  type: string
-		//  managed: no
-		//  shortdesc: MAAS IPv6 subnet to register the instance in
-		"maas.subnet.ipv6": validate.IsAny,
 		// lxdmeta:generate(entities=device-nic-bridged; group=device-conf; key=ipv4.address)
 		// Set this option to `none` to restrict all IPv4 traffic when {config:option}`device-nic-bridged-device-conf:security.ipv4_filtering` is set.
 		// ---
@@ -655,7 +655,7 @@ func nicCheckNamesUnique(instConf instance.ConfigReader) error {
 			continue
 		}
 
-		if shared.ValueInSlice(devConfig["name"], seenNICNames) {
+		if slices.Contains(seenNICNames, devConfig["name"]) {
 			return fmt.Errorf("Duplicate NIC name detected %q", devConfig["name"])
 		}
 

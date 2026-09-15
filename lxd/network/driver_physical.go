@@ -2,13 +2,17 @@ package network
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"maps"
 	"net"
+	"net/http"
+	"slices"
 	"strconv"
 
-	"github.com/canonical/lxd/lxd/cluster/request"
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/ip"
+	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/resources"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
@@ -35,18 +39,21 @@ func (n *physical) Validate(config map[string]string) error {
 		// ---
 		//  type: string
 		//  shortdesc: Existing interface to use for network
+		//  scope: local
 		"parent": validate.Required(validate.IsNotEmpty, validate.IsInterfaceName),
 		// lxdmeta:generate(entities=network-physical; group=network-conf; key=mtu)
 		//
 		// ---
 		//  type: integer
 		//  shortdesc: MTU of the new interface
+		//  scope: global
 		"mtu": validate.Optional(validate.IsNetworkMTU),
 		// lxdmeta:generate(entities=network-physical; group=network-conf; key=vlan)
 		//
 		// ---
 		//  type: integer
 		//  shortdesc: VLAN ID to attach to
+		//  scope: global
 		"vlan": validate.Optional(validate.IsNetworkVLAN),
 		// lxdmeta:generate(entities=network-physical; group=network-conf; key=gvrp)
 		// This option specifies whether to register the VLAN using the GARP VLAN Registration Protocol.
@@ -54,27 +61,15 @@ func (n *physical) Validate(config map[string]string) error {
 		//  type: bool
 		//  defaultdesc: `false`
 		//  shortdesc: Whether to use GARP VLAN Registration Protocol
+		//  scope: global
 		"gvrp": validate.Optional(validate.IsBool),
-		// lxdmeta:generate(entities=network-physical; group=network-conf; key=maas.subnet.ipv4)
-		//
-		// ---
-		//  type: string
-		//  condition: IPv4 address; using the `network` property on the NIC
-		//  shortdesc: MAAS IPv4 subnet to register instances in
-		"maas.subnet.ipv4": validate.IsAny,
-		// lxdmeta:generate(entities=network-physical; group=network-conf; key=maas.subnet.ipv6)
-		//
-		// ---
-		//  type: string
-		//  condition: IPv6 address; using the `network` property on the NIC
-		//  shortdesc: MAAS IPv6 subnet to register instances in
-		"maas.subnet.ipv6": validate.IsAny,
 		// lxdmeta:generate(entities=network-physical; group=network-conf; key=ipv4.gateway)
 		// Use CIDR notation.
 		// ---
 		//  type: string
 		//  condition: standard mode
 		//  shortdesc: IPv4 address for the gateway and network
+		//  scope: global
 		"ipv4.gateway": validate.Optional(validate.IsNetworkAddressCIDRV4),
 		// lxdmeta:generate(entities=network-physical; group=network-conf; key=ipv6.gateway)
 		// Use CIDR notation.
@@ -82,18 +77,21 @@ func (n *physical) Validate(config map[string]string) error {
 		//  type: string
 		//  condition: standard mode
 		//  shortdesc: IPv6 address for the gateway and network
+		//  scope: global
 		"ipv6.gateway": validate.Optional(validate.IsNetworkAddressCIDRV6),
 		// lxdmeta:generate(entities=network-physical; group=network-conf; key=ipv4.ovn.ranges)
 		// Specify a comma-separated list of IPv4 ranges in FIRST-LAST format.
 		// ---
 		//  type: string
 		//  shortdesc: IPv4 ranges to use for child OVN network routers
+		//  scope: global
 		"ipv4.ovn.ranges": validate.Optional(validate.IsListOf(validate.IsNetworkRangeV4)),
 		// lxdmeta:generate(entities=network-physical; group=network-conf; key=ipv6.ovn.ranges)
 		// Specify a comma-separated list of IPv6 ranges in FIRST-LAST format.
 		// ---
 		//  type: string
 		//  shortdesc: IPv6 ranges to use for child OVN network routers
+		//  scope: global
 		"ipv6.ovn.ranges": validate.Optional(validate.IsListOf(validate.IsNetworkRangeV6)),
 		// lxdmeta:generate(entities=network-physical; group=network-conf; key=ipv4.routes)
 		// Specify a comma-separated list of IPv4 CIDR subnets that can be used with child OVN network forwarders, load-balancers and {config:option}`device-nic-ovn-device-conf:ipv4.routes.external` setting.
@@ -101,6 +99,7 @@ func (n *physical) Validate(config map[string]string) error {
 		//  type: string
 		//  condition: IPv4 address
 		//  shortdesc: Additional IPv4 CIDR subnets
+		//  scope: global
 		"ipv4.routes": validate.Optional(validate.IsListOf(validate.IsNetworkV4)),
 		// lxdmeta:generate(entities=network-physical; group=network-conf; key=ipv4.routes.anycast)
 		// If set to `true`, this option allows the overlapping routes to be used on multiple networks/NICs at the same time.
@@ -109,6 +108,7 @@ func (n *physical) Validate(config map[string]string) error {
 		//  condition: IPv4 address
 		//  defaultdesc: `false`
 		//  shortdesc: Whether to allow IPv4 routes on multiple networks/NICs
+		//  scope: global
 		"ipv4.routes.anycast": validate.Optional(validate.IsBool),
 		// lxdmeta:generate(entities=network-physical; group=network-conf; key=ipv6.routes)
 		// Specify a comma-separated list of IPv6 CIDR subnets that can be used with child OVN network forwarders, load-balancers and {config:option}`device-nic-ovn-device-conf:ipv6.routes.external` setting.
@@ -116,6 +116,7 @@ func (n *physical) Validate(config map[string]string) error {
 		//  type: string
 		//  condition: IPv6 address
 		//  shortdesc: Additional IPv6 CIDR subnets
+		//  scope: global
 		"ipv6.routes": validate.Optional(validate.IsListOf(validate.IsNetworkV6)),
 		// lxdmeta:generate(entities=network-physical; group=network-conf; key=ipv6.routes.anycast)
 		// If set to `true`, this option allows the overlapping routes to be used on multiple networks/NICs at the same time.
@@ -124,6 +125,7 @@ func (n *physical) Validate(config map[string]string) error {
 		//  condition: IPv6 address
 		//  defaultdesc: `false`
 		//  shortdesc: Whether to allow IPv6 routes on multiple networks/NICs
+		//  scope: global
 		"ipv6.routes.anycast": validate.Optional(validate.IsBool),
 		// lxdmeta:generate(entities=network-physical; group=network-conf; key=dns.nameservers)
 		// Specify a list of DNS server IPs.
@@ -131,6 +133,7 @@ func (n *physical) Validate(config map[string]string) error {
 		//  type: string
 		//  condition: standard mode
 		//  shortdesc: DNS server IPs on physical network
+		//  scope: global
 		"dns.nameservers": validate.Optional(validate.IsListOf(validate.IsNetworkAddress)),
 		// lxdmeta:generate(entities=network-physical; group=network-conf; key=ovn.ingress_mode)
 		// Possible values are `l2proxy` (proxy ARP/NDP) and `routed`.
@@ -139,6 +142,7 @@ func (n *physical) Validate(config map[string]string) error {
 		//  condition: standard mode
 		//  defaultdesc: `l2proxy`
 		//  shortdesc: How OVN NIC external IPs are advertised on uplink network
+		//  scope: global
 		"ovn.ingress_mode":            validate.Optional(validate.IsOneOf("l2proxy", "routed")),
 		"volatile.last_state.created": validate.Optional(validate.IsBool),
 
@@ -147,6 +151,7 @@ func (n *physical) Validate(config map[string]string) error {
 		// ---
 		//  type: string
 		//  shortdesc: User-provided free-form key/value pairs
+		//  scope: global
 	}
 
 	// Add the BGP validation rules.
@@ -157,6 +162,7 @@ func (n *physical) Validate(config map[string]string) error {
 	//  type: string
 	//  condition: BGP server
 	//  shortdesc: Peer address for use by `ovn` downstream networks
+	//  scope: global
 
 	// lxdmeta:generate(entities=network-physical; group=network-conf; key=bgp.peers.NAME.asn)
 	//
@@ -164,6 +170,7 @@ func (n *physical) Validate(config map[string]string) error {
 	//  type: integer
 	//  condition: BGP server
 	//  shortdesc: Peer AS number for use by `ovn` downstream networks
+	//  scope: global
 
 	// lxdmeta:generate(entities=network-physical; group=network-conf; key=bgp.peers.NAME.password)
 	//
@@ -173,6 +180,7 @@ func (n *physical) Validate(config map[string]string) error {
 	//  defaultdesc: (no password)
 	//  required: no
 	//  shortdesc: Peer session password for use by `ovn` downstream networks
+	//  scope: global
 
 	// lxdmeta:generate(entities=network-physical; group=network-conf; key=bgp.peers.NAME.holdtime)
 	// Specify the peer session hold time in seconds.
@@ -182,17 +190,23 @@ func (n *physical) Validate(config map[string]string) error {
 	//  defaultdesc: `180`
 	//  required: no
 	//  shortdesc: Peer session hold time
+	//  scope: global
 	bgpRules, err := n.bgpValidationRules(config)
 	if err != nil {
 		return err
 	}
 
-	for k, v := range bgpRules {
-		rules[k] = v
-	}
+	maps.Copy(rules, bgpRules)
 
 	// Validate the configuration.
 	err = n.validate(config, rules)
+	if err != nil {
+		return err
+	}
+
+	// Check that ipv4.routes and ipv6.routes contain the routes for existing OVN network
+	// forwards and load balancers.
+	err = n.validateRoutes(config)
 	if err != nil {
 		return err
 	}
@@ -201,17 +215,32 @@ func (n *physical) Validate(config map[string]string) error {
 }
 
 // checkParentUse checks if parent is already in use by another network or instance device.
-func (n *physical) checkParentUse(ourConfig map[string]string) (bool, error) {
-	// Get all managed networks across all projects.
+// Returns an error if parent is already in use or the check has failed.
+func (n *physical) checkParentUse(ourConfig map[string]string) error {
 	var err error
-	var projectNetworks map[string]map[int64]api.Network
+	var projectNetworks map[string]map[int64]api.Network              // All managed networks across all projects.
+	var nodesNetworksParent map[int64]map[string]db.NetworkNodeParent // Node IDs mapped to networks and their node-specific parent and VLAN.
 
 	err = n.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		// Get all managed networks across all projects.
+		// If in clustered mode, returned network configs are for the current node.
 		projectNetworks, err = tx.GetCreatedNetworks(ctx)
-		return err
+		if err != nil {
+			return fmt.Errorf("Failed loading all networks: %w", err)
+		}
+
+		// Get parent interfaces for all networks on all nodes.
+		if n.state.ServerClustered && len(n.nodes) > 1 {
+			nodesNetworksParent, err = tx.GetNetworksNodeParent(ctx)
+			if err != nil {
+				return fmt.Errorf("Failed loading node-specific configs: %w", err)
+			}
+		}
+
+		return nil
 	})
 	if err != nil {
-		return false, fmt.Errorf("Failed to load all networks: %w", err)
+		return err
 	}
 
 	for projectName, networks := range projectNetworks {
@@ -229,13 +258,44 @@ func (n *physical) checkParentUse(ourConfig map[string]string) (bool, error) {
 				// If either network doesn't specify a vlan, or both specify same vlan,
 				// then we can't use this parent.
 				if (network.Config["vlan"] == "" || ourConfig["vlan"] == "") || network.Config["vlan"] == ourConfig["vlan"] {
-					return true, nil
+					return fmt.Errorf("Parent interface %q in use by another network", ourConfig["parent"])
 				}
 			}
 		}
 	}
 
-	return false, nil
+	currNodeID := n.state.DB.Cluster.GetNodeID()
+
+	// Check that parent interfaces on other nodes are not already in use. Two networks can share the same
+	// parent interface only if they are on distinct VLANs, so track the set of VLANs in use per parent.
+	for nodeID, networksParent := range nodesNetworksParent {
+		if nodeID == currNodeID {
+			continue // Skip the current node, it has been checked already.
+		}
+
+		parentVLANsInUse := make(map[string]map[string]struct{})
+
+		for _, parent := range networksParent {
+			vlansInUse, parentSeen := parentVLANsInUse[parent.Parent]
+			if parentSeen {
+				_, untaggedInUse := vlansInUse[""]
+				_, vlanInUse := vlansInUse[parent.VLAN]
+
+				// A network without a VLAN claims the whole parent interface, so it
+				// conflicts with any other network on the same parent. Otherwise only
+				// networks sharing the same VLAN conflict.
+				if parent.VLAN == "" || untaggedInUse || vlanInUse {
+					return fmt.Errorf("Parent interface %q in use by another network on cluster member %q", parent.Parent, n.nodes[nodeID].Name)
+				}
+
+				vlansInUse[parent.VLAN] = struct{}{}
+			} else {
+				parentVLANsInUse[parent.Parent] = map[string]struct{}{parent.VLAN: {}}
+			}
+		}
+	}
+
+	return nil
 }
 
 // Create checks whether the referenced parent interface is used by other networks or instance devices, as we
@@ -245,13 +305,9 @@ func (n *physical) Create(clientType request.ClientType) error {
 
 	// We only need to check in the database once, not on every clustered node.
 	if clientType == request.ClientTypeNormal {
-		inUse, err := n.checkParentUse(n.config)
+		err := n.checkParentUse(n.config)
 		if err != nil {
 			return err
-		}
-
-		if inUse {
-			return fmt.Errorf("Parent interface %q in use by another network", n.config["parent"])
 		}
 	}
 
@@ -267,7 +323,7 @@ func (n *physical) Delete(clientType request.ClientType) error {
 		return err
 	}
 
-	return n.common.delete()
+	return n.delete()
 }
 
 // Rename renames a network.
@@ -275,7 +331,7 @@ func (n *physical) Rename(newName string) error {
 	n.logger.Debug("Rename", logger.Ctx{"newName": newName})
 
 	// Rename common steps.
-	err := n.common.rename(newName)
+	err := n.rename(newName)
 	if err != nil {
 		return err
 	}
@@ -341,7 +397,7 @@ func (n *physical) setup(oldConfig map[string]string) error {
 	// Record if we created this device or not (if we have not already recorded that we created it previously),
 	// so it can be removed on stop. This way we won't overwrite the setting on LXD restart.
 	if shared.IsFalseOrEmpty(n.config["volatile.last_state.created"]) {
-		n.config["volatile.last_state.created"] = fmt.Sprintf("%t", created)
+		n.config["volatile.last_state.created"] = strconv.FormatBool(created)
 		err = n.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 			return tx.UpdateNetwork(ctx, n.project, n.name, n.description, n.config)
 		})
@@ -350,10 +406,14 @@ func (n *physical) setup(oldConfig map[string]string) error {
 		}
 	}
 
+	nodeEvacuated := n.state.DB.Cluster.LocalNodeIsEvacuated()
+
 	// Setup BGP.
-	err = n.bgpSetup(oldConfig)
-	if err != nil {
-		return err
+	if !nodeEvacuated {
+		err = n.bgpSetup(oldConfig)
+		if err != nil {
+			return err
+		}
 	}
 
 	revert.Success()
@@ -402,12 +462,28 @@ func (n *physical) Stop() error {
 	return nil
 }
 
+// Evacuate the network by clearing BGP.
+func (n *physical) Evacuate() error {
+	n.logger.Debug("Evacuate")
+
+	// Clear BGP.
+	return n.bgpClear(n.config)
+}
+
+// Restore the network by setting up BGP.
+func (n *physical) Restore() error {
+	n.logger.Debug("Restore")
+
+	// Setup BGP.
+	return n.bgpSetup(nil)
+}
+
 // Update updates the network. Accepts notification boolean indicating if this update request is coming from a
 // cluster notification, in which case do not update the database, just apply local changes needed.
 func (n *physical) Update(newNetwork api.NetworkPut, targetNode string, clientType request.ClientType) error {
 	n.logger.Debug("Update", logger.Ctx{"clientType": clientType, "newNetwork": newNetwork})
 
-	dbUpdateNeeded, changedKeys, oldNetwork, err := n.common.configChanged(newNetwork)
+	dbUpdateNeeded, changedKeys, oldNetwork, err := n.configChanged(newNetwork)
 	if err != nil {
 		return err
 	}
@@ -420,29 +496,25 @@ func (n *physical) Update(newNetwork api.NetworkPut, targetNode string, clientTy
 	// pending, then don't apply the new settings to the node, just to the database record (ready for the
 	// actual global create request to be initiated).
 	if n.Status() == api.NetworkStatusPending || n.LocalStatus() == api.NetworkStatusPending {
-		return n.common.update(newNetwork, targetNode, clientType)
+		return n.update(newNetwork, targetNode, clientType)
 	}
 
 	revert := revert.New()
 	defer revert.Fail()
 
-	hostNameChanged := shared.ValueInSlice("vlan", changedKeys) || shared.ValueInSlice("parent", changedKeys)
+	hostNameChanged := slices.Contains(changedKeys, "vlan") || slices.Contains(changedKeys, "parent")
 
 	// We only need to check in the database once, not on every clustered node.
 	if clientType == request.ClientTypeNormal {
 		if hostNameChanged {
 			isUsed, err := n.IsUsed()
 			if isUsed || err != nil {
-				return fmt.Errorf("Cannot update network parent interface when in use")
+				return errors.New("Cannot update network parent interface when in use")
 			}
 
-			inUse, err := n.checkParentUse(newNetwork.Config)
+			err = n.checkParentUse(newNetwork.Config)
 			if err != nil {
 				return err
-			}
-
-			if inUse {
-				return fmt.Errorf("Parent interface %q in use by another network", newNetwork.Config["parent"])
 			}
 		}
 	}
@@ -460,18 +532,28 @@ func (n *physical) Update(newNetwork api.NetworkPut, targetNode string, clientTy
 	// Define a function which reverts everything.
 	revert.Add(func() {
 		// Reset changes to all nodes and database.
-		_ = n.common.update(oldNetwork, targetNode, clientType)
+		err := n.update(oldNetwork, targetNode, clientType)
+		if err != nil {
+			n.logger.Warn("Failed reverting network update", logger.Ctx{"err": err})
+		}
 	})
 
-	// Apply changes to all nodes and databse.
-	err = n.common.update(newNetwork, targetNode, clientType)
+	// Apply changes to all nodes and database.
+	err = n.update(newNetwork, targetNode, clientType)
 	if err != nil {
 		return err
 	}
 
-	err = n.setup(oldNetwork.Config)
-	if err != nil {
-		return err
+	if !hostNameChanged {
+		err = n.setup(oldNetwork.Config)
+		if err != nil {
+			return err
+		}
+	} else {
+		err = n.setup(nil)
+		if err != nil {
+			return err
+		}
 	}
 
 	revert.Success()
@@ -480,7 +562,7 @@ func (n *physical) Update(newNetwork api.NetworkPut, targetNode string, clientTy
 	// Do this after the network has been successfully updated so that a failure to notify a dependent network
 	// doesn't prevent the network itself from being updated.
 	if clientType == request.ClientTypeNormal && len(changedKeys) > 0 {
-		n.common.notifyDependentNetworks(changedKeys)
+		n.notifyDependentNetworks(changedKeys)
 	}
 
 	return nil
@@ -515,7 +597,7 @@ func (n *physical) State() (*api.NetworkState, error) {
 	state, err := resources.GetNetworkState(GetHostDevice(n.config["parent"], n.config["vlan"]))
 	if err != nil {
 		// If the parent is not found, return a response indicating the network is unavailable.
-		if api.StatusErrorCheck(err, 404) {
+		if api.StatusErrorCheck(err, http.StatusNotFound) {
 			return &api.NetworkState{
 				State: "unavailable",
 				Type:  "unknown",

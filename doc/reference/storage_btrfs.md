@@ -2,6 +2,7 @@
 # Btrfs - `btrfs`
 
 ```{youtube} https://www.youtube.com/watch?v=2r5FYuusxNc
+:title: Btrfs storage and LXD
 ```
 
 {abbr}`Btrfs (B-tree file system)` is a local file system based on the {abbr}`COW (copy-on-write)` principle.
@@ -76,14 +77,4 @@ The following configuration options are available for storage pools that use the
 ```{include} ../metadata.txt
     :start-after: <!-- config group storage-btrfs-volume-conf start -->
     :end-before: <!-- config group storage-btrfs-volume-conf end -->
-```
-
-### Storage bucket configuration
-
-To enable storage buckets for local storage pool drivers and allow applications to access the buckets via the S3 protocol, you must configure the {config:option}`server-core:core.storage_buckets_address` server setting.
-
-% Include content from [../metadata.txt](../metadata.txt)
-```{include} ../metadata.txt
-    :start-after: <!-- config group storage-btrfs-bucket-conf start -->
-    :end-before: <!-- config group storage-btrfs-bucket-conf end -->
 ```

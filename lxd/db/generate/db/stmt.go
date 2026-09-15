@@ -4,11 +4,12 @@ package db
 
 import (
 	"fmt"
-	"go/ast"
 	"go/build"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/tools/go/packages"
 
 	"github.com/canonical/lxd/lxd/db/generate/file"
 	"github.com/canonical/lxd/lxd/db/generate/lex"
@@ -17,11 +18,11 @@ import (
 // Stmt generates a particular database query statement.
 type Stmt struct {
 	db     string            // Database package receiver
-	dbPkg  *ast.Package      // Package where database related helpers are located.
+	dbPkg  *packages.Package // Package where database related helpers are located.
 	entity string            // Name of the database entity
 	kind   string            // Kind of statement to generate
 	config map[string]string // Configuration parameters
-	pkg    *ast.Package      // Package to perform for struct declaration lookups
+	pkg    *packages.Package // Package to perform for struct declaration lookups
 }
 
 // NewStmt return a new statement code snippet for running the given kind of
@@ -48,7 +49,7 @@ func NewStmt(database, pkg, entity, kind string, config map[string]string) (*Stm
 		return nil, err
 	}
 
-	var dbPkg *ast.Package
+	var dbPkg *packages.Package
 	if database != "" {
 		importPkg, err := build.Import(database, "", build.FindOnly)
 		if err != nil {
@@ -77,7 +78,7 @@ func NewStmt(database, pkg, entity, kind string, config map[string]string) (*Stm
 
 // Generate plumbing and wiring code for the desired statement.
 func (s *Stmt) Generate(buf *file.Buffer) error {
-	kind := strings.Split(s.kind, "-by-")[0]
+	kind, _, _ := strings.Cut(s.kind, "-by-")
 
 	switch kind {
 	case "objects":
@@ -161,7 +162,7 @@ func (s *Stmt) objects(buf *file.Buffer) error {
 
 	table += strings.Join(joins, "")
 	sql := fmt.Sprintf(boiler, strings.Join(columns, ", "), table, strings.Join(orderBy, ", "))
-	kind := strings.Replace(s.kind, "-", "_", -1)
+	kind := strings.ReplaceAll(s.kind, "-", "_")
 	stmtName := stmtCodeVar(s.entity, kind)
 	if mapping.Type == ReferenceTable || mapping.Type == MapTable {
 		buf.L("const %s = `%s`", stmtName, sql)
@@ -182,7 +183,8 @@ func (s *Stmt) objectsBy(buf *file.Buffer) error {
 	}
 
 	where := []string{}
-	filters := strings.Split(s.kind[len("objects-by-"):], "-and-")
+	suffix, _ := strings.CutPrefix(s.kind, "objects-by-")
+	filters := strings.Split(suffix, "-and-")
 	sqlString, err := ParseStmt(s.pkg, s.dbPkg, stmtCodeVar(s.entity, "objects"))
 	if err != nil {
 		return err
@@ -227,7 +229,7 @@ func (s *Stmt) objectsBy(buf *file.Buffer) error {
 			// Ensure filters operate on the coalesced value for fields using coalesce setting.
 			where = append(where, fmt.Sprintf("coalesce(%s, %s) = ? ", column, coalesce[0]))
 		} else {
-			where = append(where, fmt.Sprintf("%s = ? ", column))
+			where = append(where, column+" = ? ")
 		}
 	}
 
@@ -271,7 +273,7 @@ func (s *Stmt) create(buf *file.Buffer, replace bool) error {
 	}
 
 	sql := fmt.Sprintf(tmpl, table, strings.Join(columns, ", "), strings.Join(values, ", "))
-	kind := strings.Replace(s.kind, "-", "_", -2)
+	kind := strings.ReplaceAll(s.kind, "-", "_")
 	stmtName := stmtCodeVar(s.entity, kind)
 	if mapping.Type == ReferenceTable || mapping.Type == MapTable {
 		buf.L("const %s = `%s`", stmtName, sql)
@@ -313,7 +315,7 @@ func (s *Stmt) id(buf *file.Buffer) error {
 			column = mapping.FieldColumnName(field.Name, table)
 		}
 
-		where = append(where, fmt.Sprintf("%s = ?", column))
+		where = append(where, column+" = ?")
 	}
 
 	sql := fmt.Sprintf(stmts[s.kind], table, table+strings.Join(joins, ""), strings.Join(where, " AND "))
@@ -346,7 +348,7 @@ func (s *Stmt) rename(buf *file.Buffer) error {
 	}
 
 	sql := fmt.Sprintf(stmts[s.kind], table, strings.Join(updates, " AND "))
-	kind := strings.Replace(s.kind, "-", "_", -1)
+	kind := strings.ReplaceAll(s.kind, "-", "_")
 	stmtName := stmtCodeVar(s.entity, kind)
 	s.register(buf, stmtName, sql)
 	return nil
@@ -377,7 +379,7 @@ func (s *Stmt) update(buf *file.Buffer) error {
 	}
 
 	sql := fmt.Sprintf(stmts[s.kind], table, strings.Join(updates, ", "), "id = ?")
-	kind := strings.Replace(s.kind, "-", "_", -1)
+	kind := strings.ReplaceAll(s.kind, "-", "_")
 	stmtName := stmtCodeVar(s.entity, kind)
 	s.register(buf, stmtName, sql)
 
@@ -396,8 +398,9 @@ func (s *Stmt) delete(buf *file.Buffer) error {
 		where = "%s_id = ?"
 	}
 
-	if strings.HasPrefix(s.kind, "delete-by") {
-		filters := strings.Split(s.kind[len("delete-by-"):], "-and-")
+	suffix, found := strings.CutPrefix(s.kind, "delete-by-")
+	if found {
+		filters := strings.Split(suffix, "-and-")
 		conditions := make([]string, 0, len(filters))
 		for _, filter := range filters {
 			field, err := mapping.FilterFieldByName(filter)
@@ -421,7 +424,7 @@ func (s *Stmt) delete(buf *file.Buffer) error {
 	}
 
 	sql := fmt.Sprintf(stmts["delete"], table, where)
-	kind := strings.Replace(s.kind, "-", "_", -1)
+	kind := strings.ReplaceAll(s.kind, "-", "_")
 	stmtName := stmtCodeVar(s.entity, kind)
 	if mapping.Type == ReferenceTable || mapping.Type == MapTable {
 		buf.L("const %s = `%s`", stmtName, sql)

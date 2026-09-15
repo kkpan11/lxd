@@ -1,78 +1,53 @@
 ---
-relatedlinks: https://www.youtube.com/watch?v=QyXOOE_4cm0
+relatedlinks: "[Running&#32;LXD&#32;in&#32;production&#32;-&#32;YouTube](https://www.youtube.com/watch?v=QyXOOE_4cm0)"
+myst:
+  html_meta:
+    description: An index of how-to guides for getting started with LXD, including installation, initialization, and accessing the UI and offline documentation.
 ---
 
 (getting-started)=
 # Getting started
 
-To get started with LXD, see the documentation in this section.
+The following how-to guides cover the initial steps for setting up and accessing LXD.
 
-```{only} diataxis
-How to install and initialize LXD:
-```
+## Perform initial setup
 
-```{filtered-toctree}
+LXD is most commonly installed using its snap, but other installation methods are possible. Afterward, LXD can be initialized using an interactive CLI or a preseed file.
+
+```{toctree}
 :maxdepth: 1
 
-:diataxis:Install LXD </installing>
-:diataxis:Initialize LXD </howto/initialize>
-:diataxis:Manage the snap </howto/snap>
+Install LXD </installing>
+Initialize LXD </howto/initialize>
 ```
 
-```{only} diataxis
-How to enable access to the UI and the documentation:
-```
+## Access the UI and offline documentation
 
-```{filtered-toctree}
+The LXD UI client provides a graphical, browser-based alternative to the CLI for interacting with the LXD server. The offline documentation is especially useful for air-gapped deployments.
+
+```{toctree}
 :maxdepth: 1
 
-:diataxis:Access the UI </howto/access_ui>
-:diataxis:Access documentation </howto/access_documentation>
+Access the UI </howto/access_ui>
+Access documentation locally </howto/access_documentation>
 ```
 
-```{only} diataxis
-How to get support and contribute:
-```
+## Watch videos
 
-```{filtered-toctree}
-:maxdepth: 1
-
-:diataxis:Get support </support>
-:diataxis:Contribute to LXD </contributing>
-```
-
-In addition, the following clip gives a quick and easy introduction for standard use cases:
+The following clip gives a quick and easy introduction for standard use cases:
 
 <div>
  <script id="asciicast-226224" src="https://asciinema.org/a/226224.js" async></script>
 </div>
 
-You can also find a series of demos and tutorials on YouTube:
+A series of demos and tutorials is also available on [YouTube](https://www.youtube.com/c/LXDvideos):
 
 <iframe width="560" height="315" src="https://www.youtube.com/embed/videoseries?list=PLddduKsl-KEhleT9VTR4hbtlNdtMr6cFd" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
 
 ## Related topics
 
-```{only} diataxis
 {{getting_started_tut}}
 
 {{getting_started_exp}}
 
 {{getting_started_ref}}
-```
-
-```{filtered-toctree}
-:maxdepth: 1
-
-:topical:/tutorial/first_steps
-:topical:/explanation/instances
-:topical:/requirements
-:topical:Install LXD </installing>
-:topical:Initialize LXD </howto/initialize>
-:topical:Manage the snap </howto/snap>
-:topical:Access the UI </howto/access_ui>
-:topical:Access the documentation </howto/access_documentation>
-:topical:Frequently asked </faq>
-:topical:Contribute to LXD </contributing>
-:topical:Get support </support>
-```

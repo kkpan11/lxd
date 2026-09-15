@@ -1,13 +1,21 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"golang.org/x/sys/unix"
+
+	agentAPI "github.com/canonical/lxd/lxd-agent/api"
+	"github.com/canonical/lxd/lxd/device/filters"
 	"github.com/canonical/lxd/lxd/events"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/response"
@@ -60,7 +68,7 @@ func eventsSocket(d *Daemon, r *http.Request, w http.ResponseWriter) error {
 	} else {
 		h, ok := w.(http.Hijacker)
 		if !ok {
-			return fmt.Errorf("Missing implemented http.Hijacker interface")
+			return errors.New("Missing implemented http.Hijacker interface")
 		}
 
 		conn, _, err := h.Hijack()
@@ -105,64 +113,129 @@ func eventsPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Handle device related actions locally.
-	go eventsProcess(event)
+	err = eventsProcess(event)
+	if err != nil {
+		logger.Error("Failed processing event", logger.Ctx{"err": err, "type": event.Type, "location": event.Location, "project": event.Project})
+	}
 
 	return response.SyncResponse(true, nil)
 }
 
-func eventsProcess(event api.Event) {
+func eventsProcess(event api.Event) error {
 	// We currently only need to react to device events.
 	if event.Type != "device" {
-		return
+		return nil
 	}
 
 	type deviceEvent struct {
-		Action string                    `json:"action"`
-		Config map[string]string         `json:"config"`
-		Name   string                    `json:"name"`
-		Mount  instancetype.VMAgentMount `json:"mount"`
+		Action agentAPI.DeviceEventAction `json:"action"`
+		Config map[string]string          `json:"config"`
+		Name   string                     `json:"name"`
+		Mount  instancetype.VMAgentMount  `json:"mount"`
 	}
 
 	e := deviceEvent{}
 	err := json.Unmarshal(event.Metadata, &e)
 	if err != nil {
-		return
+		return err
 	}
 
-	// Only care about device additions, we don't try to handle remove.
-	if e.Action != "added" {
-		return
+	// Only handle device additions and removals.
+	if e.Action != agentAPI.DeviceAdded && e.Action != agentAPI.DeviceRemoved {
+		return nil
 	}
 
-	// We only handle disk hotplug.
-	if e.Config["type"] != "disk" {
-		return
+	// We only handle disk hotplug/removal.
+	if !filters.IsDisk(e.Config) {
+		return nil
 	}
 
 	// And only for path based devices.
-	if e.Config["path"] == "" {
-		return
+	targetPath := e.Config["path"]
+	if targetPath == "" {
+		return nil
 	}
 
-	// Attempt to perform the mount.
-	mntSource := fmt.Sprintf("lxd_%s", e.Name)
+	mntSource := "lxd_" + e.Name
 	if e.Mount.Source != "" {
 		mntSource = e.Mount.Source
 	}
 
-	l := logger.AddContext(logger.Ctx{"type": "virtiofs", "source": mntSource, "path": e.Config["path"]})
+	l := logger.AddContext(logger.Ctx{"type": "virtiofs", "source": mntSource, "path": targetPath})
 
-	_ = os.MkdirAll(e.Config["path"], 0755)
-
-	for i := 0; i < 5; i++ {
-		_, err = shared.RunCommand("mount", "-t", "virtiofs", mntSource, e.Config["path"])
-		if err == nil {
-			l.Info("Mounted hotplug")
-			return
-		}
-
-		time.Sleep(500 * time.Millisecond)
+	// Reject path containing "..".
+	if strings.Contains(targetPath, "..") {
+		return fmt.Errorf("Invalid path %q: Path must not contain '..'", targetPath)
 	}
 
-	l.Info("Failed to mount hotplug", logger.Ctx{"err": err})
+	// If the path is not absolute, the mount will be created relative to the current directory.
+	// (since the mount command executed below originates from the `lxd-agent` binary that is in the `/run/lxd_agent` directory).
+	// This is not ideal and not consistent with the way mounts are handled with containers. For consistency make the path absolute.
+	targetPath, err = filepath.Abs(targetPath)
+	if err != nil || !strings.HasPrefix(targetPath, "/") {
+		return fmt.Errorf("Failed making path %q absolute", targetPath)
+	}
+
+	switch e.Action {
+	case agentAPI.DeviceAdded:
+		_ = os.MkdirAll(targetPath, 0755)
+
+		// Parse mount options, if provided.
+		var args []string
+		if len(e.Mount.Options) > 0 {
+			args = append(args, "-o", strings.Join(e.Mount.Options, ","))
+		}
+
+		args = append(args, "-t", "virtiofs", mntSource, targetPath)
+
+		// Attempt to perform the mount.
+		for range 5 {
+			_, err = shared.RunCommand(context.Background(), "mount", args...)
+			if err == nil {
+				l.Info("Mounted hotplug")
+				return nil
+			}
+
+			time.Sleep(500 * time.Millisecond)
+		}
+
+		return fmt.Errorf("Failed hotpluging device %q: %w", mntSource, err)
+	case agentAPI.DeviceRemoved:
+		mountInfoFile, err := os.Open("/proc/self/mountinfo")
+		if err != nil {
+			return fmt.Errorf("Error opening /proc/self/mountinfo: %w", err)
+		}
+
+		defer mountInfoFile.Close()
+
+		var mountPoint string
+		scanner := bufio.NewScanner(mountInfoFile)
+		trimmedPath := strings.TrimSuffix(targetPath, "/")
+
+		for scanner.Scan() {
+			fields := strings.Fields(scanner.Text())
+
+			// Check that the mount point that matches the target path exists.
+			if len(fields) >= 10 && fields[4] == trimmedPath {
+				mountPoint = fields[4]
+				break
+			}
+		}
+
+		err = scanner.Err()
+		if err != nil {
+			return fmt.Errorf("Error reading /proc/self/mountinfo: %w", err)
+		}
+
+		if mountPoint == "" {
+			return fmt.Errorf("Mount point not found for path %q", targetPath)
+		}
+
+		err = unix.Unmount(mountPoint, unix.MNT_DETACH)
+		if err != nil {
+			return fmt.Errorf("Failed unmounting %q: %w", mountPoint, err)
+		}
+	}
+
+	return nil
 }

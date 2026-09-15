@@ -2,8 +2,10 @@ package util
 
 import (
 	"bufio"
-	"fmt"
+	"context"
+	"errors"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/canonical/lxd/shared"
@@ -12,36 +14,12 @@ import (
 // LoadModule loads the kernel module with the given name, by invoking
 // modprobe. This respects any modprobe configuration on the system.
 func LoadModule(module string) error {
-	if shared.PathExists(fmt.Sprintf("/sys/module/%s", module)) {
+	if shared.PathExists("/sys/module/" + module) {
 		return nil
 	}
 
-	_, err := shared.RunCommand("modprobe", "-b", module)
+	_, err := shared.RunCommand(context.TODO(), "modprobe", "-b", module)
 	return err
-}
-
-// SupportsFilesystem checks whether a given filesystem is already supported
-// by the kernel. Note that if the filesystem is a module, you may need to
-// load it first.
-func SupportsFilesystem(filesystem string) bool {
-	file, err := os.Open("/proc/filesystems")
-	if err != nil {
-		return false
-	}
-
-	defer func() { _ = file.Close() }()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		fields := strings.Fields(strings.TrimSpace(scanner.Text()))
-		entry := fields[len(fields)-1]
-
-		if entry == filesystem {
-			return true
-		}
-	}
-
-	return false
 }
 
 // HugepagesPath attempts to locate the mount point of the hugepages filesystem.
@@ -69,15 +47,15 @@ func HugepagesPath() (string, error) {
 	}
 
 	if len(matches) == 0 {
-		return "", fmt.Errorf("No hugetlbfs mount found, can't use hugepages")
+		return "", errors.New("No hugetlbfs mount found, cannot use hugepages")
 	}
 
 	if len(matches) > 1 {
-		if shared.ValueInSlice("/dev/hugepages", matches) {
+		if slices.Contains(matches, "/dev/hugepages") {
 			return "/dev/hugepages", nil
 		}
 
-		return "", fmt.Errorf("More than one hugetlbfs instance found and none at standard /dev/hugepages")
+		return "", errors.New("More than one hugetlbfs instance found and none at standard /dev/hugepages")
 	}
 
 	return matches[0], nil

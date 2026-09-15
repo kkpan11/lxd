@@ -2,13 +2,13 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/canonical/lxd/client"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 )
 
@@ -22,7 +22,7 @@ func TestCluster_Bootstrap(t *testing.T) {
 	// request is issued to set both core.https_address and
 	// cluster.https_address to the same value.
 	f := clusterFixture{t: t}
-	f.EnableNetworkingWithClusterAddress(daemon, "")
+	f.EnableNetworkingWithClusterAddress(daemon)
 
 	client := f.ClientUnix(daemon)
 
@@ -44,12 +44,12 @@ func TestCluster_Get(t *testing.T) {
 	daemon, cleanup := newTestDaemon(t)
 	defer cleanup()
 
-	client, err := lxd.ConnectLXDUnix(daemon.UnixSocket(), nil)
+	client, err := lxd.ConnectLXDUnix(daemon.os.GetUnixSocket(), nil)
 	require.NoError(t, err)
 
 	cluster, _, err := client.GetCluster()
 	require.NoError(t, err)
-	assert.Equal(t, "", cluster.ServerName)
+	assert.Empty(t, cluster.ServerName)
 	assert.False(t, cluster.Enabled)
 }
 
@@ -59,7 +59,7 @@ func TestCluster_RenameNode(t *testing.T) {
 	defer cleanup()
 
 	f := clusterFixture{t: t}
-	f.EnableNetworking(daemon, "")
+	f.EnableNetworking(daemon)
 
 	client := f.ClientUnix(daemon)
 
@@ -78,16 +78,27 @@ func TestCluster_RenameNode(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// allocatePort asks the kernel for an ephemeral port number that was free at
+// the time of allocation. The listener is closed before returning, so reuse of
+// the returned port is subject to a race.
+func allocatePort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return -1, err
+	}
+
+	return l.Addr().(*net.TCPAddr).Port, l.Close()
+}
+
 // Test helper for cluster-related APIs.
 type clusterFixture struct {
 	t       *testing.T
 	clients map[*Daemon]lxd.InstanceServer
 }
 
-// Enable networking in the given daemon. The password is optional and can be
-// an empty string.
-func (f *clusterFixture) EnableNetworking(daemon *Daemon, password string) {
-	port, err := shared.AllocatePort()
+// Enable networking in the given daemon.
+func (f *clusterFixture) EnableNetworking(daemon *Daemon) {
+	port, err := allocatePort()
 	require.NoError(f.t, err)
 
 	address := fmt.Sprintf("127.0.0.1:%d", port)
@@ -102,10 +113,9 @@ func (f *clusterFixture) EnableNetworking(daemon *Daemon, password string) {
 }
 
 // Enable networking in the given daemon, and set cluster.https_address to the
-// same value as core.https address. The password is optional and can be an
-// empty string.
-func (f *clusterFixture) EnableNetworkingWithClusterAddress(daemon *Daemon, password string) {
-	port, err := shared.AllocatePort()
+// same value as core.https_address.
+func (f *clusterFixture) EnableNetworkingWithClusterAddress(daemon *Daemon) {
+	port, err := allocatePort()
 	require.NoError(f.t, err)
 
 	address := fmt.Sprintf("127.0.0.1:%d", port)
@@ -130,8 +140,9 @@ func (f *clusterFixture) ClientUnix(daemon *Daemon) lxd.InstanceServer {
 	client, ok := f.clients[daemon]
 	if !ok {
 		var err error
-		client, err = lxd.ConnectLXDUnix(daemon.UnixSocket(), nil)
+		client, err = lxd.ConnectLXDUnix(daemon.os.GetUnixSocket(), nil)
 		require.NoError(f.t, err)
+		f.clients[daemon] = client
 	}
 
 	return client

@@ -10,7 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/canonical/go-dqlite/driver"
+	"github.com/canonical/go-dqlite/v3/driver"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -161,7 +162,7 @@ func TestAccept_UnmetPreconditions(t *testing.T) {
 			cluster.SchemaVersion,
 			len(version.APIExtensions),
 			func(f *membershipFixtures) {},
-			"Clustering isn't enabled",
+			"Clustering is not enabled",
 		},
 		{
 			"rusp",
@@ -191,7 +192,7 @@ func TestAccept_UnmetPreconditions(t *testing.T) {
 			func(f *membershipFixtures) {
 				f.ClusterNode("5.6.7.8:666")
 			},
-			fmt.Sprintf("The joining server version doesn't match (expected %s with DB schema %d)", version.Version, cluster.SchemaVersion-1),
+			fmt.Sprintf("The joining server version does not match (expected %s with DB schema %d)", version.Version, cluster.SchemaVersion-1),
 		},
 		{
 			"buzz",
@@ -201,7 +202,7 @@ func TestAccept_UnmetPreconditions(t *testing.T) {
 			func(f *membershipFixtures) {
 				f.ClusterNode("5.6.7.8:666")
 			},
-			fmt.Sprintf("The joining server version doesn't match (expected %s with API count %d)", version.Version, len(version.APIExtensions)-1),
+			fmt.Sprintf("The joining server version does not match (expected %s with API count %d)", version.Version, len(version.APIExtensions)-1),
 		},
 	}
 
@@ -286,15 +287,9 @@ func TestJoin(t *testing.T) {
 	trustedAltServerCert, _ := x509.ParseCertificate(altServerCert.KeyPair().Certificate[0])
 
 	identityCache := &identity.Cache{}
-	err := identityCache.ReplaceAll([]identity.CacheEntry{
-		{
-			AuthenticationMethod: api.AuthenticationMethodTLS,
-			IdentityType:         api.IdentityTypeCertificateServer,
-			Identifier:           altServerCert.Fingerprint(),
-			Certificate:          trustedAltServerCert,
-		},
-	}, nil)
-	require.NoError(t, err)
+	identityCache.ReplaceAll(map[string]*x509.Certificate{
+		altServerCert.Fingerprint(): trustedAltServerCert,
+	}, nil, nil, nil, nil)
 
 	for path, handler := range targetGateway.HandlerFuncs(nil, identityCache) {
 		targetMux.HandleFunc(path, handler)
@@ -307,7 +302,9 @@ func TestJoin(t *testing.T) {
 	targetStore := targetGateway.NodeStore()
 	targetDialFunc := targetGateway.DialFunc()
 
-	targetState.DB.Cluster, err = db.OpenCluster(context.Background(), "db.bin", targetStore, targetAddress, "/unused/db/dir", 10*time.Second, nil, driver.WithDialFunc(targetDialFunc))
+	server1UUID, err := uuid.NewV7()
+	require.NoError(t, err)
+	targetState.DB.Cluster, err = db.OpenCluster(context.Background(), "db.bin", targetStore, targetAddress, "/unused/db/dir", 10*time.Second, server1UUID.String(), driver.WithDialFunc(targetDialFunc))
 	targetState.ServerCert = func() *shared.CertInfo { return targetCert }
 	require.NoError(t, err)
 
@@ -368,7 +365,10 @@ func TestJoin(t *testing.T) {
 	store := gateway.NodeStore()
 	dialFunc := gateway.DialFunc()
 
-	state.DB.Cluster, err = db.OpenCluster(context.Background(), "db.bin", store, address, "/unused/db/dir", 5*time.Second, nil, driver.WithDialFunc(dialFunc))
+	server2UUID, err := uuid.NewV7()
+	require.NoError(t, err)
+
+	state.DB.Cluster, err = db.OpenCluster(context.Background(), "db.bin", store, address, "/unused/db/dir", 5*time.Second, server2UUID.String(), driver.WithDialFunc(dialFunc))
 	require.NoError(t, err)
 
 	err = state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
@@ -392,6 +392,11 @@ func TestJoin(t *testing.T) {
 
 	f := &membershipFixtures{t: t, state: state}
 	f.ClusterAddress(address)
+
+	err = targetState.DB.Cluster.Transaction(t.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+		return cluster.EnsureServerCertificateTrusted("rusp", altServerCert, tx)
+	})
+	require.NoError(t, err)
 
 	// Accept the joining node.
 	dbCluster.PreparedStmts = targetStmts

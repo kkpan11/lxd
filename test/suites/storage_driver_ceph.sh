@@ -1,13 +1,15 @@
 test_storage_driver_ceph() {
-  local LXD_STORAGE_DIR lxd_backend
+  local lxd_backend
 
-  lxd_backend=$(storage_backend "$LXD_DIR")
-  if [ "$lxd_backend" != "ceph" ]; then
+  lxd_backend=$(storage_backend "${LXD_DIR}")
+  if [ "${lxd_backend}" != "ceph" ]; then
+    export TEST_UNMET_REQUIREMENT="ceph specific test, not for ${lxd_backend}"
     return
   fi
 
+  local LXD_STORAGE_DIR
+
   LXD_STORAGE_DIR=$(mktemp -d -p "${TEST_DIR}" XXXXXXXXX)
-  chmod +x "${LXD_STORAGE_DIR}"
   spawn_lxd "${LXD_STORAGE_DIR}" false
 
   (
@@ -16,7 +18,7 @@ test_storage_driver_ceph() {
     LXD_DIR="${LXD_STORAGE_DIR}"
 
     # shellcheck disable=SC1009
-    lxc storage create "lxdtest-$(basename "${LXD_DIR}")-pool1" ceph volume.size=25MiB ceph.osd.pg_num=16
+    lxc storage create "lxdtest-$(basename "${LXD_DIR}")-pool1" ceph volume.size="${DEFAULT_VOLUME_SIZE}" ceph.osd.pg_num=8
 
     # Set default storage pool for image import.
     lxc profile device add default root disk path="/" pool="lxdtest-$(basename "${LXD_DIR}")-pool1"
@@ -28,7 +30,7 @@ test_storage_driver_ceph() {
     ceph --cluster "${LXD_CEPH_CLUSTER}" osd pool create "lxdtest-$(basename "${LXD_DIR}")-existing-osd-pool" 1
 
     # Let LXD use an already existing osd pool.
-    lxc storage create "lxdtest-$(basename "${LXD_DIR}")-pool2" ceph source="lxdtest-$(basename "${LXD_DIR}")-existing-osd-pool" volume.size=25MiB ceph.osd.pg_num=16
+    lxc storage create "lxdtest-$(basename "${LXD_DIR}")-pool2" ceph ceph.osd.pool_name="lxdtest-$(basename "${LXD_DIR}")-existing-osd-pool" volume.size="${DEFAULT_VOLUME_SIZE}" ceph.osd.pg_num=8
 
     # Test that no invalid ceph storage pool configuration keys can be set.
     ! lxc storage create "lxdtest-$(basename "${LXD_DIR}")-invalid-ceph-pool-config" ceph lvm.thinpool_name=bla || false
@@ -36,7 +38,7 @@ test_storage_driver_ceph() {
     ! lxc storage create "lxdtest-$(basename "${LXD_DIR}")-invalid-ceph-pool-config" ceph lvm.vg_name=bla || false
 
     # Test that all valid ceph storage pool configuration keys can be set.
-    lxc storage create "lxdtest-$(basename "${LXD_DIR}")-valid-ceph-pool-config" ceph volume.block.filesystem=ext4 volume.block.mount_options=discard volume.size=25MiB ceph.rbd.clone_copy=true ceph.osd.pg_num=16
+    lxc storage create "lxdtest-$(basename "${LXD_DIR}")-valid-ceph-pool-config" ceph volume.block.filesystem=ext4 volume.block.mount_options=discard volume.size="${DEFAULT_VOLUME_SIZE}" ceph.rbd.clone_copy=true ceph.osd.pg_num=8
     lxc storage delete "lxdtest-$(basename "${LXD_DIR}")-valid-ceph-pool-config"
 
     # Muck around with some containers on various pools.
@@ -53,9 +55,7 @@ test_storage_driver_ceph() {
     lxc list -c b c4pool2 | grep "lxdtest-$(basename "${LXD_DIR}")-pool2"
 
     lxc storage set "lxdtest-$(basename "${LXD_DIR}")-pool1" volume.block.filesystem xfs
-    # xfs is unhappy with block devices < 48 MiB. It seems to calculate the
-    # ag{count,size} parameters wrong and/or sets the data area too big.
-    lxc storage set "lxdtest-$(basename "${LXD_DIR}")-pool1" volume.size 48MiB
+    lxc storage set "lxdtest-$(basename "${LXD_DIR}")-pool1" volume.size 300MiB # modern xfs requires 300MiB or more
     lxc init testimage c5pool1 -s "lxdtest-$(basename "${LXD_DIR}")-pool1"
 
     # Test whether dependency tracking is working correctly. We should be able
@@ -110,12 +110,12 @@ test_storage_driver_ceph() {
     lxc storage volume rename "lxdtest-$(basename "${LXD_DIR}")-pool2" c4pool2 c4pool2-renamed
     lxc storage volume rename "lxdtest-$(basename "${LXD_DIR}")-pool2" c4pool2-renamed c4pool2
 
-    lxc delete -f c1pool1
+    lxc delete c1pool1
     lxc delete -f c3pool1
-    lxc delete -f c5pool1
+    lxc delete c5pool1
 
     lxc delete -f c4pool2
-    lxc delete -f c2pool2
+    lxc delete c2pool2
 
     lxc storage volume set "lxdtest-$(basename "${LXD_DIR}")-pool1" c1pool1 size 500MiB
     lxc storage volume unset "lxdtest-$(basename "${LXD_DIR}")-pool1" c1pool1 size
@@ -129,7 +129,26 @@ test_storage_driver_ceph() {
     lxc profile device remove default root
     lxc storage delete "lxdtest-$(basename "${LXD_DIR}")-pool1"
     lxc storage delete "lxdtest-$(basename "${LXD_DIR}")-pool2"
-    ceph --cluster "${LXD_CEPH_CLUSTER}" osd pool rm "lxdtest-$(basename "${LXD_DIR}")-existing-osd-pool" "lxdtest-$(basename "${LXD_DIR}")-existing-osd-pool"  --yes-i-really-really-mean-it
+    ! ceph --cluster "${LXD_CEPH_CLUSTER}" osd pool ls | grep -F "lxdtest-$(basename "${LXD_DIR}")-existing-osd-pool" || false
+
+
+    # Test that pre-existing OSD pools are not affected by the config option in LXD. Only the associated pool should be affected.
+    # .mgr is auto-created by Ceph, so give it a value that is different from the size supplied to the `lxc storage create` commands.
+    ceph --cluster "${LXD_CEPH_CLUSTER}" osd pool set ".mgr" size 3
+    pool1="lxdtest-$(basename "${LXD_DIR}")-pool1"
+    pool2="lxdtest-$(basename "${LXD_DIR}")-pool2"
+    lxc storage create "${pool1}" ceph volume.size="${DEFAULT_VOLUME_SIZE}" ceph.osd.pg_num=8 ceph.osd.pool_size=1
+    ceph --cluster "${LXD_CEPH_CLUSTER}" osd pool get "${pool1}" size --format json | jq --exit-status '.size == 1'
+    ceph --cluster "${LXD_CEPH_CLUSTER}" osd pool get ".mgr" size --format json | jq --exit-status '.size == 3'
+
+    lxc storage create "${pool2}" ceph volume.size="${DEFAULT_VOLUME_SIZE}" ceph.osd.pg_num=8 ceph.osd.pool_size=2
+    ceph --cluster "${LXD_CEPH_CLUSTER}" osd pool get "${pool1}" size --format json | jq --exit-status '.size == 1'
+    ceph --cluster "${LXD_CEPH_CLUSTER}" osd pool get "${pool2}" size --format json | jq --exit-status '.size == 2'
+    ceph --cluster "${LXD_CEPH_CLUSTER}" osd pool get ".mgr" size --format json | jq --exit-status '.size == 3'
+
+    lxc storage delete "${pool1}"
+    lxc storage delete "${pool2}"
+    ceph --cluster "${LXD_CEPH_CLUSTER}" osd pool set ".mgr" size 1 --yes-i-really-mean-it
   )
 
   # shellcheck disable=SC2031

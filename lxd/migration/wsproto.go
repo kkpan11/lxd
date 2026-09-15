@@ -1,7 +1,7 @@
 package migration
 
 import (
-	"fmt"
+	"errors"
 	"io"
 
 	"github.com/gorilla/websocket"
@@ -13,7 +13,7 @@ import (
 // ProtoRecv gets a protobuf message from a websocket.
 func ProtoRecv(ws *websocket.Conn, msg proto.Message) error {
 	if ws == nil {
-		return fmt.Errorf("Empty websocket connection")
+		return errors.New("Empty websocket connection")
 	}
 
 	mt, r, err := ws.NextReader()
@@ -22,7 +22,7 @@ func ProtoRecv(ws *websocket.Conn, msg proto.Message) error {
 	}
 
 	if mt != websocket.BinaryMessage {
-		return fmt.Errorf("Only binary messages allowed")
+		return errors.New("Only binary messages allowed")
 	}
 
 	buf, err := io.ReadAll(r)
@@ -41,7 +41,7 @@ func ProtoRecv(ws *websocket.Conn, msg proto.Message) error {
 // ProtoSend sends a protobuf message over a websocket.
 func ProtoSend(ws *websocket.Conn, msg proto.Message) error {
 	if ws == nil {
-		return fmt.Errorf("Empty websocket connection")
+		return errors.New("Empty websocket connection")
 	}
 
 	w, err := ws.NextWriter(websocket.BinaryMessage)
@@ -64,6 +64,37 @@ func ProtoSend(ws *websocket.Conn, msg proto.Message) error {
 	return w.Close()
 }
 
+// ProtoSendFrame writes a protobuf message as one barrier framed message, for channels that drivers only see as an io.ReadWriteCloser rather than a websocket.
+func ProtoSendFrame(conn io.ReadWriteCloser, msg proto.Message) error {
+	data, err := proto.Marshal(msg)
+	if err != nil {
+		return err
+	}
+
+	err = shared.WriteAll(conn, data)
+	if err != nil {
+		return err
+	}
+
+	return conn.Close() // End the frame.
+}
+
+// ProtoRecvFrame reads one barrier framed message into a protobuf message, for channels that drivers only see as an io.Reader rather than a websocket.
+func ProtoRecvFrame(conn io.Reader, msg proto.Message) error {
+	buf, err := io.ReadAll(conn)
+	if err != nil {
+		return err
+	}
+
+	// A peer that closed without writing reads as an empty buffer, which unmarshals into a zero message. The
+	// caller would then negotiate against values nobody sent and report a later failure instead of this one.
+	if len(buf) == 0 {
+		return errors.New("Empty migration frame")
+	}
+
+	return proto.Unmarshal(buf, msg)
+}
+
 // ProtoSendControl sends a migration control message over a websocket.
 func ProtoSendControl(ws *websocket.Conn, err error) {
 	message := ""
@@ -72,8 +103,8 @@ func ProtoSendControl(ws *websocket.Conn, err error) {
 	}
 
 	msg := MigrationControl{
-		Success: proto.Bool(err == nil),
-		Message: proto.String(message),
+		Success: new(err == nil),
+		Message: new(message),
 	}
 
 	_ = ProtoSend(ws, &msg)

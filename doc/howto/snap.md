@@ -1,183 +1,311 @@
 ---
-discourse: ubuntu:37214
+discourse: "[Discourse&#x3a&#32;Managing&#32;the&#32;LXD&#32;snap&#32;package](37214)"
 ---
 
 (howto-snap)=
 # How to manage the LXD snap
 
-Among {ref}`other options <installing-other>`, LXD is distributed as a [snap](https://snapcraft.io/docs).
-The benefit of packaging LXD as a snap is that it makes it possible to include all of LXD’s dependencies in one package, and that it allows LXD to be installed on many different Linux distributions.
-The snap ensures that LXD runs in a consistent environment.
+The recommended way to manage LXD is its [snap package](https://snapcraft.io/lxd).
 
-## Control updates of the snap
+For the installation guide, see: {ref}`installing-snap-package`. For details about the LXD snap, including its {ref}`channels <ref-snap-channels>`, {ref}`tracks <ref-snap-tracks>`, and {ref}`release processes <ref-releases>`, see: {ref}`ref-releases-snap`.
 
-When running LXD in a production environment, you must make sure to have a suitable version of the snap installed on all machines of your LXD cluster.
+(howto-snap-info)=
+## View snap information
 
-### Choose the right channel and track
+To view information about the LXD snap, including the available channels and installed version, run:
 
-Snaps come with different channels that define which release of a snap is installed and tracked for updates.
-See [Channels and tracks](https://snapcraft.io/docs/channels) in the snap documentation for detailed information.
+```bash
+snap info lxd
+```
 
-Feature releases of LXD are available on the `latest` track.
-In addition, LXD provides tracks for the supported feature releases.
-See {ref}`installing-release` for more information.
+To view information about the installed version only, run:
 
-On all tracks, the `stable` risk level contains all fixes and features for the respective track, but it is only updated when the LXD team decides that a feature is ready and no issues have been revealed by users running the same revision on higher risk levels (`edge` and `candidate`).
+```bash
+snap list lxd
+```
 
-When installing a snap, specify the channel as follows:
+Sample output:
 
-    sudo snap install <snap_name> --channel=<channel>
+```{terminal}
+:user: root
+:host: instance
 
-For example:
+snap list lxd
 
-    sudo snap install lxd --channel=latest/stable
+Name  Version         Rev    Tracking     Publisher   Notes
+lxd   5.21.3-c5ae129  33110  5.21/stable  canonical✓  -
+```
 
-If you do not specify a channel, snap will choose the default channel (the latest LTS release).
+The first part of the version string corresponds to the LXD release (in this sample, `5.21.3`).
 
-To see all available channels of the LXD snap, run the following command:
+(howto-snap-updates-upgrades)=
+## Updates versus upgrades
 
-    snap info lxd
+{ref}`ref-snap-updates` of the LXD snap occur within the same channel, whereas {ref}`upgrades <ref-snap-upgrades>` refer to {ref}`changing the tracked snap channel <howto-snap-change>` to use a newer track.
 
-### Hold and schedule updates
+For details, see our {ref}`ref-snap-updates-upgrades` reference guide, including its section on {ref}`ref-snap-downgrades`.
 
-By default, snaps are updated automatically.
-In the case of LXD, this can be problematic because all machines of a cluster must use the same version of the LXD snap.
+(howto-snap-updates)=
+## Manage updates
 
-Therefore, you should schedule your updates and make sure that all cluster members are in sync regarding the snap version that they use.
+When LXD is {ref}`installed as a snap <installing-snap-package>`, it begins tracking the specified snap channel, or the most recent stable LTS track if not specified. Whenever a new version is published to that channel, the LXD version on your system automatically updates.
 
-#### Schedule updates
+For control over the update schedule, use either of the following approaches:
 
-There are two methods for scheduling when your snaps should be updated:
+- {ref}`howto-snap-updates-schedule`.
+- {ref}`howto-snap-updates-hold` and perform {ref}`howto-snap-updates-manual` as needed.
 
-- You can hold snap updates for a specific time, either for specific snaps or for all snaps on your system.
-  After the duration of the hold, or when you remove the hold, your snaps are automatically refreshed.
-- You can specify a system-wide refresh window, so that snaps are automatically refreshed only within this time frame.
-  Such a refresh window applies to all snaps.
+For clustered LXD installations, also follow the instructions below to {ref}`synchronize updates for cluster members <howto-snap-updates-sync>`.
 
-Hold updates
-: You can hold snap updates for a specific time or forever, for all snaps or only for the LXD snap.
-  If you want to fully control updates to your LXD deployment, you should put a hold on the LXD snap until you decide to update it.
+For more information about snap updates in general, see the Snap documentation: {ref}`snap:how-to-guides-work-with-snaps-manage-updates`.
 
-  Enter the following command to indefinitely hold all updates for the LXD snap:
+(howto-snap-updates-schedule)=
+### Schedule updates with the refresh timer
 
-      sudo snap refresh --hold lxd
+Snaps can use a refresh timer to regularly update snaps at specific times. 
+This enables you to schedule automatic updates during times that don't disturb normal operation. The `refresh.timer` option is set system-wide; you cannot set it for the LXD snap only. It does not apply to snaps that are held indefinitely.
 
-  When you choose to update your installation, use the following commands to remove the hold, update the snap, and hold the updates again:
+For example, to configure your system to update snaps only between 8:00 am and 9:00 am on Mondays, set the following option:
 
-      sudo snap refresh --unhold lxd
-      sudo snap refresh lxd --cohort="+"
-      sudo snap refresh --hold lxd
+```bash
+  sudo snap set system refresh.timer=mon,8:00-9:00
+```
 
-  See [Hold refreshes](https://snapcraft.io/docs/managing-updates#heading--hold) in the snap documentation for detailed information about holding snap updates.
+You can also use the `refresh.hold` option to hold all snap updates for up to 90 days, after which they automatically update. 
 
-Specify a refresh window
-: Depending on your setup, you might want your snaps to update regularly, but only at specific times that don't disturb normal operation.
+For details on how to use the `refresh.timer` and `refresh.hold` options, see the Snap documentation: {ref}`snap:how-to-guides-work-with-snaps-manage-updates`.
 
-  You can achieve this by specifying a refresh timer.
-  This option defines a refresh window for all snaps that are installed on the system.
+(howto-snap-updates-hold)=
+### Hold updates
 
-  For example, to configure your system to update snaps only between 8:00 am and 9:00 am on Mondays, set the following option:
+You can hold snap updates for the LXD snap, either indefinitely or for a specific duration. If you want to fully control updates to your LXD snap, you should set up an indefinite hold.
 
-      sudo snap set system refresh.timer=mon,8:00-9:00
+To indefinitely hold updates, run:
 
-  You can use a similar mechanism (setting `refresh.hold`) to hold snap updates as well.
-  However, in this case the snaps will be refreshed after 90 days, irrespective of the value of `refresh.hold`.
+```bash
+sudo snap refresh --hold lxd
+```
 
-  See [Control updates with system options](https://snapcraft.io/docs/managing-updates#heading--refresh-hold) in the snap documentation for detailed information.
+Then you can perform {ref}`manual updates <howto-snap-updates-manual>` on a schedule that you control.
 
-#### Keep cluster members in sync
+The {ref}`snap:how-to-guides-work-with-snaps-manage-updates` page in the Snap documentation provides details about how to pause or stop automatic updates.
 
-The cluster members that are part of the LXD deployment must always run the same version of the LXD snap.
-This means that when the snap on one of the cluster members is refreshed, it must also be refreshed on all other cluster members before the LXD cluster is operational again.
+(howto-snap-updates-manual)=
+### Manual updates
 
-Snap updates are delivered as [progressive releases](https://snapcraft.io/docs/progressive-releases), which means that updated snap versions are made available to different machines at different times.
-This method can cause a problem for cluster updates if some cluster members are refreshed to a version that is not available to other cluster members yet.
+For a LXD snap installed as part of a cluster, see the section on {ref}`synchronizing cluster updates <howto-snap-updates-sync>` below.
 
-To avoid this problem, use the `--cohort="+"` flag when refreshing your snaps:
+Otherwise, run:
 
-    sudo snap refresh lxd --cohort="+"
+```bash
+sudo snap refresh lxd
+```
 
-This flag ensures that all machines in a cluster see the same snap revision and are therefore not affected by a progressive rollout.
+This updates your LXD snap to the latest release within its channel.
 
-### Use a Snap Store Proxy
+(howto-snap-updates-sync)=
+### Synchronize updates for a LXD cluster cohort
 
-If you manage a large LXD cluster and you need absolute control over when updates are applied, consider installing a Snap Store Proxy.
+All {ref}`LXD cluster members <exp-clusters>` must run the same LXD version, and ideally the same snap revision of the version. To synchronize updates, set the `--cohort="+"` flag on all cluster members.
 
-The Snap Store Proxy is a separate application that sits between the snap client command on your machines and the snap store.
-You can configure the Snap Store Proxy to make only specific snap revisions available for installation.
+You only need to set this flag once per LXD snap. This can occur during {ref}`installation <installing-snap-package>`, or the first time you {ref}`perform a manual update <howto-snap-updates-manual>`.
 
-See the [Snap Store Proxy documentation](https://docs.ubuntu.com/snap-store-proxy/) for information about how to install and register the Snap Store Proxy.
+To set this flag during installation:
 
-After setting it up, configure the snap clients on all cluster members to use the proxy.
-See [Configuring snap devices](https://docs.ubuntu.com/snap-store-proxy/en/devices) for instructions.
+```bash
+sudo snap install lxd --cohort="+"
+```
 
-You can then configure the Snap Store Proxy to override the revision for the LXD snap:
+To set this flag later, during a manual update:
 
-    sudo snap-proxy override lxd <channel>=<revision>
+```bash
+sudo snap refresh lxd --cohort="+"
+```
 
-For example:
+After you set this flag, `snap list lxd` shows `in-cohort` in the `Notes` column. Example:
 
-    sudo snap-proxy override lxd stable=25846
+```{terminal}
+:user: root
+:host: instance
+
+snap list lxd
+
+Name  Version         Rev    Tracking     Publisher   Notes
+lxd   5.21.3-c5ae129  33110  5.21/stable  canonical✓  in-cohort
+```
+
+Subsequent updates to this snap automatically use the `--cohort="+"` flag, even if you {ref}`change its channel <howto-snap-change>` or use automated or {ref}`scheduled <howto-snap-updates-schedule>` updates. Thus, once the snap is `in-cohort`, you can omit that flag for future updates.
+
+````{admonition} Workaround if the cohort flag malfunctions
+:class: tip
+
+If for some reason, the `--cohort="+"` flag does not work as expected, you can update using a matching revision on all cluster members manually:
+
+```bash
+sudo snap refresh lxd --revision=<revision_number>
+```
+
+Example:
+
+```bash
+sudo snap refresh lxd --revision=33110
+```
+
+````
+
+### Manage updates with an Enterprise Store proxy
+
+```{admonition} For Snap Store Proxy users
+:class: tip
+
+If you previously used the Snap Store Proxy, see the [migration guide](https://ubuntu.com/enterprise-store/docs/how-to/migrate/) in the Enterprise Store documentation for instructions on transitioning to the Enterprise Store.
+
+```
+
+If you manage a large LXD cluster and require absolute control over when updates are applied, consider using the [Enterprise Store](https://ubuntu.com/enterprise-store/docs/). This proxy application sits between your machines' snap clients and the Snap Store, giving you control over which snap revisions are available for installation.
+
+To get started, follow the Enterprise Store documentation to [install](https://ubuntu.com/enterprise-store/docs/how-to/install/) and [register](https://ubuntu.com/enterprise-store/docs/how-to/register/) the service. Once it's running, configure all cluster members to use the proxy; see [Configure devices](https://ubuntu.com/enterprise-store/docs/how-to/devices/) for instructions. You can then [override the revision](https://ubuntu.com/enterprise-store/docs/how-to/overrides/) for the LXD snap to control which version is installed:
+
+```bash
+sudo enterprise-store override lxd <channel>=<revision>
+```
+
+Example:
+
+```bash
+sudo enterprise-store override lxd stable=25846
+```
+
+(howto-snap-change)=
+## Change the snap channel
+
+You can change the tracked channel's {ref}`track <ref-snap-tracks>`, its {ref}`risk level <ref-snap-risk>`, or both. A change to a higher track is considered an {ref}`upgrade <ref-snap-upgrades>`.
+
+Downgrading is not supported from higher to lower tracks, and neither is changing from a higher to a lower risk level in the {ref}`latest <ref-snap-tracks-latest>` or {ref}`current feature <ref-snap-track-feature>` track. For details, see: {ref}`ref-snap-downgrades`.
+
+To change the {ref}`channel <ref-snap-channels>` and immediately use the most recent release in the target channel, run:
+
+```bash
+sudo snap refresh lxd --channel=<target channel> [--cohort="+"]
+```
+
+Include the optional `--cohort="+"` flag only for cluster members who have not previously set this flag before. See: {ref}`howto-snap-updates-sync`.
+
+If you upgrade LXD on cluster members, all members must be upgraded to the same version. For details, see: {ref}`howto-cluster-manage-update-upgrade`.
+
+### Examples
+
+If your current channel is `6/stable`, the following command changes the {ref}`risk level <ref-snap-risk>` only:
+
+```bash
+sudo snap refresh lxd --channel=6/edge
+```
+
+If your current channel is `5.21/edge`, the following command upgrades LXD to the `6/stable` channel:
+
+```bash
+sudo snap refresh lxd --channel=6/stable
+```
 
 (howto-snap-configure)=
 ## Configure the snap
 
 The LXD snap has several configuration options that control the behavior of the installed LXD server.
-For example, you can define a LXD user group to achieve a multi-user environment for LXD (see {ref}`projects-confine-users` for more information).
+For example, you can define a LXD user group to achieve a multi-user environment for LXD. For more information, see: {ref}`projects-confine-users`.
 
 See the [LXD snap page](https://snapcraft.io/lxd) for a list of available configuration options.
 
-To set any of these options, use the following command:
+To set any of these options, run:
 
-    sudo snap set lxd <key>=<value>
-
-For example:
-
-    sudo snap set lxd daemon.user.group=lxd-users
-
-To see all configuration options that are set on the snap, use the following command:
-
-    sudo snap get lxd
-
-```{note}
-This command returns only configuration options that have been explicitly set.
+```bash
+sudo snap set lxd <key>=<value>
 ```
 
-See [Configure snaps](https://snapcraft.io/docs/configuration-in-snaps) in the snap documentation for more information about snap configuration options.
+Example:
 
-## Start and stop the daemon
-
-To start and stop the LXD daemon, you can use the `start` and `stop` commands of the snap:
-
-    sudo snap stop lxd
-    sudo snap start lxd
-
-These commands are equivalent to running the corresponding `systemctl` commands:
-
-    sudo systemctl stop snap.lxd.daemon.service snap.lxd.daemon.unix.socket
-    sudo systemctl start snap.lxd.daemon.unix.socket; lxc list
-
-Stopping the daemon also stops all running instances.
-
-To restart the LXD daemon, use the following command:
-
-    sudo systemctl restart snap.lxd.daemon
-
-Restarting the daemon stops all running instances.
-If you want to keep the instances running, reload the daemon instead:
-
-    sudo systemctl reload snap.lxd.daemon
-
-```{note}
-To restart the daemon, you can also use the snap commands.
-To stop all running instances and restart:
-
-    sudo snap restart lxd
-
-To keep the instances running and reload:
-
-    sudo snap restart --reload lxd
-
-However, there is currently a [bug in `snapd`](https://bugs.launchpad.net/snapd/+bug/2028141) that causes undesired side effects when using the `snap restart` command.
-Therefore, we recommend using the `systemctl` commands instead.
+```bash
+sudo snap set lxd daemon.user.group=lxd-users
 ```
+
+To see all configuration options that are explicitly set on the snap, run:
+
+```bash
+sudo snap get lxd
+```
+
+### Configure feature previews
+
+```{warning}
+**Do not** enable feature previews in a production environment.
+Feature previews enable unsupported and unfinished functionality, which might cause unwanted or unpredictable system behavior, performance degradation, or data loss/corruption and more.
+```
+
+Feature previews provide access to work-in-progress features. All previews are disabled by default.
+
+To enable one or more feature previews, set the `features` option to a comma-separated list:
+
+```bash
+sudo snap set lxd features=feature_name,another_feature
+```
+
+To disable all feature previews, run:
+
+```bash
+sudo snap unset lxd features
+```
+
+Restart the LXD daemon to apply feature preview changes to the server, as described in {ref}`howto-snap-daemon`.
+
+For more information about snap configuration options, visit {ref}`snap:how-to-guides-work-with-snaps-configure-snaps` in the Snap documentation.
+
+(howto-snap-daemon)=
+## Manage the LXD daemon
+
+Installing LXD as a snap creates the LXD daemon as a **snap service**. Use the following `snap` commands to manage this daemon.
+
+To view the status of the daemon, run:
+
+```bash
+snap services lxd
+```
+
+To stop the daemon, run:
+
+```bash
+sudo snap stop lxd
+```
+
+Stopping the daemon also stops all running LXD instances.
+
+To start the LXD daemon, run:
+
+```bash
+sudo snap start lxd
+```
+
+Starting the daemon also starts all previously running LXD instances.
+
+To restart the daemon, run:
+
+```bash
+sudo snap restart lxd
+```
+
+This also stops and starts all running LXD instances. To keep the instances running as you restart the daemon, use the `--reload` flag:
+
+```bash
+sudo snap restart --reload lxd
+```
+
+For more information about managing snap services, visit {ref}`snap:how-to-guides-manage-snaps-control-services` in the Snap documentation.
+
+## Related topics
+
+How-to guide:
+
+- {ref}`installing-snap-package`
+- {ref}`snap-track-bugfix`
+
+Reference:
+
+- {ref}`ref-releases-snap`

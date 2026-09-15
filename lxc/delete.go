@@ -13,7 +13,6 @@ import (
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	cli "github.com/canonical/lxd/shared/cmd"
-	"github.com/canonical/lxd/shared/i18n"
 )
 
 type cmdDelete struct {
@@ -22,22 +21,23 @@ type cmdDelete struct {
 	flagForce          bool
 	flagForceProtected bool
 	flagInteractive    bool
+	flagDiskVolumes    string
 }
 
 func (c *cmdDelete) command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("delete", i18n.G("[<remote>:]<instance>[/<snapshot>] [[<remote>:]<instance>[/<snapshot>]...]"))
+	cmd.Use = usage("delete", "[<remote>:]<instance>[/<snapshot>] [[<remote>:]<instance>[/<snapshot>]...]")
 	cmd.Aliases = []string{"rm"}
-	cmd.Short = i18n.G("Delete instances and snapshots")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Delete instances and snapshots`))
+	cmd.Short = "Delete instances and snapshots"
+	cmd.Long = cli.FormatSection("Description", cmd.Short)
 
 	cmd.RunE = c.run
-	cmd.Flags().BoolVarP(&c.flagForce, "force", "f", false, i18n.G("Force the removal of running instances"))
-	cmd.Flags().BoolVarP(&c.flagInteractive, "interactive", "i", false, i18n.G("Require user confirmation"))
+	cmd.Flags().BoolVarP(&c.flagForce, "force", "f", false, "Force the removal of running instances")
+	cmd.Flags().BoolVarP(&c.flagInteractive, "interactive", "i", false, "Require user confirmation")
+	cmd.Flags().StringVar(&c.flagDiskVolumes, "disk-volumes", "", cli.FormatStringFlagLabel("Disk volumes mode for snapshot deletion. Possible values are \"root\" (default) and \"all-exclusive\". \"root\" only deletes the instance's root disk volume snapshot. \"all-exclusive\" deletes the instance's root disk volume snapshot and any exclusively attached volumes (non-shared) snapshots."))
 
 	cmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		return c.global.cmpInstances(toComplete)
+		return c.global.cmpInstancesAction(toComplete, "delete", c.flagForce)
 	}
 
 	return cmd
@@ -45,12 +45,12 @@ func (c *cmdDelete) command() *cobra.Command {
 
 func (c *cmdDelete) promptDelete(name string) error {
 	reader := bufio.NewReader(os.Stdin)
-	fmt.Printf(i18n.G("Remove %s (yes/no): "), name)
+	fmt.Printf("Remove %s (yes/no): ", name)
 	input, _ := reader.ReadString('\n')
 	input = strings.TrimSuffix(input, "\n")
 
-	if !shared.ValueInSlice(strings.ToLower(input), []string{i18n.G("yes")}) {
-		return errors.New(i18n.G("User aborted delete operation"))
+	if strings.ToLower(input) != "yes" {
+		return errors.New("User aborted delete operation")
 	}
 
 	return nil
@@ -63,10 +63,10 @@ func (c *cmdDelete) doDelete(d lxd.InstanceServer, name string) error {
 	if shared.IsSnapshot(name) {
 		// Snapshot delete
 		fields := strings.SplitN(name, shared.SnapshotDelimiter, 2)
-		op, err = d.DeleteInstanceSnapshot(fields[0], fields[1])
+		op, err = d.DeleteInstanceSnapshot(fields[0], fields[1], c.flagDiskVolumes)
 	} else {
 		// Instance delete
-		op, err = d.DeleteInstance(name)
+		op, err = d.DeleteInstance(name, c.flagForce)
 	}
 
 	if err != nil {
@@ -112,7 +112,7 @@ func (c *cmdDelete) run(cmd *cobra.Command, args []string) error {
 		if shared.IsSnapshot(resource.name) {
 			err := c.doDelete(resource.server, resource.name)
 			if err != nil {
-				return fmt.Errorf(i18n.G("Failed deleting instance snapshot %q in project %q: %w"), resource.name, connInfo.Project, err)
+				return fmt.Errorf("Failed deleting instance snapshot %q in project %q: %w", resource.name, connInfo.Project, err)
 			}
 
 			continue
@@ -125,27 +125,7 @@ func (c *cmdDelete) run(cmd *cobra.Command, args []string) error {
 
 		if ct.StatusCode != 0 && ct.StatusCode != api.Stopped {
 			if !c.flagForce {
-				return errors.New(i18n.G("The instance is currently running, stop it first or pass --force"))
-			}
-
-			req := api.InstanceStatePut{
-				Action:  "stop",
-				Timeout: -1,
-				Force:   true,
-			}
-
-			op, err := resource.server.UpdateInstanceState(resource.name, req, "")
-			if err != nil {
-				return err
-			}
-
-			err = op.Wait()
-			if err != nil {
-				return fmt.Errorf(i18n.G("Stopping the instance failed: %s"), err)
-			}
-
-			if ct.Ephemeral {
-				continue
+				return errors.New("The instance is currently running, stop it first or pass --force")
 			}
 		}
 
@@ -170,7 +150,7 @@ func (c *cmdDelete) run(cmd *cobra.Command, args []string) error {
 
 		err = c.doDelete(resource.server, resource.name)
 		if err != nil {
-			return fmt.Errorf(i18n.G("Failed deleting instance %q in project %q: %w"), resource.name, connInfo.Project, err)
+			return fmt.Errorf("Failed deleting instance %q in project %q: %w", resource.name, connInfo.Project, err)
 		}
 	}
 	return nil

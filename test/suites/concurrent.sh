@@ -1,9 +1,4 @@
 test_concurrent() {
-  if [ -z "${LXD_CONCURRENT:-}" ]; then
-    echo "==> SKIP: LXD_CONCURRENT isn't set"
-    return
-  fi
-
   ensure_import_testimage
 
   spawn_container() {
@@ -11,23 +6,25 @@ test_concurrent() {
 
     name=concurrent-${1}
 
-    lxc launch testimage "${name}"
-    lxc info "${name}" | grep RUNNING
-    echo abc | lxc exec "${name}" -- cat | grep abc
-    lxc stop "${name}" --force
-    lxc delete "${name}"
+    lxc launch testimage --quiet "${name}"
+    [ "$(echo abc | lxc exec "${name}" -- cat)" = "abc" ]
+    lxc delete --force "${name}"
   }
 
   PIDS=""
 
-  for id in $(seq $(($(find /sys/bus/cpu/devices/ -type l | wc -l)*8))); do
+  # spawn x times number of available CPUs
+  COUNT="$(($(nproc)*8))"
+  for id in $(seq "${COUNT}"); do
     spawn_container "${id}" 2>&1 | tee "${LXD_DIR}/lxc-${id}.out" &
     PIDS="${PIDS} $!"
   done
 
   for pid in ${PIDS}; do
-    wait "${pid}"
+    # ignore PIDs that vanished (wait returns 127 for those)
+    wait "${pid}" || [ "$?" -eq 127 ]
   done
 
-  ! lxc list | grep -q concurrent || false
+  # Verify no `concurrent-` instances was left behind
+  [ "$(lxc list -f csv -c n concurrent- || echo fail)" = "" ]
 }

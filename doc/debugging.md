@@ -80,6 +80,15 @@ openssl pkcs12 -clcerts -inkey client.key -in client.crt -export -out client.pfx
 
 After that, opening [`https://127.0.0.1:8443/1.0`](https://127.0.0.1:8443/1.0) should work as expected.
 
+## Debug LXD using `pprof`
+LXD provides a Go [`pprof`](https://pkg.go.dev/net/http/pprof) server when the {config:option}`server-core:core.debug_address` is set.
+
+The debug server should not be exposed to an externally accessible address for production use cases. Use the following command to enable the server on the loopback interface:
+
+    lxc config set core.debug_address=localhost:8080
+
+If the LXD server is running on your workstation, you can view a summary of available information by navigating to [`http://localhost:8080/debug/pprof/`](http://localhost:8080/debug/pprof/).
+
 ## Debug the LXD database
 
 The files of the global {ref}`database <database>` are stored under the `./database/global`
@@ -110,7 +119,7 @@ against the local or global database, you can use the `lxd sql` command (run
 You should only need to do that in order to recover from broken updates or bugs.
 Please consult the LXD team first (creating a [GitHub
 issue](https://github.com/canonical/lxd/issues/new) or
-[forum](https://discourse.ubuntu.com/c/lxd/126) post).
+[forum](https://discourse.ubuntu.com/c/project/lxd/126) post).
 
 ### Running custom queries at LXD daemon startup
 
@@ -134,3 +143,42 @@ If you want to flush the content of the cluster database to disk, use the `lxd
 sql global .sync` command, that will write a plain SQLite database file into
 `./database/global/db.bin`, which you can then inspect with the `sqlite3`
 command line tool.
+
+## Inspect a core dump file
+
+In our continuous integration tests, we have configured the `core_pattern` as follows:
+
+    echo '|/bin/sh -c $@ -- eval exec gzip --fast > /var/crash/%e.%p.gz' | sudo tee /proc/sys/kernel/core_pattern
+
+Additionally, we have set the `GOTRACEBACK` environment variable to `crash`.
+Together, these ensure that when LXD crashes a core dump is compressed with `gzip` and placed in `/var/crash`.
+
+To inspect a core dump file, you will need the LXD binary that was running at the time of the crash.
+The binary must include symbols; you can check this with the `file` utility.
+You will also need any C libraries that are used by LXD which must also include symbols.
+
+You can inspect a core dump using [Delve](https://github.com/go-delve/delve) (see the [Go Wiki](https://go.dev/wiki/CoreDumpDebugging) for more information), but this does not support any dynamically linked C libraries.
+Instead, you can use [GDB](https://sourceware.org/gdb/) which can inspect linked libraries and allows sourcing a file to load Golang support.
+
+To do this, run:
+
+    gdb <LXD binary> <coredump file>
+
+Then in the GDB REPL, run:
+
+    (gdb) source <GOROOT>/src/runtime/runtime-gdb.py
+
+Substituting in the actual path to your `$GOROOT`.
+This will add Golang runtime support.
+
+Finally, set the search path for C libraries using:
+
+    (gdb) set solib-search-path <path to C libraries>
+
+You can now use the GDB REPL to inspect the core dump.
+Some useful commands are:
+
+- `backtrace` (print stack trace).
+- `info goroutines` (show goroutines).
+- `info threads` (show threads).
+- `thread <thread_number>` (change thread).

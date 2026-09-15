@@ -10,3 +10,67 @@ test_resources() {
   echo "${RES}" | grep -q "Used:"
   echo "${RES}" | grep -q "Total:"
 }
+
+test_resources_bcache() {
+  # Make sure bcache is loaded.
+  modprobe bcache
+
+  # Create two loop devices used for the bcache cache and backing device.
+  # XXX: the caching device must be larger than 256M
+  configure_loop_device loop_file_1 loop_device_1 300M
+  configure_loop_device loop_file_2 loop_device_2 300M
+
+  # Create a partition on the backing device using the loop device's entire size.
+  # shellcheck disable=SC2154
+  parted -s "${loop_device_2}" mklabel gpt mkpart primary 0% 100%
+
+  # Wait for the partition to be present.
+  # shellcheck disable=SC2154
+  partprobe "${loop_device_2}"
+  udevadm settle
+
+  # shellcheck disable=SC2154
+  backing_device_partition="${loop_device_2}p1"
+
+  # Create bcache device.
+  # shellcheck disable=SC2154
+  make-bcache -C "${loop_device_1}" -B "${backing_device_partition}"
+
+  # Register bcache device.
+  # shellcheck disable=SC2154
+  echo "${loop_device_1}" > /sys/fs/bcache/register
+  # shellcheck disable=SC2154
+  echo "${backing_device_partition}" > /sys/fs/bcache/register
+
+  # Print for debugging purposes.
+  lxc query /1.0/resources | jq --exit-status '.storage.disks'
+
+  # Check the bcache device is returned by LXD.
+  lxc query /1.0/resources | jq --exit-status '.storage.disks[] | select(.id == "bcache0")'
+
+  # Get the bcache cache and backing devices.
+  cache_device_base="$(basename "${loop_device_1}")"
+  backing_device_base="$(basename "${loop_device_2}")/$(basename "${backing_device_partition}")"
+  cache_device="$(< "/sys/block/${cache_device_base}/dev")"
+  backing_device="$(< "/sys/block/${backing_device_base}/dev")"
+
+  # Check the devices are actually used for the bcache device as cache and backing.
+  [ "$(< "/sys/block/bcache0/slaves/${cache_device_base}/dev")" = "${cache_device}" ]
+  [ "$(< "/sys/block/bcache0/slaves/$(basename "${backing_device_partition}")/dev")" = "${backing_device}" ]
+
+  # Check the devices are marked in use by bcache.
+  # The actual bcache device should report an unset 'used_by' field.
+  # The backing device is not visible as partitions are not reported as individual disks.
+  lxc query /1.0/resources | jq --exit-status '.storage.disks[] | select(.id == "bcache0") | .used_by == null'
+  lxc query /1.0/resources | jq --exit-status '.storage.disks[] | select(.device == "'"${cache_device}"'") | .used_by == "bcache"'
+  lxc query /1.0/resources | jq --exit-status '([.storage.disks[] | select(.device == "'"${backing_device}"'")] | length) == 0'
+
+  # Cleanup
+  echo 1 > /sys/block/bcache0/bcache/stop
+  for i in /sys/fs/bcache/*; do echo 1 > "$i/stop" 2>/dev/null || true; done
+  # shellcheck disable=SC2154
+  deconfigure_loop_device "${loop_file_1}" "${loop_device_1}"
+  # shellcheck disable=SC2154
+  deconfigure_loop_device "${loop_file_2}" "${loop_device_2}"
+}
+

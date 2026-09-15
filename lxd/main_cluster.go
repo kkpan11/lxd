@@ -3,16 +3,18 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/canonical/go-dqlite/client"
+	"github.com/canonical/go-dqlite/v3/client"
 	"github.com/spf13/cobra"
+	"go.yaml.in/yaml/v2"
 	"golang.org/x/sys/unix"
-	"gopkg.in/yaml.v2"
 
 	"github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/lxd/cluster"
@@ -32,7 +34,7 @@ func promptConfirmation(prompt string, opname string) error {
 	input, _ := reader.ReadString('\n')
 	input = strings.TrimSuffix(input, "\n")
 
-	if !shared.ValueInSlice(strings.ToLower(input), []string{"yes"}) {
+	if strings.ToLower(input) != "yes" {
 		return fmt.Errorf("%s operation aborted", opname)
 	}
 
@@ -124,7 +126,7 @@ const clusterEditPrompt = `You should run this command only if:
  - You are *absolutely* sure all LXD daemons are stopped
  - This instance has the most up to date database
 
-See https://documentation.ubuntu.com/lxd/en/latest/howto/cluster_recover/#reconfigure-the-cluster for more info.`
+See https://canonical.com/lxd/docs/latest/howto/cluster_recover/#reconfigure-the-cluster for more info.`
 
 const clusterEditComment = `# Member roles can be modified. Unrecoverable nodes should be given the role "spare".
 #
@@ -160,7 +162,7 @@ func (c *cmdClusterEdit) Run(cmd *cobra.Command, args []string) error {
 	// Make sure that the daemon is not running.
 	_, err := lxd.ConnectLXDUnix("", nil)
 	if err == nil {
-		return fmt.Errorf("The LXD daemon is running, please stop it first.")
+		return errors.New("The LXD daemon is running, please stop it first.")
 	}
 
 	database, err := db.OpenNode(filepath.Join(sys.DefaultOS().VarDir, "database"), nil)
@@ -177,7 +179,7 @@ func (c *cmdClusterEdit) Run(cmd *cobra.Command, args []string) error {
 
 		clusterAddress := config.ClusterAddress()
 		if clusterAddress == "" {
-			return fmt.Errorf(`Can't edit cluster configuration as server isn't clustered (missing "cluster.https_address" config)`)
+			return errors.New(`Cannot edit cluster configuration as server is not clustered (missing "cluster.https_address" config)`)
 		}
 
 		nodes, err = tx.GetRaftNodes(ctx)
@@ -287,11 +289,11 @@ func (c *cmdClusterEdit) Run(cmd *cobra.Command, args []string) error {
 
 func validateNewConfig(oldNodes []db.RaftNode, newNodes []db.RaftNode) error {
 	if len(oldNodes) > len(newNodes) {
-		return fmt.Errorf("Removing cluster members is not supported")
+		return errors.New("Removing cluster members is not supported")
 	}
 
 	if len(oldNodes) < len(newNodes) {
-		return fmt.Errorf("Adding cluster members is not supported")
+		return errors.New("Adding cluster members is not supported")
 	}
 
 	numNewVoters := 0
@@ -300,12 +302,12 @@ func validateNewConfig(oldNodes []db.RaftNode, newNodes []db.RaftNode) error {
 
 		// IDs should not be reordered among cluster members.
 		if oldNode.ID != newNode.ID {
-			return fmt.Errorf("Changing cluster member ID is not supported")
+			return errors.New("Changing cluster member ID is not supported")
 		}
 
 		// If the name field could not be populated, just ignore the new value.
 		if oldNode.Name != "" && newNode.Name != "" && oldNode.Name != newNode.Name {
-			return fmt.Errorf("Changing cluster member name is not supported")
+			return errors.New("Changing cluster member name is not supported")
 		}
 
 		if oldNode.Role == db.RaftSpare && newNode.Role == db.RaftVoter {
@@ -379,7 +381,7 @@ func (c *cmdClusterShow) Run(cmd *cobra.Command, args []string) error {
 	if len(config.Members) > 0 {
 		fmt.Printf(segmentComment+"\n\n%s", segmentID, data)
 	} else {
-		fmt.Print(data)
+		fmt.Printf("%s", data)
 	}
 
 	return nil
@@ -407,12 +409,12 @@ func (c *cmdClusterListDatabase) Run(cmd *cobra.Command, args []string) error {
 
 	db, err := db.OpenNode(filepath.Join(os.VarDir, "database"), nil)
 	if err != nil {
-		return fmt.Errorf("Failed to open local database: %w", err)
+		return fmt.Errorf("Failed opening local database: %w", err)
 	}
 
 	addresses, err := cluster.ListDatabaseNodes(db)
 	if err != nil {
-		return fmt.Errorf("Failed to get database nodes: %w", err)
+		return fmt.Errorf("Failed getting database nodes: %w", err)
 	}
 
 	columns := []string{"Address"}
@@ -428,9 +430,9 @@ func (c *cmdClusterListDatabase) Run(cmd *cobra.Command, args []string) error {
 
 const recoverFromQuorumLossPrompt = `You should run this command only if you are *absolutely* certain that this is
 the only database member left in your cluster AND that other database members will
-never come back (i.e. their LXD daemon won't ever be started again).
+never come back (i.e. their LXD daemon will not ever be started again).
 
-This will make this LXD server the only member of the cluster, and it won't
+This will make this LXD server the only member of the cluster, and it will not
 be possible to perform operations on former cluster members anymore.
 
 However all information about former cluster members will be preserved in the
@@ -439,7 +441,7 @@ database, so you can possibly inspect it for further recovery.
 You'll be able to permanently delete from the database all information about
 former cluster members by running "lxc cluster remove <member-name> --force".
 
-See https://documentation.ubuntu.com/lxd/en/latest/howto/cluster_recover/#recover-from-quorum-loss for more
+See https://canonical.com/lxd/docs/latest/howto/cluster_recover/#recover-from-quorum-loss for more
 info.`
 
 type cmdClusterRecoverFromQuorumLoss struct {
@@ -455,7 +457,7 @@ func (c *cmdClusterRecoverFromQuorumLoss) Command() *cobra.Command {
 
 	cmd.RunE = c.Run
 
-	cmd.Flags().BoolVarP(&c.flagNonInteractive, "quiet", "q", false, "Don't require user confirmation")
+	cmd.Flags().BoolVarP(&c.flagNonInteractive, "quiet", "q", false, "Do not require user confirmation")
 
 	return cmd
 }
@@ -465,7 +467,7 @@ func (c *cmdClusterRecoverFromQuorumLoss) Run(cmd *cobra.Command, args []string)
 	// Make sure that the daemon is not running.
 	_, err := lxd.ConnectLXDUnix("", nil)
 	if err == nil {
-		return fmt.Errorf("The LXD daemon is running, please stop it first.")
+		return errors.New("The LXD daemon is running, please stop it first.")
 	}
 
 	// Prompt for confirmation unless --quiet was passed.
@@ -480,7 +482,7 @@ func (c *cmdClusterRecoverFromQuorumLoss) Run(cmd *cobra.Command, args []string)
 
 	db, err := db.OpenNode(filepath.Join(os.VarDir, "database"), nil)
 	if err != nil {
-		return fmt.Errorf("Failed to open local database: %w", err)
+		return fmt.Errorf("Failed opening local database: %w", err)
 	}
 
 	return cluster.Recover(db)
@@ -488,7 +490,7 @@ func (c *cmdClusterRecoverFromQuorumLoss) Run(cmd *cobra.Command, args []string)
 
 const removeRaftNodePrompt = `You should run this command only if you ended up in an
 inconsistent state where a cluster member has been uncleanly removed (i.e. it
-doesn't show up in "lxc cluster list" but it's still in the raft configuration).`
+does not show up in "lxc cluster list" but it's still in the raft configuration).`
 
 type cmdClusterRemoveRaftNode struct {
 	global             *cmdGlobal
@@ -503,7 +505,7 @@ func (c *cmdClusterRemoveRaftNode) Command() *cobra.Command {
 
 	cmd.RunE = c.Run
 
-	cmd.Flags().BoolVarP(&c.flagNonInteractive, "quiet", "q", false, "Don't require user confirmation")
+	cmd.Flags().BoolVarP(&c.flagNonInteractive, "quiet", "q", false, "Do not require user confirmation")
 
 	return cmd
 }
@@ -512,7 +514,7 @@ func (c *cmdClusterRemoveRaftNode) Command() *cobra.Command {
 func (c *cmdClusterRemoveRaftNode) Run(cmd *cobra.Command, args []string) error {
 	if len(args) != 1 {
 		_ = cmd.Help()
-		return fmt.Errorf("Missing required arguments")
+		return errors.New("Missing required arguments")
 	}
 
 	address := util.CanonicalNetworkAddress(args[0], shared.HTTPSDefaultPort)
@@ -527,11 +529,11 @@ func (c *cmdClusterRemoveRaftNode) Run(cmd *cobra.Command, args []string) error 
 
 	client, err := lxd.ConnectLXDUnix("", nil)
 	if err != nil {
-		return fmt.Errorf("Failed to connect to LXD daemon: %w", err)
+		return fmt.Errorf("Failed connecting to LXD daemon: %w", err)
 	}
 
-	endpoint := fmt.Sprintf("/internal/cluster/raft-node/%s", address)
-	_, _, err = client.RawQuery("DELETE", endpoint, nil, "")
+	endpoint := "/internal/cluster/raft-node/" + address
+	_, _, err = client.RawQuery(http.MethodDelete, endpoint, nil, "")
 	if err != nil {
 		return err
 	}

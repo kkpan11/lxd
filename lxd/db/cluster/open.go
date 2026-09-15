@@ -3,17 +3,21 @@ package cluster
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 
-	"github.com/canonical/go-dqlite/driver"
+	"github.com/canonical/go-dqlite/v3/driver"
 
+	"github.com/canonical/lxd/lxd/auth"
 	"github.com/canonical/lxd/lxd/db/query"
 	"github.com/canonical/lxd/lxd/db/schema"
 	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared"
+	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/osarch"
 	"github.com/canonical/lxd/shared/version"
@@ -29,7 +33,7 @@ import (
 func Open(name string, store driver.NodeStore, options ...driver.Option) (*sql.DB, error) {
 	driver, err := driver.New(store, options...)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to create dqlite driver: %w", err)
+		return nil, fmt.Errorf("Failed creating dqlite driver: %w", err)
 	}
 
 	driverName := dqliteDriverName()
@@ -52,14 +56,11 @@ func Open(name string, store driver.NodeStore, options ...driver.Option) (*sql.D
 
 // EnsureSchema applies all relevant schema updates to the cluster database.
 //
-// Before actually doing anything, this function will make sure that all nodes
-// in the cluster have a schema version and a number of API extensions that
-// match our one. If it's not the case, we either return an error (if some
-// nodes have version greater than us and we need to be upgraded), or return
-// false and no error (if some nodes have a lower version, and we need to wait
-// till they get upgraded and restarted).
-func EnsureSchema(db *sql.DB, address string, dir string) (bool, error) {
-	someNodesAreBehind := false
+// Before actually doing anything, this function will make sure that all members in the cluster have a schema
+// version and a number of API extensions that match our one.
+// If it's not the case an api.StatusError with code http.StatusPreconditionFailed is returned,
+// this indicates that this member should wait for them to become aligned.
+func EnsureSchema(db *sql.DB, address string, dir string, serverUUID string) error {
 	apiExtensions := version.APIExtensionsCount()
 
 	backupDone := false
@@ -67,7 +68,7 @@ func EnsureSchema(db *sql.DB, address string, dir string) (bool, error) {
 		// Check if this is a fresh instance.
 		isUpdate, err := schema.DoesSchemaTableExist(ctx, tx)
 		if err != nil {
-			return fmt.Errorf("Failed to check if schema table exists: %w", err)
+			return fmt.Errorf("Failed checking if schema table exists: %w", err)
 		}
 
 		if !isUpdate {
@@ -78,12 +79,12 @@ func EnsureSchema(db *sql.DB, address string, dir string) (bool, error) {
 		clustered := true
 		n, err := selectUnclusteredNodesCount(ctx, tx)
 		if err != nil {
-			return fmt.Errorf("Failed to fetch standalone member count: %w", err)
+			return fmt.Errorf("Failed fetching standalone member count: %w", err)
 		}
 
 		if n > 1 {
 			// This should never happen, since we only add cluster members with valid addresses.
-			return fmt.Errorf("Found more than one cluster member with a standalone address (0.0.0.0)")
+			return errors.New("Found more than one cluster member with a standalone address (0.0.0.0)")
 		} else if n == 1 {
 			clustered = false
 		}
@@ -93,20 +94,20 @@ func EnsureSchema(db *sql.DB, address string, dir string) (bool, error) {
 		// non-clustered case, because otherwise the directory would be
 		// re-populated by replication.
 		if !clustered && !backupDone {
-			logger.Infof("Updating the LXD global schema. Backup made as \"global.bak\"")
+			logger.Info("Updating the LXD global schema. Backup made as \"global.bak\"")
 			err := shared.DirCopy(
 				filepath.Join(dir, "global"),
 				filepath.Join(dir, "global.bak"),
 			)
 			if err != nil {
-				return fmt.Errorf("Failed to backup global database: %w", err)
+				return fmt.Errorf("Failed backing up global database: %w", err)
 			}
 
 			backupDone = true
 		}
 
 		if version == -1 {
-			logger.Debugf("Running pre-update queries from file for global DB schema")
+			logger.Debug("Running pre-update queries from file for global DB schema")
 		} else {
 			logger.Debugf("Updating global DB schema from %d to %d", version, version+1)
 		}
@@ -124,12 +125,12 @@ func EnsureSchema(db *sql.DB, address string, dir string) (bool, error) {
 		// Check if we're clustered
 		n, err := selectUnclusteredNodesCount(ctx, tx)
 		if err != nil {
-			return fmt.Errorf("Failed to fetch standalone member count: %w", err)
+			return fmt.Errorf("Failed fetching standalone member count: %w", err)
 		}
 
 		if n > 1 {
 			// This should never happen, since we only add nodes with valid addresses.
-			return fmt.Errorf("Found more than one cluster member with a standalone address (0.0.0.0)")
+			return errors.New("Found more than one cluster member with a standalone address (0.0.0.0)")
 		} else if n == 1 {
 			address = "0.0.0.0" // We're not clustered
 		}
@@ -137,16 +138,15 @@ func EnsureSchema(db *sql.DB, address string, dir string) (bool, error) {
 		// Update the schema and api_extension columns of ourselves.
 		err = updateNodeVersion(tx, address, apiExtensions)
 		if err != nil {
-			return fmt.Errorf("Failed to update cluster member version info: %w", err)
+			return fmt.Errorf("Failed updating cluster member version info for %q: %w", address, err)
 		}
 
-		err = checkClusterIsUpgradable(ctx, tx, [2]int{len(updates), apiExtensions})
-		if err == errSomeNodesAreBehind {
-			someNodesAreBehind = true
-			return schema.ErrGracefulAbort
+		err = checkNoLocalStorageBuckets(ctx, tx)
+		if err != nil {
+			return err
 		}
 
-		return err
+		return checkClusterIsUpgradable(ctx, tx, [2]int{len(updates), apiExtensions})
 	}
 
 	schema := Schema()
@@ -159,24 +159,20 @@ func EnsureSchema(db *sql.DB, address string, dir string) (bool, error) {
 		var err error
 		initial, err = schema.Ensure(db)
 		if err != nil {
-			return fmt.Errorf("Failed to ensure schema: %w", err)
+			return fmt.Errorf("Failed ensuring schema: %w", err)
 		}
 
 		err = query.Transaction(ctx, db, func(ctx context.Context, tx *sql.Tx) error {
 			return applyTriggers(ctx, tx)
 		})
 		if err != nil {
-			return fmt.Errorf("Failed to apply triggers: %w", err)
+			return fmt.Errorf("Failed applying triggers: %w", err)
 		}
 
 		return err
 	})
-	if someNodesAreBehind {
-		return false, nil
-	}
-
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	// When creating a database from scratch, insert an entry for node
@@ -185,14 +181,20 @@ func EnsureSchema(db *sql.DB, address string, dir string) (bool, error) {
 	if initial == 0 {
 		arch, err := osarch.ArchitectureGetLocalID()
 		if err != nil {
-			return false, err
+			return err
 		}
 
-		err = query.Transaction(context.TODO(), db, func(ctx context.Context, tx *sql.Tx) error {
+		err = query.Transaction(context.TODO(), db, func(_ context.Context, tx *sql.Tx) error {
 			stmt := `
 INSERT INTO nodes(id, name, address, schema, api_extensions, arch, description) VALUES(1, 'none', '0.0.0.0', ?, ?, ?, '')
 `
 			_, err = tx.Exec(stmt, SchemaVersion, apiExtensions, arch)
+			if err != nil {
+				return err
+			}
+
+			// If bootstrapping, set the cluster-wide UUID to the value of the initial server UUID.
+			_, err = tx.Exec(`INSERT INTO config (key, value) VALUES ('volatile.uuid', ?)`, serverUUID)
 			if err != nil {
 				return err
 			}
@@ -203,10 +205,23 @@ INSERT INTO nodes(id, name, address, schema, api_extensions, arch, description) 
 
 			// Enable all features for default project.
 			for featureName := range ProjectFeatures {
-				_, _ = defaultProjectStmt.WriteString(fmt.Sprintf("INSERT INTO projects_config (project_id, key, value) VALUES (1, '%s', 'true');", featureName))
+				_, _ = fmt.Fprintf(&defaultProjectStmt, "INSERT INTO projects_config (project_id, key, value) VALUES (1, '%s', 'true');", featureName)
 			}
 
 			_, err = tx.Exec(defaultProjectStmt.String())
+			if err != nil {
+				return err
+			}
+
+			// Server administrators auth group
+			stmt = `INSERT INTO auth_groups (name, description) VALUES ('admins', 'Server administrators')`
+			_, err = tx.Exec(stmt)
+			if err != nil {
+				return err
+			}
+
+			stmt = `INSERT INTO auth_groups_permissions (auth_group_id, entity_type, entity_id, entitlement) VALUES (1, ?, 0, ?)`
+			_, err = tx.Exec(stmt, entityTypeCodeServer, string(auth.EntitlementAdmin))
 			if err != nil {
 				return err
 			}
@@ -233,11 +248,11 @@ INSERT INTO nodes_cluster_groups (node_id, group_id) VALUES(1, 1);
 			return nil
 		})
 		if err != nil {
-			return false, err
+			return err
 		}
 	}
 
-	return true, err
+	return nil
 }
 
 // Generate a new name for the dqlite driver registration. We need it to be
@@ -253,11 +268,47 @@ func dqliteDriverName() string {
 // registered.
 var dqliteDriverSerial uint64
 
+// checkNoLocalStorageBuckets returns an error if the database contains any storage buckets backed by
+// a local (non-object) storage pool driver. Such buckets are no longer supported and must be removed
+// before the schema can be upgraded.
+func checkNoLocalStorageBuckets(ctx context.Context, tx *sql.Tx) error {
+	// Check whether the storage_buckets table already exists (it may not in very old schemas).
+	var tableName string
+	err := tx.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type='table' AND name='storage_buckets'").Scan(&tableName)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // Table doesn't exist yet, nothing to check.
+	}
+
+	if err != nil {
+		return fmt.Errorf("Failed checking if storage_buckets table exists: %w", err)
+	}
+
+	var count int
+	err = tx.QueryRowContext(ctx, `
+SELECT COUNT(sb.id)
+FROM storage_buckets AS sb
+JOIN storage_pools AS sp ON sb.storage_pool_id = sp.id
+WHERE sp.driver != 'cephobject'
+`).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("Failed checking for local storage buckets: %w", err)
+	}
+
+	if count > 0 {
+		return errors.New("This LXD version no longer supports storage buckets backed by local storage drivers. " +
+			"This server has one or more such buckets and cannot be upgraded. " +
+			"To continue using those buckets, roll back to the previous LXD version. " +
+			"To proceed with the upgrade, back up and delete all locally-backed storage buckets first, then retry.")
+	}
+
+	return nil
+}
+
 func checkClusterIsUpgradable(ctx context.Context, tx *sql.Tx, target [2]int) error {
 	// Get the current versions in the nodes table.
 	versions, err := selectNodesVersions(ctx, tx)
 	if err != nil {
-		return fmt.Errorf("failed to fetch current nodes versions: %w", err)
+		return fmt.Errorf("Failed fetching current member versions: %w", err)
 	}
 
 	for _, version := range versions {
@@ -268,25 +319,18 @@ func checkClusterIsUpgradable(ctx context.Context, tx *sql.Tx, target [2]int) er
 
 		switch n {
 		case 0:
-			// Versions are equal, there's hope for the
-			// update. Let's check the next node.
+			// Versions are equal, there's hope for the update.
+			// Let's check the next member.
 			continue
 		case 1:
-			// Our version is bigger, we should stop here
-			// and wait for other nodes to be upgraded and
-			// restarted.
-			return errSomeNodesAreBehind
+			// Our version is ahead, we should wait for other members to align to our version.
+			return api.StatusErrorf(http.StatusPreconditionFailed, "A cluster member's version (%v) is behind this cluster member's version (%v), please ensure versions match", version, target)
 		case 2:
-			// Another node has a version greater than ours
-			// and presumeably is waiting for other nodes
-			// to upgrade. Let's error out and shutdown
-			// since we need a greater version.
-			return fmt.Errorf("This cluster member's version is behind, please upgrade")
+			// Our version is behind, we should wait for other members to align to our version.
+			return api.StatusErrorf(http.StatusPreconditionFailed, "This cluster member's version (%v) is behind another member's version (%v), please ensure versions match", target, version)
 		default:
 			panic("Unexpected return value from compareVersions")
 		}
 	}
 	return nil
 }
-
-var errSomeNodesAreBehind = fmt.Errorf("Some cluster members are behind this cluster member's version")

@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -15,12 +16,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/canonical/go-dqlite/driver"
+	"github.com/canonical/go-dqlite/v3/driver"
 
 	"github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/db/node"
 	"github.com/canonical/lxd/lxd/db/query"
 	"github.com/canonical/lxd/shared"
+	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/logger"
 )
 
@@ -35,6 +37,9 @@ type Node struct {
 	db  *sql.DB // Handle to the node-local SQLite database file.
 	dir string  // Reference to the directory where the database file lives.
 }
+
+// Transactor is used to run transactions against the cluster database.
+type Transactor func(ctx context.Context, f func(context.Context, *ClusterTx) error) error
 
 // OpenNode creates a new Node object.
 //
@@ -93,6 +98,11 @@ func (n *Node) Dir() string {
 	return n.dir
 }
 
+// DqliteDir returns the global database directory used by dqlite.
+func (n *Node) DqliteDir() string {
+	return filepath.Join(n.Dir(), "global")
+}
+
 // Transaction creates a new NodeTx object and transactionally executes the
 // node-level database interactions invoked by the given function. If the
 // function returns no error, all database changes are committed to the
@@ -122,21 +132,22 @@ type Cluster struct {
 // database.
 //
 // - name: Basename of the database file holding the data. Typically "db.bin".
-// - dialer: Function used to connect to the dqlite backend via gRPC SQL.
+// - store: Node store used to connect to the dqlite backend.
 // - address: Network address of this node (or empty string).
 // - dir: Base LXD database directory (e.g. /var/lib/lxd/database)
 // - timeout: Give up trying to open the database after this amount of time.
-// - dump: If not nil, a copy of 2.0 db data, for migrating to 3.0.
+// - serverUUID: UUID of this server, used for schema validation.
+// - options: Additional driver options passed to the dqlite driver.
 //
-// The address and api parameters will be used to determine if the cluster
-// database matches our version, and possibly trigger a schema update. If the
-// schema update can't be performed right now, because some nodes are still
-// behind, an Upgrading error is returned.
+// The address parameter will be used to determine if the cluster database
+// matches our version, and possibly trigger a schema update. If the schema
+// update can't be performed right now, because some nodes are still behind,
+// an Upgrading error is returned.
 // Accepts a closingCtx context argument used to indicate when the daemon is shutting down.
-func OpenCluster(closingCtx context.Context, name string, store driver.NodeStore, address, dir string, timeout time.Duration, dump *Dump, options ...driver.Option) (*Cluster, error) {
+func OpenCluster(closingCtx context.Context, name string, store driver.NodeStore, address, dir string, timeout time.Duration, serverUUID string, options ...driver.Option) (*Cluster, error) {
 	db, err := cluster.Open(name, store, options...)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to open database: %w", err)
+		return nil, fmt.Errorf("Failed opening database: %w", err)
 	}
 
 	db.SetMaxOpenConns(1)
@@ -154,7 +165,7 @@ func OpenCluster(closingCtx context.Context, name string, store driver.NodeStore
 		logPriority := 1 // 0 is discard, 1 is Debug, 2 is Error
 		if i > 5 {
 			logPriority = 2
-			if i > 15 && !((i % 5) == 0) {
+			if i > 15 && (i%5) != 0 {
 				logPriority = 0
 			}
 		}
@@ -178,62 +189,37 @@ func OpenCluster(closingCtx context.Context, name string, store driver.NodeStore
 			logger.Error("Failed connecting to global database", logCtx)
 		}
 
-		select {
-		case <-connectCtx.Done():
-			return nil, connectCtx.Err()
-		default:
-			time.Sleep(2 * time.Second)
+		err = connectCtx.Err()
+		if err != nil {
+			return nil, err
 		}
+
+		time.Sleep(2 * time.Second)
 	}
 
 	// FIXME: https://github.com/canonical/dqlite/issues/163
 	_, err = db.Exec("PRAGMA cache_size=-50000")
 	if err != nil {
-		return nil, fmt.Errorf("Failed to set page cache size: %w", err)
+		return nil, fmt.Errorf("Failed setting page cache size: %w", err)
 	}
 
-	if dump != nil {
-		logger.Infof("Migrating data from local to global database")
-		err := query.Transaction(context.TODO(), db, func(ctx context.Context, tx *sql.Tx) error {
-			return importPreClusteringData(tx, dump)
-		})
-		if err != nil {
-			// Restore the local sqlite3 backup and wipe the raft
-			// directory, so users can fix problems and retry.
-			path := filepath.Join(dir, "local.db")
-			copyErr := shared.FileCopy(path+".bak", path)
-			if copyErr != nil {
-				// Ignore errors here, there's not much we can do
-				logger.Errorf("Failed to restore local database: %v", copyErr)
-			}
-
-			rmErr := os.RemoveAll(filepath.Join(dir, "global"))
-			if rmErr != nil {
-				// Ignore errors here, there's not much we can do
-				logger.Errorf("Failed to cleanup global database: %v", rmErr)
-			}
-
-			return nil, fmt.Errorf("Failed to migrate data to global database: %w", err)
-		}
-	}
-
-	nodesVersionsMatch, err := cluster.EnsureSchema(db, address, dir)
+	err = cluster.EnsureSchema(db, address, dir, serverUUID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to ensure schema: %w", err)
-	}
+		if api.StatusErrorCheck(err, http.StatusPreconditionFailed) {
+			cluster := &Cluster{
+				db:         db,
+				closingCtx: closingCtx,
+			}
 
-	if !nodesVersionsMatch {
-		cluster := &Cluster{
-			db:         db,
-			closingCtx: closingCtx,
+			return cluster, err
 		}
 
-		return cluster, ErrSomeNodesAreBehind
+		return nil, fmt.Errorf("Failed ensuring schema: %w", err)
 	}
 
 	stmts, err := cluster.PrepareStmts(db, false)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to prepare statements: %w", err)
+		return nil, fmt.Errorf("Failed preparing statements: %w", err)
 	}
 
 	cluster.PreparedStmts = stmts
@@ -243,7 +229,7 @@ func OpenCluster(closingCtx context.Context, name string, store driver.NodeStore
 		closingCtx: closingCtx,
 	}
 
-	err = clusterDB.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+	err = clusterDB.Transaction(closingCtx, func(ctx context.Context, tx *ClusterTx) error {
 		// Figure out the ID of this node.
 		members, err := tx.GetNodes(ctx)
 		if err != nil {
@@ -270,24 +256,14 @@ func OpenCluster(closingCtx context.Context, name string, store driver.NodeStore
 		// Set the local member ID
 		clusterDB.NodeID(memberID)
 
-		// Delete any operation tied to this member
-		err = cluster.DeleteOperations(ctx, tx.tx, memberID)
-		if err != nil {
-			return err
-		}
-
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	return clusterDB, err
+	return clusterDB, nil
 }
-
-// ErrSomeNodesAreBehind is returned by OpenCluster if some of the nodes in the
-// cluster have a schema or API version that is less recent than this node.
-var ErrSomeNodesAreBehind = fmt.Errorf("some nodes are behind this node's version")
 
 // ForLocalInspection is a aid for the hack in initializeDbObject, which
 // sets the db-related Deamon attributes upfront, to be backward compatible
@@ -332,32 +308,43 @@ func (c *Cluster) Transaction(ctx context.Context, f func(context.Context, *Clus
 	return c.transaction(ctx, f)
 }
 
-// EnterExclusive acquires a lock on the cluster db, so any successive call to
-// Transaction will block until ExitExclusive has been called.
-func (c *Cluster) EnterExclusive() error {
-	logger.Debug("Acquiring exclusive lock on cluster db")
+// RunExclusive acquires a lock on the cluster db and calls f.
+// Any successive call to Transaction() will block until f has returned.
+// f is passed a Transactor that can be used to run transactions against the locked database.
+func (c *Cluster) RunExclusive(f func(t Transactor) error) error {
+	logger.Info("Acquiring exclusive lock on cluster database")
+
+	unlock := func() {
+		logger.Info("Releasing exclusive lock on cluster database")
+		c.mu.Unlock()
+	}
+
+	timeout := 20 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 
 	ch := make(chan struct{})
 	go func() {
 		c.mu.Lock()
-		ch <- struct{}{}
+
+		if ctx.Err() == nil {
+			// Close channel to indicate lock acquired. Safe even if outer function has returned.
+			close(ch)
+		} else {
+			// Release lock if outer function has timed out and returned.
+			// This avoids leaving the lock acquired permanently in the case of timeout.
+			unlock()
+		}
 	}()
 
-	timeout := 20 * time.Second
 	select {
 	case <-ch:
-		return nil
+		err := f(c.transaction)
+		unlock()
+		return err
 	case <-time.After(timeout):
-		return fmt.Errorf("timeout (%s)", timeout)
+		return fmt.Errorf("Timed out exclusively locking cluster database (%s)", timeout)
 	}
-}
-
-// ExitExclusive runs the given transaction and then releases the lock acquired
-// with EnterExclusive.
-func (c *Cluster) ExitExclusive(ctx context.Context, f func(context.Context, *ClusterTx) error) error {
-	logger.Debug("Releasing exclusive lock on cluster db")
-	defer c.mu.Unlock()
-	return c.transaction(ctx, f)
 }
 
 func (c *Cluster) transaction(ctx context.Context, f func(context.Context, *ClusterTx) error) error {
@@ -372,7 +359,7 @@ func (c *Cluster) transaction(ctx context.Context, f func(context.Context, *Clus
 		}
 
 		err := query.Transaction(ctx, c.db, txFunc)
-		if errors.Is(err, context.DeadlineExceeded) {
+		if err != nil && errors.Is(err, context.DeadlineExceeded) {
 			// If the query timed out it likely means that the leader has abruptly become unreachable.
 			// Now that this query has been cancelled, a leader election should have taken place by now.
 			// So let's retry the transaction once more in case the global database is now available again.
@@ -417,7 +404,7 @@ func (c *Cluster) Begin() (*sql.Tx, error) {
 }
 
 func begin(db *sql.DB) (*sql.Tx, error) {
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		tx, err := db.Begin()
 		if err == nil {
 			return tx, nil
@@ -431,19 +418,9 @@ func begin(db *sql.DB) (*sql.Tx, error) {
 		time.Sleep(30 * time.Millisecond)
 	}
 
-	logger.Debugf("DbBegin: DB still locked")
-	logger.Debugf(logger.GetStack())
-	return nil, fmt.Errorf("DB is locked")
-}
-
-// TxCommit commits the given transaction.
-func TxCommit(tx *sql.Tx) error {
-	err := tx.Commit()
-	if err == nil || err == sql.ErrTxDone { // Ignore duplicate commits/rollbacks
-		return nil
-	}
-
-	return err
+	logger.Debug("DbBegin: DB still locked")
+	logger.Debug(logger.GetStack())
+	return nil, errors.New("DB is locked")
 }
 
 // DqliteLatestSegment returns the latest segment ID in the global database.
@@ -451,14 +428,14 @@ func DqliteLatestSegment() (string, error) {
 	dir := shared.VarPath("database", "global")
 	file, err := os.Open(dir)
 	if err != nil {
-		return "", fmt.Errorf("Unable to open directory %s with error %v", dir, err)
+		return "", fmt.Errorf("Cannot open directory %s with error %v", dir, err)
 	}
 
 	defer func() { _ = file.Close() }()
 
 	fileNames, err := file.Readdirnames(0)
 	if err != nil {
-		return "", fmt.Errorf("Unable to read file names in directory %s with error %v", dir, err)
+		return "", fmt.Errorf("Cannot read file names in directory %s with error %v", dir, err)
 	}
 
 	if len(fileNames) == 0 {
@@ -475,17 +452,15 @@ func DqliteLatestSegment() (string, error) {
 	for i := range fileNames {
 		fileName := fileNames[len(fileNames)-1-i]
 		if r.MatchString(fileName) {
-			segment := strings.Split(fileName, "-")[1]
-			// Trim leading o's.
-			index := 0
-			for i, c := range segment {
-				index = i
-				if c != '0' {
-					break
-				}
+			_, segment, _ := strings.Cut(fileName, "-")
+
+			// Trim leading 0s.
+			segment = strings.TrimLeft(segment, "0")
+			if segment == "" {
+				segment = "0"
 			}
 
-			return segment[index:], nil
+			return segment, nil
 		}
 	}
 
@@ -494,78 +469,4 @@ func DqliteLatestSegment() (string, error) {
 
 func dbQueryRowScan(ctx context.Context, c *ClusterTx, q string, args []any, outargs []any) error {
 	return c.tx.QueryRowContext(ctx, q, args...).Scan(outargs...)
-}
-
-/*
- * . db a reference to a sql.DB instance
- * . q is the database query
- * . inargs is an array of interfaces containing the query arguments
- * . outfmt is an array of interfaces containing the right types of output
- *   arguments, i.e.
- *      var arg1 string
- *      var arg2 int
- *      outfmt := {}any{arg1, arg2}
- *
- * The result will be an array (one per output row) of arrays (one per output argument)
- * of interfaces, containing pointers to the actual output arguments.
- */
-func queryScan(ctx context.Context, c *ClusterTx, q string, inargs []any, outfmt []any) ([][]any, error) {
-	result := [][]any{}
-
-	rows, err := c.tx.QueryContext(ctx, q, inargs...)
-	if err != nil {
-		return [][]any{}, err
-	}
-
-	defer func() { _ = rows.Close() }()
-
-	for rows.Next() {
-		ptrargs := make([]any, len(outfmt))
-		for i := range outfmt {
-			switch t := outfmt[i].(type) {
-			case string:
-				str := ""
-				ptrargs[i] = &str
-			case int:
-				integer := 0
-				ptrargs[i] = &integer
-			case int64:
-				integer := int64(0)
-				ptrargs[i] = &integer
-			case bool:
-				boolean := bool(false)
-				ptrargs[i] = &boolean
-			default:
-				return [][]any{}, fmt.Errorf("Bad interface type: %s", t)
-			}
-		}
-		err = rows.Scan(ptrargs...)
-		if err != nil {
-			return [][]any{}, err
-		}
-
-		newargs := make([]any, len(outfmt))
-		for i := range ptrargs {
-			switch t := outfmt[i].(type) {
-			case string:
-				newargs[i] = *ptrargs[i].(*string)
-			case int:
-				newargs[i] = *ptrargs[i].(*int)
-			case int64:
-				newargs[i] = *ptrargs[i].(*int64)
-			case bool:
-				newargs[i] = *ptrargs[i].(*bool)
-			default:
-				return [][]any{}, fmt.Errorf("Bad interface type: %s", t)
-			}
-		}
-		result = append(result, newargs)
-	}
-
-	err = rows.Err()
-	if err != nil {
-		return [][]any{}, err
-	}
-
-	return result, nil
 }

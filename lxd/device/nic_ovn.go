@@ -3,10 +3,12 @@ package device
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -36,9 +38,10 @@ type ovnNet interface {
 	network.Network
 
 	InstanceDevicePortValidateExternalRoutes(deviceInstance instance.Instance, deviceName string, externalRoutes []*net.IPNet) error
-	InstanceDevicePortAdd(instanceUUID string, deviceName string, deviceConfig deviceConfig.Device) error
-	InstanceDevicePortStart(opts *network.OVNInstanceNICSetupOpts, securityACLsRemove []string) (openvswitch.OVNSwitchPort, error)
-	InstanceDevicePortRemove(instanceUUID string, deviceName string, deviceConfig deviceConfig.Device) error
+	InstanceDevicePortValidateUseByLoadBalancer(deviceInstance instance.Instance) error
+	InstanceDevicePortAdd(opts *network.OVNInstanceNICSetupOpts, securityACLsRemove []string) (openvswitch.OVNSwitchPort, error)
+	InstanceDevicePortStart(deviceInstance instance.Instance) error
+	InstanceDevicePortRemove(opts *network.OVNInstanceNICSetupOpts) error
 	InstanceDevicePortIPs(instanceUUID string, deviceName string) ([]net.IP, error)
 }
 
@@ -66,7 +69,7 @@ func (d *nicOVN) UpdatableFields(oldDevice Type) []string {
 		return []string{}
 	}
 
-	return []string{"security.acls"}
+	return []string{"security.acls", "ipv4.address", "ipv6.address"}
 }
 
 // validateConfig checks the supplied config for correctness.
@@ -97,6 +100,7 @@ func (d *nicOVN) validateConfig(instConf instance.ConfigReader) error {
 		"security.acls.default.ingress.logged",
 		"security.acls.default.egress.logged",
 		"acceleration",
+		"acceleration.parent",
 		"nested",
 		"vlan",
 	}
@@ -114,11 +118,11 @@ func (d *nicOVN) validateConfig(instConf instance.ConfigReader) error {
 	}
 
 	if n.Status() != api.NetworkStatusCreated {
-		return fmt.Errorf("Specified network is not fully created")
+		return errors.New("Specified network is not fully created")
 	}
 
 	if n.Type() != "ovn" {
-		return fmt.Errorf("Specified network must be of type ovn")
+		return errors.New("Specified network must be of type ovn")
 	}
 
 	bannedKeys := []string{"mtu"}
@@ -130,11 +134,26 @@ func (d *nicOVN) validateConfig(instConf instance.ConfigReader) error {
 
 	ovnNet, ok := n.(ovnNet)
 	if !ok {
-		return fmt.Errorf("Network is not ovnNet interface type")
+		return errors.New("Network is not ovnNet interface type")
 	}
 
 	d.network = ovnNet // Stored loaded network for use by other functions.
 	netConfig := d.network.Config()
+
+	// Copy certain keys verbatim from the network's settings.
+	inheritKeys := []string{"acceleration.parent"}
+	for _, inheritKey := range inheritKeys {
+		// Unlike other NIC types, OVN NICs always require a `network` setting, so the inherited keys are
+		// only applied from the network definition if not explicitly set on the NIC device itself.
+		if d.config[inheritKey] != "" {
+			continue
+		}
+
+		_, found := netConfig[inheritKey]
+		if found {
+			d.config[inheritKey] = netConfig[inheritKey]
+		}
+	}
 
 	if d.config["ipv4.address"] != "" {
 		// Check that DHCPv4 is enabled on parent network (needed to use static assigned IPs).
@@ -208,10 +227,10 @@ func (d *nicOVN) validateConfig(instConf instance.ConfigReader) error {
 		// may come from a combination of profile and instance configs.
 		if d.config["nested"] != "" {
 			if d.config["vlan"] == "" {
-				return fmt.Errorf("VLAN must be specified with a nested NIC")
+				return errors.New("VLAN must be specified with a nested NIC")
 			}
 
-			// Check the NIC that this NIC is neted under exists on this instance and shares same
+			// Check the NIC that this NIC is nested under exists on this instance and shares same
 			// parent network.
 			var nestedParentNIC string
 			for devName, devConfig := range instConf.ExpandedDevices() {
@@ -220,7 +239,7 @@ func (d *nicOVN) validateConfig(instConf instance.ConfigReader) error {
 				}
 
 				if devConfig["network"] != d.config["network"] {
-					return fmt.Errorf("The nested parent NIC must be connected to same network as this NIC")
+					return errors.New("The nested parent NIC must be connected to same network as this NIC")
 				}
 
 				nestedParentNIC = devName
@@ -231,7 +250,7 @@ func (d *nicOVN) validateConfig(instConf instance.ConfigReader) error {
 				return fmt.Errorf("Instance does not have a NIC called %q for nesting under", d.config["nested"])
 			}
 		} else if d.config["vlan"] != "" {
-			return fmt.Errorf("Specifying a VLAN requires that this NIC be nested")
+			return errors.New("Specifying a VLAN requires that this NIC be nested")
 		}
 
 		// Check there isn't another NIC with any of the same addresses specified on the same network.
@@ -272,9 +291,98 @@ func (d *nicOVN) validateConfig(instConf instance.ConfigReader) error {
 
 	// Check Security ACLs exist.
 	if d.config["security.acls"] != "" {
-		err = acl.Exists(d.state, networkProjectName, shared.SplitNTrimSpace(d.config["security.acls"], ",", -1, true)...)
+		err = acl.Exists(context.TODO(), d.state, networkProjectName, shared.SplitNTrimSpace(d.config["security.acls"], ",", -1, true)...)
 		if err != nil {
 			return err
+		}
+	}
+
+	// Validate that NIC passthrough does not allow IPs from OVN range.
+	err = d.validateExternalRoutes()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateExternalRoutes checks that external routes do not allow to passthrough IPs from OVN range.
+func (d *nicOVN) validateExternalRoutes() error {
+	var (
+		routesListIPv4 []*net.IPNet
+		routesListIPv6 []*net.IPNet
+
+		ovnRangesListIPv4 []*shared.IPRange
+		ovnRangesListIPv6 []*shared.IPRange
+
+		uplink *api.Network
+
+		err error
+	)
+
+	if d.network.Config() == nil {
+		return fmt.Errorf("Network config is missing for NIC device %q", d.name)
+	}
+
+	uplinkName := d.network.Config()["network"]
+	if uplinkName == "" {
+		return fmt.Errorf(`OVN network %q is missing "network" config option`, d.network.Name())
+	}
+
+	// Get uplink network config.
+	err = d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		// Uplink has to be in the "default" project.
+		_, uplink, _, err = tx.GetNetworkInAnyState(ctx, api.ProjectDefaultName, uplinkName)
+
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("Failed getting config for network %q: %w", uplinkName, err)
+	}
+
+	if d.config["ipv4.routes.external"] != "" {
+		routesListIPv4, err = shared.ParseNetworks(d.config["ipv4.routes.external"])
+		if err != nil {
+			return fmt.Errorf("Failed parsing ipv4.routes: %w", err)
+		}
+
+		if uplink.Config["ipv4.ovn.ranges"] != "" {
+			ovnRangesListIPv4, err = shared.ParseIPRanges(uplink.Config["ipv4.ovn.ranges"])
+			if err != nil {
+				return fmt.Errorf("Failed parsing ipv4.ovn.ranges: %w", err)
+			}
+		}
+	}
+
+	if d.config["ipv6.routes.external"] != "" {
+		routesListIPv6, err = shared.ParseNetworks(d.config["ipv6.routes.external"])
+		if err != nil {
+			return fmt.Errorf("Failed parsing ipv6.routes: %w", err)
+		}
+
+		if uplink.Config["ipv6.ovn.ranges"] != "" {
+			ovnRangesListIPv6, err = shared.ParseIPRanges(uplink.Config["ipv6.ovn.ranges"])
+			if err != nil {
+				return fmt.Errorf("Failed parsing ipv6.ovn.ranges: %w", err)
+			}
+		}
+	}
+
+	// Validate "ipv4.routes.external".
+	for _, routes := range routesListIPv4 {
+		for _, ovnRange := range ovnRangesListIPv4 {
+			if ovnRange.ContainsIP(routes.IP.To16()) {
+				return fmt.Errorf(`Route %q overlaps with "ipv4.ovn.ranges" (%q)`, routes, ovnRange)
+			}
+		}
+	}
+
+	// Validate "ipv6.routes.external".
+	for _, routes := range routesListIPv6 {
+		for _, ovnRange := range ovnRangesListIPv6 {
+			if ovnRange.ContainsIP(routes.IP.To16()) {
+				return fmt.Errorf(`Route %q overlaps with "ipv6.ovn.ranges" (%q)`, routes, ovnRange)
+			}
 		}
 	}
 
@@ -357,24 +465,21 @@ func (d *nicOVN) Add() error {
 		return err
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to load uplink network %q: %w", uplinkNetworkName, err)
+		return fmt.Errorf("Failed loading uplink network %q: %w", uplinkNetworkName, err)
 	}
 
-	err = d.network.InstanceDevicePortAdd(d.inst.LocalConfig()["volatile.uuid"], d.name, d.config)
-	if err != nil {
-		return err
-	}
-
-	// Add new OVN logical switch port for instance.
-	_, err = d.network.InstanceDevicePortStart(&network.OVNInstanceNICSetupOpts{
+	nicSetupOpts := &network.OVNInstanceNICSetupOpts{
 		InstanceUUID: d.inst.LocalConfig()["volatile.uuid"],
 		DNSName:      d.inst.Name(),
 		DeviceName:   d.name,
 		DeviceConfig: d.config,
 		UplinkConfig: uplink.Config,
-	}, nil)
+	}
+
+	// Add new OVN logical switch port for instance.
+	_, err = d.network.InstanceDevicePortAdd(nicSetupOpts, nil)
 	if err != nil {
-		return fmt.Errorf("Failed setting up OVN port: %w", err)
+		return fmt.Errorf("Failed adding OVN port: %w", err)
 	}
 
 	return nil
@@ -398,13 +503,13 @@ func (d *nicOVN) PreStartCheck() error {
 // validateEnvironment checks the runtime environment for correctness.
 func (d *nicOVN) validateEnvironment() error {
 	if d.inst.Type() == instancetype.Container && d.config["name"] == "" {
-		return fmt.Errorf("Requires name property to start")
+		return errors.New("Requires name property to start")
 	}
 
 	integrationBridge := d.state.GlobalConfig.NetworkOVNIntegrationBridge()
 
-	if !shared.PathExists(fmt.Sprintf("/sys/class/net/%s", integrationBridge)) {
-		return fmt.Errorf("OVS integration bridge device %q doesn't exist", integrationBridge)
+	if !network.InterfaceExists(integrationBridge) {
+		return fmt.Errorf("OVS integration bridge device %q does not exist", integrationBridge)
 	}
 
 	return nil
@@ -417,8 +522,8 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 		return nil, err
 	}
 
-	revert := revert.New()
-	defer revert.Fail()
+	reverter := revert.New()
+	defer reverter.Fail()
 
 	saveData := make(map[string]string)
 	saveData["host_name"] = d.config["host_name"]
@@ -434,123 +539,33 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 		return err
 	})
 	if err != nil {
-		return nil, fmt.Errorf("Failed to load uplink network %q: %w", uplinkNetworkName, err)
+		return nil, fmt.Errorf("Failed loading uplink network %q: %w", uplinkNetworkName, err)
 	}
 
 	// Setup the host network interface (if not nested).
 	var peerName, integrationBridgeNICName string
 	var mtu uint32
-	var vfPCIDev pcidev.Device
+	var vfPCIDev *pcidev.Device
 	var vDPADevice *ip.VDPADev
 	var pciIOMMUGroup uint64
 
 	if d.config["nested"] != "" {
 		delete(saveData, "host_name") // Nested NICs don't have a host side interface.
 	} else {
-		if d.config["acceleration"] == "sriov" {
-			ovs := openvswitch.NewOVS()
-			if !ovs.HardwareOffloadingEnabled() {
-				return nil, fmt.Errorf("SR-IOV acceleration requires hardware offloading be enabled in OVS")
-			}
-
-			// If VM, then try and load the vfio-pci module first.
-			if d.inst.Type() == instancetype.VM {
-				err := util.LoadModule("vfio-pci")
-				if err != nil {
-					return nil, fmt.Errorf("Error loading %q module: %w", "vfio-pci", err)
-				}
-			}
-
-			integrationBridge := d.state.GlobalConfig.NetworkOVNIntegrationBridge()
-
-			// Find free VF exclusively.
-			network.SRIOVVirtualFunctionMutex.Lock()
-			vfParent, vfRepresentor, vfDev, vfID, err := network.SRIOVFindFreeVFAndRepresentor(d.state, integrationBridge)
+		switch d.config["acceleration"] {
+		case "sriov", "vdpa":
+			var cleanup revert.Hook
+			cleanup, integrationBridgeNICName, peerName, vfPCIDev, pciIOMMUGroup, vDPADevice, err = d.setupAcceleration(saveData)
 			if err != nil {
-				network.SRIOVVirtualFunctionMutex.Unlock()
-				return nil, fmt.Errorf("Failed finding a suitable free virtual function on %q: %w", integrationBridge, err)
+				return nil, fmt.Errorf("Failed setting up acceleration: %w", err)
 			}
 
-			// Claim the SR-IOV virtual function (VF) on the parent (PF) and get the PCI information.
-			vfPCIDev, pciIOMMUGroup, err = networkSRIOVSetupVF(d.deviceCommon, vfParent, vfDev, vfID, false, saveData)
-			if err != nil {
-				network.SRIOVVirtualFunctionMutex.Unlock()
-				return nil, fmt.Errorf("Failed setting up VF: %w", err)
-			}
+			reverter.Add(cleanup)
+		default:
+			// Specify the OVN integration bridge as parent so that the veth/tap pair setup can take
+			// its MTU into account to avoid lowering it.
+			d.config["parent"] = d.state.GlobalConfig.NetworkOVNIntegrationBridge()
 
-			revert.Add(func() {
-				_ = networkSRIOVRestoreVF(d.deviceCommon, false, saveData)
-			})
-
-			network.SRIOVVirtualFunctionMutex.Unlock()
-
-			// Setup the guest network interface.
-			if d.inst.Type() == instancetype.Container {
-				err := networkSRIOVSetupContainerVFNIC(saveData["host_name"], d.config)
-				if err != nil {
-					return nil, fmt.Errorf("Failed setting up container VF NIC: %w", err)
-				}
-			}
-
-			integrationBridgeNICName = vfRepresentor
-			peerName = vfDev
-		} else if d.config["acceleration"] == "vdpa" {
-			ovs := openvswitch.NewOVS()
-			if !ovs.HardwareOffloadingEnabled() {
-				return nil, fmt.Errorf("SR-IOV acceleration requires hardware offloading be enabled in OVS")
-			}
-
-			err := util.LoadModule("vdpa")
-			if err != nil {
-				return nil, fmt.Errorf("Error loading %q module: %w", "vdpa", err)
-			}
-
-			// If VM, then try and load the vhost_vdpa module first.
-			if d.inst.Type() == instancetype.VM {
-				err = util.LoadModule("vhost_vdpa")
-				if err != nil {
-					return nil, fmt.Errorf("Error loading %q module: %w", "vhost_vdpa", err)
-				}
-			}
-
-			integrationBridge := d.state.GlobalConfig.NetworkOVNIntegrationBridge()
-
-			// Find free VF exclusively.
-			network.SRIOVVirtualFunctionMutex.Lock()
-			vfParent, vfRepresentor, vfDev, vfID, err := network.SRIOVFindFreeVFAndRepresentor(d.state, integrationBridge)
-			if err != nil {
-				network.SRIOVVirtualFunctionMutex.Unlock()
-				return nil, fmt.Errorf("Failed finding a suitable free virtual function on %q: %w", integrationBridge, err)
-			}
-
-			// Claim the SR-IOV virtual function (VF) on the parent (PF) and get the PCI information.
-			vfPCIDev, pciIOMMUGroup, err = networkSRIOVSetupVF(d.deviceCommon, vfParent, vfDev, vfID, false, saveData)
-			if err != nil {
-				network.SRIOVVirtualFunctionMutex.Unlock()
-				return nil, err
-			}
-
-			revert.Add(func() {
-				_ = networkSRIOVRestoreVF(d.deviceCommon, false, saveData)
-			})
-
-			// Create the vDPA management device
-			vDPADevice, err = ip.AddVDPADevice(vfPCIDev.SlotName, saveData)
-			if err != nil {
-				network.SRIOVVirtualFunctionMutex.Unlock()
-				return nil, err
-			}
-
-			network.SRIOVVirtualFunctionMutex.Unlock()
-
-			// Setup the guest network interface.
-			if d.inst.Type() == instancetype.Container {
-				return nil, fmt.Errorf("VDPA acceleration is not supported for containers")
-			}
-
-			integrationBridgeNICName = vfRepresentor
-			peerName = vfDev
-		} else {
 			// Create veth pair and configure the peer end with custom hwaddr and mtu if supplied.
 			if d.inst.Type() == instancetype.Container {
 				if saveData["host_name"] == "" {
@@ -581,23 +596,28 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 				}
 			}
 
-			revert.Add(func() { _ = network.InterfaceRemove(saveData["host_name"]) })
+			reverter.Add(func() { _ = network.InterfaceRemove(saveData["host_name"]) })
 		}
 	}
 
 	// Populate device config with volatile fields if needed.
 	networkVethFillFromVolatile(d.config, saveData)
 
-	// Add new OVN logical switch port for instance.
-	logicalPortName, err := d.network.InstanceDevicePortStart(&network.OVNInstanceNICSetupOpts{
+	nicSetupOpts := &network.OVNInstanceNICSetupOpts{
 		InstanceUUID: d.inst.LocalConfig()["volatile.uuid"],
 		DNSName:      d.inst.Name(),
 		DeviceName:   d.name,
 		DeviceConfig: d.config,
 		UplinkConfig: uplink.Config,
-	}, nil)
+	}
+
+	// Ensure the underlying OVN logical switch port exists.
+	// The operation is idempotent and safe to call even if the port already exists.
+	// It is required for the case when the switch port couldn't be created during Add().
+	// This might happen if there is an IP conflict with an existing port (e.g. caused by copying an instance).
+	logicalPortName, err := d.network.InstanceDevicePortAdd(nicSetupOpts, nil)
 	if err != nil {
-		return nil, fmt.Errorf("Failed setting up OVN port: %w", err)
+		return nil, fmt.Errorf("Failed adding OVN port: %w", err)
 	}
 
 	// Associated host side interface to OVN logical switch port (if not nested).
@@ -607,7 +627,14 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 			return nil, err
 		}
 
-		revert.Add(cleanup)
+		reverter.Add(cleanup)
+	}
+
+	// Ensure to call this after setting up the host side interface.
+	// This allows triggering actions that require the logical port to be up.
+	err = d.network.InstanceDevicePortStart(d.inst)
+	if err != nil {
+		return nil, fmt.Errorf("Failed starting up OVN port: %w", err)
 	}
 
 	runConf := deviceConfig.RunConfig{}
@@ -619,9 +646,9 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 		return nil, fmt.Errorf("Failed getting OVS Chassis ID: %w", err)
 	}
 
-	ovnClient, err := openvswitch.NewOVN(d.state)
+	ovnClient, err := openvswitch.NewOVN(d.state.GlobalConfig.NetworkOVNNorthboundConnection(), d.state.GlobalConfig.NetworkOVNSSL)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to get OVN client: %w", err)
+		return nil, fmt.Errorf("Failed getting OVN client: %w", err)
 	}
 
 	// Add post start hook for setting logical switch port chassis once instance has been started.
@@ -651,47 +678,172 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 		}
 
 		instType := d.inst.Type()
-		if instType == instancetype.VM {
-			if d.config["acceleration"] == "sriov" {
+
+		switch instType {
+		case instancetype.VM:
+			switch d.config["acceleration"] {
+			case "sriov":
 				runConf.NetworkInterface = append(runConf.NetworkInterface,
 					[]deviceConfig.RunConfigItem{
 						{Key: "devName", Value: d.name},
 						{Key: "pciSlotName", Value: vfPCIDev.SlotName},
-						{Key: "pciIOMMUGroup", Value: fmt.Sprintf("%d", pciIOMMUGroup)},
-						{Key: "mtu", Value: fmt.Sprintf("%d", mtu)},
+						{Key: "pciIOMMUGroup", Value: strconv.FormatUint(pciIOMMUGroup, 10)},
+						{Key: "mtu", Value: strconv.FormatUint(uint64(mtu), 10)},
 					}...)
-			} else if d.config["acceleration"] == "vdpa" {
+			case "vdpa":
 				if vDPADevice == nil {
-					return nil, fmt.Errorf("vDPA device is nil")
+					return nil, errors.New("vDPA device is nil")
 				}
 
 				runConf.NetworkInterface = append(runConf.NetworkInterface,
 					[]deviceConfig.RunConfigItem{
 						{Key: "devName", Value: d.name},
 						{Key: "pciSlotName", Value: vfPCIDev.SlotName},
-						{Key: "pciIOMMUGroup", Value: fmt.Sprintf("%d", pciIOMMUGroup)},
-						{Key: "maxVQP", Value: fmt.Sprintf("%d", vDPADevice.MaxVQs/2)},
+						{Key: "pciIOMMUGroup", Value: strconv.FormatUint(pciIOMMUGroup, 10)},
+						{Key: "maxVQP", Value: strconv.FormatUint(uint64(vDPADevice.MaxVQs/2), 10)},
 						{Key: "vDPADevName", Value: vDPADevice.Name},
 						{Key: "vhostVDPAPath", Value: vDPADevice.VhostVDPA.Path},
-						{Key: "mtu", Value: fmt.Sprintf("%d", mtu)},
+						{Key: "mtu", Value: strconv.FormatUint(uint64(mtu), 10)},
 					}...)
-			} else {
+			default:
 				runConf.NetworkInterface = append(runConf.NetworkInterface,
 					[]deviceConfig.RunConfigItem{
 						{Key: "devName", Value: d.name},
 						{Key: "hwaddr", Value: d.config["hwaddr"]},
-						{Key: "mtu", Value: fmt.Sprintf("%d", mtu)},
+						{Key: "mtu", Value: strconv.FormatUint(uint64(mtu), 10)},
 					}...)
 			}
-		} else if instType == instancetype.Container {
+
+		case instancetype.Container:
 			runConf.NetworkInterface = append(runConf.NetworkInterface,
 				deviceConfig.RunConfigItem{Key: "hwaddr", Value: d.config["hwaddr"]},
 			)
 		}
 	}
 
-	revert.Success()
+	reverter.Success()
 	return &runConf, nil
+}
+
+// setupAcceleration configures SRIOV and VDPA acceleration. It allocates host-side virtual functions from a
+// physical function (interface) and returns information about the representor port, VF interface and VF device.
+// Accepts saveData which is used to store volatile config keys about the VF allocated.
+func (d *nicOVN) setupAcceleration(saveData map[string]string) (cleanup revert.Hook, vfRepresentor string, vfDev string, vfPCIDev *pcidev.Device, pciIOMMUGroup uint64, vDPADevice *ip.VDPADev, err error) {
+	instType := d.inst.Type()
+	if d.config["acceleration"] == "vdpa" && instType == instancetype.Container {
+		return nil, "", "", nil, 0, nil, errors.New("VDPA acceleration is not supported for containers")
+	}
+
+	ovs := openvswitch.NewOVS()
+	if !ovs.HardwareOffloadingEnabled() {
+		return nil, "", "", nil, 0, nil, errors.New("OVN NIC acceleration requires hardware offloading to be enabled in OVS")
+	}
+
+	if instType == instancetype.VM {
+		// Load required modules for acceleration.
+		switch d.config["acceleration"] {
+		case "sriov":
+			err = util.LoadModule("vfio-pci")
+			if err != nil {
+				return nil, "", "", nil, 0, nil, fmt.Errorf("Error loading %q module: %w", "vfio-pci", err)
+			}
+
+		case "vdpa":
+			err = util.LoadModule("vdpa")
+			if err != nil {
+				return nil, "", "", nil, 0, nil, fmt.Errorf("Error loading %q module: %w", "vdpa", err)
+			}
+
+			err = util.LoadModule("vhost_vdpa")
+			if err != nil {
+				return nil, "", "", nil, 0, nil, fmt.Errorf("Error loading %q module: %w", "vhost_vdpa", err)
+			}
+		}
+	}
+
+	reverter := revert.New()
+	defer reverter.Fail()
+
+	var pfCandidates []network.PFSwitchDevPort
+
+	// Find and setup free VF exclusively.
+	network.SRIOVVirtualFunctionMutex.Lock()
+	defer network.SRIOVVirtualFunctionMutex.Unlock()
+
+	if d.config["acceleration.parent"] != "" {
+		for _, port := range shared.SplitNTrimSpace(d.config["acceleration.parent"], ",", -1, true) {
+			pf, err := network.SRIOVGetSwitchAndPFID(port)
+			if err != nil {
+				return nil, "", "", nil, 0, nil, fmt.Errorf("Failed getting switch and PF ID for port %q: %w", port, err)
+			}
+
+			pfCandidates = append(pfCandidates, *pf)
+		}
+
+		if len(pfCandidates) < 1 {
+			return nil, "", "", nil, 0, nil, errors.New(`No PF candidates specified in "acceleration.parent"`)
+		}
+	} else {
+		// Get all ports on the integration bridge.
+		ports, err := ovs.BridgePortList(d.state.GlobalConfig.NetworkOVNIntegrationBridge())
+		if err != nil {
+			return nil, "", "", nil, 0, nil, fmt.Errorf("Failed getting OVS integration bridge port list: %w", err)
+		}
+
+		for _, port := range ports {
+			pf, err := network.SRIOVGetSwitchAndPFID(port)
+			if err != nil {
+				continue // Skip non-PF ports.
+			}
+
+			pfCandidates = append(pfCandidates, *pf)
+		}
+
+		if len(pfCandidates) < 1 {
+			return nil, "", "", nil, 0, nil, errors.New(`No PF candidates connected to OVS integration bridge. Add PFs to integration bridge or specify via "acceleration.parent"`)
+		}
+	}
+
+	vfParent, vfRepresentor, vfDev, vfID, err := network.SRIOVFindFreeVFAndRepresentor(d.state, pfCandidates)
+	if err != nil {
+		pfCandidateNames := make([]string, 0, len(pfCandidates))
+		for _, pf := range pfCandidates {
+			pfCandidateNames = append(pfCandidateNames, pf.Name)
+		}
+
+		return nil, "", "", nil, 0, nil, fmt.Errorf("Failed allocating acceleration VF from PFs %v: %w", pfCandidateNames, err)
+	}
+
+	// Claim the SR-IOV virtual function (VF) on the parent (PF) and get the PCI information.
+	vfPCIDev, pciIOMMUGroup, err = networkSRIOVSetupVF(d.deviceCommon, vfParent, vfDev, vfID, false, saveData)
+	if err != nil {
+		return nil, "", "", nil, 0, nil, fmt.Errorf("Failed setting up acceleration VF: %w", err)
+	}
+
+	reverter.Add(func() {
+		_ = networkSRIOVRestoreVF(d.deviceCommon, false, saveData)
+	})
+
+	switch d.config["acceleration"] {
+	case "sriov":
+		// Setup the guest network interface.
+		if instType == instancetype.Container {
+			err := networkSRIOVSetupContainerVFNIC(saveData["host_name"], d.config)
+			if err != nil {
+				return nil, "", "", nil, 0, nil, fmt.Errorf("Failed setting up container VF NIC: %w", err)
+			}
+		}
+	case "vdpa":
+		// Create the vDPA management device
+		vDPADevice, err = ip.AddVDPADevice(vfPCIDev.SlotName, saveData)
+		if err != nil {
+			return nil, "", "", nil, 0, nil, err
+		}
+	}
+
+	cleanup = reverter.Clone().Fail
+	reverter.Success()
+	return cleanup, vfRepresentor, vfDev, vfPCIDev, pciIOMMUGroup, vDPADevice, nil
 }
 
 // postStart is run after the device is added to the instance.
@@ -704,79 +856,111 @@ func (d *nicOVN) postStart() error {
 	return nil
 }
 
-// Update applies configuration changes to a started device.
+// Update applies configuration changes to a device.
+// The underlying switch port gets removed and re-added.
 func (d *nicOVN) Update(oldDevices deviceConfig.Devices, isRunning bool) error {
 	oldConfig := oldDevices[d.name]
 
 	// Populate device config with volatile fields if needed.
 	networkVethFillFromVolatile(d.config, d.volatileGet())
 
-	// If an IPv6 address has changed, if the instance is running we should bounce the host-side
-	// veth interface to give the instance a chance to detect the change and re-apply for an
-	// updated lease with new IP address.
-	if d.config["ipv6.address"] != oldConfig["ipv6.address"] && d.config["host_name"] != "" && network.InterfaceExists(d.config["host_name"]) {
-		link := &ip.Link{Name: d.config["host_name"]}
-		err := link.SetDown()
-		if err != nil {
-			return err
-		}
+	ipv4Changed := d.config["ipv4.address"] != oldConfig["ipv4.address"]
+	ipv6Changed := d.config["ipv6.address"] != oldConfig["ipv6.address"]
+	aclsChanged := d.config["security.acls"] != oldConfig["security.acls"]
 
-		err = link.SetUp()
+	// If an IP address has changed, re-check for address conflicts.
+	if ipv4Changed || ipv6Changed {
+		err := d.checkAddressConflict()
 		if err != nil {
 			return err
 		}
 	}
 
-	// Apply any changes needed when assigned ACLs change.
-	if d.config["security.acls"] != oldConfig["security.acls"] {
-		// Work out which ACLs have been removed and remove logical port from those groups.
-		oldACLs := shared.SplitNTrimSpace(oldConfig["security.acls"], ",", -1, true)
+	// If IP addresses or ACLs changed, update the OVN logical switch port.
+	if ipv4Changed || ipv6Changed || aclsChanged {
 		newACLs := shared.SplitNTrimSpace(d.config["security.acls"], ",", -1, true)
-		removedACLs := []string{}
-		for _, oldACL := range oldACLs {
-			if !shared.ValueInSlice(oldACL, newACLs) {
-				removedACLs = append(removedACLs, oldACL)
+
+		// Work out which ACLs have been removed.
+		var removedACLs []string
+		if aclsChanged {
+			oldACLs := shared.SplitNTrimSpace(oldConfig["security.acls"], ",", -1, true)
+			for _, oldACL := range oldACLs {
+				if !slices.Contains(newACLs, oldACL) {
+					removedACLs = append(removedACLs, oldACL)
+				}
 			}
 		}
 
-		// Setup the logical port with new ACLs if running.
+		// Load uplink network config.
+		uplinkNetworkName := d.network.Config()["network"]
+
+		var uplink *api.Network
+
+		err := d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+			var err error
+
+			_, uplink, _, err = tx.GetNetworkInAnyState(ctx, api.ProjectDefaultName, uplinkNetworkName)
+
+			return err
+		})
+		if err != nil {
+			return fmt.Errorf("Failed loading uplink network %q: %w", uplinkNetworkName, err)
+		}
+
+		nicSetupOpts := &network.OVNInstanceNICSetupOpts{
+			InstanceUUID: d.inst.LocalConfig()["volatile.uuid"],
+			DNSName:      d.inst.Name(),
+			DeviceName:   d.name,
+			DeviceConfig: d.config,
+			UplinkConfig: uplink.Config,
+		}
+
+		// Remove the port only when IP addresses have changed.
+		if ipv4Changed || ipv6Changed {
+			err = d.network.InstanceDevicePortRemove(nicSetupOpts)
+			if err != nil {
+				return fmt.Errorf("Failed removing old instance device port config: %w", err)
+			}
+		}
+
+		// Always try to add the port to apply any ACL changes.
+		_, err = d.network.InstanceDevicePortAdd(nicSetupOpts, removedACLs)
+		if err != nil {
+			return fmt.Errorf("Failed adding updated instance device port config: %w", err)
+		}
+
+		// Signal a restart of the device.
+		err = d.network.InstanceDevicePortStart(d.inst)
+		if err != nil {
+			return fmt.Errorf("Failed starting up OVN port: %w", err)
+		}
+
 		if isRunning {
-			// Load uplink network config.
-			uplinkNetworkName := d.network.Config()["network"]
+			// If an address has changed and if the instance is running, we should bounce the host-side
+			// veth interface to give the instance a chance to detect the change and re-apply for an
+			// updated lease with new IP address.
+			if (ipv4Changed || ipv6Changed) && d.config["host_name"] != "" && network.InterfaceExists(d.config["host_name"]) {
+				link := &ip.Link{Name: d.config["host_name"]}
+				err := link.SetDown()
+				if err != nil {
+					return err
+				}
 
-			var uplink *api.Network
-
-			err := d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
-				var err error
-
-				_, uplink, _, err = tx.GetNetworkInAnyState(ctx, api.ProjectDefaultName, uplinkNetworkName)
-
-				return err
-			})
-			if err != nil {
-				return fmt.Errorf("Failed to load uplink network %q: %w", uplinkNetworkName, err)
-			}
-
-			// Update OVN logical switch port for instance.
-			_, err = d.network.InstanceDevicePortStart(&network.OVNInstanceNICSetupOpts{
-				InstanceUUID: d.inst.LocalConfig()["volatile.uuid"],
-				DNSName:      d.inst.Name(),
-				DeviceName:   d.name,
-				DeviceConfig: d.config,
-				UplinkConfig: uplink.Config,
-			}, removedACLs)
-			if err != nil {
-				return fmt.Errorf("Failed updating OVN port: %w", err)
+				err = link.SetUp()
+				if err != nil {
+					return err
+				}
 			}
 		}
 
+		// Clean up unused ACL port groups.
 		if len(removedACLs) > 0 {
-			client, err := openvswitch.NewOVN(d.state)
+			client, err := openvswitch.NewOVN(d.state.GlobalConfig.NetworkOVNNorthboundConnection(), d.state.GlobalConfig.NetworkOVNSSL)
 			if err != nil {
-				return fmt.Errorf("Failed to get OVN client: %w", err)
+				return fmt.Errorf("Failed getting OVN client: %w", err)
 			}
 
-			err = acl.OVNPortGroupDeleteIfUnused(d.state, d.logger, client, d.network.Project(), d.inst, d.name, newACLs...)
+			err = acl.OVNPortGroupDeleteIfUnused(context.TODO(), d.state, d.logger, client, d.network.Project(), d.inst, d.name, newACLs...)
 			if err != nil {
 				return fmt.Errorf("Failed removing unused OVN port groups: %w", err)
 			}
@@ -798,7 +982,7 @@ func (d *nicOVN) Update(oldDevices deviceConfig.Devices, isRunning bool) error {
 }
 
 func (d *nicOVN) findRepresentorPort(volatile map[string]string) (string, error) {
-	physSwitchID, pfID, err := network.SRIOVGetSwitchAndPFID(volatile["last_state.vf.parent"])
+	pf, err := network.SRIOVGetSwitchAndPFID(volatile["last_state.vf.parent"])
 	if err != nil {
 		return "", fmt.Errorf("Failed finding physical parent switch and PF ID to release representor port: %w", err)
 	}
@@ -815,9 +999,9 @@ func (d *nicOVN) findRepresentorPort(volatile map[string]string) (string, error)
 	}
 
 	// Track down the representor port to remove it from the integration bridge.
-	representorPort := network.SRIOVFindRepresentorPort(nics, string(physSwitchID), pfID, vfID)
+	representorPort := network.SRIOVFindRepresentorPort(nics, pf.SwitchID, pf.PFID, vfID)
 	if representorPort == "" {
-		return "", fmt.Errorf("Failed finding representor")
+		return "", errors.New("Failed finding representor")
 	}
 
 	return representorPort, nil
@@ -891,61 +1075,63 @@ func (d *nicOVN) postStop() error {
 	networkVethFillFromVolatile(d.config, v)
 
 	if d.config["acceleration"] == "sriov" {
-		// Restoring host-side interface.
 		network.SRIOVVirtualFunctionMutex.Lock()
+		defer network.SRIOVVirtualFunctionMutex.Unlock()
+
+		// Restoring host-side interface.
 		err := networkSRIOVRestoreVF(d.deviceCommon, false, v)
 		if err != nil {
-			network.SRIOVVirtualFunctionMutex.Unlock()
 			return err
 		}
-
-		network.SRIOVVirtualFunctionMutex.Unlock()
 
 		link := &ip.Link{Name: d.config["host_name"]}
 		err = link.SetDown()
 		if err != nil {
-			return fmt.Errorf("Failed to bring down the host interface %s: %w", d.config["host_name"], err)
+			return fmt.Errorf("Failed bringing down the host interface %s: %w", d.config["host_name"], err)
 		}
 	} else if d.config["acceleration"] == "vdpa" {
-		// Retrieve the last state vDPA device name.
 		network.SRIOVVirtualFunctionMutex.Lock()
+		defer network.SRIOVVirtualFunctionMutex.Unlock()
+
+		// Retrieve the last state vDPA device name.
 		vDPADevName, ok := v["last_state.vdpa.name"]
 		if !ok {
-			network.SRIOVVirtualFunctionMutex.Unlock()
-			return fmt.Errorf("Failed to find PCI slot name for vDPA device")
+			return errors.New("Failed finding PCI slot name for vDPA device")
 		}
 
 		// Delete the vDPA management device.
 		err := ip.DeleteVDPADevice(vDPADevName)
 		if err != nil {
-			network.SRIOVVirtualFunctionMutex.Unlock()
 			return err
 		}
 
 		// Restoring host-side interface.
-		network.SRIOVVirtualFunctionMutex.Lock()
 		err = networkSRIOVRestoreVF(d.deviceCommon, false, v)
 		if err != nil {
-			network.SRIOVVirtualFunctionMutex.Unlock()
 			return err
 		}
-
-		network.SRIOVVirtualFunctionMutex.Unlock()
 
 		link := &ip.Link{Name: d.config["host_name"]}
 		err = link.SetDown()
 		if err != nil {
-			return fmt.Errorf("Failed to bring down the host interface %q: %w", d.config["host_name"], err)
+			return fmt.Errorf("Failed bringing down the host interface %q: %w", d.config["host_name"], err)
 		}
-	} else if d.config["host_name"] != "" && shared.PathExists(fmt.Sprintf("/sys/class/net/%s", d.config["host_name"])) {
+	} else if d.config["host_name"] != "" && shared.PathExists("/sys/class/net/"+d.config["host_name"]) {
 		// Removing host-side end of veth pair will delete the peer end too.
 		err := network.InterfaceRemove(d.config["host_name"])
 		if err != nil {
-			return fmt.Errorf("Failed to remove interface %q: %w", d.config["host_name"], err)
+			return fmt.Errorf("Failed removing interface %q: %w", d.config["host_name"], err)
 		}
 	}
 
 	return nil
+}
+
+// PreRemoveCheck indicates if the device is available for removal.
+func (d *nicOVN) PreRemoveCheck() error {
+	// Check if this device is referenced by any load balancer pool on this network.
+	// Reject removal if so, as the instance must be removed from the pool first.
+	return d.network.InstanceDevicePortValidateUseByLoadBalancer(d.inst)
 }
 
 // Remove is run when the device is removed from the instance or the instance is deleted.
@@ -953,18 +1139,31 @@ func (d *nicOVN) Remove() error {
 	// Check for port groups that will become unused (and need deleting) as this NIC is deleted.
 	securityACLs := shared.SplitNTrimSpace(d.config["security.acls"], ",", -1, true)
 	if len(securityACLs) > 0 {
-		client, err := openvswitch.NewOVN(d.state)
+		client, err := openvswitch.NewOVN(d.state.GlobalConfig.NetworkOVNNorthboundConnection(), d.state.GlobalConfig.NetworkOVNSSL)
 		if err != nil {
-			return fmt.Errorf("Failed to get OVN client: %w", err)
+			return fmt.Errorf("Failed getting OVN client: %w", err)
 		}
 
-		err = acl.OVNPortGroupDeleteIfUnused(d.state, d.logger, client, d.network.Project(), d.inst, d.name)
+		err = acl.OVNPortGroupDeleteIfUnused(context.TODO(), d.state, d.logger, client, d.network.Project(), d.inst, d.name)
 		if err != nil {
 			return fmt.Errorf("Failed removing unused OVN port groups: %w", err)
 		}
 	}
 
-	return d.network.InstanceDevicePortRemove(d.inst.LocalConfig()["volatile.uuid"], d.name, d.config)
+	// Last remove the actual port.
+	nicSetupOpts := &network.OVNInstanceNICSetupOpts{
+		InstanceUUID: d.inst.LocalConfig()["volatile.uuid"],
+		DeviceName:   d.name,
+		DeviceConfig: d.config,
+		DNSName:      d.inst.Name(),
+	}
+
+	err := d.network.InstanceDevicePortRemove(nicSetupOpts)
+	if err != nil {
+		return fmt.Errorf("Failed removing instance device port: %w", err)
+	}
+
+	return nil
 }
 
 // State gets the state of an OVN NIC by querying the OVN Northbound logical switch port record.
@@ -982,13 +1181,13 @@ func (d *nicOVN) State() (*api.InstanceStateNetwork, error) {
 	var v4mask string
 	if v4subnet != nil {
 		mask, _ := v4subnet.Mask.Size()
-		v4mask = fmt.Sprintf("%d", mask)
+		v4mask = strconv.Itoa(mask)
 	}
 
 	var v6mask string
 	if v6subnet != nil {
 		mask, _ := v6subnet.Mask.Size()
-		v6mask = fmt.Sprintf("%d", mask)
+		v6mask = strconv.Itoa(mask)
 	}
 
 	// OVN only supports dynamic IP allocation if neither IPv4 or IPv6 are statically set.
@@ -1136,7 +1335,7 @@ func (d *nicOVN) setupHostNIC(hostName string, ovnPortName openvswitch.OVNSwitch
 	link := &ip.Link{Name: hostName}
 	err = link.SetUp()
 	if err != nil {
-		return nil, fmt.Errorf("Failed to bring up the host interface %s: %w", hostName, err)
+		return nil, fmt.Errorf("Failed bringing up the host interface %s: %w", hostName, err)
 	}
 
 	cleanup := revert.Clone().Fail

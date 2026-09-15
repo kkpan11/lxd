@@ -2,30 +2,44 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/sys/unix"
 
+	"github.com/canonical/lxd/lxd/auth"
 	"github.com/canonical/lxd/lxd/backup"
 	"github.com/canonical/lxd/lxd/certificate"
 	"github.com/canonical/lxd/lxd/cluster"
+	clusterConfig "github.com/canonical/lxd/lxd/cluster/config"
+	"github.com/canonical/lxd/lxd/config"
 	"github.com/canonical/lxd/lxd/db"
 	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/db/query"
+	"github.com/canonical/lxd/lxd/db/warningtype"
+	"github.com/canonical/lxd/lxd/device/filters"
+	"github.com/canonical/lxd/lxd/idmap"
+	"github.com/canonical/lxd/lxd/instance"
+	instanceDrivers "github.com/canonical/lxd/lxd/instance/drivers"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/network"
-	"github.com/canonical/lxd/lxd/node"
 	"github.com/canonical/lxd/lxd/project"
 	"github.com/canonical/lxd/lxd/state"
 	storagePools "github.com/canonical/lxd/lxd/storage"
+	"github.com/canonical/lxd/lxd/storage/connectors"
 	storageDrivers "github.com/canonical/lxd/lxd/storage/drivers"
+	"github.com/canonical/lxd/lxd/storage/filesystem"
 	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
@@ -43,6 +57,7 @@ const (
 	patchPreDaemonStorage
 	patchPostDaemonStorage
 	patchPostNetworks
+	patchPostInstancesLoaded
 )
 
 /*
@@ -54,8 +69,8 @@ Patches are one-time actions that are sometimes needed to update
 	Those patches are applied at startup time after the database schema
 	has been fully updated. Patches can therefore assume a working database.
 
-	At the time the patches are applied, the containers aren't started
-	yet and the daemon isn't listening to requests.
+	At the time the patches are applied, the containers are not started
+	yet and the daemon is not listening to requests.
 
 	DO NOT use this mechanism for database update. Schema updates must be
 	done through the separate schema update mechanism.
@@ -96,6 +111,30 @@ var patches = []patch{
 	{name: "entity_type_instance_snapshot_on_delete_trigger_typo_fix", stage: patchPreLoadClusterConfig, run: patchEntityTypeInstanceSnapshotOnDeleteTriggerTypoFix},
 	{name: "instance_remove_volatile_last_state_ip_addresses", stage: patchPostDaemonStorage, run: patchInstanceRemoveVolatileLastStateIPAddresses},
 	{name: "entity_type_identity_certificate_split", stage: patchPreLoadClusterConfig, run: patchSplitIdentityCertificateEntityTypes},
+	{name: "storage_unset_powerflex_sdt_setting", stage: patchPostDaemonStorage, run: patchUnsetPowerFlexSDTSetting},
+	{name: "oidc_groups_claim_scope", stage: patchPreLoadClusterConfig, run: patchOIDCGroupsClaimScope},
+	{name: "remove_backupsimages_symlinks", stage: patchPostDaemonStorage, run: patchRemoveBackupsImagesSymlinks},
+	{name: "move_images_storage", stage: patchPostDaemonStorage, run: patchMoveBackupsImagesStorage},
+	{name: "cluster_config_volatile_uuid", stage: patchPreLoadClusterConfig, run: patchClusterConfigVolatileUUID},
+	{name: "storage_update_powerflex_clone_copy_setting", stage: patchPostDaemonStorage, run: patchUpdatePowerFlexCloneCopySetting},
+	{name: "storage_update_powerflex_snapshot_prefix", stage: patchPostDaemonStorage, run: patchUpdatePowerFlexSnapshotPrefix},
+	{name: "config_remove_instances_placement_scriptlet", stage: patchPreLoadClusterConfig, run: patchRemoveInstancesPlacementScriptlet},
+	{name: "event_entitlement_rename", stage: patchPreLoadClusterConfig, run: patchEventEntitlementNames},
+	{name: "pool_fix_default_permissions", stage: patchPostDaemonStorage, run: patchDefaultStoragePermissions},
+	{name: "storage_unset_cephfs_pristine_setting", stage: patchPostDaemonStorage, run: patchUnsetCephFSPristineSetting},
+	{name: "update_volatile_attached_volumes_format", stage: patchPostDaemonStorage, run: patchUpdateVolatileAttachedVolumesFormat},
+	{name: "storage_unset_ceph_force_reuse_setting", stage: patchPostDaemonStorage, run: patchUnsetCephForceReuseSetting},
+	{name: "vm_rename_security_csm", stage: patchPostDaemonStorage, run: patchVMRenameSecurityCSM},
+	{name: "vm_set_max_bus_ports", stage: patchPostDaemonStorage, run: patchVMSetMaxBusPorts},
+	{name: "storage_remove_local_buckets", stage: patchPostDaemonStorage, run: patchStorageRemoveLocalBuckets},
+	{name: "config_remove_maas_keys", stage: patchPreLoadClusterConfig, run: patchRemoveMAASConfigKeys},
+	{name: "storage_unset_ceph_source_setting", stage: patchPostDaemonStorage, run: patchUnsetCephSourceSetting},
+	{name: "clustering_event_hub_role_to_control_plane", stage: patchPreLoadClusterConfig, run: patchClusteringEventHubRoleToControlPlane},
+	{name: "storage_zfs_remove_local_bucket_datasets", stage: patchPostDaemonStorage, run: patchGenericStorage},
+	{name: "storage_rename_nvme_mode", stage: patchPreLoadClusterConfig, run: patchStoragePoolConnectorNVMeMode},
+	{name: "replicators_remove_snapshot_config_key", stage: patchPreLoadClusterConfig, run: patchReplicatorsRemoveSnapshotConfigKey},
+	{name: "config_remove_legacy_nvidia_keys", stage: patchPreLoadClusterConfig, run: patchRemoveLegacyNvidiaConfigKeys},
+	{name: "instance_reattach_shared_devlxd_shmounts", stage: patchPostInstancesLoaded, run: patchReattachSharedDevLXDMounts},
 }
 
 type patch struct {
@@ -120,13 +159,13 @@ func (p *patch) apply(d *Daemon) error {
 
 // Return the names of all available patches.
 func patchesGetNames() []string {
-	names := make([]string, len(patches))
-	for i, patch := range patches {
+	names := make([]string, 0, len(patches))
+	for _, patch := range patches {
 		if patch.stage == patchNoStageSet {
 			continue // Ignore any patch without explicitly set stage (it is defined incorrectly).
 		}
 
-		names[i] = patch.name
+		names = append(names, patch.name)
 	}
 
 	return names
@@ -149,7 +188,7 @@ func patchesApply(d *Daemon, stage patchStage) error {
 			continue
 		}
 
-		if shared.ValueInSlice(patch.name, appliedPatches) {
+		if slices.Contains(appliedPatches, patch.name) {
 			continue
 		}
 
@@ -192,7 +231,7 @@ func selectedPatchClusterMember(s *state.State) (bool, error) {
 	}
 
 	if len(clusterMembers) == 0 {
-		return false, fmt.Errorf("Clustered but no member found")
+		return false, errors.New("Clustered but no member found")
 	}
 
 	// Sort the cluster members by name.
@@ -272,16 +311,16 @@ func patchClusteringServerCertTrust(name string, d *Daemon) error {
 	// Check all other members have done the same.
 	for {
 		var err error
-		var dbCerts []dbCluster.Certificate
+		var dbCerts []dbCluster.CertificateLegacy
 		err = d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
-			dbCerts, err = dbCluster.GetCertificates(ctx, tx.Tx())
+			dbCerts, _, err = dbCluster.GetCertificatesAndURLsLegacy(ctx, tx.Tx(), nil)
 			return err
 		})
 		if err != nil {
 			return err
 		}
 
-		trustedServerCerts := make(map[string]dbCluster.Certificate)
+		trustedServerCerts := make(map[string]dbCluster.CertificateLegacy)
 
 		for _, c := range dbCerts {
 			if c.Type == certificate.TypeServer {
@@ -318,7 +357,7 @@ func patchClusteringServerCertTrust(name string, d *Daemon) error {
 			continue
 		}
 
-		logger.Infof("Trusted server certificates found in trust store for all cluster members")
+		logger.Info("Trusted server certificates found in trust store for all cluster members")
 		break
 	}
 
@@ -400,9 +439,12 @@ func patchNetworkACLRemoveDefaults(name string, d *Daemon) error {
 // Its done as a patch rather than a schema update so we can use PRAGMA foreign_keys = OFF without a transaction.
 func patchDBNodesAutoInc(name string, d *Daemon) error {
 	for {
+		// Get state on every iteration in case of change, since this loop can run indefinitely.
+		s := d.State()
+
 		// Only apply patch if schema needs it.
 		var schemaSQL string
-		row := d.State().DB.Cluster.DB().QueryRow("SELECT sql FROM sqlite_master WHERE name = 'nodes'")
+		row := s.DB.Cluster.DB().QueryRow("SELECT sql FROM sqlite_master WHERE name = 'nodes'")
 		err := row.Scan(&schemaSQL)
 		if err != nil {
 			return err
@@ -413,27 +455,13 @@ func patchDBNodesAutoInc(name string, d *Daemon) error {
 			return nil // Nothing to do.
 		}
 
-		// Only apply patch on leader, otherwise wait for it to be applied.
-		var localConfig *node.Config
-		err = d.db.Node.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
-			localConfig, err = node.ConfigLoad(ctx, tx)
-			return err
-		})
+		leaderInfo, err := s.LeaderInfo()
 		if err != nil {
 			return err
 		}
 
-		leaderAddress, err := d.gateway.LeaderAddress()
-		if err != nil {
-			if errors.Is(err, cluster.ErrNodeIsNotClustered) {
-				break // Apply change on standalone node.
-			}
-
-			return err
-		}
-
-		if localConfig.ClusterAddress() == leaderAddress {
-			break // Apply change on leader node.
+		if leaderInfo.Leader {
+			break // Apply change on leader node (or standalone node).
 		}
 
 		logger.Warnf("Waiting for %q patch to be applied on leader cluster member", name)
@@ -442,8 +470,8 @@ func patchDBNodesAutoInc(name string, d *Daemon) error {
 
 	// Apply patch.
 	_, err := d.State().DB.Cluster.DB().Exec(`
-PRAGMA foreign_keys=OFF; -- So that integrity doesn't get in the way for now.
-PRAGMA legacy_alter_table = ON; -- So that views referencing this table don't block change.
+PRAGMA foreign_keys=OFF; -- So that integrity does not get in the way for now.
+PRAGMA legacy_alter_table = ON; -- So that views referencing this table do not block change.
 
 CREATE TABLE nodes_new (
 	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -493,10 +521,10 @@ func patchVMRenameUUIDKey(name string, d *Daemon) error {
 					newUUIDKey: uuid,
 				}
 
-				logger.Debugf("Renaming config key %q to %q for VM %q (Project %q)", oldUUIDKey, newUUIDKey, inst.Name, inst.Project)
+				logger.Debugf("Renaming config key %q to %q for VM %q (project %q)", oldUUIDKey, newUUIDKey, inst.Name, inst.Project)
 				err := tx.UpdateInstanceConfig(inst.ID, changes)
 				if err != nil {
-					return fmt.Errorf("Failed renaming config key %q to %q for VM %q (Project %q): %w", oldUUIDKey, newUUIDKey, inst.Name, inst.Project, err)
+					return fmt.Errorf("Failed renaming config key %q to %q for VM %q (project %q): %w", oldUUIDKey, newUUIDKey, inst.Name, inst.Project, err)
 				}
 			}
 
@@ -518,10 +546,10 @@ func patchVMRenameUUIDKey(name string, d *Daemon) error {
 						newUUIDKey: uuid,
 					}
 
-					logger.Debugf("Renaming config key %q to %q for VM %q (Project %q)", oldUUIDKey, newUUIDKey, snap.Name, snap.Project)
+					logger.Debugf("Renaming config key %q to %q for VM %q (project %q)", oldUUIDKey, newUUIDKey, snap.Name, snap.Project)
 					err = tx.UpdateInstanceSnapshotConfig(snap.ID, changes)
 					if err != nil {
-						return fmt.Errorf("Failed renaming config key %q to %q for VM %q (Project %q): %w", oldUUIDKey, newUUIDKey, snap.Name, snap.Project, err)
+						return fmt.Errorf("Failed renaming config key %q to %q for VM %q (project %q): %w", oldUUIDKey, newUUIDKey, snap.Name, snap.Project, err)
 					}
 				}
 			}
@@ -539,7 +567,7 @@ func patchThinpoolTypoFix(name string, d *Daemon) error {
 	// Setup a transaction.
 	tx, err := d.db.Cluster.Begin()
 	if err != nil {
-		return fmt.Errorf("Failed to begin transaction: %w", err)
+		return fmt.Errorf("Failed beginning transaction: %w", err)
 	}
 
 	revert.Add(func() { _ = tx.Rollback() })
@@ -547,20 +575,20 @@ func patchThinpoolTypoFix(name string, d *Daemon) error {
 	// Fetch the IDs of all existing nodes.
 	nodeIDs, err := query.SelectIntegers(context.TODO(), tx, "SELECT id FROM nodes")
 	if err != nil {
-		return fmt.Errorf("Failed to get IDs of current nodes: %w", err)
+		return fmt.Errorf("Failed getting IDs of current nodes: %w", err)
 	}
 
 	// Fetch the IDs of all existing lvm pools.
 	poolIDs, err := query.SelectIntegers(context.TODO(), tx, "SELECT id FROM storage_pools WHERE driver='lvm'")
 	if err != nil {
-		return fmt.Errorf("Failed to get IDs of current lvm pools: %w", err)
+		return fmt.Errorf("Failed getting IDs of current lvm pools: %w", err)
 	}
 
 	for _, poolID := range poolIDs {
 		// Fetch the config for this lvm pool and check if it has the lvm.thinpool_name.
 		config, err := query.SelectConfig(context.TODO(), tx, "storage_pools_config", "storage_pool_id=? AND node_id IS NULL", poolID)
 		if err != nil {
-			return fmt.Errorf("Failed to fetch of lvm pool config: %w", err)
+			return fmt.Errorf("Failed fetching of lvm pool config: %w", err)
 		}
 
 		value, ok := config["lvm.thinpool_name"]
@@ -573,7 +601,7 @@ func patchThinpoolTypoFix(name string, d *Daemon) error {
 DELETE FROM storage_pools_config WHERE key='lvm.thinpool_name' AND storage_pool_id=? AND node_id IS NULL
 `, poolID)
 		if err != nil {
-			return fmt.Errorf("Failed to delete lvm.thinpool_name config: %w", err)
+			return fmt.Errorf("Failed deleting lvm.thinpool_name config: %w", err)
 		}
 
 		// Add the config entry for each node
@@ -583,14 +611,14 @@ INSERT INTO storage_pools_config(storage_pool_id, node_id, key, value)
   VALUES(?, ?, 'lvm.thinpool_name', ?)
 `, poolID, nodeID, value)
 			if err != nil {
-				return fmt.Errorf("Failed to create lvm.thinpool_name node config: %w", err)
+				return fmt.Errorf("Failed creating lvm.thinpool_name local config: %w", err)
 			}
 		}
 	}
 
 	err = tx.Commit()
 	if err != nil {
-		return fmt.Errorf("Failed to commit transaction: %w", err)
+		return fmt.Errorf("Failed committing transaction: %w", err)
 	}
 
 	revert.Success()
@@ -699,7 +727,6 @@ func patchNetworkOVNRemoveRoutes(name string, d *Daemon) error {
 // patchNetworkOVNEnableNAT adds "ipv4.nat" and "ipv6.nat" keys set to "true" to OVN networks if not present.
 // This is to ensure existing networks retain the old behaviour of always having NAT enabled as we introduce
 // the new NAT settings which default to disabled if not specified.
-// patchNetworkCearBridgeVolatileHwaddr removes the unsupported `volatile.bridge.hwaddr` config key from networks.
 func patchNetworkOVNEnableNAT(name string, d *Daemon) error {
 	err := d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		projectNetworks, err := tx.GetCreatedNetworks(ctx)
@@ -748,20 +775,22 @@ func patchNetworkOVNEnableNAT(name string, d *Daemon) error {
 
 // Moves backups from shared.VarPath("backups") to shared.VarPath("backups", "instances").
 func patchMoveBackupsInstances(name string, d *Daemon) error {
-	if !shared.PathExists(shared.VarPath("backups")) {
-		return nil // Nothing to do, no backups directory.
-	}
+	backupsPathBase := d.State().BackupsStoragePath("")
 
-	backupsPath := shared.VarPath("backups", "instances")
+	backupsPath := filepath.Join(backupsPathBase, "instances")
 
 	err := os.MkdirAll(backupsPath, 0700)
 	if err != nil {
 		return fmt.Errorf("Failed creating instances backup directory %q: %w", backupsPath, err)
 	}
 
-	backups, err := os.ReadDir(shared.VarPath("backups"))
+	backups, err := os.ReadDir(backupsPathBase)
 	if err != nil {
-		return fmt.Errorf("Failed listing existing backup directory %q: %w", shared.VarPath("backups"), err)
+		if os.IsNotExist(err) {
+			return nil // Nothing to do, no backups directory.
+		}
+
+		return fmt.Errorf("Failed listing existing backup directory %q: %w", backupsPathBase, err)
 	}
 
 	for _, backupDir := range backups {
@@ -769,7 +798,7 @@ func patchMoveBackupsInstances(name string, d *Daemon) error {
 			continue // Don't try and move our new instances directory or temporary directories.
 		}
 
-		oldPath := shared.VarPath("backups", backupDir.Name())
+		oldPath := filepath.Join(backupsPathBase, backupDir.Name())
 		newPath := filepath.Join(backupsPath, backupDir.Name())
 		logger.Debugf("Moving backup from %q to %q", oldPath, newPath)
 		err = os.Rename(oldPath, newPath)
@@ -809,6 +838,19 @@ func patchClusteringDropDatabaseRole(name string, d *Daemon) error {
 				return err
 			}
 		}
+		return nil
+	})
+}
+
+func patchClusteringEventHubRoleToControlPlane(name string, d *Daemon) error {
+	const legacyEventHubRoleID = 1
+
+	return d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		_, err := tx.Tx().Exec("DELETE FROM nodes_roles WHERE role=?", legacyEventHubRoleID)
+		if err != nil {
+			return fmt.Errorf("Failed removing legacy event-hub role: %w", err)
+		}
+
 		return nil
 	})
 }
@@ -933,7 +975,7 @@ func patchZfsSetContentTypeUserProperty(name string, d *Daemon) error {
 
 			zfsVolName := fmt.Sprintf("%s/%s/%s", poolName, storageDrivers.VolumeTypeCustom, project.StorageVolume(vol.Project, vol.Name))
 
-			_, err = shared.RunCommand("zfs", "set", fmt.Sprintf("lxd:content_type=%s", vol.ContentType), zfsVolName)
+			_, err = shared.RunCommand(d.shutdownCtx, "zfs", "set", "lxd:content_type="+vol.ContentType, zfsVolName)
 			if err != nil {
 				logger.Debug("Failed setting lxd:content_type property", logger.Ctx{"name": zfsVolName, "err": err})
 			}
@@ -951,7 +993,7 @@ func patchStorageZfsUnsetInvalidBlockSettings(_ string, d *Daemon) error {
 
 // patchStorageZfsUnsetInvalidBlockSettingsV2 removes invalid block settings from volumes.
 // This patch fixes the previous one.
-// - Handle non-clusted environments correctly.
+// - Handle non-clustered environments correctly.
 // - Always remove block.* settings from VMs.
 func patchStorageZfsUnsetInvalidBlockSettingsV2(_ string, d *Daemon) error {
 	s := d.State()
@@ -1018,7 +1060,7 @@ func patchStorageZfsUnsetInvalidBlockSettingsV2(_ string, d *Daemon) error {
 		return err
 	}
 
-	var volType int
+	var volType dbCluster.StoragePoolVolumeType
 
 	for pool, volumes := range poolVolumes {
 		for _, vol := range volumes {
@@ -1048,12 +1090,12 @@ func patchStorageZfsUnsetInvalidBlockSettingsV2(_ string, d *Daemon) error {
 				continue
 			}
 
-			if vol.Type == dbCluster.StoragePoolVolumeTypeNameVM {
+			switch vol.Type {
+			case dbCluster.StoragePoolVolumeTypeNameVM:
 				volType = volTypeVM
-			} else if vol.Type == dbCluster.StoragePoolVolumeTypeNameCustom {
+			case dbCluster.StoragePoolVolumeTypeNameCustom:
 				volType = volTypeCustom
-			} else {
-				// Should not happen.
+			default:
 				continue
 			}
 
@@ -1095,7 +1137,7 @@ func patchRemoveCandidRBACConfigKeys(_ string, d *Daemon) error {
 		})
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to remove RBAC and Candid configuration keys: %w", err)
+		return fmt.Errorf("Failed removing RBAC and Candid configuration keys: %w", err)
 	}
 
 	return nil
@@ -1136,7 +1178,7 @@ FROM %[1]s
 			var r volumeConfigEntry
 			err = rows.Scan(&r.id, &r.value)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to scan row into struct: %w", err)
+				return nil, fmt.Errorf("Failed scanning row into struct: %w", err)
 			}
 
 			volumeUUIDs = append(volumeUUIDs, r)
@@ -1293,7 +1335,7 @@ func patchStorageRenameCustomISOBlockVolumesV2(name string, d *Daemon) error {
 
 			hasVol, err := p.Driver().HasVolume(existingVol)
 			if err != nil {
-				return fmt.Errorf("Failed to check if volume %q exists in pool %q: %w", existingVol.Name(), p.Name(), err)
+				return fmt.Errorf("Failed checking if volume %q exists in pool %q: %w", existingVol.Name(), p.Name(), err)
 			}
 
 			// patchStorageRenameCustomISOBlockVolumes might have already set the *.iso suffix.
@@ -1305,9 +1347,9 @@ func patchStorageRenameCustomISOBlockVolumesV2(name string, d *Daemon) error {
 			// We need to use ContentTypeBlock here in order for the driver to figure out the correct (old) location.
 			oldVol := storageDrivers.NewVolume(p.Driver(), p.Name(), storageDrivers.VolumeTypeCustom, storageDrivers.ContentTypeBlock, project.StorageVolume(vol.Project, vol.Name), nil, nil)
 
-			err = p.Driver().RenameVolume(oldVol, fmt.Sprintf("%s.iso", oldVol.Name()), nil)
+			err = p.Driver().RenameVolume(oldVol, oldVol.Name()+".iso", nil)
 			if err != nil {
-				return fmt.Errorf("Failed to rename volume %q in pool %q: %w", oldVol.Name(), p.Name(), err)
+				return fmt.Errorf("Failed renaming volume %q in pool %q: %w", oldVol.Name(), p.Name(), err)
 			}
 		}
 	}
@@ -1343,7 +1385,7 @@ func patchRemoveCoreTrustPassword(_ string, d *Daemon) error {
 		})
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to remove core.trust_password config key: %w", err)
+		return fmt.Errorf("Failed removing core.trust_password config key: %w", err)
 	}
 
 	return nil
@@ -1358,7 +1400,7 @@ func patchEntityTypeInstanceSnapshotOnDeleteTriggerTypoFix(_ string, d *Daemon) 
 		return err
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to remove trigger: %w", err)
+		return fmt.Errorf("Failed removing trigger: %w", err)
 	}
 
 	return nil
@@ -1369,67 +1411,36 @@ func patchInstanceRemoveVolatileLastStateIPAddresses(_ string, d *Daemon) error 
 	s := d.State()
 
 	err := s.DB.Cluster.Transaction(s.ShutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
-		foundCandidateKey := func(k string) bool {
-			if strings.HasPrefix(k, "volatile.") && strings.HasSuffix(k, ".last_state.ip_addresses") {
-				return true
-			}
-
-			return false
+		_, err := tx.Tx().ExecContext(ctx, `
+			DELETE FROM instances_config WHERE id IN(
+				SELECT instances_config.id
+				FROM instances_config
+				JOIN instances ON instances.id = instances_config.instance_id
+				JOIN nodes ON nodes.id = instances.node_id
+				WHERE key LIKE 'volatile.%.last_state.ip_addresses'
+				AND nodes.name = ?
+			)
+		`, s.ServerName)
+		if err != nil {
+			return err
 		}
 
-		// Get instances on this member.
-		return tx.InstanceList(ctx, func(dbInst db.InstanceArgs, p api.Project) error {
-			l := logger.AddContext(logger.Ctx{"project": dbInst.Project, "inst": dbInst.Name})
+		_, err = tx.Tx().ExecContext(ctx, `
+			DELETE FROM instances_snapshots_config WHERE id IN(
+				SELECT instances_snapshots_config.id
+				FROM instances_snapshots_config
+				JOIN instances_snapshots ON instances_snapshots.id = instances_snapshots_config.instance_snapshot_id
+				JOIN instances ON instances.id = instances_snapshots.instance_id
+				JOIN nodes ON nodes.id = instances.node_id
+				WHERE key LIKE 'volatile.%.last_state.ip_addresses'
+				AND nodes.name = ?
+			)
+		`, s.ServerName)
+		if err != nil {
+			return err
+		}
 
-			for k := range dbInst.Config {
-				if !foundCandidateKey(k) {
-					continue
-				}
-
-				// Remove found config key.
-				changes := map[string]string{
-					k: "",
-				}
-
-				l.Debug("Removing config key from instance", logger.Ctx{"key": k})
-				err := tx.UpdateInstanceConfig(dbInst.ID, changes)
-				if err != nil {
-					return fmt.Errorf("Failed removing config key %q for instance %q (Project %q): %w", k, dbInst.Name, dbInst.Project, err)
-				}
-			}
-
-			// Get snapshots for instance so we can check those too.
-			dbSnaps, err := tx.GetInstanceSnapshotsWithName(ctx, dbInst.Project, dbInst.Name)
-			if err != nil {
-				return fmt.Errorf("Failed getting snapshots for %q (Project %q): %w", dbInst.Name, dbInst.Project, err)
-			}
-
-			for _, dbSnap := range dbSnaps {
-				snapConfig, err := dbCluster.GetInstanceSnapshotConfig(ctx, tx.Tx(), dbSnap.ID)
-				if err != nil {
-					return err
-				}
-
-				for k := range snapConfig {
-					if !foundCandidateKey(k) {
-						continue
-					}
-
-					// Remove found config key.
-					changes := map[string]string{
-						k: "",
-					}
-
-					l.Debug("Removing config key from instance snapshot", logger.Ctx{"snapshot": dbSnap.Name, "key": k})
-					err := tx.UpdateInstanceSnapshotConfig(dbSnap.ID, changes)
-					if err != nil {
-						return fmt.Errorf("Failed removing config key %q for instance %q (Project %q): %w", k, dbSnap.Name, dbSnap.Project, err)
-					}
-				}
-			}
-
-			return nil
-		}, dbCluster.InstanceFilter{Node: &s.ServerName})
+		return nil
 	})
 	if err != nil {
 		return fmt.Errorf("Failed removing volatile.*.last_state.ip_addresses config keys: %w", err)
@@ -1450,7 +1461,7 @@ func patchSplitIdentityCertificateEntityTypes(_ string, d *Daemon) error {
 		// Select all permissions with entity type = "identity", that really are certificates (auth_method = "tls")
 		// and set their entity type to "certificate" instead. Use "UPDATE OR REPLACE" in case of UNIQUE constraint violation.
 		stmt := `
-UPDATE OR REPLACE auth_groups_permissions 
+UPDATE OR REPLACE auth_groups_permissions
 	SET entity_type = ?
 	WHERE id IN (
 	    SELECT auth_groups_permissions.id FROM auth_groups_permissions
@@ -1470,7 +1481,1155 @@ UPDATE OR REPLACE auth_groups_permissions
 		return err
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to redefine certificate and identity entity types: %w", err)
+		return fmt.Errorf("Failed redefining certificate and identity entity types: %w", err)
+	}
+
+	return nil
+}
+
+// patchUnsetPowerFlexSDTSetting unsets the powerflex.sdt setting from all storage pools configs.
+// The address used inside the config key was populated for all PowerFlex storage pools using the nvme mode.
+// The single address was used together with the "nvme connect-all" command to discover the remaining SDTs to connect to all of them.
+// Unsetting this key, discovering all SDTs from PowerFlex REST API and connecting to all of them using
+// the "nvme connect" command has the exact same effect.
+func patchUnsetPowerFlexSDTSetting(_ string, d *Daemon) error {
+	_, err := d.State().DB.Cluster.DB().ExecContext(d.shutdownCtx, `
+DELETE FROM storage_pools_config WHERE key = "powerflex.sdt"
+	`)
+	return err
+}
+
+// patchOIDCGroupsClaimScope adds the contents of oidc.groups.claim to the new configuration for oidc.scopes if present.
+// The oidc.groups.claim value was initially added to scopes but shouldn't have been. This patch will allow users with
+// working identity provider group mappings to continue using them by continuing to request the claim as an additional
+// scope.
+func patchOIDCGroupsClaimScope(_ string, d *Daemon) error {
+	err := d.State().DB.Cluster.Transaction(d.shutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+		// Get current configuration.
+		globalConfig, err := clusterConfig.Load(ctx, tx)
+		if err != nil {
+			return err
+		}
+
+		// Get the groups claim and scopes (these will just be the default values at the time of the patch)
+		_, _, _, scopes, _, groupsClaim, _ := globalConfig.OIDCServer()
+
+		// If the groups claim is not set, or this patch was already run on another member and the groups claim is
+		// already present in the list of scopes, then there is nothing to do.
+		if groupsClaim == "" || slices.Contains(scopes, groupsClaim) {
+			return nil
+		}
+
+		// Add the groups claim as an additional scope.
+		// The groups claim still needs to be set to extract group values from the token claims or userinfo.
+		oidcScopes := append(scopes, groupsClaim)
+		_, err = globalConfig.Patch(tx, map[string]string{
+			"oidc.scopes": strings.Join(oidcScopes, " "),
+		})
+
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("Failed configuring oidc.groups.claim as an OIDC scope: %w", err)
+	}
+
+	return nil
+}
+
+// Remove shared.VarPath("backups") and shared.VarPath("images") symlinks.
+func patchRemoveBackupsImagesSymlinks(_ string, d *Daemon) error {
+	dirs := []string{
+		shared.VarPath("backups"),
+		shared.VarPath("images"),
+	}
+
+	for _, dir := range dirs {
+		info, err := os.Lstat(dir)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue // Nothing to do, symlink doesn't exist
+			}
+
+			return fmt.Errorf("Failed calling Lstat() on %q: %w", dir, err)
+		}
+
+		if info.Mode()&os.ModeSymlink != 0 {
+			// Remove the symlink.
+			err = os.Remove(dir)
+			if err != nil {
+				return fmt.Errorf("Failed deleting storage symlink at %q: %w", dir, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// If storage.images_volume is set, move images into an `images` subfolder.
+func patchMoveBackupsImagesStorage(name string, d *Daemon) error {
+	moveStorage := func(storageType config.DaemonStorageType, destPath string) error {
+		sourcePath, dirName := filepath.Split(destPath)
+
+		err := os.MkdirAll(destPath, 0700)
+		if err != nil {
+			return fmt.Errorf("Failed creating directory %q: %w", destPath, err)
+		}
+
+		items, err := os.ReadDir(sourcePath)
+		if err != nil {
+			return fmt.Errorf("Failed listing existing directory %q: %w", sourcePath, err)
+		}
+
+		for _, item := range items {
+			if item.Name() == dirName {
+				continue // Don't try and move our new directory.
+			}
+
+			oldPath := filepath.Join(sourcePath, item.Name())
+			newPath := filepath.Join(destPath, item.Name())
+			logger.Debugf("Moving %s from %q to %q", storageType, oldPath, newPath)
+			err = os.Rename(oldPath, newPath)
+			if err != nil {
+				return fmt.Errorf("Failed moving file from %q to %q: %w", oldPath, newPath, err)
+			}
+		}
+
+		return nil
+	}
+
+	if d.localConfig.StorageImagesVolume("") != "" {
+		err := moveStorage(config.DaemonStorageTypeImages, d.State().ImagesStoragePath(""))
+		if err != nil {
+			return err
+		}
+	}
+
+	if d.localConfig.StorageBackupsVolume("") != "" {
+		err := moveStorage(config.DaemonStorageTypeBackups, d.State().BackupsStoragePath(""))
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// patchClusterConfigVolatileUUID checks if the clusterUUID is defined and if not, generates a new v7 UUID and saves it
+// to the `config` table under `volatile.uuid`. Note that this means existing deployments will have a 'volatile.uuid'
+// that does not match the contents of `$LXD_DIR/server.uuid`, whereas new deployments will have a 'volatile.uuid' that
+// matches the contents of 'server.uuid' on the member that initially bootstrapped the cluster.
+func patchClusterConfigVolatileUUID(name string, d *Daemon) error {
+	return d.db.Cluster.Transaction(d.shutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+		// Get current configuration.
+		globalConfig, err := clusterConfig.Load(ctx, tx)
+		if err != nil {
+			return err
+		}
+
+		// If the cluster UUID has been set, return.
+		if globalConfig.ClusterUUID() != "" {
+			return nil
+		}
+
+		clusterUUID, err := uuid.NewV7()
+		if err != nil {
+			return fmt.Errorf("Failed generating a cluster UUID: %w", err)
+		}
+
+		// Otherwise, insert the server UUID into the database.
+		_, err = tx.Tx().Exec(`INSERT INTO config (key, value) VALUES ('volatile.uuid', ?)`, clusterUUID.String())
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+// patchUpdatePowerFlexCloneCopySetting checks whether or not the 'powerflex.clone_copy' setting is present on any applicable storage pool.
+// If set it's getting replaced with the new 'powerflex.snapshot_copy' setting which also inverts the original value.
+func patchUpdatePowerFlexCloneCopySetting(_ string, d *Daemon) error {
+	err := d.State().DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		var err error
+
+		// Get all storage pool names.
+		pools, _, err := tx.GetStoragePools(ctx, nil)
+		if err != nil {
+			// Skip the rest of the patch if no storage pools were found.
+			if api.StatusErrorCheck(err, http.StatusNotFound) {
+				return nil
+			}
+
+			return err
+		}
+
+		for _, pool := range pools {
+			// Skip all pools which don't use the powerflex driver.
+			if pool.Driver != "powerflex" {
+				continue
+			}
+
+			if pool.Config["powerflex.clone_copy"] != "" {
+				if shared.IsFalse(pool.Config["powerflex.clone_copy"]) {
+					pool.Config["powerflex.snapshot_copy"] = "true"
+				} else if shared.IsTrue(pool.Config["powerflex.clone_copy"]) {
+					pool.Config["powerflex.snapshot_copy"] = "false"
+				}
+
+				// Delete the old config key.
+				delete(pool.Config, "powerflex.clone_copy")
+
+				// Persist the changes.
+				err = tx.UpdateStoragePool(ctx, pool.Name, pool.Description, pool.Config)
+				if err != nil {
+					return fmt.Errorf("Failed updating storage pool %q: %w", pool.Name, err)
+				}
+			}
+		}
+
+		return nil
+	})
+
+	return err
+}
+
+// patchUpdatePowerFlexSnapshotPrefix adds the snapshot prefix to snapshots which actually belong to
+// LXD volumes and were not created through the powerflex.snapshot_copy=true setting.
+func patchUpdatePowerFlexSnapshotPrefix(_ string, d *Daemon) error {
+	s := d.State()
+
+	isSelectedPatchMember, err := selectedPatchClusterMember(s)
+	if err != nil {
+		return err
+	}
+
+	// Only run the patch on the selected member to ensure the change is only ever performed once on the
+	// remote storage which is shared across all cluster members.
+	if !isSelectedPatchMember {
+		return nil
+	}
+
+	// Cache a list of snapshots, by pool and volume.
+	poolVolumesSnapshots := make(map[string]map[*db.StorageVolume][]db.StorageVolumeArgs)
+
+	err = d.State().DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		var err error
+
+		// Get all storage pool names.
+		pools, _, err := tx.GetStoragePools(ctx, nil)
+		if err != nil {
+			// Skip the rest of the patch if no storage pools were found.
+			if api.StatusErrorCheck(err, http.StatusNotFound) {
+				return nil
+			}
+
+			return err
+		}
+
+		for poolID, pool := range pools {
+			// Skip all pools which don't use the powerflex driver.
+			if pool.Driver != "powerflex" {
+				continue
+			}
+
+			poolVolumesSnapshots[pool.Name] = make(map[*db.StorageVolume][]db.StorageVolumeArgs)
+
+			volumes, err := tx.GetStorageVolumes(ctx, false, db.StorageVolumeFilter{PoolID: &poolID})
+			if err != nil {
+				return fmt.Errorf("Failed getting storage volumes for pool %q: %w", pool.Name, err)
+			}
+
+			for _, volume := range volumes {
+				volType, err := dbCluster.StoragePoolVolumeTypeFromName(volume.Type)
+				if err != nil {
+					return err
+				}
+
+				snapshots, err := tx.GetLocalStoragePoolVolumeSnapshotsWithType(ctx, volume.Project, volume.Name, volType, poolID)
+				if err != nil {
+					return err
+				}
+
+				poolVolumesSnapshots[pool.Name][volume] = snapshots
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	// Iterate over the pools, volumes and snapshots.
+	for poolName, volumesSnapshots := range poolVolumesSnapshots {
+		p, err := storagePools.LoadByName(s, poolName)
+		if err != nil {
+			return fmt.Errorf("Failed loading pool %q: %w", poolName, err)
+		}
+
+		var snapVols []storageDrivers.Volume
+
+		for volume, snapshots := range volumesSnapshots {
+			for _, snapshot := range snapshots {
+				snapshotName := storageDrivers.GetSnapshotVolumeName(volume.Name, snapshot.Name)
+				snapshotStorageName := project.StorageVolume(volume.Project, snapshotName)
+
+				dbVolType, err := dbCluster.StoragePoolVolumeTypeFromName(volume.Type)
+				if err != nil {
+					return err
+				}
+
+				// Get the right storage level volume type.
+				// The volume might either be a container, VM or custom snapshot.
+				volType := storagePools.VolumeDBTypeToType(dbVolType)
+
+				snapVol := storageDrivers.NewVolume(p.Driver(), p.Name(), volType, storageDrivers.ContentType(volume.ContentType), snapshotStorageName, snapshot.Config, p.ToAPI().Config)
+				snapVols = append(snapVols, snapVol)
+			}
+		}
+
+		// Invoke the driver level patch function.
+		// We are passing a list of volumes which require patching the snapshot prefix.
+		err = storageDrivers.PatchUpdatePowerFlexSnapshotPrefix(p.Driver(), snapVols)
+		if err != nil {
+			return fmt.Errorf("Failed patching volume snapshot prefixes on pool %q: %w", poolName, err)
+		}
+	}
+
+	return nil
+}
+
+// patchRemoveInstancesPlacementScriptlet removes the 'instances.placement.scriptlet' config key from the cluster.
+// If the key is set, its value is copied to 'user.instances.placement.scriptlet'.
+func patchRemoveInstancesPlacementScriptlet(name string, d *Daemon) error {
+	s := d.State()
+	return s.DB.Cluster.Transaction(d.shutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+		config, err := tx.Config(ctx)
+		if err != nil {
+			return err
+		}
+
+		const oldKey = "instances.placement.scriptlet"
+		const newKey = "user.instances.placement.scriptlet"
+
+		oldVal, ok := config[oldKey]
+		if !ok || oldVal == "" {
+			return nil
+		}
+
+		updates := map[string]string{
+			oldKey: "",
+		}
+
+		if config[newKey] == "" {
+			updates[newKey] = oldVal
+		}
+
+		return tx.UpdateClusterConfig(updates)
+	})
+}
+
+func patchEventEntitlementNames(name string, d *Daemon) error {
+	s := d.State()
+	return s.DB.Cluster.Transaction(d.shutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+		q := `UPDATE auth_groups_permissions SET entitlement = ? WHERE entitlement = ? AND entity_type = ?`
+
+		// Rename `can_view_privileged_events` on `server` to `can_view_events`.
+		_, err := tx.Tx().ExecContext(ctx, q, auth.EntitlementCanViewEvents, "can_view_privileged_events", dbCluster.EntityType(entity.TypeServer))
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+// patchDefaultStoragePermissions re-applies the default modes to all storage pools.
+func patchDefaultStoragePermissions(_ string, d *Daemon) error {
+	s := d.State()
+
+	var pools []string
+
+	err := s.DB.Cluster.Transaction(s.ShutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+		var err error
+
+		// Get all storage pool names.
+		pools, err = tx.GetStoragePoolNames(ctx)
+
+		return err
+	})
+	if err != nil {
+		// Skip the rest of the patch if no storage pools were found.
+		if api.StatusErrorCheck(err, http.StatusNotFound) {
+			return nil
+		}
+
+		return fmt.Errorf("Failed getting storage pool names: %w", err)
+	}
+
+	for _, pool := range pools {
+		for _, volEntry := range storageDrivers.BaseDirectories {
+			for _, volDir := range volEntry.Paths {
+				path := storageDrivers.GetPoolMountPath(pool) + "/" + volDir
+
+				err := os.Chmod(path, volEntry.Mode)
+				if err != nil && !errors.Is(err, fs.ErrNotExist) {
+					return fmt.Errorf("Failed setting directory mode %q: %w", path, err)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// patchUnsetCephFSPristineSetting unsets the volatile.pool.pristine setting from all CephFS storage pool's configs.
+func patchUnsetCephFSPristineSetting(_ string, d *Daemon) error {
+	_, err := d.State().DB.Cluster.DB().ExecContext(d.shutdownCtx, `
+		DELETE FROM storage_pools_config
+			WHERE key = "volatile.pool.pristine"
+			AND storage_pool_id IN (
+				SELECT id FROM storage_pools
+					WHERE driver = "cephfs"
+			)
+	`)
+	return err
+}
+
+// patchUpdateVolatileAttachedVolumesFormat updates "volatile.attached_volumes" from old format (map of volume UUID -> snapshot UUID) to new format (map of device_name -> snapshot_UUID).
+func patchUpdateVolatileAttachedVolumesFormat(_ string, d *Daemon) error {
+	s := d.State()
+
+	// Only run on a single cluster member to avoid concurrent updates.
+	isSelectedMember, err := selectedPatchClusterMember(s)
+	if err != nil {
+		return err
+	}
+
+	if !isSelectedMember {
+		return nil
+	}
+
+	err = s.DB.Cluster.Transaction(s.ShutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+		type snapshotData struct {
+			snapshotID                   int
+			instanceID                   int
+			name                         string
+			projectName                  string
+			volatileAttachedVolumesValue string
+		}
+
+		var snapshots []snapshotData
+
+		// Query to get all instance snapshots with "volatile.attached_volumes".
+		q := `
+SELECT
+	instances_snapshots.id,
+	instances_snapshots.name,
+	instances_snapshots.instance_id,
+	projects.name,
+	instances_snapshots_config.value
+FROM instances_snapshots_config
+JOIN instances_snapshots ON instances_snapshots.id = instances_snapshots_config.instance_snapshot_id
+JOIN instances ON instances.id = instances_snapshots.instance_id
+JOIN projects ON projects.id = instances.project_id
+WHERE instances_snapshots_config.key = "volatile.attached_volumes"
+`
+		err := query.Scan(ctx, tx.Tx(), q, func(scan func(dest ...any) error) error {
+			var snap snapshotData
+
+			err := scan(&snap.snapshotID, &snap.name, &snap.instanceID, &snap.projectName, &snap.volatileAttachedVolumesValue)
+			if err != nil {
+				return err
+			}
+
+			snapshots = append(snapshots, snap)
+
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+
+		// isAlreadyNewFormat checks if "volatile.attached_volumes" is already in the new format.
+		// New format uses device names as keys, old format uses volume UUIDs as keys.
+		isAlreadyNewFormat := func(attachedVolumes map[string]string, snapshotDevices map[string]dbCluster.Device) bool {
+			for key := range attachedVolumes {
+				_, keyMatchesDeviceName := snapshotDevices[key]
+				if keyMatchesDeviceName {
+					return true
+				}
+			}
+
+			return false
+		}
+
+		for _, snap := range snapshots {
+			var volatileAttachedVolumes map[string]string
+			err = json.Unmarshal([]byte(snap.volatileAttachedVolumesValue), &volatileAttachedVolumes)
+			if err != nil {
+				logger.Warn(`Failed parsing "volatile.attached_volumes", skipping snapshot`, logger.Ctx{"err": err, "snapshotName": snap.name, "snapshotID": snap.snapshotID, "instanceID": snap.instanceID, "project": snap.projectName})
+				continue
+			}
+
+			// Get instance snapshot devices.
+			devices, err := dbCluster.GetInstanceSnapshotDevices(ctx, tx.Tx(), snap.snapshotID)
+			if err != nil {
+				return fmt.Errorf("Failed getting instance snapshot %q devices: %w", snap.name, err)
+			}
+
+			if isAlreadyNewFormat(volatileAttachedVolumes, devices) {
+				continue
+			}
+
+			// Convert from old format (volume UUID -> snapshot UUID) to new format (device name -> snapshot UUID).
+
+			// Collect all volume UUIDs.
+			uuids := make([]string, 0, len(volatileAttachedVolumes))
+			for uuid := range volatileAttachedVolumes {
+				uuids = append(uuids, uuid)
+			}
+
+			customType := dbCluster.StoragePoolVolumeTypeCustom
+
+			filter := db.StorageVolumeFilter{
+				UUIDs: uuids,
+				Type:  &customType,
+			}
+
+			// Get all custom volumes with matching UUIDs.
+			volumes, err := tx.GetStorageVolumes(ctx, true, filter)
+			if err != nil {
+				return fmt.Errorf("Failed getting storage volumes: %w", err)
+			}
+
+			type volKey struct {
+				name string
+				pool string
+			}
+
+			// Create a map of [volKey] -> volume UUID for looking up volumes by device config.
+			volumeByPoolAndName := make(map[volKey]string)
+			for _, vol := range volumes {
+				volumeByPoolAndName[volKey{name: vol.Name, pool: vol.Pool}] = vol.Config["volatile.uuid"]
+			}
+
+			newVolatileAttachedVolumes := make(map[string]string, len(volatileAttachedVolumes))
+			for name, dev := range devices {
+				if !filters.IsCustomVolumeDisk(dev.Config) {
+					continue
+				}
+
+				// Look up the volume UUID by pool and name.
+				volumeUUID, found := volumeByPoolAndName[volKey{name: dev.Config["source"], pool: dev.Config["pool"]}]
+				if !found {
+					continue
+				}
+
+				// Look up the snapshot UUID by volume UUID.
+				snapshotUUID, found := volatileAttachedVolumes[volumeUUID]
+				if !found {
+					continue
+				}
+
+				newVolatileAttachedVolumes[name] = snapshotUUID
+			}
+
+			// Skip if no volumes were converted.
+			// This is a safety check and optimization to prevent an unnecessary write of an empty map, which could happen if the snapshot's "volatile.attached_volumes" references deleted volumes.
+			if len(newVolatileAttachedVolumes) == 0 {
+				continue
+			}
+
+			marshalled, err := json.Marshal(newVolatileAttachedVolumes)
+			if err != nil {
+				return fmt.Errorf(`Failed marshalling new "volatile.attached_volumes" format for instance snapshot %q: %w`, snap.name, err)
+			}
+
+			_, err = tx.Tx().ExecContext(ctx, `
+UPDATE instances_snapshots_config
+SET value = ?
+WHERE instance_snapshot_id = ? AND key = "volatile.attached_volumes"
+`, string(marshalled), snap.snapshotID)
+			if err != nil {
+				return fmt.Errorf(`Failed setting instance snapshot %q "volatile.attached_volumes": %w`, snap.name, err)
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf(`Failed updating "volatile.attached_volumes" to new format: %w`, err)
+	}
+
+	return nil
+}
+
+// patchUnsetCephForceReuseSetting unsets the ceph.osd.force_reuse setting from all storage pools' configs.
+func patchUnsetCephForceReuseSetting(_ string, d *Daemon) error {
+	_, err := d.State().DB.Cluster.DB().ExecContext(d.shutdownCtx, `
+DELETE FROM storage_pools_config WHERE key = "ceph.osd.force_reuse"
+	`)
+	return err
+}
+
+// patchVMRenameSecurityCSM migrates VM boot config keys to boot.mode in instance, snapshot, and profile configs.
+// Converts legacy keys:
+// - security.csm=true -> boot.mode=bios.
+// - security.secureboot=false -> boot.mode=uefi-nosecureboot.
+// - default/no explicit secureboot -> boot.mode=uefi-secureboot.
+func patchVMRenameSecurityCSM(name string, d *Daemon) error {
+	oldCSMKey := "security.csm"
+	oldSecureBootKey := "security.secureboot"
+	newKey := "boot.mode"
+
+	s := d.State()
+
+	// Only run on a single cluster member to avoid concurrent updates.
+	isSelectedMember, err := selectedPatchClusterMember(s)
+	if err != nil {
+		return err
+	}
+
+	if !isSelectedMember {
+		return nil
+	}
+
+	return s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		err := tx.InstanceList(ctx, func(inst db.InstanceArgs, p api.Project) error {
+			if inst.Type != instancetype.VM {
+				return nil
+			}
+
+			csmValue := inst.Config[oldCSMKey]
+			secureBootValue := inst.Config[oldSecureBootKey]
+			if csmValue != "" || secureBootValue != "" {
+				targetMode := instancetype.BootModeUEFISecureBoot
+				if shared.IsTrue(csmValue) {
+					targetMode = instancetype.BootModeBIOS
+				} else if shared.IsFalse(secureBootValue) {
+					targetMode = instancetype.BootModeUEFINoSecureBoot
+				}
+
+				changes := map[string]string{}
+				if csmValue != "" {
+					changes[oldCSMKey] = "" // Remove old key.
+				}
+
+				if secureBootValue != "" {
+					changes[oldSecureBootKey] = "" // Remove old key.
+				}
+
+				changes[newKey] = targetMode
+				logger.Debugf("Converting VM %q (project %q) boot config to %q=%q", inst.Name, inst.Project, newKey, targetMode)
+
+				err := tx.UpdateInstanceConfig(inst.ID, changes)
+				if err != nil {
+					return fmt.Errorf("Failed updating config for VM %q (project %q): %w", inst.Name, inst.Project, err)
+				}
+			}
+
+			snaps, err := tx.GetInstanceSnapshotsWithName(ctx, inst.Project, inst.Name)
+			if err != nil {
+				return err
+			}
+
+			for _, snap := range snaps {
+				config, err := dbCluster.GetInstanceSnapshotConfig(ctx, tx.Tx(), snap.ID)
+				if err != nil {
+					return err
+				}
+
+				csmValue := config[oldCSMKey]
+				secureBootValue := config[oldSecureBootKey]
+				if csmValue != "" || secureBootValue != "" {
+					targetMode := instancetype.BootModeUEFISecureBoot
+					if shared.IsTrue(csmValue) {
+						targetMode = instancetype.BootModeBIOS
+					} else if shared.IsFalse(secureBootValue) {
+						targetMode = instancetype.BootModeUEFINoSecureBoot
+					}
+
+					changes := map[string]string{}
+					if csmValue != "" {
+						changes[oldCSMKey] = "" // Remove old key.
+					}
+
+					if secureBootValue != "" {
+						changes[oldSecureBootKey] = "" // Remove old key.
+					}
+
+					changes[newKey] = targetMode
+					logger.Debugf("Converting VM snapshot %q (project %q) boot config to %q=%q", snap.Name, snap.Project, newKey, targetMode)
+
+					err = tx.UpdateInstanceSnapshotConfig(snap.ID, changes)
+					if err != nil {
+						return fmt.Errorf("Failed updating config for VM snapshot %q (project %q): %w", snap.Name, snap.Project, err)
+					}
+				}
+			}
+
+			return nil
+		})
+
+		if err != nil {
+			return err
+		}
+
+		profiles, err := dbCluster.GetProfiles(ctx, tx.Tx())
+		if err != nil {
+			return err
+		}
+
+		for _, profile := range profiles {
+			config, err := dbCluster.GetProfileConfig(ctx, tx.Tx(), profile.ID)
+			if err != nil {
+				return err
+			}
+
+			csmValue := config[oldCSMKey]
+			secureBootValue := config[oldSecureBootKey]
+			if csmValue == "" && secureBootValue == "" {
+				continue
+			}
+
+			targetMode := instancetype.BootModeUEFISecureBoot
+			if shared.IsTrue(csmValue) {
+				targetMode = instancetype.BootModeBIOS
+			} else if shared.IsFalse(secureBootValue) {
+				targetMode = instancetype.BootModeUEFINoSecureBoot
+			}
+
+			if csmValue != "" {
+				delete(config, oldCSMKey)
+			}
+
+			if secureBootValue != "" {
+				delete(config, oldSecureBootKey)
+			}
+
+			config[newKey] = targetMode
+			logger.Debugf("Converting profile %q (project %q) boot config to %q=%q", profile.Name, profile.Project, newKey, targetMode)
+
+			err = dbCluster.UpdateProfileConfig(ctx, tx.Tx(), int64(profile.ID), config)
+			if err != nil {
+				return fmt.Errorf("Failed updating config for profile %q (project %q): %w", profile.Name, profile.Project, err)
+			}
+		}
+
+		return nil
+	})
+}
+
+// patchVMSetMaxBusPorts sets the "limits.max_bus_ports" config option for VMs that have more PCIe devices attached than
+// the default value of "limits.max_bus_ports". It sets the value equal to the number of attached PCIe devices, so that
+// the VM can start successfully.
+func patchVMSetMaxBusPorts(_ string, d *Daemon) error {
+	s := d.State()
+
+	// Only run on a single cluster member to avoid concurrent updates.
+	isSelectedMember, err := selectedPatchClusterMember(s)
+	if err != nil {
+		return err
+	}
+
+	if !isSelectedMember {
+		return nil
+	}
+
+	// countPCIeDevices returns the number of attached PCIe devices.
+	countPCIeDevices := func(config map[string]string) int {
+		pciDevices := 0
+		for key := range config {
+			if strings.HasPrefix(key, "volatile.") && strings.HasSuffix(key, ".bus") {
+				pciDevices++
+			}
+		}
+
+		return pciDevices
+	}
+
+	return s.DB.Cluster.Transaction(s.ShutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+		return tx.InstanceList(ctx, func(inst db.InstanceArgs, project api.Project) error {
+			if inst.Type != instancetype.VM {
+				return nil
+			}
+
+			pcieDevices := countPCIeDevices(inst.Config)
+			_, hasCustomLimitSet := inst.Config["limits.max_bus_ports"]
+
+			// Only update the limit if the instance currently does not have it set
+			// and the number of attached PCIe devices is higher than the default value.
+			if !hasCustomLimitSet && pcieDevices > int(instanceDrivers.QEMUDefaultMaxBusPorts) {
+				err := tx.UpdateInstanceConfig(inst.ID, map[string]string{"limits.max_bus_ports": strconv.Itoa(pcieDevices)})
+				if err != nil {
+					return fmt.Errorf("Failed setting config key %q to value %d for VM %q (project %q): %w", "limits.max_bus_ports", pcieDevices, inst.Name, inst.Project, err)
+				}
+			}
+
+			snaps, err := tx.GetInstanceSnapshotsWithName(ctx, inst.Project, inst.Name)
+			if err != nil {
+				return err
+			}
+
+			for _, snap := range snaps {
+				config, err := dbCluster.GetInstanceSnapshotConfig(ctx, tx.Tx(), snap.ID)
+				if err != nil {
+					return err
+				}
+
+				pcieDevices := countPCIeDevices(config)
+				_, hasCustomLimitSet := config["limits.max_bus_ports"]
+
+				// Only update the limit if the instance snapshot currently does not have it set
+				// and the number of attached PCIe devices is higher than the default value.
+				if !hasCustomLimitSet && pcieDevices > int(instanceDrivers.QEMUDefaultMaxBusPorts) {
+					err = tx.UpdateInstanceSnapshotConfig(snap.ID, map[string]string{"limits.max_bus_ports": strconv.Itoa(pcieDevices)})
+					if err != nil {
+						return fmt.Errorf("Failed setting config key %q to value %d for VM snapshot %q (project %q): %w", "limits.max_bus_ports", pcieDevices, snap.Name, snap.Project, err)
+					}
+				}
+			}
+
+			return nil
+		})
+	})
+}
+
+// patchRemoveMAASConfigKeys removes all MAAS-related configuration keys that were used by the
+// (now-removed) maas_network API extension. These keys are no longer recognised by LXD.
+func patchRemoveMAASConfigKeys(_ string, d *Daemon) error {
+	// Remove maas.machine from the local node database (non-clustered installations).
+	err := d.db.Node.Transaction(d.shutdownCtx, func(ctx context.Context, tx *db.NodeTx) error {
+		return tx.UpdateConfig(map[string]string{
+			"maas.machine": "",
+		})
+	})
+	if err != nil {
+		return fmt.Errorf("Failed removing maas.machine from local config: %w", err)
+	}
+
+	// Remove all MAAS keys from the cluster database.
+	err = d.State().DB.Cluster.Transaction(d.shutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+		// Remove cluster-global MAAS config keys.
+		err := tx.UpdateClusterConfig(map[string]string{
+			"maas.api.url": "",
+			"maas.api.key": "",
+			"maas.machine": "",
+		})
+		if err != nil {
+			return fmt.Errorf("Failed removing global MAAS config keys: %w", err)
+		}
+
+		// Remove per-member maas.machine key from nodes_config.
+		_, err = tx.Tx().ExecContext(ctx, `DELETE FROM nodes_config WHERE key = 'maas.machine'`)
+		if err != nil {
+			return fmt.Errorf("Failed removing maas.machine from nodes_config: %w", err)
+		}
+
+		// Remove maas.subnet.ipv4 and maas.subnet.ipv6 from network configs.
+		_, err = tx.Tx().ExecContext(ctx, `DELETE FROM networks_config WHERE key IN ('maas.subnet.ipv4', 'maas.subnet.ipv6')`)
+		if err != nil {
+			return fmt.Errorf("Failed removing MAAS keys from networks_config: %w", err)
+		}
+
+		// Remove maas.subnet.ipv4 and maas.subnet.ipv6 from instance NIC device configs.
+		_, err = tx.Tx().ExecContext(ctx, `DELETE FROM instances_devices_config WHERE key IN ('maas.subnet.ipv4', 'maas.subnet.ipv6')`)
+		if err != nil {
+			return fmt.Errorf("Failed removing MAAS keys from instances_devices_config: %w", err)
+		}
+
+		// Remove maas.subnet.ipv4 and maas.subnet.ipv6 from instance snapshot NIC device configs.
+		_, err = tx.Tx().ExecContext(ctx, `DELETE FROM instances_snapshots_devices_config WHERE key IN ('maas.subnet.ipv4', 'maas.subnet.ipv6')`)
+		if err != nil {
+			return fmt.Errorf("Failed removing MAAS keys from instances_snapshots_devices_config: %w", err)
+		}
+
+		// Remove maas.subnet.ipv4 and maas.subnet.ipv6 from profile NIC device configs.
+		_, err = tx.Tx().ExecContext(ctx, `DELETE FROM profiles_devices_config WHERE key IN ('maas.subnet.ipv4', 'maas.subnet.ipv6')`)
+		if err != nil {
+			return fmt.Errorf("Failed removing MAAS keys from profiles_devices_config: %w", err)
+		}
+
+		// Delete any stale UnableToConnectToMAAS warnings (type_code 18).
+		_, err = tx.Tx().ExecContext(ctx, `DELETE FROM warnings WHERE type_code = ?`, warningtype.UnableToConnectToMAAS)
+		if err != nil {
+			return fmt.Errorf("Failed removing stale MAAS warnings: %w", err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("Failed removing MAAS configuration keys: %w", err)
+	}
+
+	return nil
+}
+
+// patchStorageRemoveLocalBuckets removes the orphaned "buckets/" directories from local storage pools
+// and the core.storage_buckets_address config key since local storage drivers no longer support storage buckets.
+func patchStorageRemoveLocalBuckets(_ string, d *Daemon) error {
+	s := d.State()
+
+	var pools []string
+
+	err := s.DB.Cluster.Transaction(s.ShutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+		var err error
+
+		pools, err = tx.GetStoragePoolNames(ctx)
+
+		return err
+	})
+	if err != nil {
+		if api.StatusErrorCheck(err, http.StatusNotFound) {
+			return nil
+		}
+
+		return fmt.Errorf("Failed getting storage pool names: %w", err)
+	}
+
+	for _, pool := range pools {
+		path := filepath.Join(storageDrivers.GetPoolMountPath(pool), "buckets")
+
+		// The upgrade is blocked by checkNoLocalStorageBuckets if any local
+		// buckets still exist in the database, so the "buckets/" directory is
+		// guaranteed to be empty here and os.Remove is safe (would fail if the
+		// directory is not empty).
+		err := os.Remove(path)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("Failed removing bucket directory %q: %w", path, err)
+		}
+	}
+
+	// Remove the core.storage_buckets_address config key which was used to configure the S3 listener.
+	_, err = s.DB.Cluster.DB().ExecContext(d.shutdownCtx, `DELETE FROM config WHERE key = 'core.storage_buckets_address'`)
+	if err != nil {
+		return fmt.Errorf("Failed removing core.storage_buckets_address config key: %w", err)
+	}
+
+	return nil
+}
+
+// patchUnsetCephSourceSetting unsets the source setting from all Ceph RBD and CephFS storage pools' configs.
+func patchUnsetCephSourceSetting(_ string, d *Daemon) error {
+	_, err := d.State().DB.Cluster.DB().ExecContext(d.shutdownCtx, `
+DELETE FROM storage_pools_config
+	WHERE key = "source"
+	AND storage_pool_id IN (
+		SELECT id FROM storage_pools
+			WHERE driver IN ("ceph", "cephfs")
+	)
+	`)
+	return err
+}
+
+// patchStoragePoolConnectorNVMeMode renames the storage pool mode from value "nvme" to "nvme/tcp"
+// for all Pure Storage, PowerFlex, and Alletra storage pools.
+func patchStoragePoolConnectorNVMeMode(_ string, d *Daemon) error {
+	oldValue := "nvme"
+	newValue := connectors.TypeNVMeTCP
+
+	driverModeKeys := map[string]string{
+		"pure":      "pure.mode",
+		"powerflex": "powerflex.mode",
+		"alletra":   "alletra.mode",
+	}
+
+	return d.State().DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		pools, _, err := tx.GetStoragePools(ctx, nil)
+		if err != nil {
+			if api.StatusErrorCheck(err, http.StatusNotFound) {
+				return nil
+			}
+
+			return err
+		}
+
+		for _, pool := range pools {
+			modeKey, ok := driverModeKeys[pool.Driver]
+			if !ok {
+				continue
+			}
+
+			if pool.Config[modeKey] != oldValue {
+				continue
+			}
+
+			pool.Config[modeKey] = newValue
+
+			err = tx.UpdateStoragePool(ctx, pool.Name, pool.Description, pool.Config)
+			if err != nil {
+				return fmt.Errorf("Failed updating storage pool %q: %w", pool.Name, err)
+			}
+		}
+
+		return nil
+	})
+}
+
+func patchReplicatorsRemoveSnapshotConfigKey(_ string, d *Daemon) error {
+	return d.State().DB.Cluster.Transaction(d.shutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+		_, err := tx.Tx().ExecContext(ctx, `DELETE FROM replicators_config WHERE key = 'snapshot'`)
+		if err != nil {
+			return fmt.Errorf("Failed removing replicator snapshot config: %w", err)
+		}
+
+		return nil
+	})
+}
+
+// patchRemoveLegacyNvidiaConfigKeys removes the legacy NVIDIA instance-level configuration keys
+// (nvidia.runtime, nvidia.driver.capabilities, nvidia.require.cuda, nvidia.require.driver) that
+// were used by the (now-removed) nvidia_runtime and nvidia_runtime_config API extensions. These
+// keys are no longer recognised by LXD. The gputype=mig and gputype=physical GPU devices use the
+// CDI for NVIDIA passthrough instead.
+func patchRemoveLegacyNvidiaConfigKeys(_ string, d *Daemon) error {
+	return d.State().DB.Cluster.Transaction(d.shutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+		// Remove the keys from instance configs, instance snapshot configs and profile configs.
+		for _, table := range []string{"instances_config", "instances_snapshots_config", "profiles_config"} {
+			_, err := tx.Tx().ExecContext(ctx, fmt.Sprintf(`DELETE FROM %s WHERE key IN ('nvidia.runtime', 'nvidia.driver.capabilities', 'nvidia.require.cuda', 'nvidia.require.driver')`, table))
+			if err != nil {
+				return fmt.Errorf("Failed removing legacy NVIDIA config keys from %s: %w", table, err)
+			}
+		}
+
+		return nil
+	})
+}
+
+// reattachSharedDevLXDMount re-establishes the devLXD bind-mount that the daemon
+// shares with a running container.
+//
+// /dev/lxd is a bind-mount, made in the container's mount namespace, of a tmpfs
+// that LXD mounts in its own. When LXD runs from the snap that per-snap namespace
+// is discarded on every refresh, so the incoming daemon can come up with a brand
+// new filesystem while a container that survived the refresh still holds a
+// bind-mount of the previous one. Such a container ends up with an empty /dev/lxd,
+// because the outgoing daemon unlinked the devLXD socket on its way down.
+//
+// This is a no-op whenever the container's mount and the daemon's current
+// filesystem are still backed by the same device ID — the common case once devlxd
+// persists across a refresh, or when the container was started by the currently
+// running daemon.  See issue #18194.
+// The caller is responsible for only passing containers that have devLXD enabled.
+func reattachSharedDevLXDMount(inst instance.Container) error {
+	pid := inst.InitPID()
+	if inst.IsSnapshot() || pid <= 0 {
+		return nil
+	}
+
+	source := shared.VarPath("devlxd")
+	expected, err := filesystem.StatDeviceID(source)
+	if err != nil {
+		logger.Warn("Skipped re-attaching devLXD mount, cannot stat the source", logger.Ctx{"project": inst.Project().Name, "instance": inst.Name(), "source": source, "err": err})
+		return nil
+	}
+
+	// Look the mount up in the container's mount namespace rather than our own,
+	// which means reading the container's mountinfo and routing the path through
+	// /proc/<pid>/root so both describe the same mount tree.
+	const target = "/dev/lxd"
+	mountinfo := fmt.Sprintf("/proc/%d/mountinfo", pid)
+	fields, err := filesystem.GetMountinfo(mountinfo, fmt.Sprintf("/proc/%d/root%s", pid, target))
+	if err != nil {
+		// Either target does not exist in the container or its mountinfo could
+		// not be read or parsed: we don't know what is mounted there, so don't
+		// touch it.
+		logger.Warn("Skipped re-attaching devLXD mount, cannot look up the container's mount", logger.Ctx{"project": inst.Project().Name, "instance": inst.Name(), "target": target, "mountinfo": mountinfo, "err": err})
+		return nil
+	}
+
+	if len(fields) < 5 {
+		logger.Warn("Skipped re-attaching devLXD mount, mountinfo entry too short", logger.Ctx{"project": inst.Project().Name, "instance": inst.Name(), "target": target, "mountinfo": mountinfo, "fields": len(fields)})
+		return nil
+	}
+
+	// Field 2 is the device ID of the mount found and field 4 its mount point.
+	actual := fields[2]
+	if actual == expected {
+		return nil
+	}
+
+	// The lookup resolves to the mount target lives in, so a mount point other
+	// than target itself means nothing is mounted there and there is nothing
+	// stale to drop first.
+	stale := fields[4] == target
+
+	logCtx := logger.Ctx{"project": inst.Project().Name, "instance": inst.Name(), "source": source, "target": target, "expected": expected, "actual": actual}
+	logger.Info("Re-attaching devLXD mount", logCtx)
+
+	if stale {
+		// Drop the stale mount first so the new one doesn't end up stacked on it.
+		err = inst.RemoveMount(target)
+		if err != nil {
+			// Not fatal: the new mount shadows whatever is left underneath for
+			// path resolution (mountinfo's "last match wins"), and the container
+			// needs a working mount more than it needs a clean mount table.
+			logger.Warn("Failed dropping the stale devLXD mount; re-attaching over it", logger.Ctx{"project": inst.Project().Name, "instance": inst.Name(), "target": target, "err": err})
+		}
+	}
+
+	// MoveMount is used rather than the insertMount paths because those hand the
+	// mount over to the container through /dev/.lxd-mounts, which the same
+	// refresh leaves stale and which this does not repair. move-mount needs no
+	// staging area.
+	err = inst.MoveMount(source, target, "none", unix.MS_BIND, idmap.IdmapStorageNone)
+	if err != nil {
+		return fmt.Errorf("Failed re-attaching %q onto %q: %w", source, target, err)
+	}
+
+	return nil
+}
+
+// patchReattachSharedDevLXDMounts re-establishes the devLXD bind-mount for any container that was
+// already running when the daemon started, so containers left holding a mount of a filesystem a
+// prior daemon owned (across a snap refresh, before the persistence fix from #18194) get repaired
+// once during the upgrade to this version.
+//
+// This is a soft patch: it never returns an error, so a failure to repair can't stop the daemon
+// from starting. The trade-off is that it still counts as applied, so anything left unrepaired
+// stays that way rather than being retried on the next start.
+func patchReattachSharedDevLXDMounts(name string, d *Daemon) error {
+	instances, err := instance.LoadNodeAll(d.State(), instancetype.Container)
+	if err != nil {
+		logger.Error("Failed loading instances, skipping devLXD mount re-attach", logger.Ctx{"name": name, "err": err})
+		return nil
+	}
+
+	var attempted int
+	var failedIDs []int
+
+	for _, inst := range instances {
+		if !inst.IsRunning() {
+			continue
+		}
+
+		c, isContainer := inst.(instance.Container)
+		if !isContainer {
+			continue
+		}
+
+		// Mirrors the condition under which the devLXD mount entry is added to
+		// the container's liblxc config.
+		if shared.IsTrueOrEmpty(c.ExpandedConfig()["security.devlxd"]) {
+			attempted++
+
+			// Best-effort: a failure here leaves this one instance no worse off
+			// than before this repair existed (it just keeps whatever mount it
+			// already had), and must not stop the other instances from being
+			// repaired.
+			err := reattachSharedDevLXDMount(c)
+			if err != nil {
+				failedIDs = append(failedIDs, inst.ID())
+				logger.Warn("Failed re-attaching devLXD mount", logger.Ctx{"id": inst.ID(), "project": inst.Project().Name, "instance": inst.Name(), "err": err})
+			}
+		}
+	}
+
+	if len(failedIDs) > 0 {
+		logger.Warn("Patch finished re-attaching devLXD mounts with failures", logger.Ctx{"name": name, "attempted": attempted, "failedInstanceIDs": failedIDs})
+	} else {
+		logger.Info("Patch finished re-attaching devLXD mounts", logger.Ctx{"name": name, "attempted": attempted})
 	}
 
 	return nil

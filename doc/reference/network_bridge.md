@@ -1,5 +1,5 @@
 ---
-discourse: 7322
+discourse: lxc:[Getting&#32;universally&#32;routable&#32;IPv6&#32;Addresses&#32;for&#32;your&#32;Linux&#32;Containers&#32;on&#32;Ubuntu&#32;18.04&#32;with&#32;LXD&#32;4.0&#32;on&#32;a&#32;VPS](7322)
 ---
 
 (network-bridge)=
@@ -46,7 +46,6 @@ The following configuration key namespaces are currently supported for the `brid
 - `fan` (configuration specific to the Ubuntu FAN overlay)
 - `ipv4` (L3 IPv4 configuration)
 - `ipv6` (L3 IPv6 configuration)
-- `maas` (MAAS network identification)
 - `security` (network ACL configuration)
 - `raw` (raw configuration file content)
 - `tunnel` (cross-host tunneling configuration)
@@ -75,16 +74,7 @@ The following features are supported for the `bridge` network type:
 - {ref}`network-bgp`
 - [How to integrate with `systemd-resolved`](network-bridge-resolved)
 
-```{only} diataxis
+
 ## Firewall issues
 
 See {ref}`network-bridge-firewall` for instructions on how to troubleshoot firewall issues.
-```
-
-```{filtered-toctree}
-:maxdepth: 1
-:hidden:
-
-:topical:Integrate with resolved </howto/network_bridge_resolved>
-:topical:Configure your firewall </howto/network_bridge_firewalld>
-```

@@ -1,13 +1,8 @@
 test_storage_local_volume_handling() {
-  ensure_import_testimage
-
   local LXD_STORAGE_DIR lxd_backend
   lxd_backend=$(storage_backend "$LXD_DIR")
   LXD_STORAGE_DIR=$(mktemp -d -p "${TEST_DIR}" XXXXXXXXX)
-  chmod +x "${LXD_STORAGE_DIR}"
   spawn_lxd "${LXD_STORAGE_DIR}" false
-
-  ensure_import_testimage
 
   (
     set -e
@@ -20,20 +15,24 @@ test_storage_local_volume_handling() {
     fi
 
     if storage_backend_available "ceph"; then
-      lxc storage create "${pool_base}-ceph" ceph volume.size=25MiB ceph.osd.pg_num=16
+      lxc storage create "${pool_base}-ceph" ceph volume.size="${DEFAULT_VOLUME_SIZE}" ceph.osd.pg_num=8
       if [ -n "${LXD_CEPH_CEPHFS:-}" ]; then
-        lxc storage create "${pool_base}-cephfs" cephfs source="${LXD_CEPH_CEPHFS}/$(basename "${LXD_DIR}")-cephfs"
+        lxc storage create "${pool_base}-cephfs" cephfs cephfs.path="${LXD_CEPH_CEPHFS}/$(basename "${LXD_DIR}")-cephfs"
       fi
     fi
 
     lxc storage create "${pool_base}-dir" dir
 
     if storage_backend_available "lvm"; then
-      lxc storage create "${pool_base}-lvm" lvm volume.size=25MiB
+      lxc storage create "${pool_base}-lvm" lvm volume.size="${DEFAULT_VOLUME_SIZE}"
     fi
 
     if storage_backend_available "zfs"; then
       lxc storage create "${pool_base}-zfs" zfs size=1GiB
+    fi
+
+    if storage_backend_available "pure"; then
+      configure_pure_pool "${pool_base}-pure"
     fi
 
     # Test all combinations of our storage drivers
@@ -48,16 +47,18 @@ test_storage_local_volume_handling() {
     fi
 
     if [ "$driver" = "ceph" ]; then
-      pool_opts="volume.size=25MiB ceph.osd.pg_num=16"
+      pool_opts="volume.size=${DEFAULT_VOLUME_SIZE} ceph.osd.pg_num=16"
     fi
 
-    if [ "$driver" = "lvm" ]; then
-      pool_opts="volume.size=25MiB"
+    if [ "$driver" = "lvm" ] || [ "$driver" = "pure" ]; then
+      pool_opts="volume.size=${DEFAULT_VOLUME_SIZE}"
     fi
 
-    if [ -n "${pool_opts}" ]; then
-      # shellcheck disable=SC2086
-      lxc storage create "${pool}1" "${driver}" $pool_opts
+    if [ "$driver" = "pure" ]; then
+      configure_pure_pool "${pool}1" "${pool_opts}"
+    elif [ -n "${pool_opts}" ]; then
+      # shellcheck disable=SC2086,SC2248
+      lxc storage create "${pool}1" "${driver}" ${pool_opts}
     else
       lxc storage create "${pool}1" "${driver}"
     fi
@@ -65,6 +66,18 @@ test_storage_local_volume_handling() {
     lxc storage volume create "${pool}" vol1
     lxc storage volume set "${pool}" vol1 user.foo=snap0
     lxc storage volume set "${pool}" vol1 snapshots.expiry=1H
+
+    lxc storage volume create "${pool}" blockVol --type=block
+    truncate -s 8MiB foo.iso
+    lxc storage volume import "${pool}" ./foo.iso isoVol
+
+    # security.shared is only allowed for block volumes
+    ! lxc storage volume set "${pool}" vol1 security.shared true || false
+    ! lxc storage volume set "${pool}" isoVol security.shared true || false
+    lxc storage volume set "${pool}" blockVol security.shared true
+
+    lxc storage volume delete "${pool}" blockVol
+    lxc storage volume delete "${pool}" isoVol
 
     # This will create the snapshot vol1/snap0
     lxc storage volume snapshot "${pool}" vol1
@@ -132,6 +145,9 @@ test_storage_local_volume_handling() {
     lxc storage volume move "${pool}1/vol1" "${pool}1/vol1" --project "${project}" --target-project default
     lxc storage volume show "${pool}1" vol1 --project default
 
+    # Create empty ISO volumes is not allowed
+    ! lxc storage volume create "${pool}" isoVol --type=iso || false
+
     # Create new pools
     lxc storage create pool_1 dir
     lxc storage create pool_2 dir
@@ -143,10 +159,10 @@ test_storage_local_volume_handling() {
     lxc storage volume create pool_2 vol2
 
     # List volumes from all pools
-    lxc storage volume list --format csv --columns pn | grep "pool_1,vol1"
-    lxc storage volume list --format csv --columns pn | grep "pool_2,vol1"
-    lxc storage volume list --format csv --columns pn | grep "pool_1,vol2"
-    lxc storage volume list --format csv --columns pn | grep "pool_2,vol2"
+    lxc storage volume list --format csv --columns pn | grep -xF "pool_1,vol1"
+    lxc storage volume list --format csv --columns pn | grep -xF "pool_2,vol1"
+    lxc storage volume list --format csv --columns pn | grep -xF "pool_1,vol2"
+    lxc storage volume list --format csv --columns pn | grep -xF "pool_2,vol2"
 
     lxc storage volume delete pool_1 vol1
     lxc storage volume delete pool_1 vol2
@@ -164,8 +180,8 @@ test_storage_local_volume_handling() {
     lxc storage volume delete "${pool}1" vol1
     lxc storage delete "${pool}1"
 
-    for source_driver in "btrfs" "ceph" "cephfs" "dir" "lvm" "zfs"; do
-      for target_driver in "btrfs" "ceph" "cephfs" "dir" "lvm" "zfs"; do
+    for source_driver in "btrfs" "ceph" "cephfs" "dir" "lvm" "zfs" "pure"; do
+      for target_driver in "btrfs" "ceph" "cephfs" "dir" "lvm" "zfs" "pure"; do
         # shellcheck disable=SC2235
         if [ "$source_driver" != "$target_driver" ] \
             && ([ "$lxd_backend" = "$source_driver" ] || ([ "$lxd_backend" = "ceph" ] && [ "$source_driver" = "cephfs" ] && [ -n "${LXD_CEPH_CEPHFS:-}" ])) \
@@ -210,32 +226,32 @@ test_storage_local_volume_handling() {
           # create custom block volume without snapshots
           lxc storage volume create "${source_pool}" vol1 --type=block size=4194304
           lxc storage volume copy "${source_pool}/vol1" "${target_pool}/vol1"
-          lxc storage volume show "${target_pool}" vol1 | grep -q 'content_type: block'
+          lxc storage volume show "${target_pool}" vol1 | grep -xF 'content_type: block'
 
           # create custom block volume with a snapshot
           lxc storage volume create "${source_pool}" vol2 --type=block size=4194304
           lxc storage volume snapshot "${source_pool}" vol2
-          lxc storage volume show "${source_pool}" vol2/snap0 | grep -q 'content_type: block'
+          lxc storage volume show "${source_pool}" vol2/snap0 | grep -xF 'content_type: block'
 
           # restore snapshot
           lxc storage volume restore "${source_pool}" vol2 snap0
-          lxc storage volume show "${source_pool}" vol2 | grep -q 'content_type: block'
+          lxc storage volume show "${source_pool}" vol2 | grep -xF 'content_type: block'
 
           # copy with snapshots
           lxc storage volume copy "${source_pool}/vol2" "${target_pool}/vol2"
-          lxc storage volume show "${target_pool}" vol2 | grep -q 'content_type: block'
-          lxc storage volume show "${target_pool}" vol2/snap0 | grep -q 'content_type: block'
+          lxc storage volume show "${target_pool}" vol2 | grep -xF 'content_type: block'
+          lxc storage volume show "${target_pool}" vol2/snap0 | grep -xF 'content_type: block'
 
           # copy without snapshots
           lxc storage volume copy "${source_pool}/vol2" "${target_pool}/vol3" --volume-only
-          lxc storage volume show "${target_pool}" vol3 | grep -q 'content_type: block'
-          ! lxc storage volume show "${target_pool}" vol3/snap0 | grep -q 'content_type: block' || false
+          lxc storage volume show "${target_pool}" vol3 | grep -xF 'content_type: block'
+          ! lxc storage volume show "${target_pool}" vol3/snap0 || false
 
           # move images
           lxc storage volume move "${source_pool}/vol2" "${target_pool}/vol4"
-          ! lxc storage volume show "${source_pool}" vol2 | grep -q 'content_type: block' || false
-          lxc storage volume show "${target_pool}" vol4 | grep -q 'content_type: block'
-          lxc storage volume show "${target_pool}" vol4/snap0 | grep -q 'content_type: block'
+          ! lxc storage volume show "${source_pool}" vol2 || false
+          lxc storage volume show "${target_pool}" vol4 | grep -xF 'content_type: block'
+          lxc storage volume show "${target_pool}" vol4/snap0 | grep -xF 'content_type: block'
 
           # check refreshing volumes
 
@@ -289,12 +305,11 @@ test_storage_local_volume_handling() {
           [ "$(lxc storage volume get "${target_pool}" vol5/snap0 volatile.uuid)" = "${old_snap0_uuid}" ]
 
           # copy ISO custom volumes
-          truncate -s 25MiB foo.iso
           lxc storage volume import "${source_pool}" ./foo.iso iso1
           lxc storage volume copy "${source_pool}/iso1" "${target_pool}/iso1"
-          lxc storage volume show "${target_pool}" iso1 | grep -q 'content_type: iso'
+          lxc storage volume show "${target_pool}" iso1 | grep -xF 'content_type: iso'
           lxc storage volume move "${source_pool}/iso1" "${target_pool}/iso2"
-          lxc storage volume show "${target_pool}" iso2 | grep -q 'content_type: iso'
+          lxc storage volume show "${target_pool}" iso2 | grep -xF 'content_type: iso'
           ! lxc storage volume show "${source_pool}" iso1 || false
 
           # clean up
@@ -308,10 +323,11 @@ test_storage_local_volume_handling() {
           lxc storage volume delete "${source_pool}" vol6
           lxc storage volume delete "${target_pool}" iso1
           lxc storage volume delete "${target_pool}" iso2
-          rm -f foo.iso
         fi
       done
     done
+
+    rm -f foo.iso
   )
 
   # shellcheck disable=SC2031,2269

@@ -8,11 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/db/query"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/version"
 )
@@ -39,6 +39,89 @@ func (c *ClusterTx) GetNetworksLocalConfig(ctx context.Context) (map[string]map[
 	}
 
 	return networks, nil
+}
+
+// NetworkNodeParent describes how a network attaches to a parent interface on a
+// given cluster member. Parent is the node-specific parent interface and VLAN is
+// the network's global VLAN setting (empty if unset).
+type NetworkNodeParent struct {
+	Parent string
+	VLAN   string
+}
+
+// GetNetworksNodeParent returns a map associating each node ID in a cluster to networks and their
+// node-specific parent interface together with the network's global VLAN setting.
+// If a network has no parent, it is omitted.
+func (c *ClusterTx) GetNetworksNodeParent(ctx context.Context) (map[int64]map[string]NetworkNodeParent, error) {
+	query := `
+   SELECT COALESCE(networks_config.node_id, 0), networks.name, networks_config.key, networks_config.value
+   FROM networks_config
+   JOIN networks ON networks.id=networks_config.network_id
+   WHERE networks_config.key IN ("parent", "vlan")`
+
+	rows, err := c.tx.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() { _ = rows.Close() }()
+
+	nodesNetworksParent := make(map[int64]map[string]string) // Node ID to network name to node-specific parent.
+	networksVLAN := make(map[string]string)                  // Network name to global VLAN setting.
+
+	for rows.Next() {
+		var (
+			nodeID      int64
+			networkName string
+			key         string
+			value       string
+		)
+
+		err = rows.Scan(&nodeID, &networkName, &key, &value)
+		if err != nil {
+			return nil, err
+		}
+
+		if networkName == "" || value == "" {
+			continue
+		}
+
+		switch key {
+		case "parent":
+			// The parent is node-specific, so it must have a node ID.
+			if nodeID == 0 {
+				continue
+			}
+
+			_, nodeInMap := nodesNetworksParent[nodeID]
+			if !nodeInMap {
+				nodesNetworksParent[nodeID] = map[string]string{}
+			}
+
+			nodesNetworksParent[nodeID][networkName] = value
+		case "vlan":
+			// The VLAN is a global setting shared across all cluster members.
+			networksVLAN[networkName] = value
+		}
+	}
+
+	err = rows.Err()
+	if err != nil {
+		return nil, err
+	}
+
+	nodesNetworks := make(map[int64]map[string]NetworkNodeParent, len(nodesNetworksParent))
+	for nodeID, networksParent := range nodesNetworksParent {
+		nodesNetworks[nodeID] = make(map[string]NetworkNodeParent, len(networksParent))
+		for networkName, parent := range networksParent {
+			nodesNetworks[nodeID][networkName] = NetworkNodeParent{
+				Parent: parent,
+				VLAN:   networksVLAN[networkName],
+			}
+		}
+	}
+
+	return nodesNetworks, nil
 }
 
 // GetNonPendingNetworkIDs returns a map associating each network name to its ID.
@@ -199,7 +282,7 @@ func (c *ClusterTx) GetNetworkID(ctx context.Context, projectName string, name s
 	case 1:
 		return int64(ids[0]), nil
 	default:
-		return -1, fmt.Errorf("More than one network has the given name")
+		return -1, errors.New("More than one network has the given name")
 	}
 }
 
@@ -266,7 +349,7 @@ WHERE networks.id = ? AND networks.state = ?
 	// Figure which nodes are missing
 	missing := []string{}
 	for _, node := range nodes {
-		if !shared.ValueInSlice(node.Name, defined) {
+		if !slices.Contains(defined, node.Name) {
 			missing = append(missing, node.Name)
 		}
 	}
@@ -302,7 +385,7 @@ func (c *ClusterTx) CreatePendingNetwork(ctx context.Context, node string, proje
 	err := query.Scan(ctx, c.tx, sql, func(scan func(dest ...any) error) error {
 		// Ensure that there is at most one network with the given name.
 		if count != 0 {
-			return fmt.Errorf("More than one network exists with the given name")
+			return errors.New("More than one network exists with the given name")
 		}
 
 		count++
@@ -330,12 +413,12 @@ func (c *ClusterTx) CreatePendingNetwork(ctx context.Context, node string, proje
 	} else {
 		// Check that the existing network is in the networkPending state.
 		if network.state != networkPending {
-			return fmt.Errorf("Network is not in pending state")
+			return errors.New("Network is not in pending state")
 		}
 
 		// Check that the existing network type matches the requested type.
 		if network.netType != netType {
-			return fmt.Errorf("Requested network type doesn't match type in existing database record")
+			return errors.New("Requested network type does not match type in existing database record")
 		}
 	}
 
@@ -464,7 +547,7 @@ func (c *ClusterTx) GetNetworkURIs(ctx context.Context, projectID int, project s
 
 	names, err := query.SelectStrings(ctx, c.tx, sql, projectID)
 	if err != nil {
-		return nil, fmt.Errorf("Unable to get URIs for network: %w", err)
+		return nil, fmt.Errorf("Cannot get URIs for network: %w", err)
 	}
 
 	uris := make([]string, len(names))
@@ -480,30 +563,64 @@ func (c *ClusterTx) GetNetworks(ctx context.Context, project string) ([]string, 
 	return c.networks(ctx, project, "")
 }
 
+// GetNetworksAllProjects returns the names of all networks across all projects.
+func (c *ClusterTx) GetNetworksAllProjects(ctx context.Context) (map[string][]string, error) {
+	q := "SELECT projects.name, networks.name FROM networks JOIN projects ON networks.project_id=projects.id"
+
+	networkNames := map[string][]string{}
+	err := query.Scan(ctx, c.tx, q, func(scan func(dest ...any) error) error {
+		var projectName string
+		var networkName string
+
+		err := scan(&projectName, &networkName)
+		if err != nil {
+			return err
+		}
+
+		_, ok := networkNames[projectName]
+		if !ok {
+			networkNames[projectName] = []string{}
+		}
+
+		networkNames[projectName] = append(networkNames[projectName], networkName)
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return networkNames, nil
+}
+
 // Get all networks matching the given WHERE filter (if given).
 func (c *ClusterTx) networks(ctx context.Context, project string, where string, args ...any) ([]string, error) {
 	q := "SELECT name FROM networks WHERE project_id = (SELECT id FROM projects WHERE name = ?)"
 	inargs := []any{project}
 
 	if where != "" {
-		q += fmt.Sprintf(" AND %s", where)
+		q += " AND " + where
 		inargs = append(inargs, args...)
 	}
 
-	var name string
-	outfmt := []any{name}
+	networkNames := []string{}
+	err := query.Scan(ctx, c.tx, q, func(scan func(dest ...any) error) error {
+		var networkName string
 
-	result, err := queryScan(ctx, c, q, inargs, outfmt)
+		err := scan(&networkName)
+		if err != nil {
+			return err
+		}
+
+		networkNames = append(networkNames, networkName)
+
+		return nil
+	}, inargs...)
 	if err != nil {
-		return []string{}, err
+		return nil, err
 	}
 
-	response := []string{}
-	for _, r := range result {
-		response = append(response, r[0].(string))
-	}
-
-	return response, nil
+	return networkNames, nil
 }
 
 // NetworkState indicates the state of the network or network node.
@@ -660,37 +777,35 @@ func networkFillType(network *api.Network, netType NetworkType) {
 
 // GetNetworkWithInterface returns the network associated with the interface with the given name.
 func (c *ClusterTx) GetNetworkWithInterface(ctx context.Context, devName string) (int64, *api.Network, error) {
-	id := int64(-1)
-	name := ""
-	value := ""
+	var id int64 = -1
+	var name string
 
 	q := "SELECT networks.id, networks.name, networks_config.value FROM networks LEFT JOIN networks_config ON networks.id=networks_config.network_id WHERE networks_config.key=\"bridge.external_interfaces\" AND networks_config.node_id=?"
-	arg1 := []any{c.nodeID}
-	arg2 := []any{id, name, value}
 
-	result, err := queryScan(ctx, c, q, arg1, arg2)
-	if err != nil {
-		return -1, nil, err
-	}
+	err := query.Scan(ctx, c.tx, q, func(scan func(dest ...any) error) error {
+		var networkID int64
+		var networkName string
+		var value string
 
-	for _, r := range result {
-		for _, entry := range strings.Split(r[2].(string), ",") {
+		err := scan(&networkID, &networkName, &value)
+		if err != nil {
+			return err
+		}
+
+		for entry := range strings.SplitSeq(value, ",") {
 			entry = strings.TrimSpace(entry)
 			if entry == devName {
-				entryID, ok := r[0].(int64)
-				if !ok {
-					continue
-				}
+				id = networkID
+				name = networkName
 
-				entryName, ok := r[1].(string)
-				if !ok {
-					continue
-				}
-
-				id = entryID
-				name = entryName
+				return nil
 			}
 		}
+
+		return nil
+	}, c.nodeID)
+	if err != nil {
+		return -1, nil, err
 	}
 
 	if id == -1 {
@@ -796,6 +911,11 @@ func (c *ClusterTx) UpdateNetwork(ctx context.Context, project string, name, des
 	return nil
 }
 
+// UpdateNetworkDescription updates only the description of the network.
+func (c *ClusterTx) UpdateNetworkDescription(networkID int64, description string) error {
+	return updateNetworkDescription(c.tx, networkID, description)
+}
+
 // Update the description of the network with the given ID.
 func updateNetworkDescription(tx *sql.Tx, id int64, description string) error {
 	_, err := tx.Exec("UPDATE networks SET description=? WHERE id=?", description, id)
@@ -817,7 +937,7 @@ func networkConfigAdd(tx *sql.Tx, networkID, nodeID int64, config map[string]str
 		}
 
 		var nodeIDValue any
-		if !shared.ValueInSlice(k, NodeSpecificNetworkConfig) {
+		if !slices.Contains(NodeSpecificNetworkConfig, k) {
 			nodeIDValue = nil
 		} else {
 			nodeIDValue = nodeID
@@ -875,4 +995,5 @@ var NodeSpecificNetworkConfig = []string{
 	"bgp.ipv6.nexthop",
 	"bridge.external_interfaces",
 	"parent",
+	"acceleration.parent",
 }

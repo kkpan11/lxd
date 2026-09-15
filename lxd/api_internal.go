@@ -4,17 +4,18 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	runtimeDebug "runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 
-	"github.com/gorilla/mux"
 	"golang.org/x/sys/unix"
 
 	"github.com/canonical/lxd/lxd/auth"
@@ -46,10 +47,13 @@ var apiInternal = []APIEndpoint{
 	internalClusterAcceptCmd,
 	internalClusterAssignCmd,
 	internalClusterHandoverCmd,
+	internalClusterHealCmd,
+	internalClusterLinkRefreshVolatileAddressesCmd,
+	internalReplicatorRunSchedulerCmd,
 	internalClusterRaftNodeCmd,
 	internalClusterRebalanceCmd,
-	internalClusterHealCmd,
 	internalContainerOnStartCmd,
+	internalContainerOnStartHostCmd,
 	internalContainerOnStopCmd,
 	internalContainerOnStopNSCmd,
 	internalGarbageCollectorCmd,
@@ -61,6 +65,9 @@ var apiInternal = []APIEndpoint{
 	internalSQLCmd,
 	internalWarningCreateCmd,
 	internalIdentityCacheRefreshCmd,
+	internalPruneTokenCmd,
+	internalOperationWaitCmd,
+	internalSnapshotScheduledTaskCmd,
 }
 
 var internalShutdownCmd = APIEndpoint{
@@ -79,6 +86,12 @@ var internalContainerOnStartCmd = APIEndpoint{
 	Path: "containers/{instanceRef}/onstart",
 
 	Get: APIEndpointAction{Handler: internalContainerOnStart, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanEdit)},
+}
+
+var internalContainerOnStartHostCmd = APIEndpoint{
+	Path: "containers/{instanceRef}/onstarthost",
+
+	Get: APIEndpointAction{Handler: internalContainerOnStartHost, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanEdit)},
 }
 
 var internalContainerOnStopNSCmd = APIEndpoint{
@@ -115,25 +128,53 @@ var internalRAFTSnapshotCmd = APIEndpoint{
 var internalImageRefreshCmd = APIEndpoint{
 	Path: "testing/image-refresh",
 
-	Get: APIEndpointAction{Handler: internalRefreshImage, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanEdit)},
+	Get: APIEndpointAction{Handler: internalTestingRefreshImage, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanEdit)},
+}
+
+var internalClusterHealCmd = APIEndpoint{
+	Path: "testing/cluster/heal",
+
+	Post: APIEndpointAction{Handler: internalTestingHealCluster, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanEdit)},
+}
+
+var internalClusterLinkRefreshVolatileAddressesCmd = APIEndpoint{
+	Path: "testing/cluster/link/refresh-volatile-addresses",
+
+	Post: APIEndpointAction{Handler: internalTestingRefreshClusterLinkVolatileAddresses, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanEdit)},
+}
+
+var internalReplicatorRunSchedulerCmd = APIEndpoint{
+	Path: "testing/replicator/run-scheduler",
+
+	Post: APIEndpointAction{Handler: internalTestingRunReplicatorScheduler, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanEdit)},
 }
 
 var internalImageOptimizeCmd = APIEndpoint{
 	Path: "image-optimize",
 
-	Post: APIEndpointAction{Handler: internalOptimizeImage, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanEdit)},
+	Post: APIEndpointAction{Handler: internalTestingOptimizeImage, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanEdit)},
 }
 
 var internalWarningCreateCmd = APIEndpoint{
 	Path: "testing/warnings",
 
-	Post: APIEndpointAction{Handler: internalCreateWarning, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanEdit)},
+	Post: APIEndpointAction{Handler: internalTestingCreateWarning, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanEdit)},
 }
 
 var internalBGPStateCmd = APIEndpoint{
 	Path: "testing/bgp",
 
-	Get: APIEndpointAction{Handler: internalBGPState, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanEdit)},
+	Get: APIEndpointAction{Handler: internalTestingBGPState, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanEdit)},
+}
+
+var internalPruneTokenCmd = APIEndpoint{
+	Path: "testing/prune-tokens",
+	Post: APIEndpointAction{Handler: internalTestingPruneTokensHandler, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanEdit)},
+}
+
+var internalOperationWaitCmd = APIEndpoint{
+	Path: "testing/operation-wait",
+	Post: APIEndpointAction{Handler: internalTestingOperationWaitHandler, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanEdit)},
 }
 
 var internalIdentityCacheRefreshCmd = APIEndpoint{
@@ -142,9 +183,16 @@ var internalIdentityCacheRefreshCmd = APIEndpoint{
 	Post: APIEndpointAction{Handler: internalIdentityCacheRefresh, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanEdit)},
 }
 
+var internalSnapshotScheduledTaskCmd = APIEndpoint{
+	Path: "testing/snapshot-scheduled-task",
+
+	Post: APIEndpointAction{Handler: internalTestingSnapshotScheduledTask, AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanEdit)},
+}
+
 type internalImageOptimizePost struct {
-	Image api.Image `json:"image" yaml:"image"`
-	Pool  string    `json:"pool"  yaml:"pool"`
+	Image   api.Image `json:"image"    yaml:"image"`
+	Pool    string    `json:"pool"     yaml:"pool"`
+	Project string    `json:"project"  yaml:"project"`
 }
 
 type internalWarningCreatePost struct {
@@ -156,8 +204,8 @@ type internalWarningCreatePost struct {
 	Message    string      `json:"message"     yaml:"message"`
 }
 
-// internalCreateWarning creates a warning, and is used for testing only.
-func internalCreateWarning(d *Daemon, r *http.Request) response.Response {
+// internalTestingCreateWarning creates a warning, and is used for testing only.
+func internalTestingCreateWarning(d *Daemon, r *http.Request) response.Response {
 	req := internalWarningCreatePost{}
 	err := json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
@@ -172,17 +220,17 @@ func internalCreateWarning(d *Daemon, r *http.Request) response.Response {
 		}
 	}
 
-	err = d.State().DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err = d.State().DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
 		return tx.UpsertWarning(ctx, req.Location, req.Project, req.EntityType, req.EntityID, warningtype.Type(req.TypeCode), req.Message)
 	})
 	if err != nil {
-		return response.SmartError(fmt.Errorf("Failed to create warning: %w", err))
+		return response.SmartError(fmt.Errorf("Failed creating warning: %w", err))
 	}
 
 	return response.EmptySyncResponse
 }
 
-func internalOptimizeImage(d *Daemon, r *http.Request) response.Response {
+func internalTestingOptimizeImage(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	req := &internalImageOptimizePost{}
@@ -193,7 +241,7 @@ func internalOptimizeImage(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
-	err = imageCreateInPool(s, &req.Image, req.Pool)
+	err = imageCreateInPool(r.Context(), s, &req.Image, req.Pool, req.Project)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -201,10 +249,45 @@ func internalOptimizeImage(d *Daemon, r *http.Request) response.Response {
 	return response.EmptySyncResponse
 }
 
-func internalRefreshImage(d *Daemon, r *http.Request) response.Response {
+func internalTestingRefreshImage(d *Daemon, _ *http.Request) response.Response {
 	s := d.State()
 
 	err := autoUpdateImages(s.ShutdownCtx, s)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	return response.EmptySyncResponse
+}
+
+func internalTestingHealCluster(d *Daemon, r *http.Request) response.Response {
+	s := d.State()
+
+	op, err := autoHealCluster(s.ShutdownCtx, s, d.gateway)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	return response.OperationResponse(op)
+}
+
+func internalTestingRefreshClusterLinkVolatileAddresses(d *Daemon, r *http.Request) response.Response {
+	s := d.State()
+
+	err := autoRefreshClusterLinkVolatileAddresses(r.Context(), s)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	return response.EmptySyncResponse
+}
+
+// internalTestingRunReplicatorScheduler triggers the replicator scheduler task immediately.
+// It is used by tests to avoid waiting for the scheduler's one-minute tick.
+func internalTestingRunReplicatorScheduler(d *Daemon, r *http.Request) response.Response {
+	s := d.State()
+
+	err := runScheduledReplicators(r.Context(), s)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -216,14 +299,63 @@ func internalWaitReady(d *Daemon, r *http.Request) response.Response {
 	// Check that we're not shutting down.
 	isClosing := d.State().ShutdownCtx.Err() != nil
 	if isClosing {
-		return response.Unavailable(fmt.Errorf("LXD daemon is shutting down"))
+		return response.Unavailable(errors.New("LXD daemon is shutting down"))
 	}
 
-	if d.waitReady.Err() == nil {
-		return response.Unavailable(fmt.Errorf("LXD daemon not ready yet"))
+	timeoutSeconds := request.QueryParam(r, "timeout")
+	waitNetwork := shared.IsTrue(request.QueryParam(r, "network"))
+	waitStorage := shared.IsTrue(request.QueryParam(r, "storage"))
+
+	notReadyErr := errors.New("LXD daemon not ready yet")
+	networkNotReadyErr := errors.New("Networks not ready yet")
+	storageNotReadyErr := errors.New("Storage pools not ready yet")
+
+	if timeoutSeconds != "" {
+		timeoutSecondsUint, err := strconv.ParseUint(timeoutSeconds, 10, 32)
+		if err != nil {
+			return response.SmartError(fmt.Errorf("Invalid timeout: %w", err))
+		}
+
+		// If timeout is 0 then block indefinitely but if >0 use that as max wait seconds.
+		ctx := r.Context()
+		if timeoutSecondsUint > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, time.Duration(timeoutSecondsUint)*time.Second)
+			defer cancel()
+		}
+
+		// If network is true, then block until all networks are marked as ready.
+		if waitNetwork {
+			select {
+			case <-d.waitNetworkReady.Done(): // Block until all networks are ready.
+			case <-ctx.Done(): // Don't leave this go routine around if client disconnects or timeout reached.
+				return response.Unavailable(networkNotReadyErr)
+			}
+		}
+
+		// If storage is true, then block until all storage pools are marked as ready.
+		if waitStorage {
+			select {
+			case <-d.waitStorageReady.Done(): // Block until all storage pools are ready.
+			case <-ctx.Done(): // Don't leave this go routine around if client disconnects or timeout reached.
+				return response.Unavailable(storageNotReadyErr)
+			}
+		}
+
+		select {
+		case <-d.waitReady.Done(): // Block until LXD is ready and then return EmptySyncResponse.
+		case <-ctx.Done(): // Don't leave this go routine around if client disconnects or timeout reached.
+			return response.Unavailable(notReadyErr)
+		}
+	} else if d.waitReady.Err() == nil {
+		return response.Unavailable(notReadyErr)
+	} else if waitNetwork && d.waitNetworkReady.Err() == nil {
+		return response.Unavailable(networkNotReadyErr)
+	} else if waitStorage && d.waitStorageReady.Err() == nil {
+		return response.Unavailable(storageNotReadyErr)
 	}
 
-	return response.EmptySyncResponse
+	return response.EmptySyncResponse // LXD is ready.
 }
 
 func internalShutdown(d *Daemon, r *http.Request) response.Response {
@@ -243,7 +375,10 @@ func internalShutdown(d *Daemon, r *http.Request) response.Response {
 	return response.ManualResponse(func(w http.ResponseWriter) error {
 		defer forceCtxCancel()
 
-		<-d.setupChan // Wait for daemon to start.
+		select {
+		case <-d.setupChan: // Wait for daemon to start.
+		case <-r.Context().Done(): // Don't leave this go routine around if client disconnects.
+		}
 
 		// Run shutdown sequence synchronously.
 		stopErr := d.Stop(forceCtx, unix.SIGPWR)
@@ -255,15 +390,14 @@ func internalShutdown(d *Daemon, r *http.Request) response.Response {
 		// Send the response before the LXD daemon process ends.
 		f, ok := w.(http.Flusher)
 		if !ok {
-			return fmt.Errorf("http.ResponseWriter is not type http.Flusher")
+			return errors.New("http.ResponseWriter is not type http.Flusher")
 		}
 
 		f.Flush()
 
-		// Send result of d.Stop() to cmdDaemon so that process stops with correct exit code from Stop().
 		go func() {
-			<-r.Context().Done() // Wait until request is finished.
-			d.shutdownDoneCh <- stopErr
+			<-r.Context().Done()    // Wait until request is finished.
+			d.shutdownDoneCh <- nil // Send nil error to cmdDaemon to ensure LXD isn't restarted by systemd.
 		}()
 
 		return nil
@@ -274,11 +408,7 @@ func internalShutdown(d *Daemon, r *http.Request) response.Response {
 // It detects whether the instance reference is an instance ID or instance name and loads instance accordingly.
 func internalContainerHookLoadFromReference(s *state.State, r *http.Request) (instance.Instance, error) {
 	var inst instance.Instance
-	instanceRef, err := url.PathUnescape(mux.Vars(r)["instanceRef"])
-	if err != nil {
-		return nil, err
-	}
-
+	instanceRef := r.PathValue("instanceRef")
 	projectName := request.ProjectParam(r)
 
 	instanceID, err := strconv.Atoi(instanceRef)
@@ -294,6 +424,12 @@ func internalContainerHookLoadFromReference(s *state.State, r *http.Request) (in
 				return nil, err
 			}
 
+			// Defend against path traversal attacks.
+			err = instancetype.ValidName(instanceRef, false)
+			if err != nil {
+				return nil, fmt.Errorf("Invalid instance name %q: %w", instanceRef, err)
+			}
+
 			// If DB not available, try loading from backup file.
 			logger.Warn("Failed loading instance from database, trying backup file", logger.Ctx{"project": projectName, "instance": instanceRef, "err": err})
 
@@ -306,7 +442,7 @@ func internalContainerHookLoadFromReference(s *state.State, r *http.Request) (in
 	}
 
 	if inst.Type() != instancetype.Container {
-		return nil, fmt.Errorf("Instance is not container type")
+		return nil, errors.New("Instance is not container type")
 	}
 
 	return inst, nil
@@ -317,13 +453,46 @@ func internalContainerOnStart(d *Daemon, r *http.Request) response.Response {
 
 	inst, err := internalContainerHookLoadFromReference(s, r)
 	if err != nil {
-		logger.Error("The start hook failed to load", logger.Ctx{"err": err})
+		logger.Error("The start hook failed loading", logger.Ctx{"err": err})
 		return response.SmartError(err)
 	}
 
+	l := logger.AddContext(logger.Ctx{"project": inst.Project().Name, "instance": inst.Name()})
+
 	err = inst.OnHook(instance.HookStart, nil)
 	if err != nil {
-		logger.Error("The start hook failed", logger.Ctx{"instance": inst.Name(), "err": err})
+		l.Error("The start hook failed", logger.Ctx{"err": err})
+		return response.SmartError(err)
+	}
+
+	return response.EmptySyncResponse
+}
+
+func internalContainerOnStartHost(d *Daemon, r *http.Request) response.Response {
+	s := d.State()
+
+	inst, err := internalContainerHookLoadFromReference(s, r)
+	if err != nil {
+		logger.Error("The start-host hook failed loading", logger.Ctx{"err": err})
+		return response.SmartError(err)
+	}
+
+	l := logger.AddContext(logger.Ctx{"project": inst.Project().Name, "instance": inst.Name()})
+
+	lxcPID := request.QueryParam(r, "lxc_pid")
+	if lxcPID == "" {
+		err := errors.New("No lxc_pid GET parameter was provided")
+		l.Error("The start-host hook failed", logger.Ctx{"err": err})
+		return response.BadRequest(err)
+	}
+
+	args := map[string]string{
+		"LXC_PID": lxcPID,
+	}
+
+	err = inst.OnHook(instance.HookStartHost, args)
+	if err != nil {
+		l.Error("The start-host hook failed", logger.Ctx{"err": err})
 		return response.SmartError(err)
 	}
 
@@ -335,9 +504,11 @@ func internalContainerOnStopNS(d *Daemon, r *http.Request) response.Response {
 
 	inst, err := internalContainerHookLoadFromReference(s, r)
 	if err != nil {
-		logger.Error("The stopns hook failed to load", logger.Ctx{"err": err})
+		logger.Error("The stopns hook failed loading", logger.Ctx{"err": err})
 		return response.SmartError(err)
 	}
+
+	l := logger.AddContext(logger.Ctx{"project": inst.Project().Name, "instance": inst.Name()})
 
 	target := request.QueryParam(r, "target")
 	if target == "" {
@@ -353,7 +524,7 @@ func internalContainerOnStopNS(d *Daemon, r *http.Request) response.Response {
 
 	err = inst.OnHook(instance.HookStopNS, args)
 	if err != nil {
-		logger.Error("The stopns hook failed", logger.Ctx{"instance": inst.Name(), "err": err})
+		l.Error("The stopns hook failed", logger.Ctx{"err": err})
 		return response.SmartError(err)
 	}
 
@@ -365,9 +536,11 @@ func internalContainerOnStop(d *Daemon, r *http.Request) response.Response {
 
 	inst, err := internalContainerHookLoadFromReference(s, r)
 	if err != nil {
-		logger.Error("The stop hook failed to load", logger.Ctx{"err": err})
+		logger.Error("The stop hook failed loading", logger.Ctx{"err": err})
 		return response.SmartError(err)
 	}
+
+	l := logger.AddContext(logger.Ctx{"project": inst.Project().Name, "instance": inst.Name()})
 
 	target := request.QueryParam(r, "target")
 	if target == "" {
@@ -380,7 +553,7 @@ func internalContainerOnStop(d *Daemon, r *http.Request) response.Response {
 
 	err = inst.OnHook(instance.HookStop, args)
 	if err != nil {
-		logger.Error("The stop hook failed", logger.Ctx{"instance": inst.Name(), "err": err})
+		l.Error("The stop hook failed", logger.Ctx{"err": err})
 		return response.SmartError(err)
 	}
 
@@ -397,7 +570,7 @@ type internalSQLQuery struct {
 }
 
 type internalSQLBatch struct {
-	Results []internalSQLResult
+	Results []internalSQLResult `json:"Results" yaml:"results"`
 }
 
 type internalSQLResult struct {
@@ -413,8 +586,8 @@ func internalSQLGet(d *Daemon, r *http.Request) response.Response {
 
 	database := r.FormValue("database")
 
-	if !shared.ValueInSlice(database, []string{"local", "global"}) {
-		return response.BadRequest(fmt.Errorf("Invalid database"))
+	if !slices.Contains([]string{"local", "global"}, database) {
+		return response.BadRequest(errors.New("Invalid database"))
 	}
 
 	schemaFormValue := r.FormValue("schema")
@@ -432,10 +605,15 @@ func internalSQLGet(d *Daemon, r *http.Request) response.Response {
 
 	tx, err := db.BeginTx(r.Context(), nil)
 	if err != nil {
-		return response.SmartError(fmt.Errorf("Failed to start transaction: %w", err))
+		return response.SmartError(fmt.Errorf("Failed starting transaction: %w", err))
 	}
 
-	defer func() { _ = tx.Rollback() }()
+	defer func() {
+		err := tx.Rollback()
+		if err != nil && !errors.Is(err, sql.ErrTxDone) {
+			logger.Warn("Failed rolling back transaction", logger.Ctx{"err": err})
+		}
+	}()
 
 	dump, err := query.Dump(r.Context(), tx, schemaOnly == 1)
 	if err != nil {
@@ -456,12 +634,12 @@ func internalSQLPost(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
-	if !shared.ValueInSlice(req.Database, []string{"local", "global"}) {
-		return response.BadRequest(fmt.Errorf("Invalid database"))
+	if !slices.Contains([]string{"local", "global"}, req.Database) {
+		return response.BadRequest(errors.New("Invalid database"))
 	}
 
 	if req.Query == "" {
-		return response.BadRequest(fmt.Errorf("No query provided"))
+		return response.BadRequest(errors.New("No query provided"))
 	}
 
 	var db *sql.DB
@@ -478,7 +656,7 @@ func internalSQLPost(d *Daemon, r *http.Request) response.Response {
 		return response.SyncResponse(true, batch)
 	}
 
-	for _, query := range strings.Split(req.Query, ";") {
+	for query := range strings.SplitSeq(req.Query, ";") {
 		query = strings.TrimLeft(query, " ")
 
 		if query == "" {
@@ -494,11 +672,17 @@ func internalSQLPost(d *Daemon, r *http.Request) response.Response {
 
 		if strings.HasPrefix(strings.ToUpper(query), "SELECT") {
 			err = internalSQLSelect(tx, query, &result)
-			_ = tx.Rollback()
+			rollbackErr := tx.Rollback()
+			if rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+				logger.Warn("Failed rolling back transaction", logger.Ctx{"err": rollbackErr})
+			}
 		} else {
 			err = internalSQLExec(tx, query, &result)
 			if err != nil {
-				_ = tx.Rollback()
+				rollbackErr := tx.Rollback()
+				if rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+					logger.Warn("Failed rolling back transaction", logger.Ctx{"err": rollbackErr})
+				}
 			} else {
 				err = tx.Commit()
 			}
@@ -518,14 +702,14 @@ func internalSQLSelect(tx *sql.Tx, query string, result *internalSQLResult) erro
 
 	rows, err := tx.Query(query)
 	if err != nil {
-		return fmt.Errorf("Failed to execute query: %w", err)
+		return fmt.Errorf("Failed executing query: %w", err)
 	}
 
 	defer func() { _ = rows.Close() }()
 
 	result.Columns, err = rows.Columns()
 	if err != nil {
-		return fmt.Errorf("Failed to fetch colume names: %w", err)
+		return fmt.Errorf("Failed fetching colume names: %w", err)
 	}
 
 	for rows.Next() {
@@ -537,7 +721,7 @@ func internalSQLSelect(tx *sql.Tx, query string, result *internalSQLResult) erro
 
 		err := rows.Scan(rowPointers...)
 		if err != nil {
-			return fmt.Errorf("Failed to scan row: %w", err)
+			return fmt.Errorf("Failed scanning row: %w", err)
 		}
 
 		for i, column := range row {
@@ -564,23 +748,25 @@ func internalSQLExec(tx *sql.Tx, query string, result *internalSQLResult) error 
 	result.Type = "exec"
 	r, err := tx.Exec(query)
 	if err != nil {
-		return fmt.Errorf("Failed to exec query: %w", err)
+		return fmt.Errorf("Failed execing query: %w", err)
 	}
 
 	result.RowsAffected, err = r.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("Failed to fetch affected rows: %w", err)
+		return fmt.Errorf("Failed fetching affected rows: %w", err)
 	}
 
 	return nil
 }
 
 // internalImportFromBackup creates instance, storage pool and volume DB records from an instance's backup file.
-// It expects the instance volume to be mounted so that the backup.yaml file is readable.
-// Also accepts an optional map of device overrides.
-func internalImportFromBackup(s *state.State, projectName string, instName string, allowNameOverride bool, deviceOverrides map[string]map[string]string) error {
+// It expects the backup's index file to determine the instance's config.
+func internalImportFromBackup(ctx context.Context, s *state.State, bInfo *backup.Info, allowNameOverride bool) error {
+	projectName := bInfo.Project
+	instName := bInfo.Name
+
 	if instName == "" {
-		return fmt.Errorf("The name of the instance is required")
+		return errors.New("The name of the instance is required")
 	}
 
 	storagePoolsPath := shared.VarPath("storage-pools")
@@ -633,42 +819,37 @@ func internalImportFromBackup(s *state.State, projectName string, instName strin
 		return fmt.Errorf(`The instance %q does not seem to exist on any storage pool`, instName)
 	}
 
-	// User needs to make sure that we can access the directory where backup.yaml lives.
-	instanceMountPoint := instanceMountPoints[0]
-	isEmpty, err := shared.PathIsEmpty(instanceMountPoint)
-	if err != nil {
-		return err
-	}
+	// Use the information from the backup index.
+	// The backup config later gets persisted to disk too.
+	backupConf := bInfo.Config
 
-	if isEmpty {
-		return fmt.Errorf(`The instance's directory %q appears to be empty. Please ensure that the instance's storage volume is mounted`, instanceMountPoint)
-	}
-
-	// Read in the backup.yaml file.
-	backupYamlPath := filepath.Join(instanceMountPoint, "backup.yaml")
-	backupConf, err := backup.ParseConfigYamlFile(backupYamlPath)
-	if err != nil {
-		return err
+	if backupConf.Instance == nil {
+		return errors.New("Instance definition in backup config is missing")
 	}
 
 	if allowNameOverride && instName != "" {
-		backupConf.Container.Name = instName
+		backupConf.Instance.Name = instName
 	}
 
-	if instName != backupConf.Container.Name {
-		return fmt.Errorf("Instance name requested %q doesn't match instance name in backup config %q", instName, backupConf.Container.Name)
+	if instName != backupConf.Instance.Name {
+		return fmt.Errorf("Requested instance name %q does not match instance name %q in backup config", instName, backupConf.Instance.Name)
 	}
 
-	if backupConf.Pool == nil {
+	if len(backupConf.Pools) == 0 {
 		// We don't know what kind of storage type the pool is.
-		return fmt.Errorf("No storage pool struct in the backup file found. The storage pool needs to be recovered manually")
+		return errors.New("No storage pool struct in the backup file found. The storage pool needs to be recovered manually")
+	}
+
+	rootVolPool, err := backupConf.RootVolumePool()
+	if err != nil {
+		return fmt.Errorf("Failed getting the root volume's pool: %w", err)
 	}
 
 	// Try to retrieve the storage pool the instance supposedly lives on.
 	pool, err := storagePools.LoadByName(s, instancePoolName)
 	if response.IsNotFoundError(err) {
 		// Create the storage pool db entry if it doesn't exist.
-		_, err = storagePoolDBCreate(s, instancePoolName, "", backupConf.Pool.Driver, backupConf.Pool.Config)
+		_, err = storagePoolDBCreate(ctx, s, instancePoolName, "", rootVolPool.Driver, rootVolPool.Config)
 		if err != nil {
 			return fmt.Errorf("Create storage pool database entry: %w", err)
 		}
@@ -681,12 +862,12 @@ func internalImportFromBackup(s *state.State, projectName string, instName strin
 		return fmt.Errorf("Find storage pool database entry: %w", err)
 	}
 
-	if backupConf.Pool.Name != instancePoolName {
-		return fmt.Errorf(`The storage pool %q the instance was detected on does not match the storage pool %q specified in the backup file`, instancePoolName, backupConf.Pool.Name)
+	if rootVolPool.Name != instancePoolName {
+		return fmt.Errorf(`The storage pool %q the instance was detected on does not match the storage pool %q specified in the backup file`, instancePoolName, rootVolPool.Name)
 	}
 
-	if backupConf.Pool.Driver != pool.Driver().Info().Name {
-		return fmt.Errorf(`The storage pool's %q driver %q conflicts with the driver %q recorded in the instance's backup file`, instancePoolName, pool.Driver().Info().Name, backupConf.Pool.Driver)
+	if rootVolPool.Driver != pool.Driver().Info().Name {
+		return fmt.Errorf(`The storage pool's %q driver %q conflicts with the driver %q recorded in the instance's backup file`, instancePoolName, pool.Driver().Info().Name, rootVolPool.Driver)
 	}
 
 	// Check snapshots are consistent.
@@ -697,8 +878,8 @@ func internalImportFromBackup(s *state.State, projectName string, instName strin
 
 	// Check if a storage volume entry for the instance already exists.
 	var dbVolume *db.StorageVolume
-	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
-		dbVolume, err = tx.GetStoragePoolVolume(ctx, pool.ID(), projectName, instanceDBVolType, backupConf.Container.Name, true)
+	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		dbVolume, err = tx.GetStoragePoolVolume(ctx, pool.ID(), projectName, instanceDBVolType, backupConf.Instance.Name, true)
 		if err != nil && !response.IsNotFoundError(err) {
 			return err
 		}
@@ -710,12 +891,12 @@ func internalImportFromBackup(s *state.State, projectName string, instName strin
 	}
 
 	if dbVolume != nil {
-		return fmt.Errorf(`Storage volume for instance %q already exists in the database`, backupConf.Container.Name)
+		return fmt.Errorf(`Storage volume for instance %q already exists in the database`, backupConf.Instance.Name)
 	}
 
-	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 		// Check if an entry for the instance already exists in the db.
-		_, err := tx.GetInstanceID(ctx, projectName, backupConf.Container.Name)
+		_, err := tx.GetInstanceID(ctx, projectName, backupConf.Instance.Name)
 
 		return err
 	})
@@ -724,35 +905,17 @@ func internalImportFromBackup(s *state.State, projectName string, instName strin
 	}
 
 	if err == nil {
-		return fmt.Errorf(`Entry for instance %q already exists in the database`, backupConf.Container.Name)
+		return fmt.Errorf(`Entry for instance %q already exists in the database`, backupConf.Instance.Name)
 	}
 
-	if backupConf.Volume == nil {
-		return fmt.Errorf(`No storage volume struct in the backup file found. The storage volume needs to be recovered manually`)
-	}
-
-	if dbVolume != nil {
-		if dbVolume.Name != backupConf.Volume.Name {
-			return fmt.Errorf(`The name %q of the storage volume is not identical to the instance's name "%s"`, dbVolume.Name, backupConf.Container.Name)
-		}
-
-		if dbVolume.Type != backupConf.Volume.Type {
-			return fmt.Errorf(`The type %q of the storage volume is not identical to the instance's type %q`, dbVolume.Type, backupConf.Volume.Type)
-		}
-
-		err := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
-			// Remove the storage volume db entry for the instance since force was specified.
-			return tx.RemoveStoragePoolVolume(ctx, projectName, backupConf.Container.Name, instanceDBVolType, pool.ID())
-		})
-		if err != nil {
-			return err
-		}
+	if len(backupConf.Volumes) == 0 {
+		return errors.New(`No storage volume struct in the backup file found. The storage volume needs to be recovered manually`)
 	}
 
 	var profiles []api.Profile
 
-	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
-		profiles, err = tx.GetProfiles(ctx, projectName, backupConf.Container.Profiles)
+	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		profiles, err = tx.GetProfiles(ctx, projectName, backupConf.Instance.Profiles)
 
 		return err
 	})
@@ -760,41 +923,19 @@ func internalImportFromBackup(s *state.State, projectName string, instName strin
 		return fmt.Errorf("Failed loading profiles for instance: %w", err)
 	}
 
-	// Initialise the devices maps.
-	if backupConf.Container.Devices == nil {
-		backupConf.Container.Devices = make(map[string]map[string]string, 0)
-	}
-
-	if backupConf.Container.ExpandedDevices == nil {
-		backupConf.Container.ExpandedDevices = make(map[string]map[string]string, 0)
-	}
-
-	// Apply device overrides.
-	// Do this before calling internalImportRootDevicePopulate so that device overrides are taken into account.
-	resultingDevices, err := shared.ApplyDeviceOverrides(backupConf.Container.Devices, backupConf.Container.ExpandedDevices, deviceOverrides)
-	if err != nil {
-		return err
-	}
-
-	backupConf.Container.Devices = resultingDevices
-
 	// Add root device if needed.
 	// And ensure root device is associated with same pool as instance has been imported to.
-	internalImportRootDevicePopulate(instancePoolName, backupConf.Container.Devices, backupConf.Container.ExpandedDevices, profiles)
+	internalImportRootDevicePopulate(instancePoolName, backupConf.Instance.Devices, backupConf.Instance.ExpandedDevices, profiles)
 
 	revert := revert.New()
 	defer revert.Fail()
-
-	if backupConf.Container == nil {
-		return fmt.Errorf("No instance config in backup config")
-	}
 
 	instDBArgs, err := backup.ConfigToInstanceDBArgs(s, backupConf, projectName, true)
 	if err != nil {
 		return err
 	}
 
-	_, instOp, cleanup, err := instance.CreateInternal(s, *instDBArgs, true)
+	_, instOp, cleanup, err := instance.CreateInternal(ctx, s, *instDBArgs, true)
 	if err != nil {
 		return fmt.Errorf("Failed creating instance record: %w", err)
 	}
@@ -802,23 +943,21 @@ func internalImportFromBackup(s *state.State, projectName string, instName strin
 	revert.Add(cleanup)
 	defer instOp.Done(err)
 
-	instancePath := storagePools.InstancePath(instanceType, projectName, backupConf.Container.Name, false)
-	isPrivileged := false
-	if backupConf.Container.Config["security.privileged"] == "" {
-		isPrivileged = true
-	}
+	instancePath := storagePools.InstancePath(instanceType, projectName, backupConf.Instance.Name, false)
+	isPrivileged := backupConf.Instance.Config["security.privileged"] == ""
 
+	instanceMountPoint := instanceMountPoints[0]
 	err = storagePools.CreateContainerMountpoint(instanceMountPoint, instancePath, isPrivileged)
 	if err != nil {
 		return err
 	}
 
 	for _, snap := range existingSnapshots {
-		snapInstName := fmt.Sprintf("%s%s%s", backupConf.Container.Name, shared.SnapshotDelimiter, snap.Name)
+		snapInstName := backupConf.Instance.Name + shared.SnapshotDelimiter + snap.Name
 
-		snapErr := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		snapErr := s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 			// Check if an entry for the snapshot already exists in the db.
-			_, err := tx.GetInstanceSnapshotID(ctx, projectName, backupConf.Container.Name, snap.Name)
+			_, err := tx.GetInstanceSnapshotID(ctx, projectName, backupConf.Instance.Name, snap.Name)
 
 			return err
 		})
@@ -832,7 +971,7 @@ func internalImportFromBackup(s *state.State, projectName string, instName strin
 
 		// Check if a storage volume entry for the snapshot already exists.
 		var dbVolume *db.StorageVolume
-		err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 			dbVolume, err = tx.GetStoragePoolVolume(ctx, pool.ID(), projectName, instanceDBVolType, snapInstName, true)
 			if err != nil && !response.IsNotFoundError(err) {
 				return err
@@ -856,7 +995,7 @@ func internalImportFromBackup(s *state.State, projectName string, instName strin
 			return err
 		}
 
-		err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 			profiles, err = tx.GetProfiles(ctx, projectName, snap.Profiles)
 
 			return err
@@ -876,7 +1015,7 @@ func internalImportFromBackup(s *state.State, projectName string, instName strin
 
 		internalImportRootDevicePopulate(instancePoolName, snap.Devices, snap.ExpandedDevices, profiles)
 
-		_, snapInstOp, cleanup, err := instance.CreateInternal(s, db.InstanceArgs{
+		_, snapInstOp, cleanup, err := instance.CreateInternal(ctx, s, db.InstanceArgs{
 			Project:      projectName,
 			Architecture: arch,
 			BaseImage:    baseImage,
@@ -896,12 +1035,12 @@ func internalImportFromBackup(s *state.State, projectName string, instName strin
 		}
 
 		revert.Add(cleanup)
-		defer snapInstOp.Done(err) //nolint:revive
+		defer snapInstOp.Done(err)
 
 		// Recreate missing mountpoints and symlinks.
 		volStorageName := project.Instance(projectName, snapInstName)
 		snapshotMountPoint := storageDrivers.GetVolumeMountPath(instancePoolName, instanceVolType, volStorageName)
-		snapshotPath := storagePools.InstancePath(instanceType, projectName, backupConf.Container.Name, true)
+		snapshotPath := storagePools.InstancePath(instanceType, projectName, backupConf.Instance.Name, true)
 		snapshotTargetPath := storageDrivers.GetVolumeSnapshotDir(instancePoolName, instanceVolType, volStorageName)
 
 		err = storagePools.CreateSnapshotMountpoint(snapshotMountPoint, snapshotTargetPath, snapshotPath)
@@ -920,25 +1059,25 @@ func internalImportFromBackup(s *state.State, projectName string, instName strin
 // device will be added, if the root disk config in the current profiles matches the effective backup.yaml config.
 func internalImportRootDevicePopulate(instancePoolName string, localDevices map[string]map[string]string, expandedDevices map[string]map[string]string, profiles []api.Profile) {
 	// First, check if localDevices from backup.yaml has a root disk.
-	rootName, _, _ := instancetype.GetRootDiskDevice(localDevices)
-	if rootName != "" {
+	rootName, _, err := api.GetRootDiskDevice(localDevices)
+	if err == nil && rootName != "" {
 		localDevices[rootName]["pool"] = instancePoolName
 
 		return // Local root disk device has been set to target pool.
 	}
 
 	// Next check if expandedDevices from backup.yaml has a root disk.
-	expandedRootName, expandedRootConfig, _ := instancetype.GetRootDiskDevice(expandedDevices)
+	expandedRootName, expandedRootConfig, expandedRootErr := api.GetRootDiskDevice(expandedDevices)
 
 	// Extract root disk from expanded profile devices.
 	profileExpandedDevices := instancetype.ExpandInstanceDevices(deviceConfig.NewDevices(localDevices), profiles)
-	profileExpandedRootName, profileExpandedRootConfig, _ := instancetype.GetRootDiskDevice(profileExpandedDevices.CloneNative())
+	profileExpandedRootName, profileExpandedRootConfig, profileExpandedRootErr := api.GetRootDiskDevice(profileExpandedDevices.CloneNative())
 
 	// Record whether we need to add a new local disk device.
 	addLocalDisk := false
 
 	// We need to add a local root disk if the profiles don't have a root disk.
-	if profileExpandedRootName == "" {
+	if profileExpandedRootErr != nil || profileExpandedRootName == "" {
 		addLocalDisk = true
 	} else {
 		// Check profile expanded root disk is in the correct pool
@@ -948,7 +1087,7 @@ func internalImportRootDevicePopulate(instancePoolName string, localDevices map[
 			// Check profile expanded root disk config matches the old expanded disk in backup.yaml.
 			// Excluding the "pool" property, which we ignore, as we have already checked the new
 			// profile root disk matches the target pool name.
-			if expandedRootName != "" {
+			if expandedRootErr == nil && expandedRootName != "" {
 				for k := range expandedRootConfig {
 					if k == "pool" {
 						continue // Ignore old pool name.
@@ -983,7 +1122,7 @@ func internalImportRootDevicePopulate(instancePoolName string, localDevices map[
 		}
 
 		// Inherit any extra root disk config from the expanded root disk from backup.yaml.
-		if expandedRootName != "" {
+		if expandedRootErr == nil && expandedRootName != "" {
 			for k, v := range expandedRootConfig {
 				_, found := rootDev[k]
 				if !found {
@@ -995,12 +1134,12 @@ func internalImportRootDevicePopulate(instancePoolName string, localDevices map[
 		// If there is already a device called "root" in the instance's config, but it does not qualify as
 		// a root disk, then try to find a free name for the new root disk device.
 		rootDevName := "root"
-		for i := 0; i < 100; i++ {
+		for i := range 100 {
 			if localDevices[rootDevName] == nil {
 				break
 			}
 
-			rootDevName = fmt.Sprintf("root%d", i)
+			rootDevName = "root" + strconv.FormatInt(int64(i), 10)
 			continue
 		}
 
@@ -1008,8 +1147,8 @@ func internalImportRootDevicePopulate(instancePoolName string, localDevices map[
 	}
 }
 
-func internalGC(d *Daemon, r *http.Request) response.Response {
-	logger.Infof("Started forced garbage collection run")
+func internalGC(_ *Daemon, _ *http.Request) response.Response {
+	logger.Info("Started forced garbage collection run")
 	runtime.GC()
 	runtimeDebug.FreeOSMemory()
 
@@ -1020,25 +1159,34 @@ func internalGC(d *Daemon, r *http.Request) response.Response {
 	logger.Infof("Requested from system: %s", units.GetByteSizeStringIEC(int64(m.Sys), 2))
 	logger.Infof("Releasable to OS: %s", units.GetByteSizeStringIEC(int64(m.HeapIdle-m.HeapReleased), 2))
 
-	logger.Infof("Completed forced garbage collection run")
+	logger.Info("Completed forced garbage collection run")
 
 	return response.EmptySyncResponse
 }
 
-func internalRAFTSnapshot(d *Daemon, r *http.Request) response.Response {
+func internalRAFTSnapshot(_ *Daemon, _ *http.Request) response.Response {
 	logger.Warn("Forced RAFT snapshot not supported")
 
-	return response.InternalError(fmt.Errorf("Not supported"))
+	return response.InternalError(errors.New("Not supported"))
 }
 
-func internalBGPState(d *Daemon, r *http.Request) response.Response {
+func internalTestingBGPState(d *Daemon, _ *http.Request) response.Response {
 	s := d.State()
 
 	return response.SyncResponse(true, s.BGP.Debug())
 }
 
-func internalIdentityCacheRefresh(d *Daemon, r *http.Request) response.Response {
+func internalIdentityCacheRefresh(d *Daemon, _ *http.Request) response.Response {
 	logger.Debug("Received identity cache update notification - refreshing cache")
 	d.State().UpdateIdentityCache()
+	return response.EmptySyncResponse
+}
+
+func internalTestingSnapshotScheduledTask(d *Daemon, r *http.Request) response.Response {
+	err := pruneExpiredAndAutoCreateInstanceSnapshots(r.Context(), d.State())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
 	return response.EmptySyncResponse
 }

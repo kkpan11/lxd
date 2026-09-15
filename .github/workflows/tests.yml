@@ -4,15 +4,64 @@ on:
     branches:
       - main
       - stable-*
+      - release-*
   pull_request:
   workflow_dispatch:
+    inputs:
+      static-analysis:
+        description: Whether to run `make static-analysis`
+        required: true
+        type: boolean
+        default: true
+      unit-tests:
+        description: Whether to run `make check-unit`
+        required: true
+        type: boolean
+        default: true
+      coverage:
+        description: Whether to enable Go coverage collection
+        required: true
+        type: boolean
+        default: false
+      go-snap-channel:
+        description: Go snap channel to test on Linux, e.g. latest/candidate. Leave empty to use go.mod.
+        required: false
+        type: string
+        default: ''
+      ubuntu-releases:
+        description: Ubuntu releases to run the tests against. In JSON format, i.e. '["24.04", "26.04"]'.
+        type: choice
+        default: '["26.04"]'
+        options:
+          - '["22.04"]'
+          - '["24.04"]'
+          - '["26.04"]'
+          - '["24.04", "26.04"]'
+      snap-risk:
+        description: Snap risk level, `edge`, `candidate` or `stable`
+        type: choice
+        default: 'edge'
+        options:
+          - 'edge'
+          - 'candidate'
+          - 'stable'
+      tmate-debug:
+        description: Use tmate debugging session on integration test failure.
+        type: boolean
+        default: false
   schedule:
     - cron: '0 0 * * *'  # Test TICS daily
 
 env:
-  LXD_REQUIRED_TESTS: "storage_buckets"
-  LXD_SKIP_TESTS: "clustering_upgrade clustering_upgrade_large"
-  GOCOVERDIR: ${{ ( github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' ) && '/home/runner/work/lxd/lxd/coverage' || '' }}
+  GOTOOLCHAIN: "local"  # Never download a different Go toolchain
+  LXD_REQUIRED_TESTS: "network_ovn"
+  GOCOVERAGE: ${{ (( github.event_name == 'workflow_dispatch' && inputs.coverage ) || ( github.event_name == 'schedule' && github.repository == 'canonical/lxd' ) || ( github.event_name == 'pull_request' && github.repository == 'canonical/lxd' )) && 'true' || 'false' }}
+  GOCOVERDIR: ''  # Later set to the fully qualified path if needed
+  IMAGE_CACHE_DIR: "/home/runner/image-cache"
+  SNAP_CACHE_DIR: "/home/runner/snap-cache"
+  # XXX: avoid Ceph 20.2.4 due to new authentication for CVE-2025-30156 not compatible with the ceph-common version shipped in the LXD snap
+  # Revert to latest/edge once https://bugs.launchpad.net/ubuntu/+source/ceph/+bug/2166817 is fixed and propagated in the LXD snap
+  MICROCEPH_SNAP_CHANNEL: "tentacle/stable"
 
 permissions:
   contents: read
@@ -29,286 +78,286 @@ defaults:
 
 jobs:
   code-tests:
+    outputs:
+      fast-backend: ${{ steps.pick-fast-backend.outputs.fast-backend }}
     env:
-      CGO_CFLAGS: "-I/home/runner/go/bin/dqlite/include/"
-      CGO_LDFLAGS: "-L/home/runner/go/bin/dqlite/libs/"
-      LD_LIBRARY_PATH: "/home/runner/go/bin/dqlite/libs/"
-      LD_RUN_PATH: "/home/runner/go/bin/dqlite/libs/"
+      CGO_CFLAGS: "-I/home/runner/go/deps/dqlite/include/ -I/home/runner/go/deps/liblxc/include/"
+      CGO_LDFLAGS: "-L/home/runner/go/deps/dqlite/.libs/"
+      LD_LIBRARY_PATH: "/home/runner/go/deps/dqlite/.libs/"
+      LD_RUN_PATH: "/home/runner/go/deps/dqlite/.libs/"
       CGO_LDFLAGS_ALLOW: "(-Wl,-wrap,pthread_create)|(-Wl,-z,now)"
+      SUDO_PRESERVE_ENV: "CGO_CFLAGS,CGO_LDFLAGS,CGO_LDFLAGS_ALLOW,GOCOVERDIR,PKG_CONFIG_PATH,LD_LIBRARY_PATH,PATH"
+    if: ${{ github.event_name != 'schedule' || github.repository == 'canonical/lxd' }}
     name: Code
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # A non-shallow clone is needed for the Differential ShellCheck
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Tune disk performance
-        uses: ./.github/actions/tune-disk-performance
+        uses: $/.github/actions/tune-disk-performance
 
       - name: Dependency Review
-        uses: actions/dependency-review-action@v4
-        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        if: github.event_name == 'pull_request' && github.repository == 'canonical/lxd'
 
       # XXX: `make static-analysis` also run shellcheck but this one provides
       #      useful feedback in the PR through github-code-scanning bot
       - id: ShellCheck
         name: Differential ShellCheck
-        uses: redhat-plumbers-in-action/differential-shellcheck@v5
+        uses: redhat-plumbers-in-action/differential-shellcheck@d965e66ec0b3b2f821f75c8eff9b12442d9a7d1e # v5.5.6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           strict-check-on-push: true
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && github.repository == 'canonical/lxd'
 
       - name: Upload artifact with ShellCheck defects in SARIF format
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: Differential ShellCheck SARIF
           path: ${{ steps.ShellCheck.outputs.sarif }}
-        if: github.event_name == 'pull_request'
+          retention-days: 1
+        if: ${{ github.event_name == 'pull_request' && runner.debug == '1' && !cancelled() }}
 
-      - name: Install Go (1.22)
-        uses: actions/setup-go@v5
+      - name: Install Go
+        uses: $/.github/actions/setup-go
         with:
-          go-version: 1.22.x
+          snap-channel: ${{ inputs.go-snap-channel }}
+
+      - name: Install Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: github.event_name != 'pull_request'
+        with:
+          # zizmor: ignore[cache-poisoning]
+          cache: 'pip' # caching pip dependencies
+          cache-dependency-path: |
+            doc/requirements.txt
+            doc/conf.py
+          python-version: '3.x'  # satisfied by any 3.x version already installed
 
       - name: Install build dependencies
-        uses: ./.github/actions/install-lxd-builddeps
-
-      - name: Install test dependencies
-        run: |
-          python3 -m pip install flake8
-
-          # Download minio ready to include in dependencies for system tests.
-          mkdir -p "$(go env GOPATH)/bin"
-          curl -sSfL https://dl.min.io/server/minio/release/linux-amd64/minio --output "$(go env GOPATH)/bin/minio"
-          chmod +x "$(go env GOPATH)/bin/minio"
-
-          # Also grab the latest minio client to maintain compatibility with the server.
-          curl -sSfL https://dl.min.io/client/mc/release/linux-amd64/mc --output "$(go env GOPATH)/bin/mc"
-          chmod +x "$(go env GOPATH)/bin/mc"
+        uses: $/.github/actions/install-lxd-builddeps
 
       - name: Download go dependencies
         run: |
           set -eux
+          # Resolve dependencies and download modules
           go mod download
 
-      - name: Check compatibility with min Go version
+          # Check compatibility with min Go version
+          make check-gomin
+
+          # Ensure go.mod and go.sum were not modified by the above
+          # commands which would indicate an issue (hint: run `make update-gomod`)
+          git diff --exit-code
+
+      - name: Make GOCOVERDIR
         run: |
           set -eux
-          GOMIN="$(sed -n 's/^GOMIN=\([0-9.]\+\)$/\1/p' Makefile)"
-          sudo chmod o+w {go.mod,go.sum}
-          go mod tidy -go="${GOMIN}"
+          mkdir -p coverage
+          chmod 0777 coverage
+          cd coverage
+          echo "GOCOVERDIR=$(pwd)" >> "${GITHUB_ENV}"
+        if: env.GOCOVERAGE == 'true'
 
-          DOC_GOMIN="$(sed -n 's/^LXD requires Go \([0-9.]\+\) .*/\1/p' doc/requirements.md)"
-          [ "${GOMIN}" = "${DOC_GOMIN}" ]
-
-      - name: Make LXD tarball and unpack it
+      - name: Prepare dist directory
         env:
           CUSTOM_VERSION: "test"
         run: |
           set -eux
-          make dist
-          tar -xzf lxd-test.tar.gz -C /home/runner/work/lxd/
-          rm lxd-test.tar.gz
+          make dist-dir
 
-      - name: Build LXD dependencies
-        run: |
-          set -eux
+          # Move the dist directory outside the workspace.
+          mv lxd-test ../
 
-          # Build from unpacked dist tarball.
-          cd /home/runner/work/lxd/lxd-test
-          make deps
-
-          # Include dqlite libs in dependencies for system tests.
-          mkdir /home/runner/go/bin/dqlite
-          mv /home/runner/work/lxd/lxd-test/vendor/dqlite/include /home/runner/go/bin/dqlite/include
-          mv /home/runner/work/lxd/lxd-test/vendor/dqlite/.libs /home/runner/go/bin/dqlite/libs
+      # In code-tests, this action warms the cache for the system-tests job
+      - name: Build or restore dqlite/liblxc dependencies
+        uses: $/.github/actions/cache-dqlite-liblxc
+        with:
+          export-env: true
 
       - name: Build binaries
         run: |
           set -eux
 
-          # Build from unpacked dist tarball.
-          cd /home/runner/work/lxd/lxd-test
+          # Build from unpacked dist directory.
+          cd "${GITHUB_WORKSPACE}/../lxd-test"
           make
 
-          strip --strip-all /home/runner/go/bin/{lxc*,lxd*} -v
+      - name: Get pinned golangci-lint version
+        id: golangci-lint-version
+        run: echo "version=$(go list -C tools -m -f '{{.Version}}' github.com/golangci/golangci-lint/v2)" >> "$GITHUB_OUTPUT"
 
-      - name: Check lxc/lxd-agent binary sizes
-        run: |
-          set -eux
-
-          # Build lxc/lxd-agent the same way as done in the snap
-          go build -trimpath -o "/tmp/bin/lxc" github.com/canonical/lxd/lxc
-          CGO_ENABLED=0 go build -trimpath -o "/tmp/bin/lxd-agent" -tags=agent,netgo github.com/canonical/lxd/lxd-agent
-          strip -s /tmp/bin/*
-
-          # bin/max (sizes are in MiB)
-          SIZES="lxc 15
-                 lxd-agent 13"
-          MIB="$((1024 * 1024))"
-
-          while read -r bin max; do
-            cur="$(stat --format=%s "/tmp/bin/${bin}")"
-            min=$((max - 1))
-            min_mib="$((min * MIB))"
-            max_mib="$((max * MIB))"
-            rm -f "/tmp/bin/${bin}"
-
-            if [ "${cur}" -gt "${max_mib}" ]; then
-              echo "FAIL: ${bin} binary size exceeds ${max}MiB"
-              exit 1
-            fi
-
-            # XXX: check for when we need to lower the min/max sizes
-            if [ "${cur}" -lt "${min_mib}" ]; then
-              echo "Congratulations: ${bin} binary size reduced below ${min}MiB"
-              echo "It is now time to edit the workflow job to use smaller min/max sizes for ${bin}"
-              exit 1
-            fi
-
-            echo "OK: ${bin} is between ${min} and ${max}MiB"
-          done <<< ${SIZES}
-
-      - name: Make GOCOVERDIR
-        run: mkdir -p "${GOCOVERDIR}"
-        if: env.GOCOVERDIR != ''
+      - name: Run golangci-lint
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.static-analysis }}
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ steps.golangci-lint-version.outputs.version }}
 
       - name: Run static analysis
-        env:
-          GITHUB_BEFORE: ${{ github.event.before }}
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.static-analysis }}
         run: |
           set -eux
-          sudo chmod o+w ./lxd/metadata/configuration.json
-          sudo chmod o+w ./doc/metadata.txt
-          sudo chmod o+w ./po/*
-          sudo chmod o+w ./lxd/auth/entitlements_generated.go
-          sudo chmod o+w ./lxd/auth/drivers/openfga_model.openfga
-          make static-analysis
+          # For `make update-api`
+          sudo chmod o+w ./doc/rest-api.yaml
+          # For `make update-auth`
+          sudo chmod o+w ./lxd/auth/entitlements_generated.go ./lxd/auth/drivers/openfga_model.openfga
+          # For `make update-metadata`
+          sudo chmod o+w ./lxd/metadata/configuration.json ./doc/metadata.txt
+          # For `make update-schema`
+          sudo chmod o+w ./lxd/db/cluster/generated.go ./lxd/db/cluster/schema.go ./lxd/db/cluster/*.mapper.go
 
-      - name: Unit tests (all)
+          make static-analysis
+          # If `git diff` does not come out clean, you likely forgot a `make update-*`
+          git diff --exit-code
+
+      - name: Unit tests
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.unit-tests }}
         run: |
           set -eux
-          sudo --preserve-env=CGO_CFLAGS,CGO_LDFLAGS,CGO_LDFLAGS_ALLOW,GOCOVERDIR,LD_LIBRARY_PATH LD_LIBRARY_PATH=${LD_LIBRARY_PATH} env "PATH=${PATH}" make check-unit
+          sudo timeout 10m apt-get install -y xdelta3 # Required for SimpleStreams client tests.
+          chmod +x ~
+          echo "root:1000000:1000000000" | sudo tee /etc/subuid /etc/subgid
+          make check-unit
+          git diff --exit-code
 
       - name: Upload coverage data
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-unit
           path: ${{env.GOCOVERDIR}}
-        if: env.GOCOVERDIR != ''
+          retention-days: 1
+        if: env.GOCOVERDIR != '' && github.repository == 'canonical/lxd'
+
+      - name: Prime cache with external test images
+        uses: $/.github/actions/download-images
+        with:
+          prime-cache-only: true
+          image-cache-dir: ${{ env.IMAGE_CACHE_DIR }}
+
+      - name: Prime cache with snap dependencies
+        uses: $/.github/actions/download-snaps
+        with:
+          prime-cache-only: true
+          snap-cache-dir: ${{ env.SNAP_CACHE_DIR }}
+          microceph-channel: ${{ env.MICROCEPH_SNAP_CHANNEL }}
 
       - name: Upload system test dependencies
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: system-test-deps
           path: |
-            /home/runner/go/bin/lxc*
-            /home/runner/go/bin/lxd*
-            /home/runner/go/bin/mc
-            /home/runner/go/bin/minio
-            /home/runner/go/bin/dqlite
-          retention-days: 1
+            /home/runner/go/bin/devlxd-client
+            /home/runner/go/bin/fuidshift
+            /home/runner/go/bin/lxc
+            /home/runner/go/bin/lxd
+            /home/runner/go/bin/lxd-agent
+            /home/runner/go/bin/lxd-benchmark
+            /home/runner/go/bin/lxd-client
+            /home/runner/go/bin/lxd-convert
+            /home/runner/go/bin/lxd-user
+            /home/runner/go/bin/mini-acme
+            /home/runner/go/bin/mini-loki
+            /home/runner/go/bin/mini-oidc
+            /home/runner/go/bin/sysinfo
+          retention-days: 3
+
+      - name: Pick fast backend for system tests
+        id: pick-fast-backend
+        run: |
+          set -eux
+          fast_backend="btrfs"
+          if [ $(( "${GITHUB_RUN_ID:-"${RANDOM}"}" % 2 )) -eq 0 ]; then
+            fast_backend="dir"
+          fi
+          echo "fast-backend=${fast_backend}" >> "$GITHUB_OUTPUT"
 
   system-tests:
     env:
       LXD_CEPH_CLUSTER: "ceph"
       LXD_CEPH_CEPHFS: "cephfs"
       LXD_CEPH_CEPHOBJECT_RADOSGW: "http://127.0.0.1"
-      LXD_CONCURRENT: "1"
+      LXD_OVN_NB_CONNECTION: "ssl:127.0.0.1:6641"
       LXD_VERBOSE: "1"
-      LXD_OFFLINE: "1"
       LXD_TMPFS: "1"
+      GOTRACEBACK: "crash"
+      SUDO_PRESERVE_ENV: "PATH,GOPATH,GOCOVERDIR,GOTRACEBACK,GITHUB_ACTIONS,GITHUB_STEP_SUMMARY,SNAP_CACHE_DIR,IMAGE_CACHE_DIR,LXD_VERBOSE,LXD_REPEAT_TESTS,LXD_BACKENDS,LXD_BACKEND,LXD_CEPH_CLUSTER,LXD_CEPH_CEPHFS,LXD_CEPH_CEPHOBJECT_RADOSGW,LXD_OVN_NB_CONNECTION,LXD_OVN_NB_CLIENT_CRT_FILE,LXD_OVN_NB_CLIENT_KEY_FILE,LXD_OVN_NB_CA_CRT_FILE,LXD_SKIP_TESTS,LXD_REQUIRED_TESTS,LXD_TMPFS"
+    if: ${{ github.event_name != 'schedule' || github.repository == 'canonical/lxd' }}
     name: System
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
     needs: code-tests
     strategy:
       fail-fast: false
       matrix:
-        go: ["1.22.x"]
-        suite: ["cluster", "standalone"]
-        backend: ["dir", "btrfs", "lvm", "zfs", "ceph", "random"]
         include:
-          - go: stable
-            suite: cluster
-            backend: dir
-          - go: stable
-            suite: standalone
-            backend: dir
+          - group: cluster
+            backends: ${{ needs.code-tests.outputs.fast-backend }}
+          - group: cluster_storage
+            backends: all
+          - group: replicator_storage
+            backends: all
+          - group: image
+            backends: fasts
+          - group: instance
+            backends: fasts
+          - group: network
+            backends: ${{ needs.code-tests.outputs.fast-backend }}
+          - group: standalone
+            backends: ${{ needs.code-tests.outputs.fast-backend }}
+          - group: snap
+            backends: all
+          - group: standalone_storage
+            backends: ceph
+          - group: standalone_storage
+            backends: fasts
+          - group: standalone_storage
+            backends: lvm
+          - group: standalone_storage
+            backends: zfs
+          - group: standalone_storage
+            backends: random
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Tune disk performance
-        uses: ./.github/actions/tune-disk-performance
+        uses: $/.github/actions/tune-disk-performance
 
-      - name: Reclaim disk space
-        uses: ./.github/actions/reclaim-disk-space
+      - name: Reclaim some memory
+        uses: $/.github/actions/reclaim-memory
 
       - name: Remove docker
-        uses: ./.github/actions/disable-docker
+        uses: $/.github/actions/disable-docker
 
-      - name: Install Go (${{ matrix.go }})
-        uses: actions/setup-go@v5
+      - name: Install runtime dependencies
+        uses: $/.github/actions/install-lxd-runtimedeps
+
+      # Restore the cache warmed in code-tests job
+      - name: Build or restore dqlite/liblxc dependencies
+        uses: $/.github/actions/cache-dqlite-liblxc
+
+      # Restore the cache warmed in code-tests job
+      - name: Download external test images
+        uses: $/.github/actions/download-images
         with:
-          go-version: ${{ matrix.go }}
+          image-cache-dir: ${{ env.IMAGE_CACHE_DIR }}
 
-      - name: Install dependencies
-        run: |
-          set -eux
-          sudo add-apt-repository ppa:ubuntu-lxc/daily -y --no-update
-          sudo apt-get update
-
-          sudo systemctl mask lxc.service lxc-net.service
-
-          sudo apt-get install --no-install-recommends -y \
-            curl \
-            git \
-            libacl1-dev \
-            libcap-dev \
-            libdbus-1-dev \
-            liblxc-dev \
-            libseccomp-dev \
-            libselinux-dev \
-            libsqlite3-dev \
-            libtool \
-            libudev-dev \
-            make \
-            pkg-config\
-            acl \
-            attr \
-            bind9-dnsutils \
-            btrfs-progs \
-            busybox-static \
-            dnsmasq-base \
-            easy-rsa \
-            gettext \
-            jq \
-            lxc-utils \
-            lvm2 \
-            nftables \
-            quota \
-            rsync \
-            s3cmd \
-            socat \
-            sqlite3 \
-            squashfs-tools \
-            tar \
-            tcl \
-            thin-provisioning-tools \
-            uuid-runtime \
-            xfsprogs \
-            xz-utils \
-            zfsutils-linux
-
-          # reclaim some space
-          sudo apt-get clean
+      # Restore the cache warmed in code-tests job
+      - name: Download snap dependencies
+        uses: $/.github/actions/download-snaps
+        with:
+          snap-cache-dir: ${{ env.SNAP_CACHE_DIR }}
+          microceph-channel: ${{ env.MICROCEPH_SNAP_CHANNEL }}
 
       - name: Download system test dependencies
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: system-test-deps
           merge-multiple: true
@@ -321,161 +370,360 @@ jobs:
           chmod uog+x /home/runner/go/bin/*
 
       - name: Setup MicroCeph
-        if: ${{ matrix.backend == 'ceph' }}
-        run: |
-          set -eux
+        if: ${{ contains(matrix.backends, 'ceph') || matrix.backends == 'all' }}
+        uses: $/.github/actions/setup-microceph
+        with:
+          microceph-channel: ${{ env.MICROCEPH_SNAP_CHANNEL }}
+          osd-count: 3
+          snap-cache-dir: ${{ env.SNAP_CACHE_DIR }}
 
-          cleanup() {
-            set +e
-            # dmesg may contain oops, IO errors, crashes, etc
-            echo "::group::dmesg logs"
-            journalctl --quiet --no-hostname --no-pager --boot=0 --lines=100 --dmesg
-            echo "::endgroup::"
-            exit 1
-          }
-          trap cleanup ERR HUP INT TERM
-
-          # If the rootfs and the ephemeral part are on the same physical disk, giving the whole
-          # disk to microceph would wipe our rootfs. Since it is pretty rare for GitHub Action
-          # runners to have a single disk, we immediately bail rather than trying to gracefully
-          # handle it. Once snapd releases with https://github.com/snapcore/snapd/pull/13150,
-          # we will be able to stop worrying about that special case.
-          if [ "$(stat -c '%d' /)" = "$(stat -c '%d' /mnt)" ]; then
-            echo "FAIL: rootfs and ephemeral part on the same disk, aborting"
-            exit 1
-          fi
-
-          # Free-up the ephemeral disk to use it as ceph OSD.
-          # https://github.com/canonical/microceph/issues/288 and https://github.com/canonical/microceph/issues/289
-          sudo swapoff /mnt/swapfile
-          ephemeral_disk="$(findmnt --noheadings --output SOURCE --target /mnt | sed 's/[0-9]\+$//')"
-          sudo umount /mnt
-
-          sudo snap install microceph --edge
-          sudo snap connect microceph:mount-observe
-          sudo apt-get install --no-install-recommends -y ceph-common
-          sudo microceph cluster bootstrap
-          sudo microceph.ceph config set global osd_pool_default_size 1
-          sudo microceph.ceph config set global mon_allow_pool_delete true
-          sudo microceph.ceph config set global osd_memory_target 939524096
-          sudo microceph.ceph osd crush rule rm replicated_rule
-          sudo microceph.ceph osd crush rule create-replicated replicated default osd
-          for flag in nosnaptrim noscrub nobackfill norebalance norecover noscrub nodeep-scrub; do
-              sudo microceph.ceph osd set $flag
-          done
-          sudo microceph disk add --wipe "${ephemeral_disk}"
-          sudo rm -rf /etc/ceph
-          sudo ln -s /var/snap/microceph/current/conf/ /etc/ceph
-          sudo microceph enable rgw || true # workaround to ignore already enabled rgw
-          sudo microceph.ceph osd pool create cephfs_meta 32
-          sudo microceph.ceph osd pool create cephfs_data 32
-          sudo microceph.ceph fs new cephfs cephfs_meta cephfs_data
-          sudo microceph.ceph fs ls
-          sleep 30
-          sudo microceph.ceph status
-          # Wait until there are no more "unkowns" pgs
-          for _ in $(seq 60); do
-            if sudo microceph.ceph pg stat | grep -wF unknown; then
-              sleep 1
-            else
-              break
-            fi
-          done
-          sudo microceph.ceph status
-          sudo rm -f /snap/bin/rbd
-
-          # reclaim some space
-          sudo apt-get clean
+      - name: Setup MicroOVN
+        uses: $/.github/actions/setup-microovn
+        with:
+          snap-cache-dir: ${{ env.SNAP_CACHE_DIR }}
 
       - name: Make GOCOVERDIR
         run: |
           set -eux
-          mkdir -p "${GOCOVERDIR}"
-        if: env.GOCOVERDIR != ''
+          mkdir -p coverage
+          chmod 0777 coverage
+          cd coverage
+          echo "GOCOVERDIR=$(pwd)" >> "${GITHUB_ENV}"
+        if: env.GOCOVERAGE == 'true'
 
-      - name: "Run system tests (${{ matrix.go }}, ${{ matrix.suite }}, ${{ matrix.backend }})"
+      - name: Sanitize Artifact Name
+        id: sanitize
+        env:
+          ID: ${{ matrix.group }}-${{ matrix.backends }}
+        run: |
+          set -eux
+          echo "artifact_name=$(echo "${ID}" | tr ': /' '-_-')" >> "${GITHUB_OUTPUT}"
+
+      - name: System Environment Setup
         run: |
           set -eux
           chmod +x ~
           echo "root:1000000:1000000000" | sudo tee /etc/subuid /etc/subgid
-          cd test
-          sudo --preserve-env=PATH,GOPATH,GOCOVERDIR,GITHUB_ACTIONS,LXD_VERBOSE,LXD_BACKEND,LXD_CEPH_CLUSTER,LXD_CEPH_CEPHFS,LXD_CEPH_CEPHOBJECT_RADOSGW,LXD_OFFLINE,LXD_SKIP_TESTS,LXD_REQUIRED_TESTS, LXD_BACKEND=${{ matrix.backend }} ./main.sh ${{ matrix.suite }}
+
+          # Check if there are existing coredumps
+          if [ -n "$(ls -A /var/crash/)" ]; then
+            echo "WARNING: coredumps found before running the system tests, removing them"
+            sudo rm /var/crash/*
+          fi
+
+      - name: "Run system tests (${{ matrix.group }}, btrfs)"
+        if: matrix.backends == 'all' || matrix.backends == 'fasts' || matrix.backends == 'btrfs'
+        env:
+          LXD_BACKEND: btrfs
+          LXD_BACKENDS: ${{ matrix.backends }}
+          GROUP: ${{ matrix.group }}
+        working-directory: test
+        run: |
+          set -eux
+          export PATH="/home/runner/go/bin:$PATH:/snap/microovn/current/commands"
+
+          # Run the tests for the selected backend
+          sudo --preserve-env="${SUDO_PRESERVE_ENV}" ./main.sh "group:${GROUP}"
+
+      - name: "Run system tests (${{ matrix.group }}, ceph)"
+        if: matrix.backends == 'all' || matrix.backends == 'ceph'
+        env:
+          LXD_BACKEND: ceph
+          LXD_BACKENDS: ${{ matrix.backends }}
+          GROUP: ${{ matrix.group }}
+        working-directory: test
+        run: |
+          set -eux
+          export PATH="/home/runner/go/bin:$PATH:/snap/microovn/current/commands"
+
+          # Run the tests for the selected backend
+          sudo --preserve-env="${SUDO_PRESERVE_ENV}" ./main.sh "group:${GROUP}"
+
+      - name: "Run system tests (${{ matrix.group }}, dir)"
+        if: matrix.backends == 'all' || matrix.backends == 'fasts' || matrix.backends == 'dir'
+        env:
+          LXD_BACKEND: dir
+          LXD_BACKENDS: ${{ matrix.backends }}
+          GROUP: ${{ matrix.group }}
+        working-directory: test
+        run: |
+          set -eux
+          export PATH="/home/runner/go/bin:$PATH:/snap/microovn/current/commands"
+
+          # Run the tests for the selected backend
+          sudo --preserve-env="${SUDO_PRESERVE_ENV}" ./main.sh "group:${GROUP}"
+
+      - name: "Run system tests (${{ matrix.group }}, lvm)"
+        if: matrix.backends == 'all' || matrix.backends == 'lvm'
+        env:
+          LXD_BACKEND: lvm
+          LXD_BACKENDS: ${{ matrix.backends }}
+          GROUP: ${{ matrix.group }}
+        working-directory: test
+        run: |
+          set -eux
+          export PATH="/home/runner/go/bin:$PATH:/snap/microovn/current/commands"
+
+          # Run the tests for the selected backend
+          sudo --preserve-env="${SUDO_PRESERVE_ENV}" ./main.sh "group:${GROUP}"
+
+      - name: "Run system tests (${{ matrix.group }}, zfs)"
+        if: matrix.backends == 'all' || matrix.backends == 'zfs'
+        env:
+          LXD_BACKEND: zfs
+          LXD_BACKENDS: ${{ matrix.backends }}
+          GROUP: ${{ matrix.group }}
+        working-directory: test
+        run: |
+          set -eux
+          export PATH="/home/runner/go/bin:$PATH:/snap/microovn/current/commands"
+
+          # Run the tests for the selected backend
+          sudo --preserve-env="${SUDO_PRESERVE_ENV}" ./main.sh "group:${GROUP}"
+
+      - name: "Run system tests (${{ matrix.group }}, random)"
+        if: matrix.backends == 'all' || matrix.backends == 'random'
+        env:
+          LXD_BACKEND: random
+          LXD_BACKENDS: ${{ matrix.backends }}
+          GROUP: ${{ matrix.group }}
+        working-directory: test
+        run: |
+          set -eux
+          export PATH="/home/runner/go/bin:$PATH:/snap/microovn/current/commands"
+
+          # Run the tests for the selected backend
+          sudo --preserve-env="${SUDO_PRESERVE_ENV}" ./main.sh "group:${GROUP}"
+
+      - name: Upload crash dumps
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crash-dumps-${{ steps.sanitize.outputs.artifact_name }}
+          path: |
+            /var/crash/*
+          retention-days: 5
+          if-no-files-found: ignore
 
       - name: Upload coverage data
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: coverage-${{ matrix.go }}-${{ matrix.suite }}-${{ matrix.backend }}
-          path: ${{env.GOCOVERDIR}}
-        if: env.GOCOVERDIR != ''
+          name: coverage-${{ steps.sanitize.outputs.artifact_name }}
+          path: ${{ env.GOCOVERDIR }}
+          retention-days: 1
+        if: env.GOCOVERDIR != '' && github.repository == 'canonical/lxd'
+
+      - name: Tmate debugging session
+        if: ${{ failure() && inputs.tmate-debug }}
+        timeout-minutes: 30
+        uses: mxschmitt/action-tmate@35b54afac29c97fb54faba5b513f8fbd1882f113 # v3.24
+        with:
+          # Never allow public SSH access
+          limit-access-to-actor: true
+
+  snap-tests:
+    if: ${{ github.event_name != 'schedule' || github.repository == 'canonical/lxd' }}
+    needs: code-tests
+    env:
+      BRANCH_NAME: ${{ github.ref_name }}
+      SNAP_RISK: ${{ inputs.snap-risk || 'edge' }}
+      SNAP_TRACK: "latest"
+    name: Snap
+    runs-on: ubuntu-${{ matrix.os }}
+    # avoid runaway test burning 6 hours of CI
+    timeout-minutes: 60
+    permissions:
+      actions: write  # to save caches (only runs from the canonical repo, not fork PRs)
+      contents: read  # for private repos or higher API rate limits
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.ubuntu-releases || '["26.04"]') }}
+        test:
+          - bgp
+          - cgroup
+          - cloud-init
+          - cluster
+          - container
+          - container-copy
+          - container-nesting
+          - conversion
+          - cpu-vm
+          - csi
+          - devlxd
+          - docker
+          - efi-vm
+          - lxd-consumers
+          - lxd-installer
+          - lxd-user
+          - interception
+          - network-bridge-firewall
+          - network-ovn ovn:deb
+          - network-ovn ovn:latest/edge
+          - network-routed
+          - pylxd
+          - qemu-external-vm
+          - snapd
+          - storage-buckets
+          - storage-disks-vm
+          - storage-metadata
+          - storage-vm btrfs
+          - storage-vm ceph
+          - storage-vm dir
+          - storage-vm lvm
+          - storage-vm lvm-thin
+          - storage-vm zfs
+          - storage-volumes-vm
+          - tpm-vm
+          - ui chromium
+          - ui firefox
+          - vm
+          - vm-migration
+          - vm-nesting
+        exclude:
+          # some tests are not worth testing on specific OSes
+          - os: 22.04
+            test: lxd-installer
+          - os: 22.04
+            test: qemu-external-vm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Tune disk performance
+        uses: $/.github/actions/tune-disk-performance
+
+      - name: Reclaim some memory
+        uses: $/.github/actions/reclaim-memory
+
+      - name: Remove docker
+        uses: $/.github/actions/disable-docker
+
+      - name: Snap track selection
+        run: |
+          set -eux
+          if [[ "${BRANCH_NAME}" =~ ^stable- ]]; then
+            SNAP_TRACK="${BRANCH_NAME#stable-}"
+            echo "SNAP_TRACK=${SNAP_TRACK}" >> "${GITHUB_ENV}"
+          fi
+
+      - name: ${{ matrix.test }}
+        uses: $/.github/actions/snap-test
+        with:
+          test: ${{ matrix.test }}
+          channel: ${{ env.SNAP_TRACK }}/${{ env.SNAP_RISK }}
+          os: ${{ matrix.os }}
+          sideload: 'true'
+          binary-dir: /home/runner/go/bin
+          coverage: ${{ env.GOCOVERAGE }}
+          image-cache-dir: ${{ env.IMAGE_CACHE_DIR }}
+          snap-cache-dir: ${{ env.SNAP_CACHE_DIR }}
+          microceph-channel: ${{ env.MICROCEPH_SNAP_CHANNEL }}
+
+      - name: Tmate debugging session
+        if: ${{ failure() && inputs.tmate-debug }}
+        timeout-minutes: 30
+        uses: mxschmitt/action-tmate@35b54afac29c97fb54faba5b513f8fbd1882f113 # v3.24
+        with:
+          # Never allow public SSH access
+          limit-access-to-actor: true
 
   tics:
     name: Tiobe TICS
-    runs-on: ubuntu-22.04
-    needs: system-tests
+    runs-on: ubuntu-26.04
+    needs: [client, system-tests, snap-tests, ui-e2e-tests]
     env:
-      CGO_CFLAGS: "-I/home/runner/go/bin/dqlite/include/"
-      CGO_LDFLAGS: "-L/home/runner/go/bin/dqlite/libs/"
-      LD_LIBRARY_PATH: "/home/runner/go/bin/dqlite/libs/"
+      CGO_CFLAGS: "-I/home/runner/go/deps/dqlite/include/ -I/home/runner/go/deps/liblxc/include/"
+      CGO_LDFLAGS: "-L/home/runner/go/deps/dqlite/.libs/"
+      LD_LIBRARY_PATH: "/home/runner/go/deps/dqlite/.libs/"
+      LD_RUN_PATH: "/home/runner/go/deps/dqlite/.libs/"
       CGO_LDFLAGS_ALLOW: "(-Wl,-wrap,pthread_create)|(-Wl,-z,now)"
-    if: ${{ ( github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' ) }}
+    if: ${{ ( github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' ) && github.ref_name == 'main' && github.repository == 'canonical/lxd' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # A non-shallow clone is needed for the Differential ShellCheck
-          fetch-depth: 0
+          persist-credentials: false
 
       - name: Tune disk performance
-        uses: ./.github/actions/tune-disk-performance
+        uses: $/.github/actions/tune-disk-performance
 
-      - name: Reclaim disk space
-        uses: ./.github/actions/reclaim-disk-space
+      - name: Reclaim some memory
+        uses: $/.github/actions/reclaim-memory
 
       - name: Remove docker
-        uses: ./.github/actions/disable-docker
+        uses: $/.github/actions/disable-docker
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: $/.github/actions/setup-go
         with:
-          go-version: 1.22.x
+          snap-channel: ${{ inputs.go-snap-channel }}
+
+      - name: Make GOCOVERDIR
+        run: |
+          set -eux
+          mkdir -p coverage
+          cd coverage
+          echo "GOCOVERDIR=$(pwd)" >> "${GITHUB_ENV}"
+        if: env.GOCOVERAGE == 'true'
 
       - name: Download coverage data
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: coverage-*
           path: ${{env.GOCOVERDIR}}
           merge-multiple: true
 
+      # Restore the cache warmed in code-tests job
+      - name: Build or restore dqlite/liblxc dependencies
+        uses: $/.github/actions/cache-dqlite-liblxc
+        with:
+          export-env: true
+
       - name: Download system test dependencies
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: system-test-deps
           merge-multiple: true
           path: /home/runner/go/bin
 
       - name: Install build dependencies
-        uses: ./.github/actions/install-lxd-builddeps
+        uses: $/.github/actions/install-lxd-builddeps
 
       - name: Install dependencies
         run: |
-          go install github.com/axw/gocov/gocov@latest
-          go install github.com/AlekSi/gocov-xml@latest
+          set -eux
+          go install github.com/afunix/gocov/gocov@latest
+          go install github.com/b-dean/gocov-xml@v1.2.1-bdd.0 # XXX: Using this repo is a temporary workaround until https://github.com/AlekSi/gocov-xml/pull/20 is merged. See https://github.com/AlekSi/gocov-xml/pull/20#issuecomment-3275134132 for more details.
           go install honnef.co/go/tools/cmd/staticcheck@latest
+
+          # TiCS requires pylint to be installed on the system to run Python checks
+          if ! command -v pylint; then
+            # no need to `apt-get update` first as it was done in prior steps.
+            sudo timeout 10m apt-get install --no-install-recommends -y pylint
+          fi
 
       - name: Convert coverage files
         run: |
+          set -eux
+          go tool covdata percent -i="${GOCOVERDIR}"
           go tool covdata textfmt -i="${GOCOVERDIR}" -o "${GOCOVERDIR}"/coverage.out
+          head "${GOCOVERDIR}"/coverage.out
+          # Convert to Cobertura XML format.
           gocov convert "${GOCOVERDIR}"/coverage.out > "${GOCOVERDIR}"/coverage.json
           gocov-xml < "${GOCOVERDIR}"/coverage.json > "${GOCOVERDIR}"/coverage-go.xml
 
       - name: Run TICS
-        uses: tiobe/tics-github-action@v3
+        uses: tiobe/tics-github-action@333078bc527399e5916a166bd1a3a788be5a01a9 # v3.12.0
         with:
           mode: qserver
           project: LXD
-          viewerUrl: https://canonical.tiobe.com/tiobeweb/TICS/api/cfg?name=default
-          branchdir: ${{ github.workspace }}
-          ticsAuthToken: ${{ secrets.TICS_AUTH_TOKEN }}
+          viewerUrl: https://canonical.tiobe.com/tiobeweb/TICS/api/cfg?name=GoProjects
+          branchdir: "${{ github.workspace }}"
+          ticsAuthToken: "${{ secrets.TICSAUTHTOKEN }}" # zizmor: ignore[secrets-outside-env]
           installTics: true
           calc: ALL
           tmpdir: /tmp/tics
@@ -485,197 +733,587 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go:
-          - 1.22.x
         os:
           - ubuntu-latest
           - macos-latest
           - windows-latest
     runs-on: ${{ matrix.os }}
+    needs: code-tests
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Go (${{ matrix.go }})
-        uses: actions/setup-go@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          go-version: ${{ matrix.go }}
+          persist-credentials: false
+
+      - name: Install Go
+        uses: $/.github/actions/setup-go
+        with:
+          snap-channel: ${{ inputs.go-snap-channel }}
 
       - name: Create build directory
         run: |
           set -eux
           mkdir bin
 
-      - name: Build static lxc (x86_64)
-        env:
-          CGO_ENABLED: 0
-          GOARCH: amd64
+      - name: Make GOCOVERDIR
         run: |
           set -eux
-          go build -ldflags "-s -w" -o trimpath -o bin/lxc.x86_64 ./lxc
+          mkdir -p coverage
+          cd coverage
+          DIR="$(pwd)"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            DIR="$(cygpath -m "$DIR")"
+          fi
+          echo "GOCOVERDIR=$DIR" >> "${GITHUB_ENV}"
+        if: env.GOCOVERAGE == 'true'
 
-      - name: Build static lxc (aarch64)
+      - name: Build static lxc
         env:
           CGO_ENABLED: 0
-          GOARCH: arm64
+          COVER: ${{ ( env.GOCOVERDIR != '' ) && '-cover' || '' }}
         run: |
           set -eux
-          go build -ldflags "-s -w" -o trimpath -o bin/lxc.aarch64 ./lxc
+          # Using `go env -w` to avoid dealing with setting variables on Windows
+          go env -w GOARCH=arm64
+          go build -ldflags "-s -w" -trimpath -o bin/lxc.aarch64 ${COVER} ./lxc
+          go env -w GOARCH=amd64
+          go build -ldflags "-s -w" -trimpath -o bin/lxc.x86_64 ${COVER} ./lxc
 
       - name: Build static lxd-benchmark
         if: runner.os == 'Linux'
         env:
           CGO_ENABLED: 0
+          COVER: ${{ ( env.GOCOVERDIR != '' ) && '-cover' || '' }}
         run: |
           set -eux
-          GOARCH=amd64 go build -ldflags "-s -w" -o trimpath -o bin/lxd-benchmark.x86_64 ./lxd-benchmark
-          GOARCH=arm64 go build -ldflags "-s -w" -o trimpath -o bin/lxd-benchmark.aarch64 ./lxd-benchmark
+          GOARCH=amd64 go build -ldflags "-s -w" -trimpath -o bin/lxd-benchmark.x86_64 ${COVER} ./lxd-benchmark
+          GOARCH=arm64 go build -ldflags "-s -w" -trimpath -o bin/lxd-benchmark.aarch64 ${COVER} ./lxd-benchmark
 
-      - name: Build static lxd-migrate
+      - name: Build static lxd-convert
         if: runner.os == 'Linux'
         env:
           CGO_ENABLED: 0
+          COVER: ${{ ( env.GOCOVERDIR != '' ) && '-cover' || '' }}
         run: |
           set -eux
-          GOARCH=amd64 go build -ldflags "-s -w" -o trimpath -o bin/lxd-migrate.x86_64 ./lxd-migrate
-          GOARCH=arm64 go build -ldflags "-s -w" -o trimpath -o bin/lxd-migrate.aarch64 ./lxd-migrate
+          GOARCH=amd64 go build -ldflags "-s -w" -trimpath -o bin/lxd-convert.x86_64 ${COVER} ./lxd-convert
+          GOARCH=arm64 go build -ldflags "-s -w" -trimpath -o bin/lxd-convert.aarch64 ${COVER} ./lxd-convert
 
       - name: Unit tests (client)
         env:
           CGO_ENABLED: 0
+          COVER: ${{ ( env.GOCOVERDIR != '' ) && '-cover' || '' }}
         run: |
           set -eux
-          go test -v ./client/...
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            # Required for SimpleStreams client tests.
+            sudo timeout 10m apt-get install -y xdelta3
+          fi
+          [ -n "${COVER}" ] && COVER="${COVER} -test.gocoverdir=${GOCOVERDIR}"
+          go test -mod=readonly -v ./client/... ${COVER}
 
       - name: Unit tests (lxc)
         env:
           CGO_ENABLED: 0
+          COVER: ${{ ( env.GOCOVERDIR != '' ) && '-cover' || '' }}
         run: |
           set -eux
-          go test -v ./lxc/...
+          [ -n "${COVER}" ] && COVER="${COVER} -test.gocoverdir=${GOCOVERDIR}"
+          go test -mod=readonly -v ./lxc/... ${COVER}
 
       - name: Unit tests (shared)
         env:
           CGO_ENABLED: 0
+          COVER: ${{ ( env.GOCOVERDIR != '' ) && '-cover' || '' }}
         run: |
           set -eux
-          go test -v ./shared/...
+          [ -n "${COVER}" ] && COVER="${COVER} -test.gocoverdir=${GOCOVERDIR}"
+          go test -mod=readonly -v ./shared/... ${COVER}
+
+      - name: Upload coverage data
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-clients-${{ runner.os }}
+          path: ${{env.GOCOVERDIR}}
+          retention-days: 1
+        if: env.GOCOVERDIR != '' && github.repository == 'canonical/lxd'
 
       - name: Upload lxc client artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ github.event_name == 'push' }}
         continue-on-error: true
         with:
           name: lxd-clients-${{ runner.os }}
           path: bin/
 
-  documentation:
-    name: Documentation
-    runs-on: ubuntu-latest
+  upload-coverage:
+    name: Upload coverage
+    needs: [code-tests, system-tests, snap-tests, client, ui-e2e-tests]
+    # Using `!cancelled()` means that failures on any of the `needs` won't prevent this from running
+    # which is why the `.result == 'success'` of each needs to be checked.
+    if: |
+      !cancelled() &&
+      needs.code-tests.result == 'success' &&
+      needs.system-tests.result == 'success' &&
+      needs.snap-tests.result == 'success' &&
+      needs.client.result == 'success' &&
+      (needs.ui-e2e-tests.result == 'success' || needs.ui-e2e-tests.result == 'skipped') &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == 'canonical/lxd')
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      code-quality: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Go (1.22)
-        uses: actions/setup-go@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          go-version: 1.22.x
+          persist-credentials: false
 
-      - name: Install dependencies
+      - name: Install Go
+        uses: $/.github/actions/setup-go
+        with:
+          snap-channel: ${{ inputs.go-snap-channel }}
+
+      - name: Make GOCOVERDIR
         run: |
           set -eux
-          sudo apt-get install aspell aspell-en
-          sudo snap install mdl
+          mkdir -p coverage
+          cd coverage
+          echo "GOCOVERDIR=$(pwd)" >> "${GITHUB_ENV}"
+
+      - name: Install coverage tools
+        run: |
+          set -eux
+          go install github.com/afunix/gocov/gocov@latest
+          go install github.com/b-dean/gocov-xml@v1.2.1-bdd.0 # XXX: Using this repo is a temporary workaround until https://github.com/AlekSi/gocov-xml/pull/20 is merged. See https://github.com/AlekSi/gocov-xml/pull/20#issuecomment-3275134132 for more details.
+
+      - name: Download coverage data
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: coverage-*
+          path: ${{env.GOCOVERDIR}}
+          merge-multiple: true
+
+      - name: Convert coverage files
+        run: |
+          set -eux
+          go tool covdata percent -i="${GOCOVERDIR}"
+          go tool covdata textfmt -i="${GOCOVERDIR}" -o="${GOCOVERDIR}"/coverage.out
+          head "${GOCOVERDIR}"/coverage.out
+          # Convert to Cobertura XML format.
+          gocov convert "${GOCOVERDIR}"/coverage.out > "${GOCOVERDIR}"/coverage.json
+          gocov-xml < "${GOCOVERDIR}"/coverage.json > "${GOCOVERDIR}"/coverage-go.xml
+
+      - name: Upload code coverage
+        uses: actions/upload-code-coverage@d8e329117199404bba6fc81efe8093dc7c015e34 # v1.4.2
+        with:
+          file: ${{env.GOCOVERDIR}}/coverage-go.xml
+          language: Go
+          label: code-coverage
+
+  ui-e2e-tests:
+    name: UI e2e tests
+    runs-on: ubuntu-26.04
+    needs: [code-tests, documentation]
+    if: ${{ ( github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event_name == 'push' ) && github.ref_name == 'main' && github.repository == 'canonical/lxd' }}
+    env:
+      LD_LIBRARY_PATH: "/home/runner/go/deps/dqlite/.libs/"
+      LXD_DIR: "/var/lib/lxd"
+      LXD_OIDC_CLIENT_ID: "${{ secrets.LXD_UI_OIDC_TEST_CLIENT_ID }}"         # zizmor: ignore[secrets-outside-env]
+      LXD_OIDC_CLIENT_SECRET: "${{ secrets.LXD_UI_OIDC_TEST_CLIENT_SECRET }}" # zizmor: ignore[secrets-outside-env]
+      LXD_OIDC_ISSUER: "${{ secrets.LXD_UI_OIDC_TEST_ISSUER }}"               # zizmor: ignore[secrets-outside-env]
+      LXD_OIDC_AUDIENCE: "${{ secrets.LXD_UI_OIDC_TEST_AUDIENCE }}"           # zizmor: ignore[secrets-outside-env]
+      LXD_OIDC_USER: "${{ secrets.LXD_UI_OIDC_TEST_USER }}"                   # zizmor: ignore[secrets-outside-env]
+      LXD_OIDC_PASSWORD: "${{ secrets.LXD_UI_OIDC_TEST_PASSWORD }}"           # zizmor: ignore[secrets-outside-env]
+      LXD_OIDC_GROUPS_CLAIM: "lxd-idp-groups"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Tune disk performance
+        uses: $/.github/actions/tune-disk-performance
+
+      - name: Checkout LXD-UI
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: 'canonical/lxd-ui'
+          ref: main
+          path: lxd-ui
+          persist-credentials: false
+
+      - name: Install Dotrun
+        run: sudo pip3 install dotrun
+
+      - name: Install LXD-UI dependencies
+        run: |
+          set -eux
+          sudo chmod 0777 ./lxd-ui
+          cd lxd-ui
+          dotrun install
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        # zizmor: ignore[cache-poisoning]
+        with:
+          node-version: 22
+
+      - name: Install Playwright Browsers
+        run: |
+          set -eux
+          cd lxd-ui
+          npx playwright install --with-deps chromium
+
+      - name: Install runtime dependencies
+        uses: $/.github/actions/install-lxd-runtimedeps
+        with:
+          optional: true
+
+      # Restore the cache warmed in code-tests job
+      - name: Build or restore dqlite/liblxc dependencies
+        uses: $/.github/actions/cache-dqlite-liblxc
+        with:
+          export-env: true
+
+      - name: Download system test dependencies
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: system-test-deps
+          merge-multiple: true
+          path: /home/runner/go/bin
+
+      - name: Setup MicroCeph
+        uses: $/.github/actions/setup-microceph
+        with:
+          microceph-channel: ${{ env.MICROCEPH_SNAP_CHANNEL }}
+
+      - name: Setup MicroOVN
+        uses: $/.github/actions/setup-microovn
+
+      - name: Set exec perms on LXD binaries
+        run: |
+          set -eux
+          ls -lR /home/runner/go/bin/
+          chmod uog+x /home/runner/go/bin/*
+
+      - name: Download docs (for the objects.inv.txt file to be available for the e2e tests)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: documentation
+          merge-multiple: true
+          path: doc/_build
+
+      - name: Make GOCOVERDIR
+        run: |
+          set -eux
+          mkdir -p coverage
+          cd coverage
+          echo "GOCOVERDIR=$(pwd)" >> "${GITHUB_ENV}"
+        if: env.GOCOVERAGE == 'true'
+
+      - name: Run LXD daemon
+        run: |
+          set -eux
+          chmod +x ~
+          echo "root:1000000:1000000000" | sudo tee /etc/subuid /etc/subgid
+          export LXD_DOCUMENTATION="${GITHUB_WORKSPACE}/doc/_build/"
+          export PATH="/home/runner/go/bin:$PATH"
+          sudo rm -rf /var/lib/lxd
+          sudo --preserve-env=PATH,GOPATH,GOCOVERDIR,LD_LIBRARY_PATH,LXD_DOCUMENTATION $(go env GOPATH)/bin/lxd --group sudo &
+
+      - name: Run LXD-UI
+        env:
+          ENVIRONMENT: devel
+          PORT: 8407
+          LXD_UI_BACKEND_IP: 172.17.0.1
+        run: |
+          set -eux
+          cd lxd-ui
+          dotrun &
+          curl --head --fail --retry-delay 2 --retry 100 --retry-connrefused --insecure https://localhost:${PORT}
+
+      - name: Setup LXD
+        shell: bash
+        run: |
+          set -eux
+          export PATH="/home/runner/go/bin:$PATH"
+          sudo chown $USER /var/lib/lxd/unix.socket
+          # Simplify PATH handling when using sudo
+          sudo ln -s /home/runner/go/bin/lxc /usr/bin/lxc
+          sudo ln -s /home/runner/go/bin/lxd /usr/bin/lxd
+          lxc storage create default zfs
+          lxc profile device add default root disk path=/ pool=default
+          lxc network create local-network
+          lxc profile device add default eth0 nic network=local-network
+          lxc config set core.https_address "[::]:8443"
+          lxc config set cluster.https_address "127.0.0.1"
+          lxc config set user.show_permissions=true
+          lxc config trust add lxd-ui/keys/lxd-ui.crt
+
+      - name: Setup for LXD-UI tests
+        shell: bash
+        run: |
+          set -eux
+          export PATH="/home/runner/go/bin:$PATH"
+          ./lxd-ui/tests/scripts/setup_test
+
+      - name: Test basic LXD functionality
+        shell: bash
+        run: |
+          set -eux
+          export PATH="/home/runner/go/bin:$PATH"
+
+          # launch a test instance
+          ./test/deps/import-busybox --alias testimage
+          lxc launch testimage --quiet c1 -d root,size=32MiB || { lxc info --show-log c1; false; }
+
+          # cleanup
+          lxc delete -f c1
+          lxc image delete testimage
+
+      - name: Run Playwright tests
+        env:
+          TARGET: >-
+            ${{ fromJson('{
+              "main": "latest-edge",
+              "stable-5.0": "5.0-edge",
+              "stable-5.21": "5.21-edge",
+            }')[github.ref_name] }}
+        run: |
+          set -eux
+          cd lxd-ui
+          sudo chown $USER -R /home/runner/.config
+          export PATH="/home/runner/go/bin:$PATH"
+          export CI=true
+          export DISABLE_VM_TESTS=true
+          npx playwright test --project "chromium:lxd-${TARGET:-latest-edge}:unclustered"
+
+      - name: Upload lxd-ui test artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: lxd-ui-test-report
+          path: lxd-ui/blob-report
+          retention-days: 14
+
+      - name: Shutdown LXD daemon
+        run: |
+          set -eux
+          export PATH="/home/runner/go/bin:$PATH"
+          sudo --preserve-env=PATH,GOPATH,GOCOVERDIR,LD_LIBRARY_PATH $(go env GOPATH)/bin/lxd shutdown
+
+      - name: Upload coverage data
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-ui-e2e-tests
+          path: ${{env.GOCOVERDIR}}
+          retention-days: 1
+        if: env.GOCOVERDIR != '' && github.repository == 'canonical/lxd'
+
+  documentation:
+    name: Documentation
+    runs-on: ubuntu-26.04
+    if: ${{ github.event_name != 'schedule' || github.repository == 'canonical/lxd' }}
+    needs: code-tests
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # A non-shallow clone is needed for the sitemap generation
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Go
+        uses: $/.github/actions/setup-go
+        with:
+          snap-channel: ${{ inputs.go-snap-channel }}
+
+      - name: Install Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          # zizmor: ignore[cache-poisoning]
+          cache: 'pip' # caching pip dependencies
+          cache-dependency-path: |
+            doc/requirements.txt
+            doc/conf.py
+          python-version: '3.x'  # satisfied by any 3.x version already installed
+
+      - name: Build docs (Sphinx)
+        run: |
+          set -eux
+          make doc
+          if [ -s doc/.sphinx/warnings.txt ]; then cat doc/.sphinx/warnings.txt; exit 1; fi
 
       - name: Run markdown linter
         run: |
           set -eux
           make doc-lint
 
-      - name: Build docs (Sphinx)
-        shell: 'script -q -e -c "export TERM=xterm-256color; bash {0}"'
-        run: |
-          set -eux
-          make doc
-          if [ -s doc/.sphinx/warnings.txt ]; then cat doc/.sphinx/warnings.txt; exit 1; fi
-
       - name: Run spell checker
         run: |
           set -eux
-          make doc-spellcheck
+          make doc-spelling
 
       - name: Run inclusive naming checker
-        uses: get-woke/woke-action@v0
+        run: |
+          set -eux
+          make doc-woke
+
+      - name: Upload documentation artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          fail-on-error: true
-          woke-args: "*.md **/*.md -c https://github.com/canonical/Inclusive-naming/raw/main/config.yml"
+          name: documentation
+          path: doc/_build
+          retention-days: 5
+
+  documentation-linkcheck:
+    name: Documentation link check
+    runs-on: ubuntu-26.04
+    needs: documentation
+    # Run link checker manually anywhere or on scheduled CI runs on the main repo.
+    if: ${{ github.event_name == 'workflow_dispatch' || ( github.event_name == 'schedule' && github.repository == 'canonical/lxd' ) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Go
+        uses: $/.github/actions/setup-go
+        with:
+          snap-channel: ${{ inputs.go-snap-channel }}
+
+      - name: Install Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          # zizmor: ignore[cache-poisoning]
+          cache: 'pip' # caching pip dependencies
+          cache-dependency-path: |
+            doc/requirements.txt
+            doc/conf.py
+          python-version: '3.x'  # satisfied by any 3.x version already installed
+
+      - name: Build LXD client
+        run: make client
+
+      - name: Download built docs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: documentation
+          merge-multiple: true
+          path: doc/_build
 
       - name: Run link checker
-        # Run link checker on PRs only
-        if: ${{ github.event_name != 'push' }}
         shell: 'script -q -e -c "export TERM=xterm-256color; bash {0}"'
         run: |
           set -eux
           make doc-linkcheck
 
-      - name: Upload documentation artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: documentation
-          path: doc/_build
-
   snap:
-    name: Trigger snap edge build
-    runs-on: ubuntu-22.04
+    name: Trigger snap build
+    runs-on: ubuntu-26.04
     needs: [code-tests, system-tests, client, documentation]
     if: ${{ github.repository == 'canonical/lxd' && github.event_name == 'push' && github.actor != 'dependabot[bot]' }}
+    env:
+      SSH_AUTH_SOCK: /tmp/ssh_agent.sock
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Launchpad SSH access
-        env:
-          SSH_AUTH_SOCK: /tmp/ssh_agent.sock
-          LAUNCHPAD_LXD_BOT_KEY: ${{ secrets.LAUNCHPAD_LXD_BOT_KEY }}
-        run: |
-          set -eux
-          mkdir -m 0700 -p ~/.ssh/
-          ssh-agent -a "${SSH_AUTH_SOCK}" > /dev/null
-          ssh-add - <<< "${{ secrets.LAUNCHPAD_LXD_BOT_KEY }}"
-          ssh-add -L > ~/.ssh/id_ed25519.pub
-          # In ephemeral environments like GitHub Action runners, relying on TOFU isn't providing any security
-          # so require the key obtained by `ssh-keyscan` to match the expected hash from https://help.launchpad.net/SSHFingerprints
-          ssh-keyscan git.launchpad.net >> ~/.ssh/known_hosts
-          ssh-keygen -qlF git.launchpad.net | grep -xF 'git.launchpad.net RSA SHA256:UNOzlP66WpDuEo34Wgs8mewypV0UzqHLsIFoqwe8dYo'
-
-      - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          go-version: 1.22.x
+          # A non-shallow clone is needed for the rebase with the lxd-private branch
+          fetch-depth: 0
+          persist-credentials: false
+
+      # XXX: from this point onwards in this **specific job**, the private SSH key is
+      #      available through the SSH_AUTH_SOCK environment variable.
+      - uses: $/.github/actions/lp-snap-build
+        with:
+          repo: "git+ssh://lxdbot@git.launchpad.net/~lxd-snap/lxd"
+          ssh-key: "${{ secrets.LAUNCHPAD_LXD_BOT_KEY}}" # zizmor: ignore[secrets-outside-env]
 
       - name: Trigger Launchpad snap build
-        env:
-          SSH_AUTH_SOCK: /tmp/ssh_agent.sock
-          TARGET: >-
-            ${{ fromJson('{
-              "main": "latest-edge",
-              "stable-5.0": "5.0-edge",
-            }')[github.ref_name] }}
         run: |
           set -eux
-          git config --global transfer.fsckobjects true
-          git config --global user.name "Canonical LXD Bot"
-          git config --global user.email "lxd@lists.canonical.com"
-          git config --global commit.gpgsign true
-          git config --global gpg.format "ssh"
-          git config --global user.signingkey ~/.ssh/id_ed25519.pub
+          set -o pipefail
+
+          # Record current commit hash before rebasing lxd-private so the snap version retains the correct hash.
           localRev="$(git rev-parse HEAD)"
-          go install github.com/canonical/lxd-ci/lxd-snapcraft@latest
-          git clone -b "${TARGET}" git+ssh://lxdbot@git.launchpad.net/~canonical-lxd/lxd ~/lxd-pkg-snap-lp
-          cd ~/lxd-pkg-snap-lp
-          lxd-snapcraft -package lxd -set-version "git-${localRev:0:7}" -set-source-commit "${localRev}"
-          git add --all
-          git commit --all --quiet -s --allow-empty -m "Automatic upstream build (${TARGET})" -m "Upstream commit: ${localRev}"
+
+          # Add the private LXD repository and rebase to incorporate private security fixes.
+          git remote add lxd-private git@github.com:canonical/lxd-private.git
+          git fetch lxd-private "${GITHUB_REF_NAME}"
+          git checkout --quiet -B "lxd-private-${GITHUB_REF_NAME}" "lxd-private/${GITHUB_REF_NAME}"
+          git rebase --quiet --no-stat "origin/${GITHUB_REF_NAME}"
+
+          # Sync the rebased lxd-private branch back to the lxd-private repo so that it is kept in sync with the public repo.
+          # Do this before any snapcraft.yaml modifications made below.
+          git push --quiet --force lxd-private HEAD:"${GITHUB_REF_NAME}"
+
+          # Extract a strict major.minor[.patch] version from shared/version/flex.go.
+          version="$(sed -nE 's/^var Version = "([0-9]+\.[0-9]+(\.[0-9]+)?)"$/\1/p' "${GITHUB_WORKSPACE}/shared/version/flex.go")"
+
+          if [ -z "${version}" ]; then
+            echo "ERROR: Invalid version format in shared/version/flex.go. Expected format: n.n or n.n.n" >&2
+            exit 1
+          fi
+
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then
+            BRANCH="latest-edge"
+          elif [[ "${GITHUB_REF_NAME}" =~ ^stable- ]]; then
+            BRANCH="${GITHUB_REF_NAME#stable-}-edge"
+          elif [[ "${GITHUB_REF_NAME}" =~ ^release-6\. ]]; then
+            BRANCH="6-candidate"
+          elif [[ "${GITHUB_REF_NAME}" =~ ^release-([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+            BRANCH="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}-candidate"
+          else
+            echo "ERROR: Unsupported GITHUB_REF_NAME pattern: ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+
+          # Determine snap version and grade based on edge or candidate.
+          grade="devel"
+          if [[ "${BRANCH}" == *"-candidate" ]]; then
+            versionString="${version}-${localRev:0:7}"
+            grade="stable"
+          else
+            versionString="git-${localRev:0:7}"
+          fi
+
+          cd "${GITHUB_WORKSPACE}/snap"
+
+          # Fail unless exactly one `version: git` line exists, then replace it.
+          match_count="$(grep -cxF 'version: git' snapcraft.yaml || true)"
+          if [ "${match_count}" -ne 1 ]; then
+            echo "ERROR: Expected exactly one 'version: git' line in snapcraft.yaml, found ${match_count}" >&2
+            exit 1
+          fi
+
+          sed -i -e "s/^version: git$/version: ${versionString}/" snapcraft.yaml
+
+          if [ "${grade}" = "stable" ]; then
+            # Fail unless exactly one `grade: devel` line exists, then replace it.
+            match_count="$(grep -cxF 'grade: devel' snapcraft.yaml || true)"
+            if [ "${match_count}" -ne 1 ]; then
+              echo "ERROR: Expected exactly one 'grade: devel' line in snapcraft.yaml, found ${match_count}" >&2
+              exit 1
+            fi
+
+            sed -i -e "s/^grade: devel$/grade: stable/" snapcraft.yaml
+          fi
+
+          git add snapcraft.yaml
+          git commit --quiet -s -m "Automatic upstream build (${BRANCH})" -m "Upstream commit: ${localRev} (version: ${versionString})"
           git show
-          git push --quiet
+
+          # Pack all objects (including lxd-private ones) and generate a bitmap index
+          # right before the push so that pack generation benefits from full bitmap coverage.
+          git config --local pack.useBitmaps true
+          git gc --prune=now
+
+          git push --quiet --force launchpad HEAD:"${BRANCH}"
+
+          # Unload the SSH key from the agent now that the push is done, to
+          # prevent accidental usage in any subsequent steps within this job.
+          ssh-add -D

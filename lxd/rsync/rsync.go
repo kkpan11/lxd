@@ -2,11 +2,15 @@ package rsync
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -16,7 +20,6 @@ import (
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/ioprogress"
 	"github.com/canonical/lxd/shared/logger"
-	"github.com/canonical/lxd/shared/version"
 )
 
 // Debug controls additional debugging in rsync output.
@@ -29,7 +32,7 @@ var RunWrapper func(cmd *exec.Cmd, source string, destination string) (func(), e
 // rsync is a wrapper for the rsync command which will respect RunWrapper.
 func rsync(args ...string) (string, error) {
 	if len(args) < 2 {
-		return "", fmt.Errorf("rsync call expects a minimum of two arguments (source and destination)")
+		return "", errors.New("rsync call expects a minimum of two arguments (source and destination)")
 	}
 
 	// Setup the command.
@@ -61,9 +64,72 @@ func rsync(args ...string) (string, error) {
 	return stdout.String(), nil
 }
 
-// LocalCopy copies a directory using rsync (with the --devices option).
-func LocalCopy(source string, dest string, bwlimit string, xattrs bool, rsyncArgs ...string) (string, error) {
-	err := os.MkdirAll(dest, 0755)
+// assertSafePath returns an error if the provided path is not absolute or if it
+// contains a ".." segment. rsync treats arguments beginning with "-" as
+// options, so source and destination paths must always be absolute (and
+// therefore begin with "/"). Rejecting ".." segments additionally prevents a
+// crafted path from traversing outside of its intended directory.
+func assertSafePath(path string) error {
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("Rsync path %q must be absolute", path)
+	}
+
+	for segment := range strings.SplitSeq(path, "/") {
+		if segment == ".." {
+			return fmt.Errorf("Rsync path %q must not contain %q segments", path, "..")
+		}
+	}
+
+	return nil
+}
+
+// rsyncSafeName matches a name that is safe to embed in the rsync "-e" remote
+// shell command. It requires a non-empty string containing no Unicode
+// separator (\p{Z}) or other (\p{C}) characters. This rejects ASCII and
+// Unicode whitespace, control characters, and format characters such as
+// bidirectional overrides (e.g. U+202E), matching the Unicode-aware validation
+// applied to volume names elsewhere rather than only ASCII.
+var rsyncSafeName = regexp.MustCompile(`^[^\p{Z}\p{C}]+$`)
+
+// assertSafeName returns an error if the provided name is not safe to embed in
+// the rsync "-e" remote shell command. The name is passed verbatim as a
+// positional argument to "lxd netcat", which rsync tokenizes on whitespace and
+// executes without a shell, and which also uses the name to build a log path
+// via filepath.Join (see lxd/main_netcat.go). The name must therefore:
+//   - be non-empty and free of whitespace and control characters, so it cannot
+//     inject additional arguments into the remote command;
+//   - be a local path, so it cannot escape the intended log directory.
+//
+// Snapshot delimiters ("/") are still allowed (e.g. "vol/snap"). A leading "-"
+// is safe because Send passes "--" to "lxd netcat" before the positional
+// arguments, so cobra never parses the name as a flag.
+func assertSafeName(name string) error {
+	if !rsyncSafeName.MatchString(name) {
+		return fmt.Errorf("Rsync name %q must be non-empty and must not contain whitespace or control characters", name)
+	}
+
+	// filepath.IsLocal rejects absolute and empty names as well as names that
+	// traverse outside of their directory (via ".."), which would otherwise
+	// let a crafted name escape the log directory used by "lxd netcat".
+	if !filepath.IsLocal(name) {
+		return fmt.Errorf("Rsync name %q must be a local path", name)
+	}
+
+	return nil
+}
+
+func runRsync(source string, dest string, bwlimit string, xattrs bool, rsyncArgs ...string) (string, error) {
+	err := assertSafePath(source)
+	if err != nil {
+		return "", err
+	}
+
+	err = assertSafePath(dest)
+	if err != nil {
+		return "", err
+	}
+
+	err = os.MkdirAll(dest, 0755)
 	if err != nil {
 		return "", err
 	}
@@ -85,10 +151,7 @@ func LocalCopy(source string, dest string, bwlimit string, xattrs bool, rsyncArg
 	}
 
 	if xattrs {
-		args = append(args, "--xattrs")
-		if AtLeast("3.1.3") {
-			args = append(args, "--filter=-x security.selinux")
-		}
+		args = append(args, "--xattrs", "--filter=-x security.selinux")
 	}
 
 	if bwlimit != "" {
@@ -99,9 +162,13 @@ func LocalCopy(source string, dest string, bwlimit string, xattrs bool, rsyncArg
 		args = append(args, rsyncArgs...)
 	}
 
+	// Add an end of options marker ("--") so that the source and destination
+	// paths are never interpreted as rsync options, even if they begin with a
+	// "-".
 	args = append(args,
 		rsyncVerbosity,
-		shared.AddSlash(source),
+		"--",
+		source,
 		dest)
 
 	msg, err := rsync(args...)
@@ -122,9 +189,29 @@ func LocalCopy(source string, dest string, bwlimit string, xattrs bool, rsyncArg
 	return msg, nil
 }
 
+// LocalCopy copies a directory using rsync (with the --devices option).
+func LocalCopy(source string, dest string, bwlimit string, xattrs bool, rsyncArgs ...string) (string, error) {
+	return runRsync(shared.AddSlash(source), dest, bwlimit, xattrs, rsyncArgs...)
+}
+
+// CopyFile copies a single file using rsync (with the --devices option).
+func CopyFile(source string, dest string, bwlimit string, xattrs bool, rsyncArgs ...string) (string, error) {
+	return runRsync(strings.TrimSuffix(source, "/"), dest, bwlimit, xattrs, rsyncArgs...)
+}
+
 // Send sets up the sending half of an rsync, to recursively send the
 // directory pointed to by path over the websocket.
-func Send(name string, path string, conn io.ReadWriteCloser, tracker *ioprogress.ProgressTracker, features []string, bwlimit string, execPath string, rsyncArgs ...string) error {
+func Send(name string, path string, conn io.ReadWriteCloser, wrapper ioprogress.ReaderWrapper, features []string, bwlimit string, execPath string, rsyncArgs ...string) error {
+	err := assertSafeName(name)
+	if err != nil {
+		return err
+	}
+
+	err = assertSafePath(path)
+	if err != nil {
+		return err
+	}
+
 	/*
 	 * The way rsync works, it invokes a subprocess that does the actual
 	 * talking (given to it by a -E argument). Since there isn't an easy
@@ -139,7 +226,7 @@ func Send(name string, path string, conn io.ReadWriteCloser, tracker *ioprogress
 	 * stdin/stdout, but that also seemed messy. In any case, this seems to
 	 * work just fine.
 	 */
-	auds := fmt.Sprintf("@lxd/%s", uuid.New().String())
+	auds := "@lxd/" + uuid.New().String()
 	// We simply copy a part of the uuid if it's longer than the allowed
 	// maximum. That should be safe enough for our purposes.
 	if len(auds) > linux.ABSTRACT_UNIX_SOCK_LEN-1 {
@@ -159,7 +246,11 @@ func Send(name string, path string, conn io.ReadWriteCloser, tracker *ioprogress
 	 * other end of the lxd websocket), and so the path specified on the
 	 * --server instance of rsync takes precedence.
 	 */
-	rsyncCmd := fmt.Sprintf("%s netcat %s %s --", execPath, auds, name)
+	// Place cobra's end-of-flags marker ("--") before the positional arguments
+	// so that neither the name nor the arguments rsync appends (the remote host
+	// and rsync's own --server options) are parsed as flags by "lxd netcat",
+	// even when the name begins with a "-".
+	rsyncCmd := fmt.Sprintf("%s netcat -- %s %s", execPath, auds, name)
 
 	args := []string{
 		"-ar",
@@ -181,11 +272,13 @@ func Send(name string, path string, conn io.ReadWriteCloser, tracker *ioprogress
 		args = append(args, rsyncArgs...)
 	}
 
-	args = append(args, []string{
-		path,
-		"localhost:/tmp/foo",
-		"-e",
-		rsyncCmd}...)
+	// The remote shell command (-e) must be passed as an option, so it has to
+	// come before the end of options marker ("--") below.
+	args = append(args, "-e", rsyncCmd)
+
+	// Add an end of options marker ("--") so that the source path is never
+	// interpreted as an rsync option, even if it begins with a "-".
+	args = append(args, "--", path, "localhost:/tmp/foo")
 
 	cmd := exec.Command("rsync", args...)
 
@@ -228,24 +321,21 @@ func Send(name string, path string, conn io.ReadWriteCloser, tracker *ioprogress
 			output, _ := io.ReadAll(stderr)
 			_ = cmd.Process.Kill()
 			_ = cmd.Wait()
-			return fmt.Errorf("Failed to ncConnect to rsync socket (%s)", string(output))
+			return fmt.Errorf("Failed connecting to rsync socket (%s)", string(output))
 		}
 
 	case <-time.After(10 * time.Second):
 		output, _ := io.ReadAll(stderr)
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-		return fmt.Errorf("rsync failed to spawn after 10s (%s)", string(output))
+		return fmt.Errorf("rsync failed spawning after 10s (%s)", string(output))
 	}
 
 	// Setup progress tracker.
 	netcatConn := *ncConn
 	readNetcatPipe := io.ReadCloser(netcatConn)
-	if tracker != nil {
-		readNetcatPipe = &ioprogress.ProgressReader{
-			ReadCloser: netcatConn,
-			Tracker:    tracker,
-		}
+	if wrapper != nil {
+		readNetcatPipe = wrapper(readNetcatPipe)
 	}
 
 	// Forward from netcat to target.
@@ -302,7 +392,12 @@ func Send(name string, path string, conn io.ReadWriteCloser, tracker *ioprogress
 // Recv sets up the receiving half of the websocket to rsync (the other
 // half set up by rsync.Send), putting the contents in the directory specified
 // by path.
-func Recv(path string, conn io.ReadWriteCloser, tracker *ioprogress.ProgressTracker, features []string) error {
+func Recv(path string, conn io.ReadWriteCloser, readWrapper ioprogress.ReaderWrapper, features []string) error {
+	err := assertSafePath(path)
+	if err != nil {
+		return err
+	}
+
 	args := []string{
 		"--server",
 		"-vlogDtpre.iLsfx",
@@ -319,7 +414,9 @@ func Recv(path string, conn io.ReadWriteCloser, tracker *ioprogress.ProgressTrac
 		args = append(args, rsyncFeatureArgs(features)...)
 	}
 
-	args = append(args, []string{".", path}...)
+	// Add an end of options marker ("--") so that the destination path is never
+	// interpreted as an rsync option, even if it begins with a "-".
+	args = append(args, "--", ".", path)
 
 	cmd := exec.Command("rsync", args...)
 
@@ -354,11 +451,8 @@ func Recv(path string, conn io.ReadWriteCloser, tracker *ioprogress.ProgressTrac
 	}
 
 	readSourcePipe := io.ReadCloser(conn)
-	if tracker != nil {
-		readSourcePipe = &ioprogress.ProgressReader{
-			ReadCloser: conn,
-			Tracker:    tracker,
-		}
+	if readWrapper != nil {
+		readSourcePipe = readWrapper(readSourcePipe)
 	}
 
 	chCopySource := make(chan error, 1)
@@ -411,50 +505,17 @@ func Recv(path string, conn io.ReadWriteCloser, tracker *ioprogress.ProgressTrac
 
 func rsyncFeatureArgs(features []string) []string {
 	args := []string{}
-	if shared.ValueInSlice("xattrs", features) {
-		args = append(args, "--xattrs")
-		if AtLeast("3.1.3") {
-			args = append(args, "--filter=-x security.selinux")
-		}
+	if slices.Contains(features, "xattrs") {
+		args = append(args, "--xattrs", "--filter=-x security.selinux")
 	}
 
-	if shared.ValueInSlice("delete", features) {
+	if slices.Contains(features, "delete") {
 		args = append(args, "--delete")
 	}
 
-	if shared.ValueInSlice("compress", features) {
-		args = append(args, "--compress")
-		args = append(args, "--compress-level=2")
+	if slices.Contains(features, "compress") {
+		args = append(args, "--compress", "--compress-level=2")
 	}
 
 	return args
-}
-
-// AtLeast compares the local version to a minimum version.
-func AtLeast(min string) bool {
-	// Parse the current version.
-	out, err := shared.RunCommand("rsync", "--version")
-	if err != nil {
-		return false
-	}
-
-	fields := strings.Split(strings.Split(out, "\n")[0], "  ")
-	if len(fields) < 3 {
-		return false
-	}
-
-	versionStr := strings.TrimPrefix(fields[1], "version ")
-
-	ver, err := version.Parse(versionStr)
-	if err != nil {
-		return false
-	}
-
-	// Load minium version.
-	minVer, err := version.NewDottedVersion(min)
-	if err != nil {
-		return false
-	}
-
-	return ver.Compare(minVer) >= 0
 }

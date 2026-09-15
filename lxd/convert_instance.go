@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -57,8 +59,8 @@ func newConversionSink(args *conversionSinkArgs) (*conversionSink, error) {
 }
 
 // Metadata returns metadata for the conversion sink.
-func (s *conversionSink) Metadata() any {
-	return shared.Jmap{
+func (s *conversionSink) Metadata() map[string]any {
+	return map[string]any{
 		api.SecretNameFilesystem: s.fsConn.Secret(),
 	}
 }
@@ -66,7 +68,7 @@ func (s *conversionSink) Metadata() any {
 // Do performs the conversion operation on the target side (sink) for the given
 // state and instance operation. It sets up the necessary websocket connection
 // for filesystem, and then receives the conversion data.
-func (s *conversionSink) Do(state *state.State, instOp *operationlock.InstanceOperation) error {
+func (s *conversionSink) Do(state *state.State, instOp *operationlock.InstanceOperation, op *operations.Operation) error {
 	l := logger.AddContext(logger.Ctx{"project": s.instance.Project().Name, "instance": s.instance.Name()})
 
 	defer l.Info("Conversion channels disconnected on target")
@@ -74,7 +76,7 @@ func (s *conversionSink) Do(state *state.State, instOp *operationlock.InstanceOp
 
 	filesystemConnFunc := func(ctx context.Context) (io.ReadWriteCloser, error) {
 		if s.fsConn == nil {
-			return nil, fmt.Errorf("Conversion target filesystem connection not initialized")
+			return nil, errors.New("Conversion target filesystem connection not initialized")
 		}
 
 		wsConn, err := s.fsConn.WebsocketIO(ctx)
@@ -94,7 +96,7 @@ func (s *conversionSink) Do(state *state.State, instOp *operationlock.InstanceOp
 		ConversionOptions: s.conversionOptions,
 	}
 
-	err := s.instance.ConversionReceive(args)
+	err := s.instance.ConversionReceive(args, op)
 	if err != nil {
 		l.Error("Failed conversion on target", logger.Ctx{"err": err})
 		return fmt.Errorf("Failed conversion on target: %w", err)
@@ -110,7 +112,8 @@ func (s *conversionSink) Connect(op *operations.Operation, r *http.Request, w ht
 		return api.StatusErrorf(http.StatusBadRequest, "Missing conversion sink secret")
 	}
 
-	if incomingSecret == s.fsConn.Secret() {
+	expectedSecret := s.fsConn.Secret()
+	if subtle.ConstantTimeCompare([]byte(incomingSecret), []byte(expectedSecret)) == 1 {
 		err := s.fsConn.AcceptIncoming(r, w)
 		if err != nil {
 			return fmt.Errorf("Failed accepting incoming conversion sink %q connection: %w", api.SecretNameFilesystem, err)

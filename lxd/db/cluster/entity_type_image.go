@@ -2,10 +2,14 @@ package cluster
 
 import (
 	"fmt"
+
+	"github.com/canonical/lxd/lxd/db/query"
 )
 
 // entityTypeImage implements entityTypeDBInfo for an Image.
-type entityTypeImage struct{}
+type entityTypeImage struct {
+	entityTypeCommon
+}
 
 func (e entityTypeImage) code() int64 {
 	return entityTypeCodeImage
@@ -19,11 +23,11 @@ JOIN projects ON images.project_id = projects.id`, e.code())
 }
 
 func (e entityTypeImage) urlsByProjectQuery() string {
-	return fmt.Sprintf("%s WHERE projects.name = ?", e.allURLsQuery())
+	return e.allURLsQuery() + " WHERE projects.name = ?"
 }
 
-func (e entityTypeImage) urlByIDQuery() string {
-	return fmt.Sprintf(`%s WHERE images.id = ?`, e.allURLsQuery())
+func (e entityTypeImage) urlsByIDsQuery(ids ...int64) string {
+	return e.allURLsQuery() + " WHERE images.id IN " + query.IntParams(ids...)
 }
 
 func (e entityTypeImage) idFromURLQuery() string {
@@ -37,16 +41,5 @@ WHERE projects.name = ?
 }
 
 func (e entityTypeImage) onDeleteTriggerSQL() (name string, sql string) {
-	name = "on_image_delete"
-	return name, fmt.Sprintf(`CREATE TRIGGER %s
-	AFTER DELETE ON images
-	BEGIN
-	DELETE FROM auth_groups_permissions 
-		WHERE entity_type = %d 
-		AND entity_id = OLD.id;
-	DELETE FROM warnings
-		WHERE entity_type_code = %d
-		AND entity_id = OLD.id;
-	END
-`, name, e.code(), e.code())
+	return standardOnDeleteTriggerSQL("on_image_delete", "images", e.code())
 }

@@ -1,18 +1,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
-	"net/url"
-
-	"github.com/gorilla/mux"
 
 	"github.com/canonical/lxd/lxd/db/operationtype"
 	"github.com/canonical/lxd/lxd/instance"
-	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/operations"
-	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/response"
+	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/version"
@@ -35,6 +32,10 @@ import (
 //	    description: Project name
 //	    type: string
 //	    example: default
+//	  - in: query
+//	    name: force
+//	    description: Force delete of running instances
+//	    type: boolean
 //	responses:
 //	  "202":
 //	    $ref: "#/responses/Operation"
@@ -50,55 +51,73 @@ func instanceDelete(d *Daemon, r *http.Request) response.Response {
 
 	s := d.State()
 
-	instanceType, err := urlInstanceTypeDetect(r)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	if shared.IsSnapshot(name) {
-		return response.BadRequest(fmt.Errorf("Invalid instance name"))
-	}
-
-	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(s, r, projectName, name, instanceType)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	projectName, name, resp := forwardedInstanceResponse(s, r)
 	if resp != nil {
 		return resp
 	}
 
-	inst, err := instance.LoadByProjectAndName(s, projectName, name)
+	var opScheduler operations.OperationScheduler = func(s *state.State, args operations.OperationArgs) (*operations.Operation, error) {
+		return operations.ScheduleUserOperationFromRequest(s, r, args)
+	}
+
+	force := shared.IsTrue(r.FormValue("force"))
+	op, err := doInstanceDelete(opScheduler, s, name, projectName, force)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	if inst.IsRunning() {
-		return response.BadRequest(fmt.Errorf("Instance is running"))
-	}
+	return response.OperationResponse(op)
+}
 
-	rmct := func(op *operations.Operation) error {
-		return inst.Delete(false)
-	}
-
-	resources := map[string][]api.URL{}
-	resources["instances"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", name)}
-
-	if inst.Type() == instancetype.Container {
-		resources["containers"] = resources["instances"]
-	}
-
-	op, err := operations.OperationCreate(s, projectName, operations.OperationClassTask, operationtype.InstanceDelete, resources, nil, rmct, nil, nil, r)
+// doInstanceDelete deletes an instance in the given project.
+// If the instance is running and force is true, the instance is force stopped asynchronously
+// as part of the delete operation. If the instance is running and force is false, the request
+// fails before the operation is created.
+func doInstanceDelete(opScheduler operations.OperationScheduler, s *state.State, name string, projectName string, force bool) (*operations.Operation, error) {
+	inst, err := instance.LoadByProjectAndName(s, projectName, name)
 	if err != nil {
-		return response.InternalError(err)
+		return nil, err
 	}
 
-	return operations.OperationResponse(op)
+	// Pre-check for immediate 400 when force isn't set.
+	instRunning := inst.IsRunning()
+	if instRunning && !force {
+		return nil, api.NewStatusError(http.StatusBadRequest, "Instance is running")
+	}
+
+	rmct := func(ctx context.Context, op *operations.Operation) error {
+		if instRunning {
+			// Stop instance.
+			err := doInstanceStatePut(ctx, inst, api.InstanceStatePut{
+				Action:  "stop",
+				Timeout: -1,
+				Force:   true,
+			}, op)
+			if err != nil {
+				return fmt.Errorf("Failed force stopping instance %q before deletion: %w", name, err)
+			}
+
+			// Ephemeral instances are automatically deleted when stopped.
+			if inst.IsEphemeral() {
+				return nil
+			}
+		}
+
+		return inst.Delete(ctx, false, "", op)
+	}
+
+	args := operations.OperationArgs{
+		ProjectName: projectName,
+		EntityURL:   api.NewURL().Path(version.APIVersion, "instances", name).Project(projectName),
+		Type:        operationtype.InstanceDelete,
+		Class:       operationtype.OperationClassTask,
+		RunHook:     rmct,
+	}
+
+	op, err := opScheduler(s, args)
+	if err != nil {
+		return nil, err
+	}
+
+	return op, nil
 }

@@ -2,14 +2,22 @@ package shared
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/flosch/pongo2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -20,7 +28,7 @@ func TestURLEncode(t *testing.T) {
 		map[string]string{"param": "with spaces", "other": "without"})
 	expected := "/path/with%20spaces?other=without&param=with+spaces"
 	if url != expected {
-		t.Error(fmt.Errorf("'%s' != '%s'", url, expected))
+		t.Error(fmt.Errorf("%q != %q", url, expected))
 	}
 }
 
@@ -36,7 +44,7 @@ func TestUrlsJoin(t *testing.T) {
 
 	expected := "https://cloud-images.ubuntu.com/releases/image/root.tar.xz"
 	if res != expected {
-		t.Error(fmt.Errorf("'%s' != '%s'", res, expected))
+		t.Error(fmt.Errorf("%q != %q", res, expected))
 	}
 }
 
@@ -49,7 +57,7 @@ func TestParseLXDFileHeader(t *testing.T) {
 
 	headers, err := ParseLXDFileHeaders(header)
 	if err != nil {
-		t.Fatalf("Failed to parse headers %q: %s", header, err)
+		t.Fatalf("Failed parsing headers %q: %s", header, err)
 	}
 
 	if headers.UID != 1000 || headers.GID != 1001 || headers.Mode != 0o700 {
@@ -69,7 +77,7 @@ func TestParseLXDFileHeader(t *testing.T) {
 
 	headers, err = ParseLXDFileHeaders(header)
 	if err != nil {
-		t.Fatalf("Failed to parse headers %q: %s", header, err)
+		t.Fatalf("Failed parsing headers %q: %s", header, err)
 	}
 
 	if headers.UID != 0 || headers.GID != 99 || headers.Mode != 0o644 {
@@ -89,7 +97,7 @@ func TestParseLXDFileHeader(t *testing.T) {
 
 	headers, err = ParseLXDFileHeaders(header)
 	if err != nil {
-		t.Fatalf("Failed to parse headers %q: %s", header, err)
+		t.Fatalf("Failed parsing headers %q: %s", header, err)
 	}
 
 	if headers.Mode != 0o640 || headers.UID != -1 || headers.GID != -1 {
@@ -223,9 +231,9 @@ func TestReaderToChannel(t *testing.T) {
 	for {
 		data, ok := <-ch
 		if len(data) > 0 {
-			for i := 0; i < len(data); i++ {
+			for i := range data {
 				if buf[offset+i] != data[i] {
-					t.Errorf("byte %d didn't match", offset+i)
+					t.Errorf("byte %d did not match", offset+i)
 					return
 				}
 			}
@@ -245,11 +253,78 @@ func TestReaderToChannel(t *testing.T) {
 			if !finished {
 				t.Error("connection closed too early")
 				return
-			} else {
-				break
 			}
+
+			break
 		}
 	}
+}
+
+func TestRenderTemplate(t *testing.T) {
+	// Reject invalid templates.
+	out, err := RenderTemplate(`{% include "/etc/hosts" %}`, nil)
+	assert.Error(t, err)
+	assert.Empty(t, out)
+
+	out, err = RenderTemplate(`{{ "{"|escape }}{{ "%"|escape }} include "/etc/hosts" {{ "%"|escape }}{{ "}"|escape }}`, nil)
+	assert.Error(t, err)
+	assert.Empty(t, out)
+
+	// Recursion limit hit.
+	out, err = RenderTemplate(`{{ "{{ '{{ \"{{ 1 }}' }}" }}" }}`, nil)
+	assert.ErrorContains(t, err, "Recursion limit")
+	assert.Empty(t, out)
+
+	// Render proper templates.
+	out, err = RenderTemplate(`Hello, world!`, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, `Hello, world!`, out)
+
+	out, err = RenderTemplate(`{{ "Hello, world!" }}`, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, `Hello, world!`, out)
+
+	out, err = RenderTemplate(`mysnap%d`, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, `mysnap%d`, out)
+
+	out, err = RenderTemplate(`mysnap%`, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, `mysnap%`, out)
+
+	out, err = RenderTemplate(`{{ "h"|capfirst }}`, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, `H`, out)
+
+	// Recursion limit not hit.
+	out, err = RenderTemplate(`{{ "{{ '{{ \"1\" }}' }}" }}`, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, `1`, out)
+
+	// Check pongo2 panics are handled.
+	_, err = RenderTemplate(`{{ badsnap%d }}`, nil)
+	assert.Error(t, err)
+}
+
+func TestRenderTemplateFile(t *testing.T) {
+	// Render proper template.
+	var buf bytes.Buffer
+	err := RenderTemplateFile(&buf, `Hello, {{ name }}!`, pongo2.Context{"name": "world"})
+	assert.NoError(t, err)
+	assert.Equal(t, `Hello, world!`, buf.String())
+
+	// Ban dangerous tags.
+	for _, tag := range []string{"extends", "import", "include", "ssi"} {
+		buf.Reset()
+		err = RenderTemplateFile(&buf, fmt.Sprintf(`{%% %s "/etc/hosts" %%}`, tag), nil)
+		assert.Error(t, err)
+		assert.Empty(t, buf.String())
+	}
+
+	// Check pongo2 panics are handled.
+	buf.Reset()
+	err = RenderTemplateFile(&buf, `{{ badsnap%d }}`, nil)
+	assert.Error(t, err)
 }
 
 func TestGetExpiry(t *testing.T) {
@@ -259,18 +334,22 @@ func TestGetExpiry(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, expectedDate, expiryDate)
 
-	refDate = time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
 	expiryDate, err = GetExpiry(refDate, "5S 1M 2H 3d 4y")
 	expectedDate = time.Date(2004, time.January, 4, 2, 1, 5, 0, time.UTC)
 	require.NoError(t, err)
 	require.Equal(t, expectedDate, expiryDate)
 
 	expiryDate, err = GetExpiry(refDate, "0M 0H 0d 0w 0m 0y")
+	expectedDate = time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
 	require.NoError(t, err)
-	require.Equal(t, expiryDate, expiryDate)
+	require.Equal(t, expectedDate, expiryDate)
 
 	expiryDate, err = GetExpiry(refDate, "")
 	require.NoError(t, err)
+	require.Equal(t, time.Time{}, expiryDate)
+
+	expiryDate, err = GetExpiry(refDate, "1M 1M")
+	require.Error(t, err)
 	require.Equal(t, time.Time{}, expiryDate)
 
 	expiryDate, err = GetExpiry(refDate, "1z")
@@ -335,4 +414,265 @@ func TestRemoveElementsFromStringSlice(t *testing.T) {
 		gotList := RemoveElementsFromSlice(tt.list, tt.elementsToRemove...)
 		assert.ElementsMatch(t, tt.expectedList, gotList)
 	}
+}
+
+func TestResolveSnapPath(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("This test is only relevant on Linux")
+	}
+
+	tests := []struct {
+		name     string
+		snap     string
+		snapName string
+		unset    bool
+		input    string
+		want     string
+		isSuffix bool
+		wantOk   bool
+	}{
+		{
+			name:   "Not in snap",
+			unset:  true,
+			input:  "/foo/bar",
+			want:   "/foo/bar",
+			wantOk: false,
+		},
+		{
+			name:     "In snap but not LXD",
+			snap:     "/snap/other/current",
+			snapName: "other",
+			input:    "/foo/bar",
+			want:     "/foo/bar",
+			wantOk:   false,
+		},
+		{
+			name:     "In LXD snap - empty path",
+			snap:     "/snap/lxd/current",
+			snapName: "lxd",
+			input:    "",
+			want:     "",
+			wantOk:   false,
+		},
+		{
+			name:     "In LXD snap - dash",
+			snap:     "/snap/lxd/current",
+			snapName: "lxd",
+			input:    "-",
+			want:     "-",
+			wantOk:   false,
+		},
+		{
+			name:     "In LXD snap - absolute path",
+			snap:     "/snap/lxd/current",
+			snapName: "lxd",
+			input:    "/foo/bar",
+			want:     "/foo/bar",
+			wantOk:   true,
+		},
+		{
+			name:     "In LXD snap - relative path",
+			snap:     "/snap/lxd/current",
+			snapName: "lxd",
+			input:    "foo/bar",
+			want:     "/foo/bar",
+			isSuffix: true,
+			wantOk:   true,
+		},
+	}
+
+	// Helper to reset env
+	resetEnv := func(key, val string, set bool) {
+		if set {
+			_ = os.Setenv(key, val)
+		} else {
+			_ = os.Unsetenv(key)
+		}
+	}
+
+	origSnap, snapSet := os.LookupEnv("SNAP")
+	origSnapName, snapNameSet := os.LookupEnv("SNAP_NAME")
+	defer func() {
+		resetEnv("SNAP", origSnap, snapSet)
+		resetEnv("SNAP_NAME", origSnapName, snapNameSet)
+	}()
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.unset {
+				_ = os.Unsetenv("SNAP")
+				_ = os.Unsetenv("SNAP_NAME")
+			} else {
+				_ = os.Setenv("SNAP", tt.snap)
+				_ = os.Setenv("SNAP_NAME", tt.snapName)
+			}
+
+			p, ok := resolveSnapPath(tt.input)
+
+			if tt.isSuffix {
+				assert.True(t, strings.HasSuffix(p, tt.want), "expected %q to have suffix %q", p, tt.want)
+				assert.True(t, filepath.IsAbs(p), "expected absolute path")
+			} else {
+				assert.Equal(t, tt.want, p)
+			}
+
+			assert.Equal(t, tt.wantOk, ok)
+		})
+	}
+}
+
+func TestEnsurePort(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		addr string
+		port string
+		want string
+	}{
+		{name: "empty", addr: "", port: "", want: ":"},
+		{name: "empty-address", addr: "", port: "1234", want: ":1234"},
+		{name: "empty-port", addr: "host", port: "", want: "host:"},
+		{name: "host-without-port", addr: "host", port: "1234", want: "host:1234"},
+		{name: "host-with-port", addr: "host:9876", port: "1234", want: "host:9876"},
+		{name: "host-in-brackets", addr: "[host]", port: "1234", want: "host:1234"},
+		{name: "host-in-brackets-with-port", addr: "[host]:9876", port: "1234", want: "host:9876"},
+		{name: "ipv4-without-port", addr: "123.123.123.123", port: "1234", want: "123.123.123.123:1234"},
+		{name: "ipv4-with-port", addr: "123.123.123.123:9876", port: "1234", want: "123.123.123.123:9876"},
+		{name: "ipv4-in-brackets", addr: "[123.123.123.123]", port: "1234", want: "123.123.123.123:1234"},
+		{name: "ipv4-in-brackets-with-port", addr: "[123.123.123.123]:9876", port: "1234", want: "123.123.123.123:9876"},
+		{name: "ipv6-without-port", addr: "1234:567::89ab:cd:ef01", port: "1234", want: "[1234:567::89ab:cd:ef01]:1234"},
+		{name: "ipv6-with-port", addr: "1234:567::89ab:cd:ef01:9876", port: "1234", want: "[1234:567::89ab:cd:ef01:9876]:1234"},
+		{name: "ipv6-in-brackets", addr: "[1234:567::89ab:cd:ef01]", port: "1234", want: "[1234:567::89ab:cd:ef01]:1234"},
+		{name: "ipv6-in-brackets-with-port", addr: "[1234:567::89ab:cd:ef01]:9876", port: "1234", want: "[1234:567::89ab:cd:ef01]:9876"},
+		{name: "ipv6-full-without-port", addr: "1234:5678:9abc:def0:1234:5678:9abc:def0", port: "1234", want: "[1234:5678:9abc:def0:1234:5678:9abc:def0]:1234"},
+		{name: "ipv6-full-with-port", addr: "1234:5678:9abc:def0:1234:5678:9abc:def0:9876", port: "1234", want: "[1234:5678:9abc:def0:1234:5678:9abc:def0:9876]:1234"},
+		{name: "ipv6-full-in-brackets", addr: "[1234:5678:9abc:def0:1234:5678:9abc:def0]", port: "1234", want: "[1234:5678:9abc:def0:1234:5678:9abc:def0]:1234"},
+		{name: "ipv6-full-in-brackets-with-port", addr: "[1234:5678:9abc:def0:1234:5678:9abc:def0]:9876", port: "1234", want: "[1234:5678:9abc:def0:1234:5678:9abc:def0]:9876"},
+		{name: "ipv6-min-without-port", addr: "1234::5678", port: "1234", want: "[1234::5678]:1234"},
+		{name: "ipv6-min-with-port", addr: "1234::5678:9876", port: "1234", want: "[1234::5678:9876]:1234"},
+		{name: "ipv6-min-in-brackets", addr: "[1234::5678]", port: "1234", want: "[1234::5678]:1234"},
+		{name: "ipv6-min-in-brackets-with-port", addr: "[1234::5678]:9876", port: "1234", want: "[1234::5678]:9876"},
+		{name: "ipv6-loopback-without-port", addr: "::1", port: "1234", want: "[::1]:1234"},
+		{name: "ipv6-loopback-with-port", addr: "::1:9876", port: "1234", want: "[::1:9876]:1234"},
+		{name: "ipv6-loopback-in-brackets", addr: "[::1]", port: "1234", want: "[::1]:1234"},
+		{name: "ipv6-loopback-in-brackets-with-port", addr: "[::1]:9876", port: "1234", want: "[::1]:9876"},
+		{name: "colon-without-port", addr: ":", port: "1234", want: ":1234"},
+		{name: "colon-with-port", addr: "::9876", port: "1234", want: "[::9876]:1234"},
+		{name: "colon-in-brackets", addr: "[:]", port: "1234", want: "[:]:1234"},
+		{name: "colon-in-brackets-with-port", addr: "[:]:9876", port: "1234", want: "[:]:9876"},
+		{name: "colons-without-port", addr: "::", port: "1234", want: "[::]:1234"},
+		{name: "colons-with-port", addr: ":::9876", port: "1234", want: "[:::9876]:1234"},
+		{name: "colons-in-brackets", addr: "[::]", port: "1234", want: "[::]:1234"},
+		{name: "colons-in-brackets-with-port", addr: "[::]:9876", port: "1234", want: "[::]:9876"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got := EnsurePort(test.addr, test.port)
+			require.Equal(t, test.want, got, "unexpected EnsurePort function result")
+		})
+	}
+}
+
+// TestDownloadFileHashCapsBySize verifies that DownloadFileHash caps the number of bytes read
+// from the response body at the trusted expected size (so a malicious or MITM mirror cannot
+// stream unbounded data), that a negative size disables the cap, and that a zero size reads
+// nothing. The cap must hold even for chunked responses that carry no Content-Length header.
+func TestDownloadFileHashCapsBySize(t *testing.T) {
+	content := []byte("the real trusted image bytes")
+	sum := sha256.Sum256(content)
+	contentHash := hex.EncodeToString(sum[:])
+	expectedSize := int64(len(content))
+
+	// A stream that matches the advertised size and hash downloads successfully.
+	t.Run("exact size succeeds", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write(content)
+		}))
+		defer server.Close()
+
+		target, err := os.CreateTemp(t.TempDir(), "download")
+		require.NoError(t, err)
+		defer func() { _ = target.Close() }()
+
+		size, err := DownloadFileHash(context.Background(), server.Client(), "", nil, nil, "test-image", server.URL, contentHash, sha256.New(), target, expectedSize)
+		require.NoError(t, err)
+		require.Equal(t, expectedSize, size)
+	})
+
+	// A malicious mirror streaming far more than the advertised size (using a chunked
+	// response with no Content-Length) is capped exactly at expectedSize and then fails the
+	// hash verification instead of consuming the unbounded stream.
+	t.Run("oversized chunked stream is capped and fails verification", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Writing in multiple flushed chunks forces chunked transfer encoding, so no
+			// Content-Length header is sent.
+			flusher, _ := w.(http.Flusher)
+			chunk := bytes.Repeat([]byte{0xff}, 4096)
+			for range 4096 { // Up to 16 MiB were the cap not enforced.
+				_, err := w.Write(chunk)
+				if err != nil {
+					return
+				}
+
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+		}))
+		defer server.Close()
+
+		target, err := os.CreateTemp(t.TempDir(), "download")
+		require.NoError(t, err)
+		defer func() { _ = target.Close() }()
+
+		_, err = DownloadFileHash(context.Background(), server.Client(), "", nil, nil, "test-image", server.URL, contentHash, sha256.New(), target, expectedSize)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "Hash mismatch")
+
+		// The read stopped exactly at the trusted size.
+		info, err := target.Stat()
+		require.NoError(t, err)
+		require.Equal(t, expectedSize, info.Size())
+	})
+
+	// A negative expected size disables the cap and reads the whole body to EOF.
+	t.Run("negative size disables the cap", func(t *testing.T) {
+		body := bytes.Repeat([]byte{0xab}, 100000)
+		bodySum := sha256.Sum256(body)
+		bodyHash := hex.EncodeToString(bodySum[:])
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write(body)
+		}))
+		defer server.Close()
+
+		target, err := os.CreateTemp(t.TempDir(), "download")
+		require.NoError(t, err)
+		defer func() { _ = target.Close() }()
+
+		size, err := DownloadFileHash(context.Background(), server.Client(), "", nil, nil, "test-image", server.URL, bodyHash, sha256.New(), target, -1)
+		require.NoError(t, err)
+		require.Equal(t, int64(len(body)), size)
+	})
+
+	// A zero expected size caps the body at zero bytes.
+	t.Run("zero size reads nothing", func(t *testing.T) {
+		emptySum := sha256.Sum256(nil)
+		emptyHash := hex.EncodeToString(emptySum[:])
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write(content)
+		}))
+		defer server.Close()
+
+		target, err := os.CreateTemp(t.TempDir(), "download")
+		require.NoError(t, err)
+		defer func() { _ = target.Close() }()
+
+		size, err := DownloadFileHash(context.Background(), server.Client(), "", nil, nil, "test-image", server.URL, emptyHash, sha256.New(), target, 0)
+		require.NoError(t, err)
+		require.Equal(t, int64(0), size)
+	})
 }

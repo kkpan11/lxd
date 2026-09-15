@@ -1,6 +1,7 @@
 package device
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,7 +16,6 @@ import (
 	"github.com/canonical/lxd/lxd/network"
 	"github.com/canonical/lxd/lxd/resources"
 	"github.com/canonical/lxd/lxd/util"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/revert"
 )
@@ -53,11 +53,11 @@ func (d *infinibandSRIOV) validateConfig(instConf instance.ConfigReader) error {
 // validateEnvironment checks the runtime environment for correctness.
 func (d *infinibandSRIOV) validateEnvironment() error {
 	if d.inst.Type() == instancetype.Container && d.config["name"] == "" {
-		return fmt.Errorf("Requires name property to start")
+		return errors.New("Requires name property to start")
 	}
 
-	if !shared.PathExists(fmt.Sprintf("/sys/class/net/%s", d.config["parent"])) {
-		return fmt.Errorf("Parent device '%s' doesn't exist", d.config["parent"])
+	if !network.InterfaceExists(d.config["parent"]) {
+		return fmt.Errorf("Parent device %q does not exist", d.config["parent"])
 	}
 
 	return nil
@@ -90,7 +90,7 @@ func (d *infinibandSRIOV) startContainer() (*deviceConfig.RunConfig, error) {
 	}
 
 	if len(ibDevs) < 1 {
-		return nil, fmt.Errorf("All virtual functions on parent device are already in use")
+		return nil, errors.New("All virtual functions on parent device are already in use")
 	}
 
 	// Get first VF device that is free.
@@ -98,6 +98,10 @@ func (d *infinibandSRIOV) startContainer() (*deviceConfig.RunConfig, error) {
 	for _, v := range ibDevs {
 		vfDev = v
 		break
+	}
+
+	if vfDev == nil {
+		return nil, errors.New("All virtual functions on parent device are already in use")
 	}
 
 	saveData["host_name"] = vfDev.ID
@@ -112,7 +116,7 @@ func (d *infinibandSRIOV) startContainer() (*deviceConfig.RunConfig, error) {
 	if d.config["hwaddr"] != "" {
 		err := infinibandSetDevMAC(saveData["host_name"], d.config["hwaddr"])
 		if err != nil {
-			return nil, fmt.Errorf("Failed to set the MAC address: %s", err)
+			return nil, fmt.Errorf("Failed setting the MAC address: %s", err)
 		}
 	}
 
@@ -192,16 +196,16 @@ func (d *infinibandSRIOV) startVM() (*deviceConfig.RunConfig, error) {
 
 	pciParentDev, err := pcidev.ParseUeventFile(filepath.Join(devicePath, "uevent"))
 	if err != nil {
-		return nil, fmt.Errorf("Failed to get PCI device info for %q: %w", parentPCIAddress, err)
+		return nil, fmt.Errorf("Failed getting PCI device info for %q: %w", parentPCIAddress, err)
 	}
 
 	vfID, err := d.findFreeVirtualFunction(pciParentDev)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to find free virtual function: %w", err)
+		return nil, fmt.Errorf("Failed finding free virtual function: %w", err)
 	}
 
 	if vfID == -1 {
-		return nil, fmt.Errorf("All virtual functions on parent device are already in use")
+		return nil, errors.New("All virtual functions on parent device are already in use")
 	}
 
 	vfPCIDev, err := d.setupSriovParent(parentPCIAddress, vfID, saveData)
@@ -230,7 +234,7 @@ func (d *infinibandSRIOV) startVM() (*deviceConfig.RunConfig, error) {
 	runConf.NetworkInterface = append(runConf.NetworkInterface, []deviceConfig.RunConfigItem{
 		{Key: "devName", Value: d.name},
 		{Key: "pciSlotName", Value: vfPCIDev.SlotName},
-		{Key: "pciIOMMUGroup", Value: fmt.Sprintf("%d", pciIOMMUGroup)},
+		{Key: "pciIOMMUGroup", Value: strconv.FormatUint(pciIOMMUGroup, 10)},
 	}...)
 
 	return &runConf, nil
@@ -285,7 +289,7 @@ func (d *infinibandSRIOV) postStop() error {
 		// Remove infiniband host files for this device.
 		err := unixDeviceDeleteFiles(d.state, d.inst.DevicesPath(), IBDevPrefix, d.name, "")
 		if err != nil {
-			return fmt.Errorf("Failed to delete files for device '%s': %w", d.name, err)
+			return fmt.Errorf("Failed deleting files for device %q: %w", d.name, err)
 		}
 	}
 
@@ -327,7 +331,7 @@ func (d *infinibandSRIOV) setupSriovParent(parentPCIAddress string, vfID int, vo
 	defer revert.Fail()
 
 	volatile["last_state.pci.parent"] = parentPCIAddress
-	volatile["last_state.vf.id"] = fmt.Sprintf("%d", vfID)
+	volatile["last_state.vf.id"] = strconv.Itoa(vfID)
 	volatile["last_state.created"] = "false" // Indicates don't delete device at stop time.
 
 	// Get VF device's PCI Slot Name so we can unbind and rebind it from the host.
@@ -386,7 +390,7 @@ func (d *infinibandSRIOV) findFreeVirtualFunction(parentDev pcidev.Device) (int,
 
 	vfID := -1
 
-	for i := 0; i < sriovNum; i++ {
+	for i := range sriovNum {
 		pciDev, err := pcidev.ParseUeventFile(fmt.Sprintf("/sys/bus/pci/devices/%s/virtfn%d/uevent", parentDev.SlotName, i))
 		if err != nil {
 			return 0, err

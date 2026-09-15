@@ -2,215 +2,103 @@ package identity
 
 import (
 	"crypto/x509"
-	"fmt"
 	"net/http"
+	"slices"
 	"sync"
 
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 )
 
-// Cache represents a thread-safe in-memory cache of the identities in the database.
+// Cache represents a thread-safe in-memory cache of the credentials of identities in the database.
+//
+// Certificates are keyed on the certificate fingerprint. Secrets are keyed on the bearer identity identifier.
+// It is necessary to separate server, client and metrics certificates because of their different handling during authentication.
+// For example, metrics certificates are not considered for authentication unless the API route is under /1.0/metrics.
+// Additionally, it is crucial that authentication can identify server certificates without a database call (because
+// establishing a database connection requires authentication).
 type Cache struct {
-	// entries is a map of authentication method to map of identifier to CacheEntry. The identifier is either a
-	// certificate fingerprint (tls) or an email address (oidc).
-	entries map[string]map[string]*CacheEntry
-
-	// identityProviderGroups is a map of identity provider group name to slice of LXD group names.
-	identityProviderGroups map[string]*[]string
-	mu                     sync.RWMutex
+	serverCertificates      map[string]*x509.Certificate
+	serverCertificatesMu    sync.RWMutex
+	clientCertificates      map[string]*x509.Certificate
+	clientCertificatesMu    sync.RWMutex
+	metricsCertificates     map[string]*x509.Certificate
+	metricsCertificatesMu   sync.RWMutex
+	bearerIdentitySecrets   map[string][]byte
+	bearerIdentitySecretsMu sync.RWMutex
+	initialUITokenSecret    []byte
+	initialUITokenSecretMu  sync.Mutex
 }
 
-// CacheEntry represents an identity.
-type CacheEntry struct {
-	Identifier           string
-	Name                 string
-	AuthenticationMethod string
-	IdentityType         string
-	Projects             []string
-	Groups               []string
-
-	// Certificate is optional. It is pre-computed for identities with AuthenticationMethod api.AuthenticationMethodTLS.
-	Certificate *x509.Certificate
-
-	// Subject is optional. It is only set when AuthenticationMethod is api.AuthenticationMethodOIDC.
-	Subject string
+// GetServerCertificates returns matching server certificates.
+func (c *Cache) GetServerCertificates(fingerprints ...string) map[string]x509.Certificate {
+	return getCerts(&c.serverCertificatesMu, c.serverCertificates, fingerprints...)
 }
 
-// Get returns a single CacheEntry by its authentication method and identifier.
-func (c *Cache) Get(authenticationMethod string, identifier string) (*CacheEntry, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+// GetClientCertificates returns matching client certificates.
+func (c *Cache) GetClientCertificates(fingerprints ...string) map[string]x509.Certificate {
+	return getCerts(&c.clientCertificatesMu, c.clientCertificates, fingerprints...)
+}
 
-	err := ValidateAuthenticationMethod(authenticationMethod)
-	if err != nil {
-		return nil, err
+// GetMetricsCertificates returns matching metrics certificates.
+func (c *Cache) GetMetricsCertificates(fingerprints ...string) map[string]x509.Certificate {
+	return getCerts(&c.metricsCertificatesMu, c.metricsCertificates, fingerprints...)
+}
+
+func getCerts(mu *sync.RWMutex, m map[string]*x509.Certificate, fingerprints ...string) map[string]x509.Certificate {
+	mu.RLock()
+	defer mu.RUnlock()
+
+	out := make(map[string]x509.Certificate, len(m))
+	for k, v := range m {
+		if len(fingerprints) == 0 || slices.Contains(fingerprints, k) {
+			out[k] = *v
+		}
 	}
 
-	if c.entries == nil {
-		return nil, api.StatusErrorf(http.StatusNotFound, "Identity %q (%s) not found", identifier, authenticationMethod)
-	}
+	return out
+}
 
-	entriesByAuthMethod, ok := c.entries[authenticationMethod]
+// GetSecret returns the secret of a bearer identity by their UUID.
+func (c *Cache) GetSecret(bearerIdentityUUID string) ([]byte, error) {
+	c.bearerIdentitySecretsMu.RLock()
+	defer c.bearerIdentitySecretsMu.RUnlock()
+	secret, ok := c.bearerIdentitySecrets[bearerIdentityUUID]
 	if !ok {
-		return nil, api.StatusErrorf(http.StatusNotFound, "Identity %q (%s) not found", identifier, authenticationMethod)
+		return nil, api.NewStatusError(http.StatusNotFound, "No secret found for bearer token identity")
 	}
 
-	entry, ok := entriesByAuthMethod[identifier]
-	if !ok {
-		return nil, api.StatusErrorf(http.StatusNotFound, "Identity %q (%s) not found", identifier, authenticationMethod)
-	}
-
-	if entry == nil {
-		return nil, api.StatusErrorf(http.StatusNotFound, "Identity %q (%s) not found", identifier, authenticationMethod)
-	}
-
-	entryCopy := *entry
-	return &entryCopy, nil
+	return secret, nil
 }
 
-// GetByType returns a map of identifier to CacheEntry, where all entries have the given identity type.
-func (c *Cache) GetByType(identityType string) map[string]CacheEntry {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+// GetInitialUISecret gets the secret for the initial UI identity.
+func (c *Cache) GetInitialUISecret() ([]byte, error) {
+	c.initialUITokenSecretMu.Lock()
+	defer c.initialUITokenSecretMu.Unlock()
 
-	// Explicitly ignore the error here. It is expected that the caller will use the constants defined in shared/api.
-	authenticationMethod, _ := AuthenticationMethodFromIdentityType(identityType)
-	entriesByAuthMethod, ok := c.entries[authenticationMethod]
-	if !ok {
-		return nil
+	if len(c.initialUITokenSecret) == 0 {
+		return nil, api.NewStatusError(http.StatusNotFound, "No secret found for initial UI identity")
 	}
 
-	entriesOfType := make(map[string]CacheEntry)
-	for _, entry := range entriesByAuthMethod {
-		if entry != nil && entry.IdentityType == identityType {
-			entriesOfType[entry.Identifier] = *entry
-		}
-	}
-
-	return entriesOfType
+	return c.initialUITokenSecret, nil
 }
 
-// GetByAuthenticationMethod returns a map of identifier to CacheEntry, where all entries have the given authentication
-// method.
-func (c *Cache) GetByAuthenticationMethod(authenticationMethod string) map[string]CacheEntry {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+// ReplaceAll deletes all credentials from the cache and replaces them with the given values.
+func (c *Cache) ReplaceAll(serverCerts map[string]*x509.Certificate, clientCerts map[string]*x509.Certificate, metricsCerts map[string]*x509.Certificate, secrets map[string][]byte, initialUITokenSecret []byte) {
+	c.bearerIdentitySecretsMu.Lock()
+	c.serverCertificatesMu.Lock()
+	c.clientCertificatesMu.Lock()
+	c.metricsCertificatesMu.Lock()
+	c.initialUITokenSecretMu.Lock()
 
-	entriesOfAuthMethod, ok := c.entries[authenticationMethod]
-	if !ok {
-		return nil
-	}
+	defer c.bearerIdentitySecretsMu.Unlock()
+	defer c.serverCertificatesMu.Unlock()
+	defer c.clientCertificatesMu.Unlock()
+	defer c.metricsCertificatesMu.Unlock()
+	defer c.initialUITokenSecretMu.Unlock()
 
-	// A go map is a pointer. To make the cache thread-safe we need to copy entriesOfAuthMethod into a new map.
-	entriesOfAuthMethodCopy := make(map[string]CacheEntry, len(entriesOfAuthMethod))
-	for identifier, entry := range entriesOfAuthMethod {
-		if entry != nil {
-			entriesOfAuthMethodCopy[identifier] = *entry
-		}
-	}
-
-	return entriesOfAuthMethodCopy
-}
-
-// ReplaceAll deletes all entries and identity provider groups from the cache and replaces them with the given values.
-func (c *Cache) ReplaceAll(entries []CacheEntry, idpGroups map[string][]string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.entries = make(map[string]map[string]*CacheEntry)
-	for _, entry := range entries {
-		err := ValidateAuthenticationMethod(entry.AuthenticationMethod)
-		if err != nil {
-			return err
-		}
-
-		if entry.AuthenticationMethod == api.AuthenticationMethodTLS && entry.Certificate == nil {
-			return fmt.Errorf("Identity cache entries of type %q must have a certificate", api.AuthenticationMethodTLS)
-		}
-
-		_, ok := c.entries[entry.AuthenticationMethod]
-		if !ok {
-			c.entries[entry.AuthenticationMethod] = make(map[string]*CacheEntry)
-		}
-
-		e := entry
-		c.entries[entry.AuthenticationMethod][entry.Identifier] = &e
-	}
-
-	c.identityProviderGroups = make(map[string]*[]string, len(idpGroups))
-	for idpGroupName, authGroupNames := range idpGroups {
-		authGroupNamesCopy := make([]string, 0, len(authGroupNames))
-		authGroupNamesCopy = append(authGroupNamesCopy, authGroupNames...)
-		c.identityProviderGroups[idpGroupName] = &authGroupNamesCopy
-	}
-
-	return nil
-}
-
-// X509Certificates returns a map of certificate fingerprint to the x509 certificates of TLS identities. Identity types
-// can be passed in to filter the results. If no identity types are given, all certificates are returned.
-func (c *Cache) X509Certificates(identityTypes ...string) map[string]x509.Certificate {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	if c.entries == nil {
-		return nil
-	}
-
-	tlsEntries, ok := c.entries[api.AuthenticationMethodTLS]
-	if !ok {
-		return nil
-	}
-
-	certificates := make(map[string]x509.Certificate, len(tlsEntries))
-	for _, tlsEntry := range tlsEntries {
-		if (len(identityTypes) == 0 || shared.ValueInSlice(tlsEntry.IdentityType, identityTypes)) && tlsEntry.Certificate != nil {
-			certificates[tlsEntry.Identifier] = *tlsEntry.Certificate
-		}
-	}
-
-	return certificates
-}
-
-// GetByOIDCSubject returns a CacheEntry with the given subject or returns an api.StatusError with http.StatusNotFound.
-func (c *Cache) GetByOIDCSubject(subject string) (*CacheEntry, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	oidcEntries, ok := c.entries[api.AuthenticationMethodOIDC]
-	if !ok {
-		return nil, api.StatusErrorf(http.StatusNotFound, "Identity with OIDC subject %q not found", subject)
-	}
-
-	for _, entry := range oidcEntries {
-		if entry == nil {
-			continue
-		}
-
-		if entry.Subject == subject {
-			entryCopy := *entry
-			return &entryCopy, nil
-		}
-	}
-
-	return nil, api.StatusErrorf(http.StatusNotFound, "Identity with OIDC subject %q not found", subject)
-}
-
-// GetIdentityProviderGroupMapping returns the auth groups that the given identity provider group maps to or an
-// api.StatusError with http.StatusNotFound.
-func (c *Cache) GetIdentityProviderGroupMapping(idpGroup string) ([]string, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	lxdGroups, ok := c.identityProviderGroups[idpGroup]
-	if !ok {
-		return nil, api.StatusErrorf(http.StatusNotFound, "No mapping found for identity provider group %q", idpGroup)
-	}
-
-	if lxdGroups == nil {
-		return nil, api.StatusErrorf(http.StatusNotFound, "No mapping found for identity provider group %q", idpGroup)
-	}
-
-	return *lxdGroups, nil
+	c.serverCertificates = serverCerts
+	c.clientCertificates = clientCerts
+	c.metricsCertificates = metricsCerts
+	c.bearerIdentitySecrets = secrets
+	c.initialUITokenSecret = initialUITokenSecret
 }

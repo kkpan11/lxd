@@ -1,4 +1,10 @@
 test_container_devices_proxy() {
+  ensure_import_testimage
+
+  HOST_TCP_PORT="$(local_tcp_port)"
+  HOST_TCP_PORT2="$(local_tcp_port)"
+  HOST_TCP_PORT3="$(local_tcp_port)"
+
   container_devices_proxy_validation
   container_devices_proxy_tcp
   container_devices_proxy_tcp_unix
@@ -8,12 +14,14 @@ test_container_devices_proxy() {
   container_devices_proxy_unix_udp
   container_devices_proxy_unix_tcp
   container_devices_proxy_with_overlapping_forward_net
+
+  unset HOST_TCP_PORT HOST_TCP_PORT2 HOST_TCP_PORT3
 }
 
 container_devices_proxy_validation() {
-  ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
-  HOST_TCP_PORT=$(local_tcp_port)
+  echo "====> Testing proxy validation"
+
+  # Setup
   lxc launch testimage proxyTester
 
   # Check that connecting to a DNS name is not allowed (security risk).
@@ -61,21 +69,18 @@ container_devices_proxy_validation() {
 
 container_devices_proxy_tcp() {
   echo "====> Testing tcp proxying"
-  ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
 
   # Setup
   MESSAGE="Proxy device test string: tcp"
-  HOST_TCP_PORT=$(local_tcp_port)
   lxc launch testimage proxyTester
 
   # Initial test
-  nsenter -n -U -t "$(lxc query /1.0/containers/proxyTester/state | jq .pid)" -- socat tcp-listen:4321 exec:/bin/cat &
+  nsenter -n -U -t "$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)" -- socat tcp4-listen:4321 exec:/bin/cat &
   NSENTER_PID=$!
   lxc config device add proxyTester proxyDev proxy "listen=tcp:127.0.0.1:$HOST_TCP_PORT" connect=tcp:127.0.0.1:4321 bind=host
-  sleep 0.5
+  sleep 0.2
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - tcp:127.0.0.1:"${HOST_TCP_PORT}")
+  ECHO=$( echo "${MESSAGE}" | socat - tcp4:127.0.0.1:"${HOST_TCP_PORT}",shut-down)
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -87,11 +92,11 @@ container_devices_proxy_tcp() {
 
   # Restart the container
   lxc restart -f proxyTester
-  nsenter -n -U -t "$(lxc query /1.0/containers/proxyTester/state | jq .pid)" -- socat tcp-listen:4321 exec:/bin/cat &
+  nsenter -n -U -t "$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)" -- socat tcp4-listen:4321 exec:/bin/cat &
   NSENTER_PID=$!
-  sleep 1
+  sleep 0.2
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - tcp:127.0.0.1:"${HOST_TCP_PORT}")
+  ECHO=$( echo "${MESSAGE}" | socat - tcp4:127.0.0.1:"${HOST_TCP_PORT}",shut-down)
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -102,12 +107,12 @@ container_devices_proxy_tcp() {
   fi
 
   # Change the port
-  nsenter -n -U -t "$(lxc query /1.0/containers/proxyTester/state | jq .pid)" -- socat tcp-listen:1337 exec:/bin/cat &
+  nsenter -n -U -t "$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)" -- socat tcp4-listen:1337 exec:/bin/cat &
   NSENTER_PID=$!
   lxc config device set proxyTester proxyDev connect tcp:127.0.0.1:1337
-  sleep 0.5
+  sleep 0.2
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - tcp:127.0.0.1:"${HOST_TCP_PORT}")
+  ECHO=$( echo "${MESSAGE}" | socat - tcp4:127.0.0.1:"${HOST_TCP_PORT}",shut-down)
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -117,22 +122,34 @@ container_devices_proxy_tcp() {
     false
   fi
 
-  # Initial test
+  # Initial test: Setting up multiple TCP port proxies
   lxc config device remove proxyTester proxyDev
-  HOST_TCP_PORT2=$(local_tcp_port)
-  nsenter -n -U -t "$(lxc query /1.0/containers/proxyTester/state | jq .pid)" -- socat tcp-listen:4321 exec:/bin/cat &
-  NSENTER_PID=$!
-  nsenter -n -U -t "$(lxc query /1.0/containers/proxyTester/state | jq .pid)" -- socat tcp-listen:4322 exec:/bin/cat &
-  NSENTER_PID1=$!
-  lxc config device add proxyTester proxyDev proxy "listen=tcp:127.0.0.1:$HOST_TCP_PORT,$HOST_TCP_PORT2" connect=tcp:127.0.0.1:4321-4322 bind=host
-  sleep 0.5
+  PID=$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - tcp:127.0.0.1:"${HOST_TCP_PORT}")
+  # Set up three socat listeners in the container
+  nsenter -n -U -t "${PID}" -- socat tcp4-listen:4321 exec:/bin/cat &
+  NSENTER_PID=$!
+  nsenter -n -U -t "${PID}" -- socat tcp4-listen:4322 exec:/bin/cat &
+  NSENTER_PID1=$!
+  nsenter -n -U -t "${PID}" -- socat tcp4-listen:4323 exec:/bin/cat &
+  NSENTER_PID2=$!
+
+  # Create a proxy device that maps three host ports to three container ports
+  lxc config device add proxyTester proxyDev proxy "listen=tcp:127.0.0.1:$HOST_TCP_PORT,$HOST_TCP_PORT2,$HOST_TCP_PORT3" connect=tcp:127.0.0.1:4321-4323 bind=host
+  sleep 0.2
+
+  echo "Testing standard TCP connection through proxy"
+  ECHO=$( echo "${MESSAGE}" | socat - tcp4:127.0.0.1:"${HOST_TCP_PORT}",shut-down)
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
-  ECHO1=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - tcp:127.0.0.1:"${HOST_TCP_PORT2}")
+  echo "Testing standard TCP connection through proxy with different port"
+  ECHO1=$( echo "${MESSAGE}" | socat - tcp4:127.0.0.1:"${HOST_TCP_PORT2}",shut-down)
   kill "${NSENTER_PID1}" 2>/dev/null || true
   wait "${NSENTER_PID1}" 2>/dev/null || true
+  echo "Testing half-closed TCP connection through proxy"
+  ECHO2=$( echo "${MESSAGE}" | nc -N 127.0.0.1 "${HOST_TCP_PORT3}") # the -N flag to netcat closes the socket after EOF on input
+  kill "${NSENTER_PID2}" 2>/dev/null || true
+  wait "${NSENTER_PID2}" 2>/dev/null || true
 
   if [ "${ECHO}" != "${MESSAGE}" ]; then
     cat "${LXD_DIR}/logs/proxyTester/proxy.proxyDev.log"
@@ -146,24 +163,29 @@ container_devices_proxy_tcp() {
     false
   fi
 
+  if [ "${ECHO2}" != "${MESSAGE}" ]; then
+    cat "${LXD_DIR}/logs/proxyTester/proxy.proxyDev.log"
+    echo "Proxy device did not properly send data from host to container"
+    false
+  fi
+
   # Cleanup
   lxc delete -f proxyTester
 
   # Try NAT
   lxc init testimage nattest
 
-  lxc network create lxdt$$ dns.domain=test dns.mode=managed ipv6.dhcp.stateful=true
+  lxc network create lxdt$$ dns.domain=test dns.mode=managed ipv6.dhcp.stateful=true ipv4.address=192.0.2.1/24 ipv6.address=2001:db8::1/64
   lxc network attach lxdt$$ nattest eth0
-  v4_addr="$(lxc network get lxdt$$ ipv4.address | cut -d/ -f1)0"
-  v6_addr="$(lxc network get lxdt$$ ipv6.address | cut -d/ -f1)00"
-  lxc config device set nattest eth0 ipv4.address "${v4_addr}"
-  lxc config device set nattest eth0 ipv6.address "${v6_addr}"
+  v4_addr="192.0.2.10"
+  v6_addr="2001:db8::100"
+  lxc config device set nattest eth0 ipv4.address="${v4_addr}" ipv6.address="${v6_addr}"
 
   firewallDriver=$(lxc info | awk -F ":" '/firewall:/{gsub(/ /, "", $0); print $2}')
 
   lxc start nattest
   if [ "$firewallDriver" = "xtables" ]; then
-    [ "$(iptables -w -t nat -S | grep -c "generated for LXD container nattest (validNAT)")" -eq 0 ]
+    [ "$(iptables -w -t nat -S | grep -cF "generated for LXD container nattest (validNAT)")" = "0" ]
   else
     ! nft -nn list chain inet lxd prert.nattest.validNAT || false
     ! nft -nn list chain inet lxd out.nattest.validNAT || false
@@ -171,7 +193,7 @@ container_devices_proxy_tcp() {
 
   lxc config device add nattest validNAT proxy listen="tcp:127.0.0.1:1234" connect="tcp:${v4_addr}:1234" bind=host
   if [ "$firewallDriver" = "xtables" ]; then
-    [ "$(iptables -w -t nat -S | grep -c "generated for LXD container nattest (validNAT)")" -eq 0 ]
+    [ "$(iptables -w -t nat -S | grep -cF "generated for LXD container nattest (validNAT)")" = "0" ]
   else
     ! nft -nn list chain inet lxd prert.nattest.validNAT || false
     ! nft -nn list chain inet lxd out.nattest.validNAT || false
@@ -180,33 +202,33 @@ container_devices_proxy_tcp() {
   # enable NAT
   lxc config device set nattest validNAT nat true
   if [ "$firewallDriver" = "xtables" ]; then
-    iptables -w -t nat -S | grep -- "-A PREROUTING -d 127.0.0.1/32 -p tcp -m tcp --dport 1234 -m comment --comment \"generated for LXD container nattest (validNAT)\" -j DNAT --to-destination ${v4_addr}:1234"
-    iptables -w -t nat -S | grep -- "-A OUTPUT -d 127.0.0.1/32 -p tcp -m tcp --dport 1234 -m comment --comment \"generated for LXD container nattest (validNAT)\" -j DNAT --to-destination ${v4_addr}:1234"
-    iptables -w -t nat -S | grep -- "-A POSTROUTING -s ${v4_addr}/32 -d ${v4_addr}/32 -p tcp -m tcp --dport 1234 -m comment --comment \"generated for LXD container nattest (validNAT)\" -j MASQUERADE"
+    iptables -w -t nat -S | grep -F -- "-A PREROUTING -d 127.0.0.1/32 -p tcp -m tcp --dport 1234 -m comment --comment \"generated for LXD container nattest (validNAT)\" -j DNAT --to-destination ${v4_addr}:1234"
+    iptables -w -t nat -S | grep -F -- "-A OUTPUT -d 127.0.0.1/32 -p tcp -m tcp --dport 1234 -m comment --comment \"generated for LXD container nattest (validNAT)\" -j DNAT --to-destination ${v4_addr}:1234"
+    iptables -w -t nat -S | grep -F -- "-A POSTROUTING -s ${v4_addr}/32 -d ${v4_addr}/32 -p tcp -m tcp --dport 1234 -m comment --comment \"generated for LXD container nattest (validNAT)\" -j MASQUERADE"
   else
-    [ "$(nft -nn list chain inet lxd prert.nattest.validNAT | grep -c "ip daddr 127.0.0.1 tcp dport 1234 dnat ip to ${v4_addr}:1234")" -eq 1 ]
-    [ "$(nft -nn list chain inet lxd out.nattest.validNAT | grep -c "ip daddr 127.0.0.1 tcp dport 1234 dnat ip to ${v4_addr}:1234")" -eq 1 ]
+    [ "$(nft -nn list chain inet lxd prert.nattest.validNAT | grep -cF "ip daddr 127.0.0.1 tcp dport 1234 dnat ip to ${v4_addr}:1234")" = "1" ]
+    [ "$(nft -nn list chain inet lxd out.nattest.validNAT | grep -cF "ip daddr 127.0.0.1 tcp dport 1234 dnat ip to ${v4_addr}:1234")" = "1" ]
   fi
 
   lxc config device remove nattest validNAT
   if [ "$firewallDriver" = "xtables" ]; then
-    [ "$(iptables -w -t nat -S | grep -c "generated for LXD container nattest (validNAT)")" -eq 0 ]
+    [ "$(iptables -w -t nat -S | grep -cF "generated for LXD container nattest (validNAT)")" = "0" ]
   else
-    ! nft -nn list chain inet lxd prert.nattest.validNAT
-    ! nft -nn list chain inet lxd out.nattest.validNAT
+    ! nft -nn list chain inet lxd prert.nattest.validNAT || false
+    ! nft -nn list chain inet lxd out.nattest.validNAT || false
   fi
 
   lxc config device add nattest validNAT proxy listen="tcp:127.0.0.1:1234-1235" connect="tcp:${v4_addr}:1234" bind=host nat=true
   if [ "$firewallDriver" = "xtables" ]; then
-    [ "$(iptables -w -t nat -S | grep -c "generated for LXD container nattest (validNAT)")" -eq 3 ]
+    [ "$(iptables -w -t nat -S | grep -cF "generated for LXD container nattest (validNAT)")" = "3" ]
   else
-    [ "$(nft -nn list chain inet lxd prert.nattest.validNAT | grep -c "ip daddr 127.0.0.1 tcp dport 1234-1235 dnat ip to ${v4_addr}:1234")" -eq 1 ]
-    [ "$(nft -nn list chain inet lxd out.nattest.validNAT | grep -c "ip daddr 127.0.0.1 tcp dport 1234-1235 dnat ip to ${v4_addr}:1234")" -eq 1 ]
+    [ "$(nft -nn list chain inet lxd prert.nattest.validNAT | grep -cF "ip daddr 127.0.0.1 tcp dport 1234-1235 dnat ip to ${v4_addr}:1234")" = "1" ]
+    [ "$(nft -nn list chain inet lxd out.nattest.validNAT | grep -cF "ip daddr 127.0.0.1 tcp dport 1234-1235 dnat ip to ${v4_addr}:1234")" = "1" ]
   fi
 
   lxc config device remove nattest validNAT
   if [ "$firewallDriver" = "xtables" ]; then
-    [ "$(iptables -w -t nat -S | grep -c "generated for LXD container nattest (validNAT)")" -eq 0 ]
+    [ "$(iptables -w -t nat -S | grep -cF "generated for LXD container nattest (validNAT)")" = "0" ]
   else
     ! nft -nn list chain inet lxd prert.nattest.validNAT || false
     ! nft -nn list chain inet lxd out.nattest.validNAT || false
@@ -214,15 +236,15 @@ container_devices_proxy_tcp() {
 
   lxc config device add nattest validNAT proxy listen="tcp:127.0.0.1:1234-1235" connect="tcp:${v4_addr}:1234-1235" bind=host nat=true
   if [ "$firewallDriver" = "xtables" ]; then
-    [ "$(iptables -w -t nat -S | grep -c "generated for LXD container nattest (validNAT)")" -eq 3 ]
+    [ "$(iptables -w -t nat -S | grep -cF "generated for LXD container nattest (validNAT)")" = "3" ]
   else
-    [ "$(nft -nn list chain inet lxd prert.nattest.validNAT | grep -c "ip daddr 127.0.0.1 tcp dport 1234-1235 dnat ip to ${v4_addr}")" -eq 1 ]
-    [ "$(nft -nn list chain inet lxd out.nattest.validNAT | grep -c "ip daddr 127.0.0.1 tcp dport 1234-1235 dnat ip to ${v4_addr}")" -eq 1 ]
+    [ "$(nft -nn list chain inet lxd prert.nattest.validNAT | grep -cF "ip daddr 127.0.0.1 tcp dport 1234-1235 dnat ip to ${v4_addr}")" = "1" ]
+    [ "$(nft -nn list chain inet lxd out.nattest.validNAT | grep -cF "ip daddr 127.0.0.1 tcp dport 1234-1235 dnat ip to ${v4_addr}")" = "1" ]
   fi
 
   lxc config device remove nattest validNAT
   if [ "$firewallDriver" = "xtables" ]; then
-    [ "$(iptables -w -t nat -S | grep -c "generated for LXD container nattest (validNAT)")" -eq 0 ]
+    [ "$(iptables -w -t nat -S | grep -cF "generated for LXD container nattest (validNAT)")" = "0" ]
   else
     ! nft -nn list chain inet lxd prert.nattest.validNAT || false
     ! nft -nn list chain inet lxd out.nattest.validNAT || false
@@ -231,15 +253,15 @@ container_devices_proxy_tcp() {
   # IPv6 test
   lxc config device add nattest validNAT proxy listen="tcp:[::1]:1234" connect="tcp:[::]:1234" bind=host nat=true
   if [ "$firewallDriver" = "xtables" ]; then
-    [ "$(ip6tables -w -t nat -S | grep -c "generated for LXD container nattest (validNAT)")" -eq 3 ]
+    [ "$(ip6tables -w -t nat -S | grep -cF "generated for LXD container nattest (validNAT)")" = "3" ]
   else
-    [ "$(nft -nn list chain inet lxd prert.nattest.validNAT | grep -c "ip6 daddr ::1 tcp dport 1234 dnat ip6 to \[${v6_addr}\]:1234")" -eq 1 ]
-    [ "$(nft -nn list chain inet lxd out.nattest.validNAT | grep -c "ip6 daddr ::1 tcp dport 1234 dnat ip6 to \[${v6_addr}\]:1234")" -eq 1 ]
+    [ "$(nft -nn list chain inet lxd prert.nattest.validNAT | grep -cF "ip6 daddr ::1 tcp dport 1234 dnat ip6 to [${v6_addr}]:1234")" = "1" ]
+    [ "$(nft -nn list chain inet lxd out.nattest.validNAT | grep -cF "ip6 daddr ::1 tcp dport 1234 dnat ip6 to [${v6_addr}]:1234")" = "1" ]
   fi
 
   lxc config device unset nattest validNAT nat
   if [ "$firewallDriver" = "xtables" ]; then
-    [ "$(ip6tables -w -t nat -S | grep -c "generated for LXD container nattest (validNAT)")" -eq 0 ]
+    [ "$(ip6tables -w -t nat -S | grep -cF "generated for LXD container nattest (validNAT)")" = "0" ]
   else
     ! nft -nn list chain inet lxd prert.nattest.validNAT || false
     ! nft -nn list chain inet lxd out.nattest.validNAT || false
@@ -250,7 +272,7 @@ container_devices_proxy_tcp() {
   # This won't enable NAT
   lxc config device add nattest invalidNAT proxy listen="tcp:127.0.0.1:1234" connect="udp:${v4_addr}:1234" bind=host
   if [ "$firewallDriver" = "xtables" ]; then
-    [ "$(iptables -w -t nat -S | grep -c "generated for LXD container nattest (invalidNAT)")" -eq 0 ]
+    [ "$(iptables -w -t nat -S | grep -cF "generated for LXD container nattest (invalidNAT)")" = "0" ]
   else
     ! nft -nn list chain inet lxd prert.nattest.invalidNAT || false
     ! nft -nn list chain inet lxd out.nattest.invalidNAT || false
@@ -258,7 +280,7 @@ container_devices_proxy_tcp() {
 
   lxc delete -f nattest
   if [ "$firewallDriver" = "xtables" ]; then
-    [ "$(iptables -w -t nat -S | grep -c "generated for LXD container nattest (validNAT)")" -eq 0 ]
+    [ "$(iptables -w -t nat -S | grep -cF "generated for LXD container nattest (validNAT)")" = "0" ]
   else
     ! nft -nn list chain inet lxd prert.nattest.validNAT || false
     ! nft -nn list chain inet lxd out.nattest.validNAT || false
@@ -269,8 +291,6 @@ container_devices_proxy_tcp() {
 
 container_devices_proxy_unix() {
   echo "====> Testing unix proxying"
-  ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
 
   # Setup
   MESSAGE="Proxy device test string: unix"
@@ -282,17 +302,17 @@ container_devices_proxy_unix() {
 
   # Initial test
   (
-    PID="$(lxc query /1.0/containers/proxyTester/state | jq .pid)"
+    PID="$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)"
     cd "/proc/${PID}/root/tmp/" || exit
     umask 0000
     exec nsenter -n -U -t "${PID}" -- socat unix-listen:"lxdtest-$(basename "${LXD_DIR}").sock",unlink-early exec:/bin/cat
   ) &
   NSENTER_PID=$!
-  sleep 0.5
+  sleep 0.2
 
   lxc config device add proxyTester proxyDev proxy "listen=unix:${HOST_SOCK}" uid=1234 gid=1234 security.uid=1234 security.gid=1234 connect=unix:/tmp/"lxdtest-$(basename "${LXD_DIR}").sock" bind=host
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - unix:"${HOST_SOCK#"$(pwd)"/}")
+  ECHO=$( (echo "${MESSAGE}" ; sleep 0.1) | socat - unix:"${HOST_SOCK}")
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -307,15 +327,15 @@ container_devices_proxy_unix() {
   # Restart the container
   lxc restart -f proxyTester
   (
-    PID="$(lxc query /1.0/containers/proxyTester/state | jq .pid)"
+    PID="$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)"
     cd "/proc/${PID}/root/tmp/" || exit
     umask 0000
     exec nsenter -n -U -t "${PID}" -- socat unix-listen:"lxdtest-$(basename "${LXD_DIR}").sock",unlink-early exec:/bin/cat
   ) &
   NSENTER_PID=$!
-  sleep 1
+  sleep 0.2
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - unix:"${HOST_SOCK#"$(pwd)"/}")
+  ECHO=$( (echo "${MESSAGE}" ; sleep 0.1) | socat - unix:"${HOST_SOCK}")
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -329,7 +349,7 @@ container_devices_proxy_unix() {
 
   # Change the socket
   (
-    PID="$(lxc query /1.0/containers/proxyTester/state | jq .pid)"
+    PID="$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)"
     cd "/proc/${PID}/root/tmp/" || exit
     umask 0000
     exec nsenter -n -U -t "${PID}" -- socat unix-listen:"lxdtest-$(basename "${LXD_DIR}")-2.sock",unlink-early exec:/bin/cat
@@ -337,9 +357,9 @@ container_devices_proxy_unix() {
   NSENTER_PID=$!
 
   lxc config device set proxyTester proxyDev connect unix:/tmp/"lxdtest-$(basename "${LXD_DIR}")-2.sock"
-  sleep 0.5
+  sleep 0.2
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - unix:"${HOST_SOCK#"$(pwd)"/}")
+  ECHO=$( (echo "${MESSAGE}" ; sleep 0.1) | socat - unix:"${HOST_SOCK}")
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -349,7 +369,12 @@ container_devices_proxy_unix() {
     false
   fi
 
-  rm -f "${HOST_SOCK}"
+  # Ensure host socket removed upon device removal.
+  lxc config device remove proxyTester proxyDev
+  if [ -e "${HOST_SOCK}" ]; then
+    echo "Host socket was not removed upon device removal"
+    false
+  fi
 
   # Cleanup
   lxc delete -f proxyTester
@@ -357,17 +382,14 @@ container_devices_proxy_unix() {
 
 container_devices_proxy_tcp_unix() {
   echo "====> Testing tcp to unix proxying"
-  ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
 
   # Setup
   MESSAGE="Proxy device test string: tcp -> unix"
-  HOST_TCP_PORT=$(local_tcp_port)
   lxc launch testimage proxyTester
 
   # Initial test
   (
-    PID="$(lxc query /1.0/containers/proxyTester/state | jq .pid)"
+    PID="$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)"
     cd "/proc/${PID}/root/tmp/" || exit
     umask 0000
     exec nsenter -n -U -t "${PID}" -- socat unix-listen:"lxdtest-$(basename "${LXD_DIR}").sock",unlink-early exec:/bin/cat
@@ -375,9 +397,9 @@ container_devices_proxy_tcp_unix() {
   NSENTER_PID=$!
 
   lxc config device add proxyTester proxyDev proxy "listen=tcp:127.0.0.1:${HOST_TCP_PORT}" connect=unix:/tmp/"lxdtest-$(basename "${LXD_DIR}").sock" bind=host
-  sleep 0.5
+  sleep 0.2
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - tcp:127.0.0.1:"${HOST_TCP_PORT}")
+  ECHO=$( echo "${MESSAGE}" | socat - tcp4:127.0.0.1:"${HOST_TCP_PORT}",shut-down)
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -390,15 +412,15 @@ container_devices_proxy_tcp_unix() {
   # Restart the container
   lxc restart -f proxyTester
   (
-    PID="$(lxc query /1.0/containers/proxyTester/state | jq .pid)"
+    PID="$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)"
     cd "/proc/${PID}/root/tmp/" || exit
     umask 0000
     exec nsenter -n -U -t "${PID}" -- socat unix-listen:"lxdtest-$(basename "${LXD_DIR}").sock",unlink-early exec:/bin/cat
   ) &
   NSENTER_PID=$!
-  sleep 1
+  sleep 0.2
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - tcp:127.0.0.1:"${HOST_TCP_PORT}")
+  ECHO=$( echo "${MESSAGE}" | socat - tcp4:127.0.0.1:"${HOST_TCP_PORT}",shut-down)
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -410,7 +432,7 @@ container_devices_proxy_tcp_unix() {
 
   # Change the socket
   (
-    PID="$(lxc query /1.0/containers/proxyTester/state | jq .pid)"
+    PID="$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)"
     cd "/proc/${PID}/root/tmp/" || exit
     umask 0000
     exec nsenter -n -U -t "${PID}" -- socat unix-listen:"lxdtest-$(basename "${LXD_DIR}")-2.sock",unlink-early exec:/bin/cat
@@ -418,9 +440,9 @@ container_devices_proxy_tcp_unix() {
   NSENTER_PID=$!
 
   lxc config device set proxyTester proxyDev connect unix:/tmp/"lxdtest-$(basename "${LXD_DIR}")-2.sock"
-  sleep 0.5
+  sleep 0.2
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - tcp:127.0.0.1:"${HOST_TCP_PORT}")
+  ECHO=$( echo "${MESSAGE}" | socat - tcp4:127.0.0.1:"${HOST_TCP_PORT}",shut-down)
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -436,8 +458,6 @@ container_devices_proxy_tcp_unix() {
 
 container_devices_proxy_unix_tcp() {
   echo "====> Testing unix to tcp proxying"
-  ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
 
   # Setup
   MESSAGE="Proxy device test string: unix -> tcp"
@@ -445,12 +465,12 @@ container_devices_proxy_unix_tcp() {
   lxc launch testimage proxyTester
 
   # Initial test
-  nsenter -n -U -t "$(lxc query /1.0/containers/proxyTester/state | jq .pid)" -- socat tcp-listen:4321 exec:/bin/cat &
+  nsenter -n -U -t "$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)" -- socat tcp4-listen:4321 exec:/bin/cat &
   NSENTER_PID=$!
   lxc config device add proxyTester proxyDev proxy "listen=unix:${HOST_SOCK}" connect=tcp:127.0.0.1:4321 bind=host
-  sleep 0.5
+  sleep 0.2
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - unix:"${HOST_SOCK#"$(pwd)"/}")
+  ECHO=$( (echo "${MESSAGE}" ; sleep 0.1) | socat - unix:"${HOST_SOCK}")
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -464,11 +484,11 @@ container_devices_proxy_unix_tcp() {
 
   # Restart the container
   lxc restart -f proxyTester
-  nsenter -n -U -t "$(lxc query /1.0/containers/proxyTester/state | jq .pid)" -- socat tcp-listen:4321 exec:/bin/cat &
+  nsenter -n -U -t "$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)" -- socat tcp4-listen:4321 exec:/bin/cat &
   NSENTER_PID=$!
-  sleep 1
+  sleep 0.2
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - unix:"${HOST_SOCK#"$(pwd)"/}")
+  ECHO=$( (echo "${MESSAGE}" ; sleep 0.1) | socat - unix:"${HOST_SOCK}")
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -481,12 +501,12 @@ container_devices_proxy_unix_tcp() {
   rm -f "${HOST_SOCK}"
 
   # Change the port
-  nsenter -n -U -t "$(lxc query /1.0/containers/proxyTester/state | jq .pid)" -- socat tcp-listen:1337 exec:/bin/cat &
+  nsenter -n -U -t "$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)" -- socat tcp4-listen:1337 exec:/bin/cat &
   NSENTER_PID=$!
   lxc config device set proxyTester proxyDev connect tcp:127.0.0.1:1337
-  sleep 0.5
+  sleep 0.2
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - unix:"${HOST_SOCK#"$(pwd)"/}")
+  ECHO=$( (echo "${MESSAGE}" ; sleep 0.1) | socat - unix:"${HOST_SOCK}")
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -504,8 +524,6 @@ container_devices_proxy_unix_tcp() {
 
 container_devices_proxy_udp() {
   echo "====> Testing udp proxying"
-  ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
 
   # Setup
   MESSAGE="Proxy device test string: udp"
@@ -513,12 +531,12 @@ container_devices_proxy_udp() {
   lxc launch testimage proxyTester
 
   # Initial test
-  nsenter -n -U -t "$(lxc query /1.0/containers/proxyTester/state | jq .pid)" -- socat udp-listen:4321 exec:/bin/cat &
+  nsenter -n -U -t "$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)" -- socat udp4-listen:4321 exec:/bin/cat &
   NSENTER_PID=$!
   lxc config device add proxyTester proxyDev proxy "listen=udp:127.0.0.1:$HOST_UDP_PORT" connect=udp:127.0.0.1:4321 bind=host
-  sleep 0.5
+  sleep 0.2
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - udp:127.0.0.1:"${HOST_UDP_PORT}")
+  ECHO=$( echo "${MESSAGE}" | socat - udp:127.0.0.1:"${HOST_UDP_PORT}")
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -530,11 +548,11 @@ container_devices_proxy_udp() {
 
   # Restart the container
   lxc restart -f proxyTester
-  nsenter -n -U -t "$(lxc query /1.0/containers/proxyTester/state | jq .pid)" -- socat udp-listen:4321 exec:/bin/cat &
+  nsenter -n -U -t "$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)" -- socat udp4-listen:4321 exec:/bin/cat &
   NSENTER_PID=$!
-  sleep 1
+  sleep 0.2
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - udp:127.0.0.1:"${HOST_UDP_PORT}")
+  ECHO=$( echo "${MESSAGE}" | socat - udp:127.0.0.1:"${HOST_UDP_PORT}")
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -545,12 +563,12 @@ container_devices_proxy_udp() {
   fi
 
   # Change the port
-  nsenter -n -U -t "$(lxc query /1.0/containers/proxyTester/state | jq .pid)" -- socat udp-listen:1337 exec:/bin/cat &
+  nsenter -n -U -t "$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)" -- socat udp4-listen:1337 exec:/bin/cat &
   NSENTER_PID=$!
   lxc config device set proxyTester proxyDev connect udp:127.0.0.1:1337
-  sleep 0.5
+  sleep 0.2
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - udp:127.0.0.1:"${HOST_UDP_PORT}")
+  ECHO=$( echo "${MESSAGE}" | socat - udp:127.0.0.1:"${HOST_UDP_PORT}")
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -566,8 +584,6 @@ container_devices_proxy_udp() {
 
 container_devices_proxy_unix_udp() {
   echo "====> Testing unix to udp proxying"
-  ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
 
   # Setup
   MESSAGE="Proxy device test string: unix -> udp"
@@ -575,12 +591,12 @@ container_devices_proxy_unix_udp() {
   lxc launch testimage proxyTester
 
   # Initial test
-  nsenter -n -U -t "$(lxc query /1.0/containers/proxyTester/state | jq .pid)" -- socat udp-listen:4321 exec:/bin/cat &
+  nsenter -n -U -t "$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)" -- socat udp4-listen:4321 exec:/bin/cat &
   NSENTER_PID=$!
   lxc config device add proxyTester proxyDev proxy "listen=unix:${HOST_SOCK}" connect=udp:127.0.0.1:4321 bind=host
-  sleep 0.5
+  sleep 0.2
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - unix:"${HOST_SOCK#"$(pwd)"/}")
+  ECHO=$( (echo "${MESSAGE}" ; sleep 0.1) | socat - unix:"${HOST_SOCK}")
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -594,11 +610,11 @@ container_devices_proxy_unix_udp() {
 
   # Restart the container
   lxc restart -f proxyTester
-  nsenter -n -U -t "$(lxc query /1.0/containers/proxyTester/state | jq .pid)" -- socat udp-listen:4321 exec:/bin/cat &
+  nsenter -n -U -t "$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)" -- socat udp4-listen:4321 exec:/bin/cat &
   NSENTER_PID=$!
-  sleep 1
+  sleep 0.2
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - unix:"${HOST_SOCK#"$(pwd)"/}")
+  ECHO=$( (echo "${MESSAGE}" ; sleep 0.1) | socat - unix:"${HOST_SOCK}")
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -611,12 +627,12 @@ container_devices_proxy_unix_udp() {
   rm -f "${HOST_SOCK}"
 
   # Change the port
-  nsenter -n -U -t "$(lxc query /1.0/containers/proxyTester/state | jq .pid)" -- socat udp-listen:1337 exec:/bin/cat &
+  nsenter -n -U -t "$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)" -- socat udp4-listen:1337 exec:/bin/cat &
   NSENTER_PID=$!
   lxc config device set proxyTester proxyDev connect udp:127.0.0.1:1337
-  sleep 0.5
+  sleep 0.2
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - unix:"${HOST_SOCK#"$(pwd)"/}")
+  ECHO=$( (echo "${MESSAGE}" ; sleep 0.1) | socat - unix:"${HOST_SOCK}")
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -634,21 +650,18 @@ container_devices_proxy_unix_udp() {
 
 container_devices_proxy_tcp_udp() {
   echo "====> Testing tcp to udp proxying"
-  ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
 
   # Setup
   MESSAGE="Proxy device test string: tcp -> udp"
-  HOST_TCP_PORT=$(local_tcp_port)
   lxc launch testimage proxyTester
 
   # Initial test
-  nsenter -n -U -t "$(lxc query /1.0/containers/proxyTester/state | jq .pid)" -- socat udp-listen:4321 exec:/bin/cat &
+  nsenter -n -U -t "$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)" -- socat udp4-listen:4321 exec:/bin/cat &
   NSENTER_PID=$!
   lxc config device add proxyTester proxyDev proxy "listen=tcp:127.0.0.1:$HOST_TCP_PORT" connect=udp:127.0.0.1:4321 bind=host
-  sleep 0.5
+  sleep 0.2
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - tcp:127.0.0.1:"${HOST_TCP_PORT}")
+  ECHO=$( echo "${MESSAGE}" | socat - tcp4:127.0.0.1:"${HOST_TCP_PORT}",shut-down)
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -660,11 +673,11 @@ container_devices_proxy_tcp_udp() {
 
   # Restart the container
   lxc restart -f proxyTester
-  nsenter -n -U -t "$(lxc query /1.0/containers/proxyTester/state | jq .pid)" -- socat udp-listen:4321 exec:/bin/cat &
+  nsenter -n -U -t "$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)" -- socat udp4-listen:4321 exec:/bin/cat &
   NSENTER_PID=$!
-  sleep 1
+  sleep 0.2
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - tcp:127.0.0.1:"${HOST_TCP_PORT}")
+  ECHO=$( echo "${MESSAGE}" | socat - tcp4:127.0.0.1:"${HOST_TCP_PORT}",shut-down)
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -675,12 +688,12 @@ container_devices_proxy_tcp_udp() {
   fi
 
   # Change the port
-  nsenter -n -U -t "$(lxc query /1.0/containers/proxyTester/state | jq .pid)" -- socat udp-listen:1337 exec:/bin/cat &
+  nsenter -n -U -t "$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)" -- socat udp4-listen:1337 exec:/bin/cat &
   NSENTER_PID=$!
   lxc config device set proxyTester proxyDev connect udp:127.0.0.1:1337
-  sleep 0.5
+  sleep 0.2
 
-  ECHO=$( (echo "${MESSAGE}" ; sleep 0.5) | socat - tcp:127.0.0.1:"${HOST_TCP_PORT}")
+  ECHO=$( echo "${MESSAGE}" | socat - tcp4:127.0.0.1:"${HOST_TCP_PORT}",shut-down)
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
@@ -696,26 +709,23 @@ container_devices_proxy_tcp_udp() {
 
 container_devices_proxy_with_overlapping_forward_net() {
   echo "====> Testing proxy creation with overlapping network forward"
-  ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
 
   netName="testnet"
 
   lxc network create "${netName}" \
         ipv4.address=192.0.2.1/24 \
-        ipv6.address=fd42:4242:4242:1010::1/64
+        ipv6.address=none
 
   overlappingAddr="192.0.2.2"
   proxyTesterStaticIP="192.0.2.3"
-  HOST_TCP_PORT=$(local_tcp_port)
 
   # First, launch container with a static IP
   lxc launch testimage proxyTester
   lxc config device add proxyTester eth0 nic \
     nictype=bridged \
     name=eth0 \
-    parent=${netName} \
-    ipv4.address=${proxyTesterStaticIP}
+    parent="${netName}" \
+    ipv4.address="${proxyTesterStaticIP}"
 
   # Check creating empty forward doesn't create any firewall rules.
   lxc network forward create "${netName}" "${overlappingAddr}"
@@ -732,8 +742,8 @@ container_devices_proxy_with_overlapping_forward_net() {
   lxc config device add proxyTester eth0 nic \
     nictype=bridged \
     name=eth0 \
-    parent=${netName} \
-    ipv4.address=${proxyTesterStaticIP}
+    parent="${netName}" \
+    ipv4.address="${proxyTesterStaticIP}"
 
   lxc config device add proxyTester proxyDev proxy "listen=tcp:${overlappingAddr}:$HOST_TCP_PORT" "connect=tcp:${proxyTesterStaticIP}:4321" nat=true
 

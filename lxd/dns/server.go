@@ -59,7 +59,7 @@ func (s *Server) start(address string) error {
 	go func() {
 		err := s.tcpDNS.ListenAndServe()
 		if err != nil {
-			logger.Errorf("Failed to bind TCP DNS address %q: %v", address, err)
+			logger.Errorf("Failed binding TCP DNS address %q: %v", address, err)
 		}
 	}()
 
@@ -67,7 +67,7 @@ func (s *Server) start(address string) error {
 	go func() {
 		err := s.udpDNS.ListenAndServe()
 		if err != nil {
-			logger.Errorf("Failed to bind TCP DNS address %q: %v", address, err)
+			logger.Errorf("Failed binding TCP DNS address %q: %v", address, err)
 		}
 	}()
 
@@ -81,15 +81,6 @@ func (s *Server) start(address string) error {
 	s.address = address
 
 	return nil
-}
-
-// Stop tears down the DNS listener.
-func (s *Server) Stop() error {
-	// Locking.
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.stop()
 }
 
 func (s *Server) stop() error {

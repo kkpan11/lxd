@@ -1,11 +1,25 @@
 package operationtype
 
 import (
-	"github.com/canonical/lxd/lxd/auth"
+	"fmt"
+
 	"github.com/canonical/lxd/shared/entity"
 )
 
-// Type is a numeric code indentifying the type of an Operation.
+// init disallows import of the package if any Type is not well-defined.
+func init() {
+	for t := Type(1); t < upperBound; t++ {
+		if t.Description() == "" {
+			panic(fmt.Sprintf("Operation type #%d does not have a description", t))
+		}
+
+		if t.EntityType() == "" {
+			panic(fmt.Sprintf("Operation type #%d does not have an entity type", t))
+		}
+	}
+}
+
+// Type is a numeric code identifying the type of Operation.
 type Type int64
 
 // Possible values for Type
@@ -41,14 +55,16 @@ const (
 	SnapshotTransfer
 	SnapshotUpdate
 	SnapshotDelete
+	SnapshotCopy
 	ImageDownload
 	ImageDelete
-	ImageToken
+	ImageDownloadToken
 	ImageRefresh
 	VolumeCopy
 	VolumeCreate
 	VolumeMigrate
 	VolumeMove
+	VolumeSnapshotCopy
 	VolumeSnapshotCreate
 	VolumeSnapshotDelete
 	VolumeSnapshotUpdate
@@ -76,7 +92,76 @@ const (
 	RenewServerCertificate
 	RemoveExpiredTokens
 	ClusterHeal
+	RemoveExpiredOIDCSessions
+	ProfileUpdate
+	VolumeUpdate
+	VolumeDelete
+	ImageUploadToken
+	ImageUpload
+	InstanceCopy
+	VolumeSnapshotsCreateScheduled
+	InstanceStateUpdateBulk
+	VolumeSnapshotTransfer
+	ProjectDelete
+	Wait
+	SnapshotsCreateScheduled
+	SynchronizeOperations
+	StoragePoolCreate
+	StoragePoolUpdate
+	StoragePoolDelete
+	NetworkCreate
+	NetworkUpdate
+	NetworkDelete
+	NetworkRename
+	NetworkACLCreate
+	NetworkACLUpdate
+	NetworkACLDelete
+	NetworkACLRename
+	StorageBucketCreate
+	StorageBucketUpdate
+	StorageBucketDelete
+	StorageBucketKeyCreate
+	StorageBucketKeyUpdate
+	StorageBucketKeyDelete
+	NetworkLoadBalancerCreate
+	NetworkLoadBalancerUpdate
+	NetworkLoadBalancerDelete
+	NetworkLoadBalancerPoolCreate
+	NetworkLoadBalancerPoolUpdate
+	NetworkLoadBalancerPoolDelete
+	NetworkForwardCreate
+	NetworkForwardUpdate
+	NetworkForwardDelete
+	RefreshClusterLinkVolatileAddresses
+	NetworkPeerCreate
+	NetworkPeerUpdate
+	NetworkPeerDelete
+	NetworkZoneCreate
+	NetworkZoneUpdate
+	NetworkZoneDelete
+	NetworkZoneRecordCreate
+	NetworkZoneRecordUpdate
+	NetworkZoneRecordDelete
+	ReplicatorRun
+	ReplicatorRunInstanceForward
+	ProjectReplicaModeUpdate
+	ReplicatorRunInstanceRestore
+	ReplicatorFinalize
+	ReplicatorSnapshotInstance
+
+	// upperBound is used only to enforce consistency in the package on init.
+	// Make sure it's always the last item in this list.
+	upperBound
 )
+
+// Validate returns an error if the given Type is not defined.
+func Validate(operationTypeCode Type) error {
+	if operationTypeCode > 0 && operationTypeCode < upperBound {
+		return nil
+	}
+
+	return fmt.Errorf("Unknown operation type code %d", operationTypeCode)
+}
 
 // Description return a human-readable description of the operation type.
 func (t Type) Description() string {
@@ -97,6 +182,8 @@ func (t Type) Description() string {
 		return "Showing console"
 	case InstanceCreate:
 		return "Creating instance"
+	case InstanceCopy:
+		return "Copying instance"
 	case InstanceUpdate:
 		return "Updating instance"
 	case InstanceRename:
@@ -119,6 +206,8 @@ func (t Type) Description() string {
 		return "Restarting instance"
 	case InstanceRebuild:
 		return "Rebuilding instance"
+	case ProfileUpdate:
+		return "Updating profile"
 	case CommandExec:
 		return "Executing command"
 	case SnapshotCreate:
@@ -133,22 +222,32 @@ func (t Type) Description() string {
 		return "Updating snapshot"
 	case SnapshotDelete:
 		return "Deleting snapshot"
+	case SnapshotCopy:
+		return "Copying snapshot"
 	case ImageDownload:
 		return "Downloading image"
 	case ImageDelete:
 		return "Deleting image"
-	case ImageToken:
+	case ImageDownloadToken:
 		return "Image download token"
+	case ImageUploadToken:
+		return "Image upload token"
 	case ImageRefresh:
 		return "Refreshing image"
 	case VolumeCopy:
 		return "Copying storage volume"
 	case VolumeCreate:
 		return "Creating storage volume"
+	case VolumeUpdate:
+		return "Updating storage volume"
+	case VolumeDelete:
+		return "Deleting storage volume"
 	case VolumeMigrate:
 		return "Migrating storage volume"
 	case VolumeMove:
 		return "Moving storage volume"
+	case VolumeSnapshotCopy:
+		return "Copying storage volume snapshot"
 	case VolumeSnapshotCreate:
 		return "Creating storage volume snapshot"
 	case VolumeSnapshotDelete:
@@ -199,88 +298,265 @@ func (t Type) Description() string {
 		return "Remove expired tokens"
 	case ClusterHeal:
 		return "Healing cluster"
+	case ClusterJoinToken:
+		return "Cluster join token"
+	case CertificateAddToken:
+		return "Certificate add token"
+	case RemoveExpiredOIDCSessions:
+		return "Removing expired OIDC sessions"
+	case ImageUpload:
+		return "Uploading image"
+	case VolumeSnapshotsCreateScheduled:
+		return "Creating scheduled volume snapshots"
+	case InstanceStateUpdateBulk:
+		return "Updating the state of multiple instances"
+	case VolumeSnapshotTransfer:
+		return "Transferring volume snapshot"
+	case ProjectDelete:
+		return "Deleting project"
+	// Wait is just a testing operation spawned by the testing/operation-wait API endpoint
+	case Wait:
+		return "Just chilling"
+	case SnapshotsCreateScheduled:
+		return "Creating scheduled instance snapshots"
+	case SynchronizeOperations:
+		return "Synchronizing operations"
+	case StoragePoolCreate:
+		return "Creating storage pool"
+	case StoragePoolUpdate:
+		return "Updating storage pool"
+	case StoragePoolDelete:
+		return "Deleting storage pool"
+	case NetworkCreate:
+		return "Creating network"
+	case NetworkUpdate:
+		return "Updating network"
+	case NetworkDelete:
+		return "Deleting network"
+	case NetworkRename:
+		return "Renaming network"
+	case NetworkACLCreate:
+		return "Creating network ACL"
+	case NetworkACLUpdate:
+		return "Updating network ACL"
+	case NetworkACLDelete:
+		return "Deleting network ACL"
+	case NetworkACLRename:
+		return "Renaming network ACL"
+	case StorageBucketCreate:
+		return "Creating storage bucket"
+	case StorageBucketUpdate:
+		return "Updating storage bucket"
+	case StorageBucketDelete:
+		return "Deleting storage bucket"
+	case StorageBucketKeyCreate:
+		return "Creating storage bucket key"
+	case StorageBucketKeyUpdate:
+		return "Updating storage bucket key"
+	case StorageBucketKeyDelete:
+		return "Deleting storage bucket key"
+	case NetworkLoadBalancerCreate:
+		return "Creating network load balancer"
+	case NetworkLoadBalancerUpdate:
+		return "Updating network load balancer"
+	case NetworkLoadBalancerDelete:
+		return "Deleting network load balancer"
+	case NetworkLoadBalancerPoolCreate:
+		return "Creating network load balancer pool"
+	case NetworkLoadBalancerPoolUpdate:
+		return "Updating network load balancer pool"
+	case NetworkLoadBalancerPoolDelete:
+		return "Deleting network load balancer pool"
+	case NetworkForwardCreate:
+		return "Creating network forward"
+	case NetworkForwardUpdate:
+		return "Updating network forward"
+	case NetworkForwardDelete:
+		return "Deleting network forward"
+	case RefreshClusterLinkVolatileAddresses:
+		return "Refreshing cluster link volatile addresses"
+	case NetworkPeerCreate:
+		return "Creating network peer"
+	case NetworkPeerUpdate:
+		return "Updating network peer"
+	case NetworkPeerDelete:
+		return "Deleting network peer"
+	case NetworkZoneCreate:
+		return "Creating network zone"
+	case NetworkZoneUpdate:
+		return "Updating network zone"
+	case NetworkZoneDelete:
+		return "Deleting network zone"
+	case NetworkZoneRecordCreate:
+		return "Creating network zone record"
+	case NetworkZoneRecordUpdate:
+		return "Updating network zone record"
+	case NetworkZoneRecordDelete:
+		return "Deleting network zone record"
+	case ReplicatorRun:
+		return "Running replicator"
+	case ReplicatorRunInstanceForward:
+		return "Replicating instance"
+	case ReplicatorRunInstanceRestore:
+		return "Restoring replicated instance"
+	case ProjectReplicaModeUpdate:
+		return "Updating project replica mode"
+	case ReplicatorFinalize:
+		return "Finalizing replicator"
+	case ReplicatorSnapshotInstance:
+		return "Snapshotting instance for replication"
+
+	// It should never be possible to reach the default clause.
+	// See the init function.
 	default:
-		return "Executing operation"
+		return ""
 	}
 }
 
-// Permission returns the entity.Type and auth.Entitlement required to cancel the operation.
-func (t Type) Permission() (entity.Type, auth.Entitlement) {
+// EntityType returns the primary entity.Type that the Type operates on.
+func (t Type) EntityType() entity.Type {
 	switch t {
-	case BackupCreate:
-		return entity.TypeInstance, auth.EntitlementCanManageBackups
-	case BackupRename:
-		return entity.TypeInstance, auth.EntitlementCanManageBackups
-	case BackupRestore:
-		return entity.TypeInstance, auth.EntitlementCanManageBackups
-	case BackupRemove:
-		return entity.TypeInstance, auth.EntitlementCanManageBackups
-	case ConsoleShow:
-		return entity.TypeInstance, auth.EntitlementCanAccessConsole
-	case InstanceFreeze:
-		return entity.TypeInstance, auth.EntitlementCanUpdateState
-	case InstanceUnfreeze:
-		return entity.TypeInstance, auth.EntitlementCanUpdateState
-	case InstanceStart:
-		return entity.TypeInstance, auth.EntitlementCanUpdateState
-	case InstanceStop:
-		return entity.TypeInstance, auth.EntitlementCanUpdateState
-	case InstanceRestart:
-		return entity.TypeInstance, auth.EntitlementCanUpdateState
-	case CommandExec:
-		return entity.TypeInstance, auth.EntitlementCanExec
-	case SnapshotCreate:
-		return entity.TypeInstance, auth.EntitlementCanManageSnapshots
-	case SnapshotRename:
-		return entity.TypeInstance, auth.EntitlementCanManageSnapshots
-	case SnapshotTransfer:
-		return entity.TypeInstance, auth.EntitlementCanManageSnapshots
-	case SnapshotUpdate:
-		return entity.TypeInstance, auth.EntitlementCanManageSnapshots
-	case SnapshotDelete:
-		return entity.TypeInstance, auth.EntitlementCanManageSnapshots
+	// Server level operations and background tasks.
+	case ClusterBootstrap, ClusterJoin, CustomVolumeSnapshotsExpire, ImagesExpire, ImagesPruneLeftover,
+		ImagesSynchronize, RemoveExpiredOIDCSessions, RemoveExpiredTokens, RemoveOrphanedOperations,
+		WarningsPruneResolved, ClusterMemberEvacuate, ClusterMemberRestore, LogsExpire, InstanceTypesUpdate,
+		BackupsExpire, SnapshotsExpire, ClusterJoinToken, CertificateAddToken, RenewServerCertificate,
+		ClusterHeal, ImagesUpdate, VolumeSnapshotsCreateScheduled, SnapshotsCreateScheduled,
+		SynchronizeOperations, RefreshClusterLinkVolatileAddresses,
+		StoragePoolCreate, Wait:
+		return entity.TypeServer
 
-	case InstanceCreate:
-		return entity.TypeInstance, auth.EntitlementCanEdit
-	case InstanceUpdate:
-		return entity.TypeInstance, auth.EntitlementCanEdit
-	case InstanceRename:
-		return entity.TypeInstance, auth.EntitlementCanEdit
-	case InstanceMigrate:
-		return entity.TypeInstance, auth.EntitlementCanEdit
-	case InstanceLiveMigrate:
-		return entity.TypeInstance, auth.EntitlementCanEdit
-	case InstanceDelete:
-		return entity.TypeInstance, auth.EntitlementCanEdit
-	case InstanceRebuild:
-		return entity.TypeInstance, auth.EntitlementCanEdit
-	case SnapshotRestore:
-		return entity.TypeInstance, auth.EntitlementCanEdit
+	// Project level operations.
+	// If creating a resource, then the parent project is the primary entity
+	// (the entity being created is not yet referenceable).
+	case VolumeCreate, ProjectRename, InstanceCreate, ImageDownload, ImageUploadToken, CustomVolumeBackupRestore,
+		InstanceStateUpdateBulk, BackupRestore, ProjectDelete, NetworkCreate, NetworkACLCreate, StorageBucketCreate,
+		NetworkZoneCreate, ProjectReplicaModeUpdate, ReplicatorRunInstanceRestore:
+		return entity.TypeProject
 
-	case ImageDownload:
-		return entity.TypeImage, auth.EntitlementCanEdit
-	case ImageDelete:
-		return entity.TypeImage, auth.EntitlementCanEdit
-	case ImageToken:
-		return entity.TypeImage, auth.EntitlementCanEdit
-	case ImageRefresh:
-		return entity.TypeImage, auth.EntitlementCanEdit
-	case ImagesUpdate:
-		return entity.TypeImage, auth.EntitlementCanEdit
-	case ImagesSynchronize:
-		return entity.TypeImage, auth.EntitlementCanEdit
+	// Storage bucket operations.
+	case StorageBucketUpdate, StorageBucketDelete, StorageBucketKeyCreate, StorageBucketKeyUpdate, StorageBucketKeyDelete:
+		return entity.TypeStorageBucket
 
-	case CustomVolumeSnapshotsExpire:
-		return entity.TypeStorageVolume, auth.EntitlementCanEdit
-	case CustomVolumeBackupCreate:
-		return entity.TypeStorageVolume, auth.EntitlementCanManageBackups
-	case CustomVolumeBackupRemove:
-		return entity.TypeStorageVolume, auth.EntitlementCanManageBackups
-	case CustomVolumeBackupRename:
-		return entity.TypeStorageVolume, auth.EntitlementCanManageBackups
-	case CustomVolumeBackupRestore:
-		return entity.TypeStorageVolume, auth.EntitlementCanEdit
+	// Volume operations.
+	case VolumeMigrate, VolumeMove, VolumeSnapshotCreate, CustomVolumeBackupCreate, VolumeCopy, VolumeUpdate, VolumeDelete:
+		return entity.TypeStorageVolume
+
+	// Volume snapshot operations
+	case VolumeSnapshotRename, VolumeSnapshotUpdate, VolumeSnapshotDelete, VolumeSnapshotTransfer, VolumeSnapshotCopy:
+		return entity.TypeStorageVolumeSnapshot
+
+	// Instance operations.
+	case BackupCreate, ConsoleShow, InstanceFreeze, InstanceUpdate, InstanceUnfreeze,
+		InstanceStart, InstanceStop, InstanceRestart, InstanceRename, InstanceMigrate, InstanceLiveMigrate,
+		InstanceDelete, InstanceRebuild, SnapshotRestore, CommandExec, SnapshotCreate, InstanceCopy,
+		ReplicatorRunInstanceForward, ReplicatorSnapshotInstance:
+		return entity.TypeInstance
+
+	// Instance backup operations.
+	case BackupRename, BackupRemove:
+		return entity.TypeInstanceBackup
+
+	// Instance snapshot operations.
+	case SnapshotRename, SnapshotTransfer, SnapshotUpdate, SnapshotDelete, SnapshotCopy:
+		return entity.TypeInstanceSnapshot
+
+	// Image operations.
+	case ImageDelete, ImageRefresh, ImageDownloadToken, ImageUpload:
+		return entity.TypeImage
+
+	// Volume backup operations.
+	case CustomVolumeBackupRemove, CustomVolumeBackupRename:
+		return entity.TypeStorageVolumeBackup
+
+	// Storage pool operations.
+	case StoragePoolUpdate, StoragePoolDelete:
+		return entity.TypeStoragePool
+
+	// Profile operations.
+	case ProfileUpdate:
+		return entity.TypeProfile
+
+	// Network operations.
+	case NetworkUpdate, NetworkDelete, NetworkRename:
+		return entity.TypeNetwork
+
+	// Network ACL operations.
+	case NetworkACLUpdate, NetworkACLDelete, NetworkACLRename:
+		return entity.TypeNetworkACL
+
+	// Network load balancer operations.
+	case NetworkLoadBalancerCreate, NetworkLoadBalancerUpdate, NetworkLoadBalancerDelete, NetworkLoadBalancerPoolCreate, NetworkLoadBalancerPoolUpdate, NetworkLoadBalancerPoolDelete:
+		return entity.TypeNetwork
+
+	// Network forward operations.
+	case NetworkForwardCreate, NetworkForwardUpdate, NetworkForwardDelete:
+		return entity.TypeNetwork
+
+	// Network peer operations.
+	case NetworkPeerCreate, NetworkPeerUpdate, NetworkPeerDelete:
+		return entity.TypeNetwork
+
+	// Network zone operations.
+	case NetworkZoneUpdate, NetworkZoneDelete, NetworkZoneRecordCreate, NetworkZoneRecordUpdate, NetworkZoneRecordDelete:
+		return entity.TypeNetworkZone
+	// Replicator operations.
+	case ReplicatorRun, ReplicatorFinalize:
+		return entity.TypeReplicator
+
+	// It should never be possible to reach the default clause.
+	// See the init function.
+	default:
+		return ""
+	}
+}
+
+// IsBulk returns true if the operation type can have child operations, and false otherwise.
+func (t Type) IsBulk() bool {
+	switch t {
+	case InstanceStateUpdateBulk, ReplicatorRun:
+		return true
+	default:
+		return false
+	}
+}
+
+// ConflictAction returns the action to take if a conflicting operation is already running.
+type ConflictAction int
+
+const (
+	// ConflictActionNone means operation has no conflicts, all operations of this type can run concurrently.
+	ConflictActionNone ConflictAction = iota
+	// ConflictActionFail asks to resolve conflicts by failing to create a new operation if a conflicting operation is already running.
+	ConflictActionFail
+)
+
+// ConflictAction returns the action to take if a conflicting operation is already running.
+func (t Type) ConflictAction() ConflictAction {
+	switch t {
+	case Wait:
+		return ConflictActionFail
+	case ClusterMemberEvacuate:
+		return ConflictActionFail // Enforces cluster-wide evacuation exclusivity when used with a shared ConflictReference; this prevents evacuation race conditions.
+	case ReplicatorRun:
+		return ConflictActionFail // Prevents concurrent runs of the same replicator; the replicator URL is used as the per-replicator conflict reference.
 	}
 
-	return "", ""
+	return ConflictActionNone
+}
+
+// MustRun returns true if operations with this type must run regardless of previous stage failures.
+func (t Type) MustRun() bool {
+	switch t {
+	case ReplicatorFinalize:
+		// Replicator finalization must always run so that it updates the last run status of the replicator.
+		return true
+	case ReplicatorRunInstanceForward:
+		// Replicator instance forward replication must always run, even if a snapshot has failed.
+		// This is so that instance refreshes still occur for instances whose snapshot succeeded.
+		// The operation run hook is responsible for checking that the snapshot stage for the same instance has succeeded.
+		return true
+	default:
+		return false
+	}
 }

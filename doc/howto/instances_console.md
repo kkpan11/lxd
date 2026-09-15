@@ -1,5 +1,5 @@
 ---
-discourse: 9223
+discourse: lxc:[GUI&#32;in&#32;Virtual&#32;Machines/VMs](9223)
 ---
 
 (instances-console)=
@@ -23,7 +23,7 @@ To show new log messages (only for containers), pass the `--show-log` flag:
 You can also immediately attach to the console when you start your instance:
 
     lxc start <instance_name> --console
-    lxc start <instance_name> --console=vga
+    lxc start <instance_name> --console=vga # VM only
 
 ```{tip}
 To exit the console, enter {kbd}`Ctrl`+{kbd}`a` {kbd}`q`.
@@ -86,6 +86,7 @@ Navigate to the instance detail page and switch to the {guilabel}`Console` tab t
 ## Access the graphical console (for virtual machines)
 
 ```{youtube} https://www.youtube.com/watch?v=pEUsTMiq4B4
+:title: Arch Linux and Ubuntu Desktop in LXD VMs
 ```
 
 On virtual machines, log on to the console to get graphical output.
@@ -96,7 +97,7 @@ This means that you can access the VM through the console before the `lxd-agent`
 
 ````{tabs}
 ```{group-tab} CLI
-To start the VGA console with graphical output for your VM, you must install a SPICE client (for example, `virt-viewer` or `spice-gtk-client`).
+To start the VGA console with graphical output for your VM, you must install a SPICE client (for example, `virt-viewer` or `spice-client-gtk`).
 Then enter the following command:
 
     lxc console <vm_name> --type vga

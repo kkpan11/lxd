@@ -4,10 +4,11 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 
-	"github.com/canonical/go-dqlite/client"
+	"github.com/canonical/go-dqlite/v3/client"
 
 	"github.com/canonical/lxd/lxd/db/query"
 	"github.com/canonical/lxd/shared/api"
@@ -27,9 +28,9 @@ type RaftRole = client.NodeRole
 
 // RaftNode roles.
 const (
-	RaftVoter   = client.Voter
-	RaftStandBy = client.StandBy
-	RaftSpare   = client.Spare
+	RaftVoter   = client.Voter   // Replicate log, participates in quorum
+	RaftStandBy = client.StandBy // Replicate log, does not participate in quorum
+	RaftSpare   = client.Spare   // Does not replicate log, does not participate in quorum
 )
 
 // GetRaftNodes returns information about all LXD nodes that are members of the
@@ -51,7 +52,7 @@ func (n *NodeTx) GetRaftNodes(ctx context.Context) ([]RaftNode, error) {
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch raft nodes: %w", err)
+		return nil, fmt.Errorf("Failed fetching raft nodes: %w", err)
 	}
 
 	return nodes, nil
@@ -81,7 +82,7 @@ func (n *NodeTx) GetRaftNodeAddress(ctx context.Context, id int64) (string, erro
 	default:
 		// This should never happen since we have a UNIQUE constraint
 		// on the raft_nodes.id column.
-		return "", fmt.Errorf("more than one match found")
+		return "", errors.New("more than one match found")
 	}
 }
 
@@ -99,7 +100,7 @@ func (n *NodeTx) CreateFirstRaftNode(address string, name string) error {
 	}
 
 	if id != 1 {
-		return fmt.Errorf("could not set raft node ID to 1")
+		return errors.New("could not set raft node ID to 1")
 	}
 
 	return nil

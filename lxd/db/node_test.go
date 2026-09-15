@@ -232,7 +232,7 @@ func TestNodeIsEmpty_Instances(t *testing.T) {
 
 	message, err := tx.NodeIsEmpty(context.Background(), id)
 	require.NoError(t, err)
-	assert.Equal(t, "", message)
+	assert.Empty(t, message)
 
 	_, err = tx.Tx().Exec(`
 INSERT INTO instances (id, node_id, name, architecture, type, project_id, description) VALUES (1, ?, 'foo', 1, 1, 1, '')
@@ -248,7 +248,7 @@ INSERT INTO instances (id, node_id, name, architecture, type, project_id, descri
 
 	message, err = tx.NodeIsEmpty(context.Background(), id)
 	require.NoError(t, err)
-	assert.Equal(t, "", message)
+	assert.Empty(t, message)
 }
 
 // A node is considered empty only if it has no images that are available only
@@ -280,7 +280,7 @@ INSERT INTO images_nodes(image_id, node_id) VALUES(1, 1)`)
 
 	message, err = tx.NodeIsEmpty(context.Background(), id)
 	require.NoError(t, err)
-	assert.Equal(t, "", message)
+	assert.Empty(t, message)
 }
 
 // A node is considered empty only if it has no custom volumes on it.
@@ -374,8 +374,8 @@ func TestGetNodeWithLeastInstances_Pending(t *testing.T) {
 
 	// Add a pending instance to the default node (ID 1)
 	_, err = tx.Tx().Exec(`
-INSERT INTO operations (id, uuid, node_id, type, project_id) VALUES (1, 'abc', 1, ?, 1)
-`, operationtype.InstanceCreate)
+INSERT INTO operations (id, uuid, node_id, type, project_id, class, metadata, inputs, error, conflict_reference, status_code) VALUES (1, 'abc', 1, ?, 1, 1, '', '', '', '', ?)
+`, operationtype.InstanceCreate, api.Running)
 	require.NoError(t, err)
 
 	allMembers, err := tx.GetNodes(context.Background())

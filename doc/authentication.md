@@ -1,6 +1,6 @@
 ---
-discourse: 13114,15142
-relatedlinks: https://www.youtube.com/watch?v=6O0q3rSWr8A
+discourse: lxc:[Token&#32;based&#32;remote&#32;connection](13114),lxc:[ACME&#32;support&#32;for&#32;server&#32;certificate](15142)
+relatedlinks: "[LXD&#32;for&#32;multi-user&#32;systems&#32;-&#32;YouTube](https://www.youtube.com/watch?v=6O0q3rSWr8A)"
 ---
 
 (authentication)=
@@ -14,11 +14,13 @@ The following authentication methods are supported:
 
 - {ref}`authentication-tls-certs`
 - {ref}`authentication-openid`
+- {ref}`authentication-bearer`
 
 (authentication-tls-certs)=
 ## TLS client certificates
 
 ```{youtube} https://www.youtube.com/watch?v=4iNpiL-lrXU
+:title: LXD token based remote authentication
 ```
 
 When using {abbr}`TLS (Transport Layer Security)` client certificates for authentication, both the client and the server will generate a key pair the first time they're launched.
@@ -31,9 +33,7 @@ On the next connection, a new certificate is generated.
 ### Communication protocol
 
 The supported protocol must be TLS 1.3 or better.
-
-It's possible to force LXD to accept TLS 1.2 by setting the `LXD_INSECURE_TLS` environment variable on both client and server.
-However this isn't a supported setup and should only ever be used when forced to use an outdated corporate proxy.
+LXD uses the [Go TLS stack](https://pkg.go.dev/crypto/tls) as the TLS implementation.
 
 All communications must use perfect forward secrecy, and ciphers must be limited to strong elliptic curve ones (such as ECDHE-RSA or ECDHE-ECDSA).
 
@@ -46,13 +46,6 @@ any backward compatibility to broken protocol or ciphers.
 (authentication-trusted-clients)=
 ### Trusted TLS clients
 
-You can obtain the list of TLS certificates trusted by a LXD server with [`lxc config trust list`](lxc_config_trust_list.md).
-
-Trusted clients can be added in either of the following ways:
-
-- {ref}`authentication-add-certs`
-- {ref}`authentication-token`
-
 The workflow to authenticate with the server is similar to that of SSH, where an initial connection to an unknown server triggers a prompt:
 
 1. When the user adds a server with [`lxc remote add`](lxc_remote_add.md), the server is contacted over HTTPS, its certificate is downloaded and the fingerprint is shown to the user.
@@ -64,44 +57,7 @@ The workflow to authenticate with the server is similar to that of SSH, where an
      If the provided token matches, the client certificate is added to the server's trust store and the connection is granted.
      Otherwise, the connection is rejected.
 
-To revoke trust to a client, remove its certificate from the server with [`lxc config trust remove <fingerprint>`](lxc_config_trust_remove.md).
-
-TLS clients can be restricted to a subset of projects, see {ref}`restricted-tls-certs` for more information.
-
-(authentication-add-certs)=
-#### Adding trusted certificates to the server
-
-The preferred way to add trusted clients is to directly add their certificates to the trust store on the server.
-To do so, copy the client certificate to the server and register it using [`lxc config trust add <file>`](lxc_config_trust_add.md).
-
-(authentication-token)=
-#### Adding client certificates using tokens
-
-You can also add new clients by using tokens. These tokens expire after a configurable time ({config:option}`server-core:core.remote_token_expiry`) or once they've been used.
-
-To use this method, generate a token for each client by calling [`lxc config trust add`](lxc_config_trust_add.md), which will prompt for the client name.
-The clients can then add their certificates to the server's trust store by providing the generated token.
-
-<!-- Include start NAT authentication -->
-
-```{note}
-If your LXD server is behind NAT, you must specify its external public address when adding it as a remote for a client:
-
-    lxc remote add <name> <IP_address>
-
-When you are prompted for the token, specify the generated token from the previous step.
-Alternatively, use the `--token` flag:
-
-    lxc remote add <name> <IP_address> --token <token>
-
-When generating the token on the server, LXD includes a list of IP addresses that the client can use to access the server.
-However, if the server is behind NAT, these addresses might be local addresses that the client cannot connect to.
-In this case, you must specify the external address manually.
-```
-
-<!-- Include end NAT authentication -->
-
-Alternatively, the clients can provide the token directly when adding the remote: [`lxc remote add <name> <token>`](lxc_remote_add.md).
+See {ref}`server-expose` and {ref}`server-authenticate` for instructions on how to configure TLS authentication and add trusted clients.
 
 (authentication-pki)=
 ### Using a PKI system
@@ -164,6 +120,7 @@ You must still add them to the server in one of the ways described in {ref}`auth
 To automatically trust CA-signed client certificates, set the {config:option}`server-core:core.trust_ca_certificates` server configuration to true.
 When `core.trust_ca_certificates` is enabled, any new clients with a CA-signed certificate will have full access to LXD.
 
+(authentication-revoke-certificates)=
 #### Revoking certificates
 
 To revoke certificates via the PKI, place a certificate revocation list in the server's configuration directory as `ca.crl` and restart the LXD daemon.
@@ -175,9 +132,12 @@ A client with a CA-signed certificate that has been revoked, and is present in `
 LXD supports using [OpenID Connect](https://openid.net/developers/how-connect-works/) to authenticate users through an {abbr}`OIDC (OpenID Connect)` Identity Provider.
 
 To configure LXD to use OIDC authentication, set the [`oidc.*`](server-options-oidc) server configuration options.
-Your OIDC provider must be configured to enable the [Device Authorization Grant](https://oauth.net/2/device-flow/) type.
+See the {ref}`how-to guides <howto-oidc>` for more information.
 
-To add a remote pointing to a LXD server configured with OIDC authentication, run [`lxc remote add <remote_name> <remote_address>`](lxc_remote_add.md).
+Once configured, the LXD UI will display a {guilabel}`Log in with SSO` button which will redirect you to the Identity Provider to log in.
+
+To use OIDC authentication in the LXD CLI, run [`lxc remote add <remote_name> <remote_address>`](lxc_remote_add.md).
+This defaults to OIDC authentication if configured on the remote server.
 You are then prompted to authenticate through your web browser, where you must confirm that the device code displayed in the browser matches the device code that is displayed in the terminal window.
 The LXD client then retrieves and stores an access token, which it provides to LXD for all interactions.
 The identity provider might also provide a refresh token.
@@ -198,85 +158,152 @@ To enable this feature, set the following server configuration:
 - {config:option}`server-acme:acme.agree_tos`: Must be set to `true` to agree to the ACME service's terms of service.
 - {config:option}`server-acme:acme.ca_url`: The directory URL of the ACME service. By default, LXD uses "Let's Encrypt".
 
-For this feature to work, LXD must be reachable from port 80.
-This can be achieved by using a reverse proxy such as [HAProxy](http://www.haproxy.org/).
+LXD currently only supports the [`HTTP-01 challenge`](https://letsencrypt.org/docs/challenge-types/#http-01-challenge), which requires handling incoming HTTP requests on port 80.
+This can be achieved by using a reverse proxy such as [HAProxy](https://www.haproxy.org/).
 
-Here's a minimal HAProxy configuration that uses `lxd.example.net` as the domain.
+The HAProxy configuration example below uses `lxd.example.net` as the domain.
 After the certificate has been issued, LXD will be reachable from `https://lxd.example.net/`.
+It applies filtering to minimize the amount of undesired traffic coming from the internet reaching the protected LXD cluster.
 
 ```
-# Global configuration
+# HAProxy
 global
   log /dev/log local0
+  log /dev/log local1 notice
   chroot /var/lib/haproxy
   stats socket /run/haproxy/admin.sock mode 660 level admin
   stats timeout 30s
   user haproxy
   group haproxy
   daemon
-  ssl-default-bind-options ssl-min-ver TLSv1.2
-  tune.ssl.default-dh-param 2048
   maxconn 100000
 
-# Default settings
 defaults
   mode tcp
+  log global
+  option tcplog
+  option dontlognull
   timeout connect 5s
   timeout client 30s
   timeout client-fin 30s
-  timeout server 120s
-  timeout tunnel 6h
+  timeout server 30s
+  timeout tunnel 300s
   timeout http-request 5s
+  timeout check 5s
   maxconn 80000
 
-# Default backend - Return HTTP 301 (TLS upgrade)
-backend http-301
+# Frontend for HTTP traffic - HTTP mode for ACME challenges redirection
+frontend http_frontend
+  bind *:80
   mode http
+  option httplog
+
+  # ACME challenges are very low traffic even with MPIC
+  # (Multi-Perspective Issuance Corroboration) validation.
+  maxconn 32
+
+  # Only redirect ACME challenges for known hosts to HTTPS
+  http-request deny unless { hdr(host) lxd.example.com }
+  http-request deny unless { path_beg /.well-known/acme-challenge/ }
   redirect scheme https code 301
 
-# Default backend - Return HTTP 403
-backend http-403
-  mode http
-  http-request deny deny_status 403
+# Frontend for HTTPS traffic - TCP mode with SNI inspection
+frontend https_frontend
+  bind *:443
 
-# HTTP dispatcher
-frontend http-dispatcher
-  bind :80
-  mode http
-
-  # Backend selection
+  # TCP request inspection for SNI and client filtering
   tcp-request inspect-delay 5s
 
-  # Dispatch
-  default_backend http-403
-  use_backend http-301 if { hdr(host) -i lxd.example.net }
+  # Extract SNI from TLS handshake
+  tcp-request content capture req.ssl_sni len 64
 
-# SNI dispatcher
-frontend sni-dispatcher
-  bind :443
-  mode tcp
-
-  # Backend selection
-  tcp-request inspect-delay 5s
-
-  # require TLS
+  # Reject unwanted traffic
+  # non-TLS
   tcp-request content reject unless { req.ssl_hello_type 1 }
 
-  # Dispatch
-  default_backend http-403
-  use_backend lxd-nodes if { req.ssl_sni -i lxd.example.net }
+  # for unknown SNI hosts
+  tcp-request content reject unless { req.ssl_sni lxd.example.com }
 
-# LXD nodes
-backend lxd-nodes
-  mode tcp
+  # using too old TLS version
+  # TLS 1.3 (SSL version 3.4) but it is hard to distinguish TLS 1.2
+  # from 1.3 as TLS 1.3 tries to masquerade as a resumed TLS 1.2
+  # connection to work around broken middleboxes. Reject anything
+  # older than TLS 1.2.
+  # See https://datatracker.ietf.org/doc/html/rfc8446#appendix-D.4
+  tcp-request content reject if { req.ssl_ver lt 3.3 }
 
+  # Rate limiting for LXD traffic (that passed above checks)
+  stick-table type ip size 100k expire 30s store conn_rate(10s)
+  tcp-request content track-sc0 src
+  tcp-request content reject if { sc_conn_rate(0) gt 50 }
+
+  # Route to backend
+  default_backend lxd_cluster_tcp
+
+# Additional frontend for LXD management on different port (optional)
+frontend lxd_management
+  bind *:8443
+
+  # Network restrictions (only allow trusted networks)
+  tcp-request connection reject unless { src 192.0.2.0/24 }
+
+  # Route to backend
+  default_backend lxd_cluster_tcp
+
+# Backend for LXD cluster (TCP mode with TLS passthrough)
+backend lxd_cluster_tcp
+  balance roundrobin
+
+  # Sticky sessions based on TLS session ID (extracted from handshake)
+  stick-table type binary len 32 size 30k expire 30m
+  acl clienthello req_ssl_hello_type 1
+  acl serverhello rep_ssl_hello_type 2
+  # use tcp content accepts to detects ssl client and server hello.
+  tcp-request inspect-delay 5s
+  tcp-request content accept if clienthello
+  # no timeout on response inspect delay by default.
+  tcp-response content accept if serverhello
+  # SSL session ID (SSLID) may be present on a client or server hello.
+  # Its length is coded on 1 byte at offset 43 and its value starts
+  # at offset 44.
+  # Match and learn on request if client hello.
+  stick on payload_lv(43,1) if clienthello
+  # Learn on response if server hello.
+  stick store-response payload_lv(43,1) if serverhello
+
+  # Health checks using simple TCP connect
   option tcp-check
 
-  # Multiple servers should be listed when running a cluster
-  server lxd-node01 1.2.3.4:8443 check
-  server lxd-node02 1.2.3.5:8443 check
-  server lxd-node03 1.2.3.6:8443 check
+  # Failed connections will be redispatched to another cluster member
+  option redispatch
+
+  # LXD cluster members with PROXY protocol and core.https_trusted_proxy
+  server lxd-1 1.2.3.4:8443 check send-proxy
+  server lxd-2 1.2.3.5:8443 check send-proxy
+  server lxd-3 1.2.3.6:8443 check send-proxy
+# EOF
 ```
+
+(authentication-bearer)=
+## Bearer token authentication
+
+LXD supports authenticating to the LXD API using bearer tokens. Bearer tokens provide a secure way to authenticate API requests without requiring {ref}`client certificates <authentication-trusted-clients>` or {ref}`OpenID Connect configuration <authentication-openid>`.
+
+Bearer tokens can be issued for identities of type `bearer`. The permissions associated with a token are derived from the identity it belongs to and are enforced through {ref}`fine-grained-authorization`.
+
+A bearer identity is created in a pending state, with the type `Client token bearer (pending)` or `DevLXD token bearer (pending)`.
+Issuing a bearer token activates the identity and its type changes to `Client token bearer` or `DevLXD token bearer`, respectively.
+Revoking the token removes it and returns the identity to the pending state.
+An expired token remains associated with the identity.
+Therefore, the identity remains active, even though its token can no longer be used for authentication.
+
+To authenticate an API request using a bearer token, include it in the `Authorization` header
+as `Authorization: Bearer <token>`, where `<token>` represents an actual token value.
+
+By default, bearer tokens expire after 10 years, unless they are manually revoked.
+The expiration time can be customized when issuing the token.
+
+See {ref}`howto-auth-bearer` to learn how to issue and use bearer token in LXD.
 
 ## Failure scenarios
 
@@ -302,6 +329,10 @@ In this case, the server still uses the same certificate, but all API calls retu
 
 ## Related topics
 
+How-to guides:
+
+- {ref}`howto-security-harden`
+- {ref}`server-expose`
+
 {{security_exp}}
 
-{{security_how}}

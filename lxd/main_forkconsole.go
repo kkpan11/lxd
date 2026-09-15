@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -14,6 +15,7 @@ type cmdForkconsole struct {
 	global *cmdGlobal
 }
 
+// Command setup the console.
 func (c *cmdForkconsole) Command() *cobra.Command {
 	// Main subcommand
 	cmd := &cobra.Command{}
@@ -30,6 +32,7 @@ func (c *cmdForkconsole) Command() *cobra.Command {
 	return cmd
 }
 
+// Run executes the fork console command.
 func (c *cmdForkconsole) Run(cmd *cobra.Command, args []string) error {
 	// Quick checks.
 	if len(args) != 5 {
@@ -39,12 +42,12 @@ func (c *cmdForkconsole) Run(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 
-		return fmt.Errorf("Missing required arguments")
+		return errors.New("Missing required arguments")
 	}
 
 	// Only root should run this
 	if os.Geteuid() != 0 {
-		return fmt.Errorf("This must be run as root")
+		return errors.New("This must be run as root")
 	}
 
 	name := args[0]
@@ -54,13 +57,13 @@ func (c *cmdForkconsole) Run(cmd *cobra.Command, args []string) error {
 	ttyNum := strings.TrimPrefix(args[3], "tty=")
 	tty, err := strconv.Atoi(ttyNum)
 	if err != nil {
-		return fmt.Errorf("Failed to retrieve tty number: %q", err)
+		return fmt.Errorf("Failed retrieving tty number: %q", err)
 	}
 
 	escapeNum := strings.TrimPrefix(args[4], "escape=")
-	escape, err := strconv.Atoi(escapeNum)
+	escape, err := strconv.ParseInt(escapeNum, 10, 32)
 	if err != nil {
-		return fmt.Errorf("Failed to retrieve escape character: %q", err)
+		return fmt.Errorf("Failed retrieving escape character: %q", err)
 	}
 
 	d, err := liblxc.NewContainer(name, lxcpath)

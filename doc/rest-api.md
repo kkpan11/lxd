@@ -1,6 +1,8 @@
+(rest-api)=
 # REST API
 
 ```{youtube} https://www.youtube.com/watch?v=YvGbvspXObI
+:title: LXD REST API
 ```
 
 All communication between LXD and its clients happens using a RESTful API over HTTP.
@@ -165,7 +167,7 @@ The default value is 0 which means that collection member URLs are
 returned. Setting it to 1 will have those URLs be replaced by the object
 they point to (typically another JSON object).
 
-Recursion is implemented by simply replacing any pointer to an job (URL)
+Recursion is implemented by simply replacing any pointer to a job (URL)
 by the object itself.
 
 (rest-api-filtering)=
@@ -218,33 +220,27 @@ It's recommended that the client always subscribes to the operations
 notification type before triggering remote operations so that it doesn't
 have to then poll for their status.
 
+(rest-api-put-vs-patch)=
 ## PUT vs PATCH
 
-The LXD API supports both PUT and PATCH to modify existing objects.
+The LXD API supports both PUT and PATCH to modify existing objects:
 
-PUT replaces the entire object with a new definition, it's typically
-called after the current object state was retrieved through GET.
+(rest-api-put)=
+### The PUT method
 
-To avoid race conditions, the ETag header should be read from the GET
-response and sent as If-Match for the PUT request. This will cause LXD
-to fail the request if the object was modified between GET and PUT.
+PUT *replaces* the entire object with a new definition. Since it overwrites the existing state, it's often called after retrieving and recording the current object state through GET.
 
-PATCH can be used to modify a single field inside an object by only
-specifying the property that you want to change. To unset a key, setting
-it to empty will usually do the trick, but there are cases where PATCH
-won't work and PUT needs to be used instead.
+To avoid race conditions, the ETag header should be read from the GET response and sent as If-Match for the PUT request. This will cause LXD to fail the request if the object was modified between GET and PUT.
 
-## Instances, containers and virtual-machines
+(rest-api-patch)=
+### The PATCH method
 
-The documentation shows paths such as `/1.0/instances/...`, which were introduced with LXD 3.19.
-Older releases that supported only containers and not virtual machines supply the exact same API at `/1.0/containers/...`.
+PATCH can be used to modify a single field inside an object by only specifying the property that you want to change. To unset a key, setting it to empty will usually do the trick, but there are cases where PATCH won't work and PUT needs to be used instead.
 
-For backward compatibility reasons, LXD does still expose and support
-that `/1.0/containers` API, though for the sake of brevity, we decided
-not to double-document everything.
+## Instances
 
-An additional endpoint at `/1.0/virtual-machines` is also present and
-much like `/1.0/containers` will only show you instances of that type.
+The documentation shows paths such as `/1.0/instances/...`, which is the canonical API path since LXD 3.19.
+To filter by instance type, use the `instance-type` query parameter (e.g. `/1.0/instances?instance-type=container` or `/1.0/instances?instance-type=virtual-machine`).
 
 ## API structure
 

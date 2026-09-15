@@ -1,22 +1,46 @@
-test_container_devices_gpu() {
-  ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
+gpu_get_first_card() {
+  gpuCardDev="$(find /dev/dri -maxdepth 1 -name 'card*' 2>/dev/null | sort | head -n1)"
+  [ -n "${gpuCardDev}" ] || return 1
 
-  if [ ! -c /dev/dri/card0 ]; then
-    echo "==> SKIP: No /dev/dri/card0 device found"
-    return
+  gpuCardName="$(basename "${gpuCardDev}")"
+  gpuCardIndex="${gpuCardName#card}"
+  if ! echo "${gpuCardIndex}" | grep -Eq '^[0-9]+$'; then
+    return 1
   fi
 
-  ctName="ct$$"
-  lxc launch testimage "${ctName}"
+  echo "${gpuCardName}"
+}
 
-  # Check adding all cards creates the correct device mounts and cleans up on removal.
+gpu_run_basic_validation() {
+  echo "==> Running basic GPU device validation tests"
+  local ctName="$1"
+
+  lxc init --empty "${ctName}"
+  ! lxc config device add "${ctName}" gpu-basic gpu id=foo || false
+  ! lxc config device add "${ctName}" gpu-basic gpu id=foo.com/gpu=0 || false
+
+  lxc config device add "${ctName}" gpu-basic gpu id=nvidia.com/gpu=0
+  lxc config device remove "${ctName}" gpu-basic
+
+  lxc config device add "${ctName}" gpu-basic gpu id=amd.com/gpu=0
+  lxc config device remove "${ctName}" gpu-basic
+
+  lxc delete "${ctName}"
+}
+
+gpu_run_generic_tests() {
+  echo "==> Running generic GPU device tests"
+  local ctName="$1"
+  local gpuCardName="$2"
+  local gpuCardIndex="$3"
+
+  # Check adding a card creates the correct device mounts and cleans up on removal.
   startMountCount=$(lxc exec "${ctName}" -- mount | wc -l)
   startDevCount=$(find "${LXD_DIR}"/devices/"${ctName}" -type c | wc -l)
-  lxc config device add "${ctName}" gpu-basic gpu mode=0600 id=0
-  lxc exec "${ctName}" -- mount | grep "/dev/dri/card0"
-  lxc exec "${ctName}" -- stat -c '%a' /dev/dri/card0 | grep 600
-  stat -c '%a' "${LXD_DIR}"/devices/"${ctName}"/unix.gpu--basic.dev-dri-card0 | grep 600
+  lxc config device add "${ctName}" gpu-basic gpu mode=0600 id="${gpuCardIndex}"
+  lxc exec "${ctName}" -- mount | grep -wF "/dev/dri/${gpuCardName}"
+  [ "$(lxc exec "${ctName}" -- stat -c '%a' /dev/dri/"${gpuCardName}")" = "600" ]
+  [ "$(stat -c '%a' "${LXD_DIR}"/devices/"${ctName}"/unix.gpu--basic.dev-dri-"${gpuCardName}")" = "600" ]
   lxc config device remove "${ctName}" gpu-basic
   endMountCount=$(lxc exec "${ctName}" -- mount | wc -l)
   endDevCount=$(find "${LXD_DIR}"/devices/"${ctName}" -type c | wc -l)
@@ -32,56 +56,160 @@ test_container_devices_gpu() {
   fi
 
   # Check adding non-existent card fails.
-  ! lxc config device add "${ctName}" gpu-missing gpu id=9999
+  ! lxc config device add "${ctName}" gpu-missing gpu id=9999 || false
 
   # Check default create mode is 0660.
   lxc config device add "${ctName}" gpu-default gpu
-  lxc exec "${ctName}" -- stat -c '%a' /dev/dri/card0 | grep 660
+  [ "$(lxc exec "${ctName}" -- stat -c '%a' /dev/dri/"${gpuCardName}")" = "660" ]
   lxc config device remove "${ctName}" gpu-default
+}
+
+gpu_verify_nvidia_mounts() {
+  local ctName="$1"
+
+  lxc exec "${ctName}" -- mount | grep -E '/dev/dri/card[0-9]+'
+  lxc exec "${ctName}" -- mount | grep -wF /dev/nvidia0
+  lxc exec "${ctName}" -- mount | grep -wF /dev/nvidia-modeset
+  lxc exec "${ctName}" -- mount | grep -wF /dev/nvidia-uvm
+  lxc exec "${ctName}" -- mount | grep -wF /dev/nvidia-uvm-tools
+  lxc exec "${ctName}" -- mount | grep -wF /dev/nvidiactl
+
+  # Verify ldconfig configuration exists
+  lxc exec "${ctName}" -- test -f /etc/ld.so.conf.d/00-lxdcdi.conf
+
+  # Verify the CDI library paths are in the config
+  lxc exec "${ctName}" -- grep -q "/usr/lib" /etc/ld.so.conf.d/00-lxdcdi.conf
+
+  # Verify key NVIDIA libraries are accessible (mounted via CDI)
+  lxc exec "${ctName}" -- test -f /usr/lib/x86_64-linux-gnu/libcuda.so.1 || \
+    lxc exec "${ctName}" -- test -f /usr/lib64/libcuda.so.1 || \
+    lxc exec "${ctName}" -- test -f /usr/lib/libcuda.so.1
+}
+
+gpu_run_nvidia_tests() {
+  echo "==> Running NVIDIA GPU device tests"
+  local ctName="$1"
+  local gpuCardName="$2"
 
   # Check if nvidia GPU exists.
   if [ ! -c /dev/nvidia0  ]; then
     echo "==> SKIP: /dev/nvidia0 does not exist, skipping nvidia tests"
-    lxc delete -f "${ctName}"
     return
   fi
 
-  # Check /usr/bin/nvidia-container-cli exists (requires libnvidia-container-tools be installed).
-  if [ ! -f /usr/bin/nvidia-container-cli ]; then
-    echo "==> SKIP: /usr/bin/nvidia-container-cli not available (please install libnvidia-container-tools)"
-    lxc delete -f "${ctName}"
+  # Check nvidia-container-cli exists (requires libnvidia-container-tools be installed).
+  if ! command -v nvidia-container-cli > /dev/null 2>&1; then
+    echo "==> SKIP: nvidia-container-cli not available (please install libnvidia-container-tools)"
     return
   fi
 
-  # Check the Nvidia specific devices are mounted correctly.
-  lxc config device add "${ctName}" gpu-nvidia gpu mode=0600
-
-  lxc exec "${ctName}" -- mount | grep /dev/nvidia0
-  stat -c '%a' "${LXD_DIR}"/devices/"${ctName}"/unix.gpu--nvidia.dev-dri-card0 | grep 600
-
-  lxc exec "${ctName}" -- mount | grep /dev/nvidia-modeset
-  stat -c '%a' "${LXD_DIR}"/devices/"${ctName}"/unix.gpu--nvidia.dev-nvidia--modeset | grep 600
-
-  lxc exec "${ctName}" -- mount | grep /dev/nvidia-uvm
-  stat -c '%a' "${LXD_DIR}"/devices/"${ctName}"/unix.gpu--nvidia.dev-nvidia--uvm | grep 600
-
-  lxc exec "${ctName}" -- mount | grep /dev/nvidia-uvm-tools
-  stat -c '%a' "${LXD_DIR}"/devices/"${ctName}"/unix.gpu--nvidia.dev-nvidia--uvm--tools | grep 600
-
-  lxc exec "${ctName}" -- mount | grep /dev/nvidiactl
-  stat -c '%a' "${LXD_DIR}"/devices/"${ctName}"/unix.gpu--nvidia.dev-nvidiactl | grep 600
-
-  lxc config device remove "${ctName}" gpu-nvidia
-
-  # Check support for nvidia runtime
+  # The instance is stopped.
   lxc stop -f "${ctName}"
-  lxc config set "${ctName}" nvidia.runtime true
+  lxc config device add "${ctName}" gpu-cdi-stopped gpu id=nvidia.com/gpu=0
   lxc start "${ctName}"
-  nvidiaMountCount=$(lxc exec "${ctName}" -- mount | grep -c nvidia)
-  if [ "$nvidiaMountCount" != "16" ]; then
-    echo "nvidia runtime mounts invalid"
-    false
+  gpu_verify_nvidia_mounts "${ctName}"
+  lxc stop -f "${ctName}"
+  lxc config device remove "${ctName}" gpu-cdi-stopped
+  lxc start "${ctName}"
+
+  # The instance is running (hot plugging).
+  lxc config device add "${ctName}" gpu-cdi gpu id=nvidia.com/gpu=0
+  gpu_verify_nvidia_mounts "${ctName}"
+  lxc config device remove "${ctName}" gpu-cdi
+
+  lxc config device add "${ctName}" gpu-cdi-all gpu id=nvidia.com/gpu=all
+  gpu_verify_nvidia_mounts "${ctName}"
+  lxc config device remove "${ctName}" gpu-cdi-all
+
+  # Verify user-supplied uid/gid/mode are honored on NVIDIA CDI GPU devices.
+  lxc config device add "${ctName}" gpu-cdi-perms gpu id=nvidia.com/gpu=0 uid=1000 gid=1000 mode=0640
+  [ "$(lxc exec "${ctName}" -- stat -c '%u %g %a' /dev/nvidia0)" = "1000 1000 640" ]
+  [ "$(lxc exec "${ctName}" -- stat -c '%u %g %a' /dev/nvidiactl)" = "1000 1000 640" ]
+  lxc config device remove "${ctName}" gpu-cdi-perms
+}
+
+gpu_run_amd_tests() {
+  echo "==> Running AMD GPU device tests"
+  local ctName="$1"
+  local amdDeviceName="$2"
+
+  if ! command -v amd-ctk > /dev/null 2>&1; then
+    echo "==> SKIP: amd-ctk not available (please install amd-container-toolkit)"
+    return
   fi
+
+  # Check if AMD GPU exists.
+  if [ ! -c /dev/kfd ]; then
+    echo "==> SKIP: /dev/kfd does not exist, skipping AMD tests"
+    return
+  fi
+
+  hostKfdUid="$(stat -c '%u' /dev/kfd)"
+  hostKfdGid="$(stat -c '%g' /dev/kfd)"
+  hostCardUid="$(stat -c '%u' /dev/dri/"${amdDeviceName}")"
+  hostCardGid="$(stat -c '%g' /dev/dri/"${amdDeviceName}")"
+
+  # The instance is stopped.
+  lxc stop -f "${ctName}"
+  lxc config device add "${ctName}" gpu-amd-stopped gpu id=amd.com/gpu=0
+  lxc start "${ctName}"
+
+  lxc exec "${ctName}" -- mount | grep -wF /dev/kfd
+  lxc exec "${ctName}" -- mount | grep -wF "${amdDeviceName}"
+
+  [ "$(lxc exec "${ctName}" -- stat -c '%u' /dev/kfd)" = "${hostKfdUid}" ]
+  [ "$(lxc exec "${ctName}" -- stat -c '%g' /dev/kfd)" = "${hostKfdGid}" ]
+  [ "$(lxc exec "${ctName}" -- stat -c '%u' /dev/dri/"${amdDeviceName}")" = "${hostCardUid}" ]
+  [ "$(lxc exec "${ctName}" -- stat -c '%g' /dev/dri/"${amdDeviceName}")" = "${hostCardGid}" ]
+
+  lxc stop -f "${ctName}"
+  lxc config device remove "${ctName}" gpu-amd-stopped
+  lxc start "${ctName}"
+
+  # The instance is running (hot plugging).
+  lxc config device add "${ctName}" gpu-amd gpu id=amd.com/gpu=0
+
+  lxc exec "${ctName}" -- mount | grep -wF /dev/kfd
+  lxc exec "${ctName}" -- mount | grep -wF "${amdDeviceName}"
+
+  [ "$(lxc exec "${ctName}" -- stat -c '%u' /dev/kfd)" = "${hostKfdUid}" ]
+  [ "$(lxc exec "${ctName}" -- stat -c '%g' /dev/kfd)" = "${hostKfdGid}" ]
+  [ "$(lxc exec "${ctName}" -- stat -c '%u' /dev/dri/"${amdDeviceName}")" = "${hostCardUid}" ]
+  [ "$(lxc exec "${ctName}" -- stat -c '%g' /dev/dri/"${amdDeviceName}")" = "${hostCardGid}" ]
+
+  lxc config device remove "${ctName}" gpu-amd
+
+  lxc config device add "${ctName}" gpu-amd-all gpu id=amd.com/gpu=all
+
+  lxc exec "${ctName}" -- mount | grep -wF /dev/kfd
+  lxc exec "${ctName}" -- mount | grep -wF "${amdDeviceName}"
+
+  lxc config device remove "${ctName}" gpu-amd-all
+
+  # Verify user-supplied uid/gid/mode are honored on AMD CDI GPU devices.
+  lxc config device add "${ctName}" gpu-amd-perms gpu id=amd.com/gpu=0 uid=2000 gid=2000 mode=0640
+  [ "$(lxc exec "${ctName}" -- stat -c '%u %g %a' /dev/kfd)" = "2000 2000 640" ]
+  [ "$(lxc exec "${ctName}" -- stat -c '%u %g %a' /dev/dri/"${amdDeviceName}")" = "2000 2000 640" ]
+  lxc config device remove "${ctName}" gpu-amd-perms
+}
+
+test_container_devices_gpu() {
+  ctName="ct$$"
+
+  gpu_run_basic_validation "${ctName}"
+
+  gpuCardName="$(gpu_get_first_card)" || {
+    echo "==> SKIP: No /dev/dri/card* device found"
+    return
+  }
+  gpuCardIndex="${gpuCardName#card}"
+
+  ensure_import_testimage
+  lxc launch testimage "${ctName}"
+
+  gpu_run_generic_tests "${ctName}" "${gpuCardName}" "${gpuCardIndex}"
+  gpu_run_nvidia_tests "${ctName}" "${gpuCardName}"
+  gpu_run_amd_tests "${ctName}" "${gpuCardName}"
 
   lxc delete -f "${ctName}"
 }

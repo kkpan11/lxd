@@ -3,17 +3,17 @@ package zone
 import (
 	"context"
 	"fmt"
+	"math"
+	"slices"
 
 	"github.com/miekg/dns"
 
-	"github.com/canonical/lxd/lxd/cluster/request"
 	"github.com/canonical/lxd/lxd/db"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 )
 
 // AddRecord adds a network zone record.
-func (d *zone) AddRecord(req api.NetworkZoneRecordsPost) error {
+func (d *zone) AddRecord(ctx context.Context, req api.NetworkZoneRecordsPost) error {
 	// lxdmeta:generate(entities=network-zone; group=record-properties; key=name)
 	//
 	// ---
@@ -54,7 +54,7 @@ func (d *zone) AddRecord(req api.NetworkZoneRecordsPost) error {
 		return err
 	}
 
-	err = d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err = d.state.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 		// Add the new record.
 		_, err = tx.CreateNetworkZoneRecord(ctx, d.id, req)
 
@@ -68,14 +68,14 @@ func (d *zone) AddRecord(req api.NetworkZoneRecordsPost) error {
 }
 
 // GetRecords fetches the network zone records.
-func (d *zone) GetRecords() ([]api.NetworkZoneRecord, error) {
+func (d *zone) GetRecords(ctx context.Context) ([]api.NetworkZoneRecord, error) {
 	s := d.state
 
 	var names []string
 	records := []api.NetworkZoneRecord{}
 	var record *api.NetworkZoneRecord
 
-	err := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err := s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 		var err error
 
 		// Get the record names.
@@ -104,10 +104,10 @@ func (d *zone) GetRecords() ([]api.NetworkZoneRecord, error) {
 }
 
 // GetRecord fetches the network zone record corresponding to the given name.
-func (d *zone) GetRecord(name string) (*api.NetworkZoneRecord, error) {
+func (d *zone) GetRecord(ctx context.Context, name string) (*api.NetworkZoneRecord, error) {
 	var record *api.NetworkZoneRecord
 
-	err := d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err := d.state.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 		var err error
 
 		// Get the record.
@@ -123,7 +123,7 @@ func (d *zone) GetRecord(name string) (*api.NetworkZoneRecord, error) {
 }
 
 // UpdateRecord updates the network zone record corresponding to the given name.
-func (d *zone) UpdateRecord(name string, req api.NetworkZoneRecordPut, clientType request.ClientType) error {
+func (d *zone) UpdateRecord(ctx context.Context, name string, req api.NetworkZoneRecordPut) error {
 	s := d.state
 
 	// Validate.
@@ -138,7 +138,7 @@ func (d *zone) UpdateRecord(name string, req api.NetworkZoneRecordPut, clientTyp
 		return err
 	}
 
-	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 		// Get the record.
 		id, _, err := tx.GetNetworkZoneRecord(ctx, d.id, name)
 		if err != nil {
@@ -161,10 +161,10 @@ func (d *zone) UpdateRecord(name string, req api.NetworkZoneRecordPut, clientTyp
 }
 
 // DeleteRecord delete the network zone record corresponding to the given name.
-func (d *zone) DeleteRecord(name string) error {
+func (d *zone) DeleteRecord(ctx context.Context, name string) error {
 	s := d.state
 
-	err := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err := s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 		// Get the record.
 		id, _, err := tx.GetNetworkZoneRecord(ctx, d.id, name)
 		if err != nil {
@@ -207,13 +207,21 @@ func (d *zone) validateEntries(info api.NetworkZoneRecordPut) error {
 			entry.TTL = 300
 		}
 
+		// RFC 1035 defines TTL as a 32-bit unsigned integer.  The API field is
+		// uint64, so values above math.MaxUint32 must be rejected explicitly;
+		// miekg/dns parses the TTL with uint32 arithmetic and silently wraps
+		// without returning an error.
+		if entry.TTL > math.MaxUint32 {
+			return fmt.Errorf("TTL value %d exceeds the maximum allowed value of %d", entry.TTL, uint64(math.MaxUint32))
+		}
+
 		_, err := dns.NewRR(fmt.Sprintf("record %d IN %s %s", entry.TTL, entry.Type, entry.Value))
 		if err != nil {
 			return fmt.Errorf("Bad zone record entry: %w", err)
 		}
 
 		entryID := entry.Type + "/" + entry.Value
-		if shared.ValueInSlice(entryID, uniqueEntries) {
+		if slices.Contains(uniqueEntries, entryID) {
 			return fmt.Errorf("Duplicate record for type %q and value %q", entry.Type, entry.Value)
 		}
 

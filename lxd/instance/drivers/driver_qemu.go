@@ -3,6 +3,7 @@ package drivers
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"compress/gzip"
 	"context"
 	"crypto/tls"
@@ -13,12 +14,14 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,20 +34,21 @@ import (
 	"github.com/kballard/go-shellquote"
 	"github.com/mdlayher/vsock"
 	"github.com/pkg/sftp"
+	"go.yaml.in/yaml/v2"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
-	"google.golang.org/protobuf/proto"
-	"gopkg.in/yaml.v2"
 
 	"github.com/canonical/lxd/client"
 	agentAPI "github.com/canonical/lxd/lxd-agent/api"
 	"github.com/canonical/lxd/lxd/apparmor"
+	"github.com/canonical/lxd/lxd/backup/config"
 	"github.com/canonical/lxd/lxd/cgroup"
 	"github.com/canonical/lxd/lxd/db"
 	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/db/warningtype"
 	"github.com/canonical/lxd/lxd/device"
 	deviceConfig "github.com/canonical/lxd/lxd/device/config"
+	"github.com/canonical/lxd/lxd/device/filters"
 	"github.com/canonical/lxd/lxd/device/nictype"
 	"github.com/canonical/lxd/lxd/instance"
 	"github.com/canonical/lxd/lxd/instance/drivers/edk2"
@@ -67,13 +71,13 @@ import (
 	storageDrivers "github.com/canonical/lxd/lxd/storage/drivers"
 	"github.com/canonical/lxd/lxd/storage/filesystem"
 	"github.com/canonical/lxd/lxd/subprocess"
-	pongoTemplate "github.com/canonical/lxd/lxd/template"
 	"github.com/canonical/lxd/lxd/util"
 	lxdvsock "github.com/canonical/lxd/lxd/vsock"
 	"github.com/canonical/lxd/lxd/warnings"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/entity"
+	"github.com/canonical/lxd/shared/ioprogress"
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/osarch"
 	"github.com/canonical/lxd/shared/revert"
@@ -87,11 +91,14 @@ const QEMUDefaultCPUCores = 1
 // QEMUDefaultMemSize is the default memory size for VMs if no limit specified.
 const QEMUDefaultMemSize = "1GiB"
 
+// QEMUDefaultMaxBusPorts is the default number of PCI ports available for VMs.
+const QEMUDefaultMaxBusPorts uint8 = 8
+
 // qemuSerialChardevName is used to communicate state via qmp between Qemu and LXD.
 const qemuSerialChardevName = "qemu_serial-chardev"
 
 // qemuPCIDeviceIDStart is the first PCI slot used for user configurable devices.
-const qemuPCIDeviceIDStart = 4
+const qemuPCIDeviceIDStart uint8 = 4
 
 // qemuDeviceIDPrefix used as part of the name given QEMU devices generated from user added devices.
 const qemuDeviceIDPrefix = "dev-lxd_"
@@ -112,7 +119,13 @@ const qemuMigrationNBDExportName = "lxd_root"
 // 4 are reserved, and the other 4 can be used for any USB device.
 const qemuSparseUSBPorts = 8
 
-var errQemuAgentOffline = fmt.Errorf("LXD VM agent isn't currently running")
+// qemuBusModePersistent is the volatile.bus.mode for persistent bus allocation mode.
+const qemuBusModePersistent = "persistent"
+
+// agentConnectTimeout is the amount of time to wait when connecting to the QEMU agent before timing out.
+const agentConnectTimeout = 3 * time.Second
+
+var errQemuAgentOffline = errors.New("LXD VM agent is not currently running")
 
 type monitorHook func(m *qmp.Monitor) error
 
@@ -187,7 +200,7 @@ func qemuInstantiate(s *state.State, args db.InstanceArgs, expandedDevices devic
 
 // qemuCreate creates a new storage volume record and returns an initialised Instance.
 // Returns a revert fail function that can be used to undo this function if a subsequent step fails.
-func qemuCreate(s *state.State, args db.InstanceArgs, p api.Project) (instance.Instance, revert.Hook, error) {
+func qemuCreate(ctx context.Context, s *state.State, args db.InstanceArgs, p api.Project) (instance.Instance, revert.Hook, error) {
 	revert := revert.New()
 	defer revert.Fail()
 
@@ -244,18 +257,21 @@ func qemuCreate(s *state.State, args db.InstanceArgs, p api.Project) (instance.I
 	// Load the config.
 	err = d.init()
 	if err != nil {
-		return nil, nil, fmt.Errorf("Failed to expand config: %w", err)
+		return nil, nil, fmt.Errorf("Failed expanding config: %w", err)
 	}
 
-	// Validate expanded config (allows mixed instance types for profiles).
-	err = instance.ValidConfig(s.OS, d.expandedConfig, true, instancetype.Any)
-	if err != nil {
-		return nil, nil, fmt.Errorf("Invalid config: %w", err)
-	}
+	// When not a snapshot, perform full validation.
+	if !args.Snapshot {
+		// Validate expanded config (allows mixed instance types for profiles).
+		err = instance.ValidConfig(s.OS, d.expandedConfig, true, instancetype.Any)
+		if err != nil {
+			return nil, nil, fmt.Errorf("Invalid config: %w", err)
+		}
 
-	err = instance.ValidDevices(s, d.project, d.Type(), d.localDevices, d.expandedDevices)
-	if err != nil {
-		return nil, nil, fmt.Errorf("Invalid devices: %w", err)
+		err = instance.ValidDevices(s, d.project, d.Type(), d.localDevices, d.expandedDevices)
+		if err != nil {
+			return nil, nil, fmt.Errorf("Invalid devices: %w", err)
+		}
 	}
 
 	// Retrieve the instance's storage pool.
@@ -265,7 +281,7 @@ func qemuCreate(s *state.State, args db.InstanceArgs, p api.Project) (instance.I
 	}
 
 	if rootDiskDevice["pool"] == "" {
-		return nil, nil, fmt.Errorf("The instance's root device is missing the pool property")
+		return nil, nil, errors.New("The instance's root device is missing the pool property")
 	}
 
 	// Initialize the storage pool.
@@ -279,16 +295,10 @@ func qemuCreate(s *state.State, args db.InstanceArgs, p api.Project) (instance.I
 		return nil, nil, err
 	}
 
-	storagePoolSupported := false
-	for _, supportedType := range d.storagePool.Driver().Info().VolumeTypes {
-		if supportedType == volType {
-			storagePoolSupported = true
-			break
-		}
-	}
+	storagePoolSupported := slices.Contains(d.storagePool.Driver().Info().VolumeTypes, volType)
 
 	if !storagePoolSupported {
-		return nil, nil, fmt.Errorf("Storage pool does not support instance type")
+		return nil, nil, errors.New("Storage pool does not support instance type")
 	}
 
 	if !d.IsSnapshot() {
@@ -308,9 +318,9 @@ func qemuCreate(s *state.State, args db.InstanceArgs, p api.Project) (instance.I
 	}
 
 	if d.isSnapshot {
-		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceSnapshotCreated.Event(d, nil))
+		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceSnapshotCreated.Event(ctx, d, nil))
 	} else {
-		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceCreated.Event(d, map[string]any{
+		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceCreated.Event(ctx, d, map[string]any{
 			"type":         api.InstanceTypeVM,
 			"storage-pool": d.storagePool.Name(),
 			"location":     d.Location(),
@@ -348,12 +358,15 @@ func (d *qemu) getAgentClient() (*http.Client, error) {
 		return nil, err
 	}
 
-	if !monitor.AgenStarted() {
+	if !monitor.AgentStarted() {
 		return nil, errQemuAgentOffline
 	}
 
 	// The connection uses mutual authentication, so use the LXD server's key & cert for client.
-	agentCert, _, clientCert, clientKey, err := d.generateAgentCert()
+	// Read the certificates rather than generating them: the instance is already
+	// running, so they exist, and generating here would write into a possibly
+	// unmounted instance directory (see readAgentCert).
+	agentCert, clientCert, clientKey, err := d.readAgentCert()
 	if err != nil {
 		return nil, err
 	}
@@ -380,8 +393,8 @@ func (d *qemu) getMonitorEventHandler() func(event string, data map[string]any) 
 	state := d.state
 
 	return func(event string, data map[string]any) {
-		if !shared.ValueInSlice(event, []string{qmp.EventVMShutdown, qmp.EventAgentStarted}) {
-			return // Don't bother loading the instance from DB if we aren't going to handle the event.
+		if !slices.Contains([]string{qmp.EventVMShutdown, qmp.EventAgentStarted}, event) {
+			return // Do not bother loading the instance from DB if we are not going to handle the event.
 		}
 
 		var err error
@@ -406,18 +419,20 @@ func (d *qemu) getMonitorEventHandler() func(event string, data map[string]any) 
 
 		d, ok := inst.(*qemu)
 		if !ok || d == nil {
-			logger.Error("Failed to cast instance to *qemu")
+			logger.Error("Failed casting instance to *qemu")
 			return
 		}
 
-		if event == qmp.EventAgentStarted {
+		switch event {
+		case qmp.EventAgentStarted:
 			d.logger.Debug("Instance agent started")
 			err := d.advertiseVsockAddress()
 			if err != nil {
-				d.logger.Warn("Failed to advertise vsock address to instance agent", logger.Ctx{"err": err})
+				d.logger.Warn("Failed advertising vsock address to instance agent", logger.Ctx{"err": err})
 				return
 			}
-		} else if event == qmp.EventVMShutdown {
+
+		case qmp.EventVMShutdown:
 			target := "stop"
 			entry, ok := data["reason"]
 			if ok && entry == "guest-reset" {
@@ -430,9 +445,9 @@ func (d *qemu) getMonitorEventHandler() func(event string, data map[string]any) 
 				d.logger.Debug("Instance stopped", logger.Ctx{"target": target, "reason": data["reason"]})
 			}
 
-			err = d.onStop(target)
+			err = d.onStop(context.Background(), target)
 			if err != nil {
-				d.logger.Error("Failed to cleanly stop instance", logger.Ctx{"err": err})
+				d.logger.Error("Failed cleanly stopping instance", logger.Ctx{"err": err})
 				return
 			}
 		}
@@ -479,12 +494,56 @@ func (d *qemu) unmount() error {
 	return nil
 }
 
+// readAgentCert reads the instance's existing agent certificates, without ever
+// creating them.
+//
+// It is meant for callers that run while the instance is already up, where the
+// certificates are expected to have been created at startup. Those callers must
+// not fall back to generating a fresh set.
+//
+// These live on the instance's config volume, which for a running instance is of
+// course mounted -- but not necessarily in the mount namespace of the daemon
+// asking. After a snap refresh the daemon restarts into a new namespace, where
+// the config volume is not mounted until RegisterDevices re-establishes it, and
+// getAgentClient is driven by QMP events that can fire before that happens.
+// Generating then writes a stray set into the *underlying* instance directory and
+// breaks the agent connection, which still trusts the original certificates. The
+// stray files get shadowed once the config volume is mounted over them, and
+// resurface at deletion time as "Failed removing ... directory not empty".
+func (d *qemu) readAgentCert() (agentCert string, clientCert string, clientKey string, err error) {
+	instancePath := d.Path()
+
+	for _, f := range []struct {
+		out  *string
+		name string
+	}{
+		{&agentCert, "agent.crt"},
+		{&clientCert, "agent-client.crt"},
+		{&clientKey, "agent-client.key"},
+	} {
+		contents, err := os.ReadFile(filepath.Join(instancePath, f.name))
+		if err != nil {
+			return "", "", "", fmt.Errorf("Failed reading agent TLS material %q (the instance's config volume may not be mounted in this mount namespace): %w", f.name, err)
+		}
+
+		*f.out = string(contents)
+	}
+
+	return agentCert, clientCert, clientKey, nil
+}
+
 // generateAgentCert creates the necessary server key and certificate if needed.
+//
+// This writes into the instance's directory, so it must only be called on paths
+// where the instance's volume is known to be mounted (e.g. instance startup).
+// Callers that merely need to read the certificates of a running instance must
+// use readAgentCert instead.
 func (d *qemu) generateAgentCert() (agentCert string, agentKey string, clientCert string, clientKey string, err error) {
-	agentCertFile := filepath.Join(d.Path(), "agent.crt")
-	agentKeyFile := filepath.Join(d.Path(), "agent.key")
-	clientCertFile := filepath.Join(d.Path(), "agent-client.crt")
-	clientKeyFile := filepath.Join(d.Path(), "agent-client.key")
+	instancePath := d.Path()
+	agentCertFile := filepath.Join(instancePath, "agent.crt")
+	agentKeyFile := filepath.Join(instancePath, "agent.key")
+	clientCertFile := filepath.Join(instancePath, "agent-client.crt")
+	clientKeyFile := filepath.Join(instancePath, "agent-client.key")
 
 	// Create server certificate.
 	err = shared.FindOrGenCert(agentCertFile, agentKeyFile, false, shared.CertOptions{})
@@ -498,8 +557,9 @@ func (d *qemu) generateAgentCert() (agentCert string, agentKey string, clientCer
 		return "", "", "", "", err
 	}
 
-	// Read all the files
-	agentCertBytes, err := os.ReadFile(agentCertFile)
+	// Read back what was just created. Everything but the server key is shared
+	// with the read-only path.
+	agentCert, clientCert, clientKey, err = d.readAgentCert()
 	if err != nil {
 		return "", "", "", "", err
 	}
@@ -509,21 +569,11 @@ func (d *qemu) generateAgentCert() (agentCert string, agentKey string, clientCer
 		return "", "", "", "", err
 	}
 
-	clientCertBytes, err := os.ReadFile(clientCertFile)
-	if err != nil {
-		return "", "", "", "", err
-	}
-
-	clientKeyBytes, err := os.ReadFile(clientKeyFile)
-	if err != nil {
-		return "", "", "", "", err
-	}
-
-	return string(agentCertBytes), string(agentKeyBytes), string(clientCertBytes), string(clientKeyBytes), nil
+	return agentCert, string(agentKeyBytes), clientCert, clientKey, nil
 }
 
 // Freeze freezes the instance.
-func (d *qemu) Freeze() error {
+func (d *qemu) Freeze(ctx context.Context) error {
 	// Connect to the monitor.
 	monitor, err := qmp.Connect(d.monitorPath(), qemuSerialChardevName, d.getMonitorEventHandler())
 	if err != nil {
@@ -536,7 +586,7 @@ func (d *qemu) Freeze() error {
 		return err
 	}
 
-	d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstancePaused.Event(d, nil))
+	d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstancePaused.Event(ctx, d, nil))
 	return nil
 }
 
@@ -547,13 +597,23 @@ func (d *qemu) configDriveMountPath() string {
 
 // configDriveMountPathClear attempts to unmount the config drive bind mount and remove the directory.
 func (d *qemu) configDriveMountPathClear() error {
+	// Unmount the nested lxd-agent bind mount first, otherwise the parent mount is busy.
+	agentMntPath := filepath.Join(d.configDriveMountPath(), "lxd-agent")
+	if filesystem.IsMountPoint(agentMntPath) {
+		err := storageDrivers.TryUnmount(agentMntPath, unix.MNT_DETACH)
+		if err != nil {
+			return fmt.Errorf("Failed unmounting lxd-agent bind mount %q: %w", agentMntPath, err)
+		}
+	}
+
 	return device.DiskMountClear(d.configDriveMountPath())
 }
 
 // configVirtiofsdPaths returns the path for the socket and PID file to use with config drive virtiofsd process.
 func (d *qemu) configVirtiofsdPaths() (sockPath string, pidPath string) {
-	sockPath = filepath.Join(d.LogPath(), "virtio-fs.config.sock")
-	pidPath = filepath.Join(d.LogPath(), "virtiofsd.pid")
+	logPath := d.LogPath()
+	sockPath = filepath.Join(logPath, "virtio-fs.config.sock")
+	pidPath = filepath.Join(logPath, "virtiofsd.pid")
 
 	return sockPath, pidPath
 }
@@ -573,14 +633,14 @@ func (d *qemu) pidWait(timeout time.Duration) bool {
 			return false
 		}
 
-		time.Sleep(time.Millisecond * time.Duration(250))
+		time.Sleep(time.Millisecond * 250)
 	}
 
 	return true
 }
 
 // onStop is run when the instance stops.
-func (d *qemu) onStop(target string) error {
+func (d *qemu) onStop(ctx context.Context, target string) error {
 	d.logger.Debug("onStop hook started", logger.Ctx{"target": target})
 	defer d.logger.Debug("onStop hook finished", logger.Ctx{"target": target})
 
@@ -601,7 +661,7 @@ func (d *qemu) onStop(target string) error {
 		d.logger.Debug("VM process finished")
 	} else {
 		// Log a warning, but continue clean up as best we can.
-		d.logger.Error("VM process failed to stop", logger.Ctx{"timeout": waitTimeout})
+		d.logger.Error("VM process failed stopping", logger.Ctx{"timeout": waitTimeout})
 	}
 
 	// Record power state.
@@ -622,9 +682,21 @@ func (d *qemu) onStop(target string) error {
 	// Stop the storage for the instance.
 	err = d.unmount()
 	if err != nil && !errors.Is(err, storageDrivers.ErrInUse) {
-		err = fmt.Errorf("Failed unmounting instance: %w", err)
-		op.Done(err)
-		return err
+		// If we are migrating an instance and receive status locked error (indicating the device or
+		// resource is busy) during unmount while LXD_TEST_LIVE_MIGRATION_ON_THE_SAME_HOST is set,
+		// we ignore the error.
+		// The server is running on the same host in which case it is not possible to unmount
+		// the source device because it is already used by the destination (migrated) instance.
+		isLiveMigrationTest := shared.IsTrue(os.Getenv("LXD_TEST_LIVE_MIGRATION_ON_THE_SAME_HOST"))
+
+		//nolint:revive // Ignore early-return for clarity.
+		if isLiveMigrationTest && op.Action() == operationlock.ActionMigrate && api.StatusErrorCheck(err, http.StatusLocked) {
+			d.logger.Warn("Failed unmounting source instance during migration", logger.Ctx{"err": err})
+		} else {
+			err = fmt.Errorf("Failed unmounting instance: %w", err)
+			op.Done(err)
+			return err
+		}
 	}
 
 	// Unload the apparmor profile
@@ -636,23 +708,25 @@ func (d *qemu) onStop(target string) error {
 
 	// Log and emit lifecycle if not user triggered.
 	if op.GetInstanceInitiated() {
-		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceShutdown.Event(d, nil))
-	} else {
-		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceStopped.Event(d, nil))
+		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceShutdown.Event(ctx, d, nil))
+	} else if op.Action() != operationlock.ActionMigrate {
+		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceStopped.Event(ctx, d, nil))
 	}
 
 	// Reboot the instance.
 	if target == "reboot" {
-		err = d.Start(false)
+		// Progress tracking here is not useful. We are in the on stop hook, which is called via lxc hook, so progress
+		// reporting would not be returned to the original client.
+		err = d.Start(ctx, false, nil)
 		if err != nil {
 			op.Done(err)
 			return err
 		}
 
-		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceRestarted.Event(d, nil))
+		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceRestarted.Event(ctx, d, nil))
 	} else if d.ephemeral {
 		// Destroy ephemeral virtual machines.
-		err = d.delete(true)
+		err = d.delete(ctx, true)
 		if err != nil {
 			op.Done(err)
 			return err
@@ -663,7 +737,7 @@ func (d *qemu) onStop(target string) error {
 }
 
 // Shutdown shuts the instance down.
-func (d *qemu) Shutdown(timeout time.Duration) error {
+func (d *qemu) Shutdown(ctx context.Context, timeout time.Duration) error {
 	d.logger.Debug("Shutdown started", logger.Ctx{"timeout": timeout})
 	defer d.logger.Debug("Shutdown finished", logger.Ctx{"timeout": timeout})
 
@@ -684,7 +758,7 @@ func (d *qemu) Shutdown(timeout time.Duration) error {
 	// of its operations. This allow for multiple Shutdown() attempts.
 	op, err := operationlock.CreateWaitGet(d.Project().Name, d.Name(), operationlock.ActionStop, []operationlock.Action{operationlock.ActionRestart}, true, true)
 	if err != nil {
-		if errors.Is(err, operationlock.ErrNonReusuableSucceeded) {
+		if errors.Is(err, operationlock.ErrNonReusableSucceeded) {
 			// An existing matching operation has now succeeded, return.
 			return nil
 		}
@@ -694,7 +768,7 @@ func (d *qemu) Shutdown(timeout time.Duration) error {
 
 	// If frozen, resume so the signal can be handled.
 	if d.IsFrozen() {
-		err := d.Unfreeze()
+		err := d.Unfreeze(ctx)
 		if err != nil {
 			return err
 		}
@@ -723,9 +797,24 @@ func (d *qemu) Shutdown(timeout time.Duration) error {
 		return err
 	}
 
+	// Wait 500ms for the first event to be received by the guest.
+	time.Sleep(500 * time.Millisecond)
+
+	// Send a second system_powerdown command (required to get Windows to shutdown).
+	err = monitor.Powerdown()
+	if err != nil {
+		if err == qmp.ErrMonitorDisconnect {
+			op.Done(nil)
+			return nil
+		}
+
+		op.Done(err)
+		return err
+	}
+
 	d.logger.Debug("Shutdown request sent to instance")
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	// Wait for operation lock to be Done or context to timeout. The operation lock is normally completed by
@@ -752,13 +841,13 @@ func (d *qemu) Shutdown(timeout time.Duration) error {
 }
 
 // Restart restart the instance.
-func (d *qemu) Restart(timeout time.Duration) error {
-	return d.restartCommon(d, timeout)
+func (d *qemu) Restart(ctx context.Context, timeout time.Duration, progressReporter ioprogress.ProgressReporter) error {
+	return d.restartCommon(ctx, d, timeout, progressReporter)
 }
 
 // Rebuild rebuilds the instance using the supplied image fingerprint as source.
-func (d *qemu) Rebuild(img *api.Image, op *operations.Operation) error {
-	return d.rebuildCommon(d, img, op)
+func (d *qemu) Rebuild(ctx context.Context, img *api.Image, op *operations.Operation) error {
+	return d.rebuildCommon(ctx, d, img, op)
 }
 
 // killQemuProcess kills specified process. Optimistically attempts to wait for the process to fully exit, but does
@@ -794,7 +883,7 @@ func (d *qemu) killQemuProcess(pid int) error {
 			return nil
 		}
 
-		d.logger.Warn("Failed to collect VM process exit status", logger.Ctx{"pid": pid, "err": err})
+		d.logger.Warn("Failed collecting VM process exit status", logger.Ctx{"pid": pid, "err": err})
 	}
 
 	return nil
@@ -820,7 +909,7 @@ func (d *qemu) restoreState(monitor *qmp.Monitor) error {
 	if d.migrationReceiveStateful != nil {
 		stateConn := d.migrationReceiveStateful[api.SecretNameState]
 		if stateConn == nil {
-			return fmt.Errorf("Migration state connection is not initialized")
+			return errors.New("Migration state connection is not initialized")
 		}
 
 		// Perform non-shared storage transfer if requested.
@@ -1021,13 +1110,13 @@ func (d *qemu) validateRootDiskStatefulStop() error {
 		memoryLimitStr = d.expandedConfig["limits.memory"]
 	}
 
-	memoryLimit, err := units.ParseByteSizeString(memoryLimitStr)
+	memoryLimit, err := parseMemoryStr(memoryLimitStr)
 	if err != nil {
 		return fmt.Errorf("Failed parsing limits.memory: %w", err)
 	}
 
 	if stateDiskSize < memoryLimit {
-		return fmt.Errorf("When migration.stateful is enabled the root disk's size.state setting should be set to at least the limits.memory size in order to accommodate the stateful stop file")
+		return errors.New("When migration.stateful is enabled the root disk's size.state setting should be set to at least the limits.memory size in order to accommodate the stateful stop file")
 	}
 
 	return nil
@@ -1042,19 +1131,19 @@ func (d *qemu) validateStartup(stateful bool, statusCode api.StatusCode) error {
 
 	// Cannot perform stateful start unless config is appropriately set.
 	if stateful && shared.IsFalseOrEmpty(d.expandedConfig["migration.stateful"]) {
-		return fmt.Errorf("Stateful start requires migration.stateful to be set to true")
+		return errors.New("Stateful start requires migration.stateful to be set to true")
 	}
 
 	// Check if instance is start protected.
 	if shared.IsTrue(d.expandedConfig["security.protection.start"]) {
-		return fmt.Errorf("Instance is protected from being started")
+		return errors.New("Instance is protected from being started")
 	}
 
 	return nil
 }
 
 // Start starts the instance.
-func (d *qemu) Start(stateful bool) error {
+func (d *qemu) Start(ctx context.Context, stateful bool, progressReporter ioprogress.ProgressReporter) error {
 	unlock, err := d.updateBackupFileLock(context.Background())
 	if err != nil {
 		return err
@@ -1062,11 +1151,11 @@ func (d *qemu) Start(stateful bool) error {
 
 	defer unlock()
 
-	return d.start(stateful, nil)
+	return d.start(ctx, stateful, nil, progressReporter)
 }
 
 // start starts the instance and can use an existing InstanceOperation lock.
-func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
+func (d *qemu) start(ctx context.Context, stateful bool, op *operationlock.InstanceOperation, progressReporter ioprogress.ProgressReporter) error {
 	d.logger.Debug("Start started", logger.Ctx{"stateful": stateful})
 	defer d.logger.Debug("Start finished", logger.Ctx{"stateful": stateful})
 
@@ -1078,25 +1167,24 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 		return err
 	}
 
-	// Ensure secureboot is turned off for images that are not secureboot enabled
-	if shared.IsFalse(d.localConfig["image.requirements.secureboot"]) && shared.IsTrueOrEmpty(d.expandedConfig["security.secureboot"]) {
-		return fmt.Errorf("The image used by this instance is incompatible with secureboot. Please set security.secureboot=false on the instance")
+	// Cache UEFI support for this architecture.
+	supportsUEFI := d.architectureSupportsUEFI(d.architecture)
+
+	// Ensure secure boot is disabled for images that don't support it.
+	bootMode := d.effectiveBootMode()
+	if shared.IsFalse(d.localConfig["image.requirements.secureboot"]) && bootMode == instancetype.BootModeUEFISecureBoot {
+		return errors.New("The image used by this instance is incompatible with secure boot. Set boot.mode=uefi-nosecureboot")
 	}
 
-	if shared.IsTrue(d.expandedConfig["security.csm"]) {
-		// Ensure CSM is turned off for all arches except x86_64
+	if bootMode == instancetype.BootModeBIOS {
+		// Ensure BIOS mode is only used on x86_64.
 		if d.architecture != osarch.ARCH_64BIT_INTEL_X86 {
-			return fmt.Errorf("CSM can be enabled for x86_64 architecture only. Please set security.csm=false on the instance")
+			return errors.New("BIOS mode is only supported on x86_64. Set boot.mode=uefi-secureboot")
 		}
 
-		// Having boot.debug_edk2 enabled contradicts with enabling CSM
-		if shared.IsTrue(d.localConfig["boot.debug_edk2"]) {
-			return fmt.Errorf("CSM can not be enabled together with boot.debug_edk2. Please set one of them to false")
-		}
-
-		// Ensure secureboot is turned off when CSM is on
-		if shared.IsTrueOrEmpty(d.expandedConfig["security.secureboot"]) {
-			return fmt.Errorf("Secure boot can't be enabled while CSM is turned on. Please set security.secureboot=false on the instance")
+		// boot.debug_edk2 requires UEFI and cannot be used with BIOS mode.
+		if shared.IsTrue(d.expandedConfig["boot.debug_edk2"]) {
+			return errors.New("boot.debug_edk2 cannot be enabled when boot.mode=bios")
 		}
 	}
 
@@ -1104,12 +1192,12 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 	if op == nil {
 		op, err = operationlock.CreateWaitGet(d.Project().Name, d.Name(), operationlock.ActionStart, []operationlock.Action{operationlock.ActionRestart, operationlock.ActionRestore}, false, false)
 		if err != nil {
-			if errors.Is(err, operationlock.ErrNonReusuableSucceeded) {
+			if errors.Is(err, operationlock.ErrNonReusableSucceeded) {
 				// An existing matching operation has now succeeded, return.
 				return nil
 			}
 
-			return fmt.Errorf("Failed to create instance start operation: %w", err)
+			return fmt.Errorf("Failed creating instance start operation: %w", err)
 		}
 	}
 
@@ -1127,22 +1215,27 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 
 	// Rotate the log file.
 	logfile := d.LogFilePath()
-	if shared.PathExists(logfile) {
-		_ = os.Remove(logfile + ".old")
-		err := os.Rename(logfile, logfile+".old")
-		if err != nil && !os.IsNotExist(err) {
+	err = os.Rename(logfile, logfile+".old")
+	if err != nil && !os.IsNotExist(err) {
+		op.Done(err)
+		return err
+	}
+
+	// Remove stale edk2 debug log if boot.debug_edk2 is not enabled.
+	if shared.IsFalseOrEmpty(d.expandedConfig["boot.debug_edk2"]) {
+		err = os.Remove(d.EDK2LogFilePath())
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			op.Done(err)
-			return err
+			return fmt.Errorf("Failed removing edk2 log file: %w", err)
 		}
 	}
 
 	// Remove old pid file if needed.
-	if shared.PathExists(d.pidFilePath()) {
-		err = os.Remove(d.pidFilePath())
-		if err != nil {
-			op.Done(err)
-			return fmt.Errorf("Failed removing old PID file %q: %w", d.pidFilePath(), err)
-		}
+	pidFilePath := d.pidFilePath()
+	err = os.Remove(pidFilePath)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		op.Done(err)
+		return fmt.Errorf("Failed removing old PID file %q: %w", pidFilePath, err)
 	}
 
 	// Mount the instance's config volume.
@@ -1196,8 +1289,17 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 		volatileSet["volatile.uuid.generation"] = vmGenUUID
 	}
 
+	// Resolve the host lxd-agent once so the config drive placeholder and the bind mount
+	// below agree on the same binary. Empty if the agent is not installed.
+	lxdAgentSrcPath, err := d.lxdAgentSourcePath()
+	if err != nil {
+		err = fmt.Errorf("Failed resolving lxd-agent path: %w", err)
+		op.Done(err)
+		return err
+	}
+
 	// Generate the config drive.
-	err = d.generateConfigShare()
+	err = d.generateConfigShare(lxdAgentSrcPath)
 	if err != nil {
 		op.Done(err)
 		return err
@@ -1224,11 +1326,76 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 
 	// Copy EDK2 settings firmware to nvram file if needed.
 	// This firmware file can be modified by the VM so it must be copied from the defaults.
-	if d.architectureSupportsUEFI(d.architecture) && (!shared.PathExists(d.nvramPath()) || shared.IsTrue(d.localConfig["volatile.apply_nvram"])) {
-		err = d.setupNvram()
+	if supportsUEFI {
+		// ovmfNeedsUpdate checks if the NVRAM file must be regenerated from the
+		// firmware template. This action is destructive in the sense that the
+		// NVRAM state is lost which is not ideal but also not terrible as it is
+		// rarely used (only for custom SB keys, boot order tweaks, etc). This
+		// covers cases where the existing NVRAM content is genuinely
+		// incompatible with the current firmware. The OVMF 4MB -> _4M rename
+		// (content-compatible) is handled separately below.
+		ovmfNeedsUpdate := func(nvramTarget string) bool {
+			if !shared.InSnap() {
+				return false
+			}
+
+			if filepath.Base(nvramTarget) == "qemu.nvram" {
+				// Older versions of LXD didn't setup a symlink from qemu.nvram to a named
+				// firmware variant specific file, but rather copied the template directly.
+				// So if the resolved target is infact still just the qemu.nvram file we
+				// know its an older version of the firmware and it needs regenerating.
+				return true
+			} else if strings.Contains(nvramTarget, "OVMF") {
+				// The 2MB firmware was deprecated in the LXD snap.
+				// Detect this by the absence of both "4MB" and "_4M" in the nvram file target.
+				// Note: "_4M" must also be accepted as valid to handle VMs that were already
+				// migrated to the new naming convention (e.g. by an updated snap).
+				if !strings.Contains(nvramTarget, "4MB") && !strings.Contains(nvramTarget, "_4M") {
+					return true
+				}
+
+				// The EDK2-based CSM firmwares were replaced with Seabios in the LXD snap.
+				// Detect this by the presence of "CSM" in the nvram file target.
+				if strings.Contains(nvramTarget, "CSM") {
+					return true
+				}
+			}
+
+			return false
+		}
+
+		// Check if nvram path and its target exist.
+		nvramMissing := false
+		nvramPath := d.nvramPath()
+		nvramTarget, err := filepath.EvalSymlinks(nvramPath)
 		if err != nil {
-			op.Done(err)
-			return err
+			if !errors.Is(err, fs.ErrNotExist) {
+				op.Done(err)
+				return err
+			}
+
+			nvramMissing = true
+		}
+
+		// Decide if nvram file needs to be setup/refreshed.
+		if nvramMissing || shared.IsTrue(d.localConfig["volatile.apply_nvram"]) || ovmfNeedsUpdate(nvramTarget) {
+			err = d.setupNvram()
+			if err != nil {
+				op.Done(err)
+				return err
+			}
+		} else if !nvramMissing {
+			// When the firmware filename convention changed but the content is
+			// identical (e.g. OVMF 4MB -> _4M on x86_64, or OVMF-named arm64 ->
+			// AAVMF), rename the existing file to preserve boot order, custom
+			// Secure Boot keys, and other NVRAM state. renameNvram only proceeds
+			// when the preferred firmware actually exists in the snap, making it
+			// safe to deploy this LXD change before the snap is updated.
+			_, err = d.renameNvram(nvramTarget)
+			if err != nil {
+				op.Done(err)
+				return err
+			}
 		}
 	}
 
@@ -1240,7 +1407,6 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 	// Apply any volatile changes that need to be made.
 	err = d.VolatileSet(volatileSet)
 	if err != nil {
-		err = fmt.Errorf("Failed setting volatile keys: %w", err)
 		op.Done(err)
 		return err
 	}
@@ -1282,7 +1448,7 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 		// Start the device.
 		runConf, err := d.deviceStart(dev, false)
 		if err != nil {
-			err = fmt.Errorf("Failed to start device %q: %w", dev.Name(), err)
+			err = fmt.Errorf("Failed starting device %q: %w", dev.Name(), err)
 			op.Done(err)
 			return err
 		}
@@ -1290,12 +1456,24 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 		revert.Add(func() {
 			err := d.deviceStop(dev, false, "")
 			if err != nil {
-				d.logger.Error("Failed to cleanup device", logger.Ctx{"device": dev.Name(), "err": err})
+				d.logger.Error("Failed cleaning up device", logger.Ctx{"device": dev.Name(), "err": err})
 			}
 		})
 
 		if runConf == nil {
 			continue
+		}
+
+		// Extract the previous bus number from volatile config if set.
+		// Used in generateQemuConfigFile() to ensure that the bus number is consistent across restarts.
+		deviceVolatileKey := "volatile." + dev.Name() + busDeviceVolatileSuffix
+		if d.localConfig[deviceVolatileKey] != "" {
+			busNum, err := strconv.ParseUint(d.localConfig[deviceVolatileKey], 10, 8)
+			if err != nil {
+				return fmt.Errorf("Failed parsing volatile key %q: %w", deviceVolatileKey, err)
+			}
+
+			runConf.BusNum = uint8(busNum)
 		}
 
 		if runConf.Revert != nil {
@@ -1339,22 +1517,35 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 		return err
 	}
 
+	// Bind-mount the host lxd-agent over the placeholder so its bytes come from the host,
+	// not the quota'd config volume (see generateConfigShare). This intentionally pins the
+	// running daemon's agent revision for the VM's lifetime, as the daemon does for itself.
+	if lxdAgentSrcPath != "" {
+		agentDstPath := filepath.Join(configMntPath, "lxd-agent")
+		err = device.DiskMount(lxdAgentSrcPath, agentDstPath, false, "", []string{"ro"}, "none")
+		if err != nil {
+			err = fmt.Errorf("Failed mounting lxd-agent into config drive: %w", err)
+			op.Done(err)
+			return err
+		}
+	}
+
 	// Setup virtiofsd for the config drive mount path.
 	// This is used by the lxd-agent in preference to 9p (due to its improved performance) and in scenarios
 	// where 9p isn't available in the VM guest OS.
 	configSockPath, configPIDPath := d.configVirtiofsdPaths()
-	revertFunc, unixListener, err := device.DiskVMVirtiofsdStart(d.state.OS.KernelVersion, d, configSockPath, configPIDPath, "", configMntPath, nil)
+	revertFunc, err := device.DiskVMVirtiofsdStart(d, configSockPath, configPIDPath, "", configMntPath, nil, 0)
 	if err != nil {
 		var errUnsupported device.UnsupportedError
 		if !errors.As(err, &errUnsupported) {
 			// Resolve previous warning.
 			_ = warnings.ResolveWarningsByNodeAndProjectAndType(d.state.DB.Cluster, d.node, d.project.Name, warningtype.MissingVirtiofsd)
-			err = fmt.Errorf("Failed to setup virtiofsd for config drive: %w", err)
+			err = fmt.Errorf("Failed setting up virtiofsd for config drive: %w", err)
 			op.Done(err)
 			return err
 		}
 
-		d.logger.Warn("Unable to use virtio-fs for config drive, using 9p as a fallback", logger.Ctx{"err": errUnsupported})
+		d.logger.Warn("Cannot use virtio-fs for config drive, using 9p as a fallback", logger.Ctx{"err": errUnsupported})
 
 		if errUnsupported == device.ErrMissingVirtiofsd {
 			_ = d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
@@ -1367,9 +1558,6 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 		}
 	} else {
 		revert.Add(revertFunc)
-
-		// Request the unix listener is closed after QEMU has connected on startup.
-		defer func() { _ = unixListener.Close() }()
 	}
 
 	// Get qemu configuration and check qemu is installed.
@@ -1388,7 +1576,7 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 	}
 
 	if snapName != "" && expiry != nil {
-		err := d.snapshot(snapName, *expiry, false)
+		err := d.snapshot(ctx, snapName, expiry, false, api.DiskVolumesModeRoot, progressReporter)
 		if err != nil {
 			err = fmt.Errorf("Failed taking startup snapshot: %w", err)
 			op.Done(err)
@@ -1406,10 +1594,11 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 	cpuExtensions := []string{}
 
 	if d.architecture == osarch.ARCH_64BIT_INTEL_X86 {
-		// If using Linux 5.10 or later, use HyperV optimizations.
+		// If using Linux 5.10 or later, use HyperV optimizations when not using migration.stateful or BIOS mode.
+		// Hyper-V extensions can cause problems with live migration and Windows booting in BIOS mode.
 		minVer, _ := version.NewDottedVersion("5.10.0")
-		if d.state.OS.KernelVersion.Compare(minVer) >= 0 && shared.IsFalseOrEmpty(d.expandedConfig["migration.stateful"]) {
-			// x86_64 can use hv_time to improve Windows guest performance.
+		if d.state.OS.KernelVersion.Compare(minVer) >= 0 && shared.IsFalseOrEmpty(d.expandedConfig["migration.stateful"]) && d.effectiveBootMode() != instancetype.BootModeBIOS {
+			// x86_64 with UEFI can use hv_time (bundled in hv_passthrough) to improve Windows guest performance.
 			cpuExtensions = append(cpuExtensions, "hv_passthrough")
 		}
 
@@ -1452,7 +1641,7 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 	}
 
 	// If user wants to run with debug version of edk2
-	if shared.IsTrue(d.localConfig["boot.debug_edk2"]) {
+	if shared.IsTrue(d.expandedConfig["boot.debug_edk2"]) {
 		// Here we ask the Qemu to redirect debug console output from I/O port to the file.
 		// 0x402 is the default PcdDebugIoPort value in the edk2.
 		// This I/O port is used by DebugLib in the edk2 to print debug messages.
@@ -1462,7 +1651,7 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 	// If stateful, restore now.
 	if stateful {
 		if !d.stateful {
-			err = fmt.Errorf("Instance has no existing state to restore")
+			err = errors.New("Instance has no existing state to restore")
 			op.Done(err)
 			return err
 		}
@@ -1487,27 +1676,35 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 	}
 
 	// SMBIOS only on x86_64 and aarch64.
-	if d.architectureSupportsUEFI(d.architecture) {
+	if supportsUEFI {
 		qemuCmd = append(qemuCmd, "-smbios", "type=2,manufacturer=Canonical Ltd.,product=LXD")
 	}
 
 	// Attempt to drop privileges (doesn't work when restoring state).
 	if !stateful && d.state.OS.UnprivUser != "" {
-		qemuCmd = append(qemuCmd, "-runas", d.state.OS.UnprivUser)
+		qemuVer, _ := d.version()
+		qemuVer91, _ := version.NewDottedVersion("9.1.0")
 
-		nvRAMPath := d.nvramPath()
-		if d.architectureSupportsUEFI(d.architecture) && shared.PathExists(nvRAMPath) {
+		// Since QEMU 9.1 the parameter `runas` has been marked as deprecated.
+		if qemuVer != nil && qemuVer.Compare(qemuVer91) >= 0 {
+			qemuCmd = append(qemuCmd, "-run-with", "user="+d.state.OS.UnprivUser)
+		} else {
+			qemuCmd = append(qemuCmd, "-runas", d.state.OS.UnprivUser)
+		}
+
+		if supportsUEFI {
+			nvRAMPath := d.nvramPath()
 			// Ensure UEFI nvram file is writable by the QEMU process.
 			// This is needed when doing stateful snapshots because the QEMU process will reopen the
 			// file for writing.
 			err = os.Chown(nvRAMPath, int(d.state.OS.UnprivUID), -1)
-			if err != nil {
+			if err != nil && !os.IsNotExist(err) {
 				op.Done(err)
 				return err
 			}
 
 			err = os.Chmod(nvRAMPath, 0600)
-			if err != nil {
+			if err != nil && !os.IsNotExist(err) {
 				op.Done(err)
 				return err
 			}
@@ -1520,8 +1717,8 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 		// to the VM. In order to ensure that non-root users in the VM cannot access these
 		// files be sure to mount the 9P share in the VM with the "access=0" option to allow
 		// only root user in VM to access the mounted share.
-		err := filepath.Walk(filepath.Join(d.Path(), "config"),
-			func(path string, info os.FileInfo, err error) error {
+		err := filepath.Walk(configSrcPath,
+			func(path string, _ os.FileInfo, err error) error {
 				if err != nil {
 					return err
 				}
@@ -1576,7 +1773,8 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 	}
 
 	// Setup background process.
-	p, err := subprocess.NewProcess(d.state.OS.ExecPath, append(forkLimitsCmd, qemuCmd...), d.EarlyLogFilePath(), d.EarlyLogFilePath())
+	earlyLogFilePath := d.EarlyLogFilePath()
+	p, err := subprocess.NewProcess(d.state.OS.ExecPath, append(forkLimitsCmd, qemuCmd...), earlyLogFilePath, earlyLogFilePath)
 	if err != nil {
 		op.Done(err)
 		return err
@@ -1609,15 +1807,15 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 
 	_, err = p.Wait(context.Background())
 	if err != nil {
-		stderr, _ := os.ReadFile(d.EarlyLogFilePath())
-		err = fmt.Errorf("Failed to run: %s: %s: %w", strings.Join(p.Args, " "), string(stderr), err)
+		stderr, _ := os.ReadFile(earlyLogFilePath)
+		err = fmt.Errorf("Failed running: %s: %s: %w", strings.Join(p.Args, " "), string(stderr), err)
 		op.Done(err)
 		return err
 	}
 
 	pid, err := d.pid()
 	if err != nil || pid <= 0 {
-		d.logger.Error("Failed to get VM process ID", logger.Ctx{"err": err, "pid": pid})
+		d.logger.Error("Failed getting VM process ID", logger.Ctx{"err": err, "pid": pid})
 		op.Done(err)
 		return err
 	}
@@ -1645,7 +1843,7 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 		// Setup CPUs and core scheduling for hotpluggable CPU systems.
 		err := d.setCPUs(cpuInfo.cores)
 		if err != nil {
-			err = fmt.Errorf("Failed to add CPUs: %w", err)
+			err = fmt.Errorf("Failed adding CPUs: %w", err)
 			op.Done(err)
 			return err
 		}
@@ -1661,14 +1859,14 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 
 		err = d.setCoreSched(pids)
 		if err != nil {
-			err = fmt.Errorf("Failed to allocate new core scheduling domain for vCPU threads: %w", err)
+			err = fmt.Errorf("Failed allocating new core scheduling domain for vCPU threads: %w", err)
 			op.Done(err)
 			return err
 		}
 	}
 
 	// Trigger a rebalance procedure which will set vCPU affinity (pinning) (explicit or implicit)
-	cgroup.TaskSchedulerTrigger("virtual-machine", d.name, "started")
+	cgroup.TaskSchedulerTrigger(d.dbType, d.name, "started")
 
 	// Run monitor hooks from devices.
 	for _, monHook := range monHooks {
@@ -1696,7 +1894,7 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 	// the guest instead.
 	actions := map[string]string{
 		"shutdown": "poweroff",
-		"reboot":   "shutdown", // Don't reset on reboot. Let LXD handle reboots.
+		"reboot":   "shutdown", // Do not reset on reboot. Let LXD handle reboots.
 		"panic":    "pause",    // Pause on panics to allow investigation.
 	}
 
@@ -1753,12 +1951,12 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 		op.Done(err) // Must come before Stop() otherwise stop will not proceed.
 
 		// Shut down the VM if hooks fail.
-		_ = d.Stop(false)
+		_ = d.Stop(ctx, false)
 		return err
 	}
 
 	if op.Action() == "start" {
-		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceStarted.Event(d, nil))
+		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceStarted.Event(ctx, d, nil))
 	}
 
 	// The VM started cleanly so now enable the unexpected disconnection event to ensure the onStop hook is
@@ -1789,7 +1987,7 @@ func (d *qemu) setupSEV(fdFiles *[]*os.File) (*qemuSevOpts, error) {
 	// Get the SEV guest `cbitpos` and `reducedPhysBits`.
 	sevCapabilities, ok := sev.(qmp.AMDSEVCapabilities)
 	if !ok {
-		return nil, errors.New(`Failed to get the guest "sev" capabilities`)
+		return nil, errors.New(`Failed getting the guest "sev" capabilities`)
 	}
 
 	cbitpos := sevCapabilities.CBitPos
@@ -1870,7 +2068,7 @@ func (d *qemu) getAgentConnectionInfo() (*agentAPI.API10Put, error) {
 
 	vsockaddr, ok := addr.(*vsock.Addr)
 	if !ok {
-		return nil, fmt.Errorf("Listen address is not vsock.Addr")
+		return nil, errors.New("Listen address is not vsock.Addr")
 	}
 
 	req := agentAPI.API10Put{
@@ -1890,7 +2088,10 @@ func (d *qemu) advertiseVsockAddress() error {
 		return fmt.Errorf("Failed getting agent client handle: %w", err)
 	}
 
-	agent, err := lxd.ConnectLXDHTTP(nil, client)
+	ctx, cancel := context.WithTimeout(context.Background(), agentConnectTimeout)
+	defer cancel()
+
+	agent, err := lxd.ConnectLXDHTTPWithContext(ctx, nil, client)
 	if err != nil {
 		return fmt.Errorf("Failed connecting to lxd-agent: %w", err)
 	}
@@ -1906,7 +2107,7 @@ func (d *qemu) advertiseVsockAddress() error {
 		return nil
 	}
 
-	_, _, err = agent.RawQuery("PUT", "/1.0", connInfo, "")
+	_, _, err = agent.RawQuery(http.MethodPut, "/1.0", connInfo, "")
 	if err != nil {
 		return fmt.Errorf("Failed sending VM sock address to lxd-agent: %w", err)
 	}
@@ -1917,10 +2118,6 @@ func (d *qemu) advertiseVsockAddress() error {
 // AgentCertificate returns the server certificate of the lxd-agent.
 func (d *qemu) AgentCertificate() *x509.Certificate {
 	agentCert := filepath.Join(d.Path(), "config", "agent.crt")
-	if !shared.PathExists(agentCert) {
-		return nil
-	}
-
 	cert, err := shared.ReadCert(agentCert)
 	if err != nil {
 		return nil
@@ -1930,7 +2127,107 @@ func (d *qemu) AgentCertificate() *x509.Certificate {
 }
 
 func (d *qemu) architectureSupportsUEFI(arch int) bool {
-	return shared.ValueInSlice(arch, []int{osarch.ARCH_64BIT_INTEL_X86, osarch.ARCH_64BIT_ARMV8_LITTLE_ENDIAN})
+	return slices.Contains([]int{osarch.ARCH_64BIT_INTEL_X86,
+		osarch.ARCH_64BIT_ARMV8_LITTLE_ENDIAN,
+		osarch.ARCH_64BIT_RISCV_LITTLE_ENDIAN},
+		arch)
+}
+
+func (d *qemu) effectiveBootMode() string {
+	bootMode := d.expandedConfig["boot.mode"]
+	if bootMode == "" {
+		return instancetype.BootModeUEFISecureBoot
+	}
+
+	return bootMode
+}
+
+// renameNvram renames the existing NVRAM vars file when the firmware filename has
+// changed but the content remains compatible, preserving any existing boot settings
+// such as boot order or custom Secure Boot keys. This covers:
+//   - OVMF 4MB -> _4M rename on x86_64 (identical binary content)
+//   - OVMF-named arm64 EDK2 -> AAVMF rename (both are AArch64 EDK2 builds)
+//
+// Returns true if the rename was performed successfully.
+func (d *qemu) renameNvram(nvramTarget string) (bool, error) {
+	if !shared.InSnap() {
+		return false, nil
+	}
+
+	// Only applicable to OVMF 4MB variants: the 4MB size is the content-compatible
+	// baseline used across all renames handled here (x86_64 _4M and arm64 AAVMF).
+	nvramBasename := filepath.Base(nvramTarget)
+	if !strings.Contains(nvramBasename, "OVMF") || !strings.Contains(nvramBasename, "4MB") {
+		return false, nil
+	}
+
+	// Determine the expected firmware for this VM's boot mode.
+	var firmwares []edk2.FirmwarePair
+	switch d.effectiveBootMode() {
+	case instancetype.BootModeUEFISecureBoot:
+		firmwares = edk2.GetArchitectureFirmwarePairsForUsage(d.architecture, edk2.SECUREBOOT)
+	default:
+		firmwares = edk2.GetArchitectureFirmwarePairsForUsage(d.architecture, edk2.GENERIC)
+	}
+
+	if len(firmwares) == 0 {
+		return false, nil
+	}
+
+	// The preferred (first available) firmware determines the new vars filename.
+	newVarsName := filepath.Base(firmwares[0].Vars)
+
+	// Nothing to rename if the preferred firmware already matches the current one.
+	if newVarsName == nvramBasename {
+		return false, nil
+	}
+
+	newVarsPath := filepath.Join(d.Path(), newVarsName)
+
+	// If the destination already exists the file was previously migrated (e.g. by an earlier
+	// LXD start that failed mid-way). Skip the rename to avoid overwriting current NVRAM state.
+	_, err := os.Stat(newVarsPath)
+	if err == nil {
+		d.logger.Info("Skipping NVRAM vars file rename, destination already exists", logger.Ctx{"source": nvramBasename, "destination": newVarsName})
+		return false, nil
+	}
+
+	if !os.IsNotExist(err) {
+		return false, fmt.Errorf("Failed checking existing NVRAM vars file %q: %w", newVarsPath, err)
+	}
+
+	// Rename the vars file and update the symlink atomically so that a failure mid-way
+	// does not leave the instance in an unbootable state.
+	rev := revert.New()
+	defer rev.Fail()
+
+	err = os.Rename(nvramTarget, newVarsPath)
+	if err != nil {
+		return false, fmt.Errorf("Failed renaming NVRAM vars file %q to %q: %w", nvramTarget, newVarsPath, err)
+	}
+
+	rev.Add(func() { _ = os.Rename(newVarsPath, nvramTarget) })
+
+	// Update the symlink via a temporary name so the replacement is atomic.
+	nvramPath := d.nvramPath()
+	tmpNvramPath := nvramPath + ".tmp"
+	_ = os.Remove(tmpNvramPath)
+
+	err = os.Symlink(newVarsName, tmpNvramPath)
+	if err != nil {
+		return false, fmt.Errorf("Failed creating temporary NVRAM symlink to %q: %w", newVarsName, err)
+	}
+
+	err = os.Rename(tmpNvramPath, nvramPath)
+	if err != nil {
+		_ = os.Remove(tmpNvramPath)
+		return false, fmt.Errorf("Failed updating NVRAM symlink to %q: %w", newVarsName, err)
+	}
+
+	rev.Success()
+
+	d.logger.Info("Renamed NVRAM vars file", logger.Ctx{"old": nvramBasename, "new": newVarsName})
+	return true, nil
 }
 
 func (d *qemu) setupNvram() error {
@@ -1939,8 +2236,9 @@ func (d *qemu) setupNvram() error {
 	d.logger.Debug("Generating NVRAM")
 
 	// Cleanup existing variables file.
-	for _, varsName := range edk2.GetAchitectureFirmwareVarsCandidates(d.architecture) {
-		err := os.Remove(filepath.Join(d.Path(), varsName))
+	instancePath := d.Path()
+	for _, varsName := range edk2.GetArchitectureFirmwareVarsCandidates(d.architecture) {
+		err := os.Remove(filepath.Join(instancePath, varsName))
 		if err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("Failed removing firmware vars file %q: %w", varsName, err)
 		}
@@ -1948,11 +2246,17 @@ func (d *qemu) setupNvram() error {
 
 	// Determine expected firmware.
 	var firmwares []edk2.FirmwarePair
-	if shared.IsTrue(d.expandedConfig["security.csm"]) {
+	bootMode := d.effectiveBootMode()
+	switch bootMode {
+	case instancetype.BootModeBIOS:
 		firmwares = edk2.GetArchitectureFirmwarePairsForUsage(d.architecture, edk2.CSM)
-	} else if shared.IsTrueOrEmpty(d.expandedConfig["security.secureboot"]) {
+	case instancetype.BootModeUEFISecureBoot:
 		firmwares = edk2.GetArchitectureFirmwarePairsForUsage(d.architecture, edk2.SECUREBOOT)
-	} else {
+		if len(firmwares) == 0 {
+			return errors.New("Secure boot firmware not available. Set boot.mode=uefi-nosecureboot")
+		}
+
+	default:
 		firmwares = edk2.GetArchitectureFirmwarePairsForUsage(d.architecture, edk2.GENERIC)
 	}
 
@@ -1973,11 +2277,11 @@ func (d *qemu) setupNvram() error {
 	}
 
 	if vmFirmwarePath == "" {
-		return fmt.Errorf("Couldn't find one of the required VM firmware files: %+v", firmwares)
+		return fmt.Errorf("Could not find one of the required VM firmware files: %+v", firmwares)
 	}
 
 	// Copy the template.
-	err = shared.FileCopy(vmFirmwarePath, filepath.Join(d.Path(), vmFirmwareName))
+	err = shared.FileCopy(vmFirmwarePath, filepath.Join(instancePath, vmFirmwareName))
 	if err != nil {
 		return err
 	}
@@ -1985,8 +2289,9 @@ func (d *qemu) setupNvram() error {
 	// Generate a symlink.
 	// This is so qemu.nvram can always be assumed to be the EDK2 vars file.
 	// The real file name is then used to determine what firmware must be selected.
-	_ = os.Remove(d.nvramPath())
-	err = os.Symlink(vmFirmwareName, d.nvramPath())
+	nvramPath := d.nvramPath()
+	_ = os.Remove(nvramPath)
+	err = os.Symlink(vmFirmwareName, nvramPath)
 	if err != nil {
 		return err
 	}
@@ -1996,32 +2301,43 @@ func (d *qemu) setupNvram() error {
 
 func (d *qemu) qemuArchConfig(arch int) (path string, bus string, err error) {
 	basePath := ""
-	if shared.InSnap() && os.Getenv("SNAP_QEMU_PREFIX") != "" {
-		basePath = filepath.Join(os.Getenv("SNAP"), os.Getenv("SNAP_QEMU_PREFIX")) + "/bin/"
+	if shared.InSnap() {
+		snapQEMUPrefix := os.Getenv("SNAP_QEMU_PREFIX")
+		if snapQEMUPrefix != "" {
+			basePath = filepath.Join(os.Getenv("SNAP"), snapQEMUPrefix) + "/bin/"
+		}
 	}
 
-	if arch == osarch.ARCH_64BIT_INTEL_X86 {
+	switch arch {
+	case osarch.ARCH_64BIT_INTEL_X86:
 		path, err := exec.LookPath(basePath + "qemu-system-x86_64")
 		if err != nil {
 			return "", "", err
 		}
 
 		return path, "pcie", nil
-	} else if arch == osarch.ARCH_32BIT_ARMV7_LITTLE_ENDIAN || arch == osarch.ARCH_32BIT_ARMV8_LITTLE_ENDIAN || arch == osarch.ARCH_64BIT_ARMV8_LITTLE_ENDIAN {
+	case osarch.ARCH_32BIT_ARMV7_LITTLE_ENDIAN, osarch.ARCH_32BIT_ARMV8_LITTLE_ENDIAN, osarch.ARCH_64BIT_ARMV8_LITTLE_ENDIAN:
 		path, err := exec.LookPath(basePath + "qemu-system-aarch64")
 		if err != nil {
 			return "", "", err
 		}
 
 		return path, "pcie", nil
-	} else if arch == osarch.ARCH_64BIT_POWERPC_LITTLE_ENDIAN {
+	case osarch.ARCH_64BIT_POWERPC_LITTLE_ENDIAN:
 		path, err := exec.LookPath(basePath + "qemu-system-ppc64")
 		if err != nil {
 			return "", "", err
 		}
 
 		return path, "pci", nil
-	} else if arch == osarch.ARCH_64BIT_S390_BIG_ENDIAN {
+	case osarch.ARCH_64BIT_RISCV_LITTLE_ENDIAN:
+		path, err := exec.LookPath(basePath + "qemu-system-riscv64")
+		if err != nil {
+			return "", "", err
+		}
+
+		return path, "pcie", nil
+	case osarch.ARCH_64BIT_S390_BIG_ENDIAN:
 		path, err := exec.LookPath(basePath + "qemu-system-s390x")
 		if err != nil {
 			return "", "", err
@@ -2030,7 +2346,7 @@ func (d *qemu) qemuArchConfig(arch int) (path string, bus string, err error) {
 		return path, "ccw", nil
 	}
 
-	return "", "", fmt.Errorf("Architecture isn't supported for virtual machines")
+	return "", "", errors.New("Architecture is not supported for virtual machines")
 }
 
 // RegisterDevices calls the Register() function on all of the instance's devices.
@@ -2039,9 +2355,7 @@ func (d *qemu) RegisterDevices() {
 }
 
 func (d *qemu) saveConnectionInfo(connInfo *agentAPI.API10Put) error {
-	configDrivePath := filepath.Join(d.Path(), "config")
-
-	f, err := os.Create(filepath.Join(configDrivePath, "agent.conf"))
+	f, err := os.Create(filepath.Join(d.Path(), "config", "agent.conf"))
 	if err != nil {
 		return err
 	}
@@ -2059,7 +2373,7 @@ func (d *qemu) saveConnectionInfo(connInfo *agentAPI.API10Put) error {
 }
 
 // OnHook is the top-level hook handler.
-func (d *qemu) OnHook(hookName string, args map[string]string) error {
+func (d *qemu) OnHook(_ string, _ map[string]string) error {
 	return instance.ErrNotImplemented
 }
 
@@ -2073,7 +2387,7 @@ func (d *qemu) deviceStart(dev device.Device, instanceRunning bool) (*deviceConf
 	defer revert.Fail()
 
 	if instanceRunning && !dev.CanHotPlug() {
-		return nil, fmt.Errorf("Device cannot be started when instance is running")
+		return nil, errors.New("Device cannot be started when instance is running")
 	}
 
 	runConf, err := dev.Start()
@@ -2088,47 +2402,55 @@ func (d *qemu) deviceStart(dev device.Device, instanceRunning bool) (*deviceConf
 		}
 	})
 
-	// If runConf supplied, perform any instance specific setup of device.
-	if runConf != nil {
-		// If instance is running and then live attach device.
-		if instanceRunning {
-			// Attach network interface if requested.
-			if len(runConf.NetworkInterface) > 0 {
-				err = d.deviceAttachNIC(dev.Name(), runConf.NetworkInterface)
-				if err != nil {
-					return nil, err
-				}
-			}
-
-			for i, mount := range runConf.Mounts {
-				if mount.FSType == "9p" {
-					mountTag, err := d.deviceAttachPath(dev.Name())
-					if err != nil {
-						return nil, err
-					}
-
-					runConf.Mounts[i].Opts = append(runConf.Mounts[i].Opts, fmt.Sprintf("mountTag=%s", mountTag))
-				} else {
-					err = d.deviceAttachBlockDevice(mount)
-					if err != nil {
-						return nil, err
-					}
-				}
-			}
-
-			for _, usbDev := range runConf.USBDevice {
-				err = d.deviceAttachUSB(usbDev)
-				if err != nil {
-					return nil, err
-				}
-			}
-
-			// If running, run post start hooks now (if not running LXD will run them
-			// once the instance is started).
-			err = d.runHooks(runConf.PostHooks)
+	// If runConf supplied and the instance is running, perform any instance
+	// specific setup of device and then live attach it to the instance.
+	if runConf != nil && instanceRunning {
+		// Attach NIC to running instance.
+		if len(runConf.NetworkInterface) > 0 {
+			err = d.deviceAttachNIC(runConf.NetworkInterface)
 			if err != nil {
 				return nil, err
 			}
+		}
+
+		// Attach disk to running instance.
+		for i, mount := range runConf.Mounts {
+			if mount.FSType == "virtiofs" {
+				mountTag, err := d.deviceAttachPath(dev.Name())
+				if err != nil {
+					return nil, err
+				}
+
+				runConf.Mounts[i].Opts = append(runConf.Mounts[i].Opts, "mountTag="+mountTag)
+			} else {
+				err = d.deviceAttachBlockDevice(mount)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+
+		// Attach USB to running instance.
+		for _, usbDev := range runConf.USBDevice {
+			err = d.deviceAttachUSB(usbDev)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// Attach PCI to running instance.
+		if len(runConf.PCIDevice) > 0 {
+			err = d.deviceAttachPCI(runConf.PCIDevice)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// If running, run post start hooks now (if not, they will be run
+		// once the instance is started).
+		err = d.runHooks(runConf.PostHooks)
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -2136,30 +2458,182 @@ func (d *qemu) deviceStart(dev device.Device, instanceRunning bool) (*deviceConf
 	return runConf, nil
 }
 
-func (d *qemu) deviceAttachPath(deviceName string) (mountTag string, err error) {
-	deviceID := qemuDeviceNameOrID(qemuDeviceIDPrefix, deviceName, "-virtio-fs", qemuDeviceIDMaxLength)
-	mountTag = qemuDeviceNameOrID(qemuDeviceNamePrefix, deviceName, "", qemuDeviceNameMaxLength)
+// getPCISlotCount returns the number of PCI slots currently provisioned in the instance.
+func (d *qemu) getPCISlotCount() (pciSlots uint8, err error) {
+	// Check if the agent is running.
+	monitor, err := qmp.Connect(d.monitorPath(), qemuSerialChardevName, d.getMonitorEventHandler())
+	if err != nil {
+		return 0, err
+	}
 
-	// Detect virtiofsd path.
-	virtiofsdSockPath := filepath.Join(d.DevicesPath(), fmt.Sprintf("virtio-fs.%s.sock", filesystem.PathNameEncode(deviceName)))
-	if !shared.PathExists(virtiofsdSockPath) {
-		return "", fmt.Errorf("Virtiofsd isn't running")
+	// Get the current PCI devices.
+	devices, err := monitor.QueryPCI()
+	if err != nil {
+		return 0, fmt.Errorf("Failed querying PCI devices: %w", err)
+	}
+
+	for _, dev := range devices {
+		if strings.HasPrefix(dev.DevID, busDevicePortPrefix) {
+			pciSlots++
+		}
+	}
+
+	return pciSlots, nil
+}
+
+// getMaxPCISlotCount returns the maximum allowed number of PCI/PCIe slots for the instance.
+func (d *qemu) getMaxPCISlotCount() (pciSlotCountMax uint8, err error) {
+	pciSlotCountMaxStr, ok := d.expandedConfig["limits.max_bus_ports"]
+	if ok && pciSlotCountMaxStr != "" {
+		val, err := strconv.ParseUint(pciSlotCountMaxStr, 10, 8)
+		if err != nil {
+			return 0, fmt.Errorf("Failed parsing %q: %w", "limits.max_bus_ports", err)
+		}
+
+		return uint8(val), nil
+	}
+
+	// Return the default value for "limits.max_bus_ports".
+	return QEMUDefaultMaxBusPorts, nil
+}
+
+// busAllocatePCIeHotplug provides a busAllocator implementation for hotplugging PCIe devices.
+func (d *qemu) busAllocatePCIeHotplug(deviceName string, _ bool) (cleanup revert.Hook, busName string, busAddress string, multifunction bool, err error) {
+	if d.localConfig["volatile.bus.mode"] != qemuBusModePersistent {
+		return d.busAllocatePCIeHotplugLegacy(deviceName, false)
 	}
 
 	reverter := revert.New()
 	defer reverter.Fail()
 
+	// Get current PCI slot count from QEMU.
+	pciSlotCount, err := d.getPCISlotCount()
+	if err != nil {
+		return nil, "", "", false, fmt.Errorf("Failed getting PCI slot count: %w", err)
+	}
+
+	if pciSlotCount == 0 {
+		return nil, "", "", false, errors.New("No PCIe slots available for hotplugging")
+	}
+
+	firstFunctionAddress := "00.0" // The address of the first function on the port.
+
+	// Identify used PCIe slots based on device volatile keys.
+	usedSlots := make(map[uint8]struct{})
+	for eDevName := range d.expandedDevices {
+		deviceVolatileKey := "volatile." + eDevName + busDeviceVolatileSuffix
+		busNumStr := d.localConfig[deviceVolatileKey]
+		if busNumStr == "" {
+			continue // Skip devices without existing persistent bus number.
+		}
+
+		busNum, err := strconv.ParseUint(busNumStr, 10, 8)
+		if err != nil {
+			return nil, "", "", false, fmt.Errorf("Failed parsing volatile key %q: %w", deviceVolatileKey, err)
+		}
+
+		// Re-use existing PCIe port if its currently assigned to the device.
+		// This occurs when an existing device's settings are changed and the device is hotplugged again.
+		if eDevName == deviceName {
+			busName = busDevicePortPrefix + busNumStr
+			d.logger.Debug("Hotplugging device into bus (reuse)", logger.Ctx{"device": deviceName, "busType": "pcie", "bus": busName})
+
+			cleanup := reverter.Clone().Fail
+			reverter.Success()
+			return cleanup, busName, firstFunctionAddress, false, nil
+		}
+
+		if busNum > 0 {
+			// Record that this port is referenced by an existing device volatile key.
+			usedSlots[uint8(busNum)] = struct{}{}
+		}
+	}
+
+	deviceVolatileKey := "volatile." + deviceName + busDeviceVolatileSuffix
+
+	// Find an unused PCIe slot by iterating through the available slots and checking against the used slots.
+	for i := qemuPCIDeviceIDStart; i < pciSlotCount; i++ {
+		_, used := usedSlots[i]
+		if used {
+			continue
+		}
+
+		busNum := strconv.FormatUint(uint64(i), 10)
+		err = d.VolatileSet(map[string]string{deviceVolatileKey: busNum})
+		if err != nil {
+			return nil, "", "", false, fmt.Errorf("Failed setting config key %q: %w", deviceVolatileKey, err)
+		}
+
+		reverter.Add(func() {
+			err := d.VolatileSet(map[string]string{deviceVolatileKey: ""})
+			if err != nil {
+				d.logger.Warn("Failed clearing config key", logger.Ctx{"key": deviceVolatileKey, "err": err})
+			}
+		})
+
+		busName = busDevicePortPrefix + busNum
+		d.logger.Debug("Hotplugging device into bus", logger.Ctx{"device": deviceName, "busType": "pcie", "bus": busName})
+
+		cleanup := reverter.Clone().Fail
+		reverter.Success()
+		return cleanup, busName, firstFunctionAddress, false, nil
+	}
+
+	return nil, "", "", false, errors.New("No unused PCIe ports available for hotplugging")
+}
+
+// busAllocatePCIeHotplugLegacy provides a busAllocator implementation for hotplugging PCIe devices using the
+// legacy sorted device ordering method.
+func (d *qemu) busAllocatePCIeHotplugLegacy(deviceName string, _ bool) (cleanup revert.Hook, busName string, busAddress string, multifunction bool, err error) {
+	pciDevID := qemuPCIDeviceIDStart
+
+	// Iterate through all the instance devices in the same sorted order as is used when allocating the
+	// boot time devices in order to find the PCI bus slot device we would have used at boot time.
+	// Then attempt to use that same device, assuming it is available.
+	for _, dev := range d.expandedDevices.Sorted() {
+		if dev.Name == deviceName {
+			break // Found our device.
+		}
+
+		pciDevID++
+	}
+
+	busName = busDevicePortPrefix + strconv.FormatUint(uint64(pciDevID), 10)
+	busAddress = "00.0" // First function on the bus.
+
+	d.logger.Debug("Hotplugging device into bus (legacy)", logger.Ctx{"device": deviceName, "busType": "pcie", "bus": busName})
+
+	return nil, busName, busAddress, false, nil
+}
+
+func (d *qemu) deviceAttachPath(deviceName string) (mountTag string, err error) {
+	deviceID := qemuDeviceNameOrID(qemuDeviceIDPrefix, deviceName, "-virtio-fs", qemuDeviceIDMaxLength)
+	mountTag = qemuDeviceNameOrID(qemuDeviceNamePrefix, deviceName, "", qemuDeviceNameMaxLength)
+
+	// Detect virtiofsd path.
+	virtiofsdSockPath := filepath.Join(d.DevicesPath(), "virtio-fs."+filesystem.PathNameEncode(deviceName)+".sock")
 	// Check if the agent is running.
 	monitor, err := qmp.Connect(d.monitorPath(), qemuSerialChardevName, d.getMonitorEventHandler())
 	if err != nil {
-		return "", fmt.Errorf("Failed to connect to QMP monitor: %w", err)
+		return "", fmt.Errorf("Failed connecting to QMP monitor: %w", err)
 	}
 
 	// Open a file descriptor to the socket file through O_PATH to avoid acessing the file descriptor to the sockfs inode.
 	socketFile, err := os.OpenFile(virtiofsdSockPath, unix.O_PATH|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return "", fmt.Errorf("Failed to open device socket file %q: %w", virtiofsdSockPath, err)
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Errorf("Failed opening virtiofsd socket file (virtiofsd is not running) %q: %w", virtiofsdSockPath, err)
+		}
+
+		return "", fmt.Errorf("Failed opening virtiofsd socket file %q: %w", virtiofsdSockPath, err)
 	}
+
+	defer func() {
+		err := socketFile.Close()
+		if err != nil {
+			d.logger.Warn("Failed closing device socket file", logger.Ctx{"device": deviceName, "file": virtiofsdSockPath, "err": err})
+		}
+	}()
 
 	shortPath := fmt.Sprintf("/dev/fd/%d", socketFile.Fd())
 
@@ -2180,9 +2654,12 @@ func (d *qemu) deviceAttachPath(deviceName string) (mountTag string, err error) 
 		return "", fmt.Errorf("Error opening virtiofs socket %q: %w", virtiofsdSockPath, err)
 	}
 
+	reverter := revert.New()
+	defer reverter.Fail()
+
 	err = monitor.SendFile(virtiofsdSockPath, virtiofsFile)
 	if err != nil {
-		return "", fmt.Errorf("Failed to send virtiofs file descriptor: %w", err)
+		return "", fmt.Errorf("Failed sending virtiofs file descriptor: %w", err)
 	}
 
 	reverter.Add(func() { _ = monitor.CloseFile(virtiofsdSockPath) })
@@ -2203,32 +2680,25 @@ func (d *qemu) deviceAttachPath(deviceName string) (mountTag string, err error) 
 		},
 	})
 	if err != nil {
-		return "", fmt.Errorf("Failed to add the character device: %w", err)
+		return "", fmt.Errorf("Failed adding the character device: %w", err)
 	}
 
 	reverter.Add(func() { _ = monitor.RemoveCharDevice(deviceID) })
 
-	// Figure out a hotplug slot.
-	pciDevID := qemuPCIDeviceIDStart
-
-	// Iterate through all the instance devices in the same sorted order as is used when allocating the
-	// boot time devices in order to find the PCI bus slot device we would have used at boot time.
-	// Then attempt to use that same device, assuming it is available.
-	for _, dev := range d.expandedDevices.Sorted() {
-		if dev.Name == deviceName {
-			break // Found our device.
-		}
-
-		pciDevID++
+	// Try to get a PCI address for hotplugging.
+	busCleanup, busName, busAddr, _, err := d.busAllocatePCIeHotplug(deviceName, false)
+	if err != nil {
+		return "", err
 	}
 
-	pciDeviceName := fmt.Sprintf("%s%d", busDevicePortPrefix, pciDevID)
-	d.logger.Debug("Using PCI bus device to hotplug virtiofs into", logger.Ctx{"device": deviceName, "port": pciDeviceName})
+	if busCleanup != nil {
+		reverter.Add(busCleanup)
+	}
 
-	qemuDev := map[string]string{
+	qemuDev := map[string]any{
 		"driver":  "vhost-user-fs-pci",
-		"bus":     pciDeviceName,
-		"addr":    "00.0",
+		"bus":     busName,
+		"addr":    busAddr,
 		"tag":     mountTag,
 		"chardev": deviceID,
 		"id":      deviceID,
@@ -2236,7 +2706,7 @@ func (d *qemu) deviceAttachPath(deviceName string) (mountTag string, err error) 
 
 	err = monitor.AddDevice(qemuDev)
 	if err != nil {
-		return "", fmt.Errorf("Failed to add the virtiofs device: %w", err)
+		return "", fmt.Errorf("Failed adding the virtiofs device to port %q: %w", busName, err)
 	}
 
 	reverter.Success()
@@ -2247,37 +2717,36 @@ func (d *qemu) deviceAttachBlockDevice(mount deviceConfig.MountEntryItem) error 
 	// Check if the agent is running.
 	monitor, err := qmp.Connect(d.monitorPath(), qemuSerialChardevName, d.getMonitorEventHandler())
 	if err != nil {
-		return fmt.Errorf("Failed to connect to QMP monitor: %w", err)
+		return fmt.Errorf("Failed connecting to QMP monitor: %w", err)
 	}
 
-	monHook, err := d.addDriveConfig(nil, nil, mount)
+	monHook, err := d.addDriveConfig(d.busAllocatePCIeHotplug, nil, mount)
 	if err != nil {
-		return fmt.Errorf("Failed to add drive config: %w", err)
+		return fmt.Errorf("Failed adding drive config: %w", err)
 	}
 
 	err = monHook(monitor)
 	if err != nil {
-		return fmt.Errorf("Failed to call monitor hook for block device: %w", err)
+		return fmt.Errorf("Failed setting up device via monitor: %w", err)
 	}
 
 	return nil
 }
 
 func (d *qemu) deviceDetachPath(deviceName string) error {
-	deviceID := qemuDeviceNameOrID(qemuDeviceIDPrefix, deviceName, "-virtio-fs", qemuDeviceIDMaxLength)
-
 	// Check if the agent is running.
 	monitor, err := qmp.Connect(d.monitorPath(), qemuSerialChardevName, d.getMonitorEventHandler())
 	if err != nil {
 		return err
 	}
 
+	deviceID := qemuDeviceNameOrID(qemuDeviceIDPrefix, deviceName, "-virtio-fs", qemuDeviceIDMaxLength)
 	err = monitor.RemoveDevice(deviceID)
 	if err != nil {
 		return err
 	}
 
-	waitDuration := time.Duration(time.Second * time.Duration(10))
+	waitDuration := time.Second * 10
 	waitUntil := time.Now().Add(waitDuration)
 	for {
 		err = monitor.RemoveCharDevice(deviceID)
@@ -2286,12 +2755,12 @@ func (d *qemu) deviceDetachPath(deviceName string) error {
 		}
 
 		if api.StatusErrorCheck(err, http.StatusLocked) {
-			time.Sleep(time.Second * time.Duration(2))
+			time.Sleep(time.Second * 2)
 			continue
 		}
 
 		if time.Now().After(waitUntil) {
-			return fmt.Errorf("Failed to detach path device after %v: %w", waitDuration, err)
+			return fmt.Errorf("Failed detaching path device after %v", waitDuration)
 		}
 	}
 
@@ -2299,13 +2768,15 @@ func (d *qemu) deviceDetachPath(deviceName string) error {
 }
 
 func (d *qemu) deviceDetachBlockDevice(deviceName string) error {
+	d.logger.Debug("Detaching block device", logger.Ctx{"device": deviceName})
+	defer d.logger.Debug("Finished detaching block device", logger.Ctx{"device": deviceName})
+
 	// Check if the agent is running.
 	monitor, err := qmp.Connect(d.monitorPath(), qemuSerialChardevName, d.getMonitorEventHandler())
 	if err != nil {
 		return err
 	}
 
-	deviceID := fmt.Sprintf("%s%s", qemuDeviceIDPrefix, filesystem.PathNameEncode(deviceName))
 	blockDevName := qemuDeviceNameOrID(qemuDeviceNamePrefix, deviceName, "", qemuDeviceNameMaxLength)
 
 	err = monitor.RemoveFDFromFDSet(blockDevName)
@@ -2313,12 +2784,13 @@ func (d *qemu) deviceDetachBlockDevice(deviceName string) error {
 		return err
 	}
 
+	deviceID := qemuDeviceIDPrefix + filesystem.PathNameEncode(deviceName)
 	err = monitor.RemoveDevice(deviceID)
 	if err != nil {
 		return err
 	}
 
-	waitDuration := time.Duration(time.Second * time.Duration(10))
+	waitDuration := time.Second * 10
 	waitUntil := time.Now().Add(waitDuration)
 	for {
 		err = monitor.RemoveBlockDevice(blockDevName)
@@ -2326,13 +2798,13 @@ func (d *qemu) deviceDetachBlockDevice(deviceName string) error {
 			break
 		}
 
-		if api.StatusErrorCheck(err, http.StatusLocked) {
-			time.Sleep(time.Second * time.Duration(2))
-			continue
+		if time.Now().After(waitUntil) {
+			return fmt.Errorf("Failed detaching block device after %v: %w", waitDuration, err)
 		}
 
-		if time.Now().After(waitUntil) {
-			return fmt.Errorf("Failed to detach block device after %v: %w", waitDuration, err)
+		if api.StatusErrorCheck(err, http.StatusLocked) {
+			time.Sleep(time.Second * 2)
+			continue
 		}
 	}
 
@@ -2340,7 +2812,7 @@ func (d *qemu) deviceDetachBlockDevice(deviceName string) error {
 }
 
 // deviceAttachNIC live attaches a NIC device to the instance.
-func (d *qemu) deviceAttachNIC(deviceName string, netIF []deviceConfig.RunConfigItem) error {
+func (d *qemu) deviceAttachNIC(netIF []deviceConfig.RunConfigItem) error {
 	devName := ""
 	for _, dev := range netIF {
 		if dev.Key == "link" {
@@ -2350,7 +2822,7 @@ func (d *qemu) deviceAttachNIC(deviceName string, netIF []deviceConfig.RunConfig
 	}
 
 	if devName == "" {
-		return fmt.Errorf("Device didn't provide a link property to use")
+		return errors.New("Device did not provide a link property to use")
 	}
 
 	_, qemuBus, err := d.qemuArchConfig(d.architecture)
@@ -2364,37 +2836,40 @@ func (d *qemu) deviceAttachNIC(deviceName string, netIF []deviceConfig.RunConfig
 		return err
 	}
 
-	qemuDev := make(map[string]string)
-
-	// PCIe and PCI require a port device name to hotplug the NIC into.
-	if shared.ValueInSlice(qemuBus, []string{"pcie", "pci"}) {
-		pciDevID := qemuPCIDeviceIDStart
-
-		// Iterate through all the instance devices in the same sorted order as is used when allocating the
-		// boot time devices in order to find the PCI bus slot device we would have used at boot time.
-		// Then attempt to use that same device, assuming it is available.
-		for _, dev := range d.expandedDevices.Sorted() {
-			if dev.Name == deviceName {
-				break // Found our device.
-			}
-
-			pciDevID++
-		}
-
-		pciDeviceName := fmt.Sprintf("%s%d", busDevicePortPrefix, pciDevID)
-		d.logger.Debug("Using PCI bus device to hotplug NIC into", logger.Ctx{"device": deviceName, "port": pciDeviceName})
-		qemuDev["bus"] = pciDeviceName
-		qemuDev["addr"] = "00.0"
-	}
-
-	monHook, err := d.addNetDevConfig(qemuBus, qemuDev, nil, netIF)
+	monHook, err := d.addNetDevConfig(qemuBus, d.busAllocatePCIeHotplug, nil, netIF)
 	if err != nil {
 		return err
 	}
 
 	err = monHook(monitor)
 	if err != nil {
+		return fmt.Errorf("Failed setting up device via monitor: %w", err)
+	}
+
+	return nil
+}
+
+// deviceAttachPCI live attaches a generic PCI device to the instance.
+func (d *qemu) deviceAttachPCI(pciConfig []deviceConfig.RunConfigItem) error {
+	_, qemuBus, err := d.qemuArchConfig(d.architecture)
+	if err != nil {
 		return err
+	}
+
+	// Check if the agent is running.
+	monitor, err := qmp.Connect(d.monitorPath(), qemuSerialChardevName, d.getMonitorEventHandler())
+	if err != nil {
+		return err
+	}
+
+	monHook, err := d.addPCIDevConfig(qemuBus, d.busAllocatePCIeHotplug, pciConfig)
+	if err != nil {
+		return err
+	}
+
+	err = monHook(monitor)
+	if err != nil {
+		return fmt.Errorf("Failed setting up device via monitor: %w", err)
 	}
 
 	return nil
@@ -2407,7 +2882,7 @@ func (d *qemu) deviceStop(dev device.Device, instanceRunning bool, _ string) err
 	l.Debug("Stopping device")
 
 	if instanceRunning && !dev.CanHotPlug() {
-		return fmt.Errorf("Device cannot be stopped when instance is running")
+		return errors.New("Device cannot be stopped when instance is running")
 	}
 
 	runConf, err := dev.Stop()
@@ -2455,6 +2930,14 @@ func (d *qemu) deviceStop(dev device.Device, instanceRunning bool, _ string) err
 				}
 			}
 		}
+
+		// Detach generic PCI device from running instance.
+		if configCopy["type"] == "pci" {
+			err = d.deviceDetachPCI(dev.Name())
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	if runConf != nil {
@@ -2476,27 +2959,9 @@ func (d *qemu) deviceDetachNIC(deviceName string) error {
 		return err
 	}
 
-	// pciDeviceExists checks if the deviceID exists as a bridged PCI device.
-	pciDeviceExists := func(deviceID string) (bool, error) {
-		pciDevs, err := monitor.QueryPCI()
-		if err != nil {
-			return false, err
-		}
-
-		for _, pciDev := range pciDevs {
-			for _, bridgeDev := range pciDev.Bridge.Devices {
-				if bridgeDev.DevID == deviceID {
-					return true, nil
-				}
-			}
-		}
-
-		return false, nil
-	}
-
 	escapedDeviceName := filesystem.PathNameEncode(deviceName)
-	deviceID := fmt.Sprintf("%s%s", qemuDeviceIDPrefix, escapedDeviceName)
-	netDevID := fmt.Sprintf("%s%s", qemuDeviceNamePrefix, escapedDeviceName)
+	deviceID := qemuDeviceIDPrefix + escapedDeviceName
+	netDevID := qemuDeviceNamePrefix + escapedDeviceName
 
 	// Request removal of device.
 	err = monitor.RemoveDevice(deviceID)
@@ -2514,12 +2979,12 @@ func (d *qemu) deviceDetachNIC(deviceName string) error {
 		return err
 	}
 
-	if shared.ValueInSlice(qemuBus, []string{"pcie", "pci"}) {
+	if slices.Contains([]string{"pcie", "pci"}, qemuBus) {
 		// Wait until the device is actually removed (or we timeout waiting).
-		waitDuration := time.Duration(time.Second * time.Duration(10))
+		waitDuration := time.Second * 10
 		waitUntil := time.Now().Add(waitDuration)
 		for {
-			devExists, err := pciDeviceExists(deviceID)
+			devExists, err := monitor.CheckPCIDevice(deviceID)
 			if err != nil {
 				return fmt.Errorf("Failed getting PCI devices to check for NIC detach: %w", err)
 			}
@@ -2529,11 +2994,59 @@ func (d *qemu) deviceDetachNIC(deviceName string) error {
 			}
 
 			if time.Now().After(waitUntil) {
-				return fmt.Errorf("Failed to detach NIC after %v: %w", waitDuration, err)
+				return fmt.Errorf("Failed detaching NIC after %v", waitDuration)
 			}
 
 			d.logger.Debug("Waiting for NIC device to be detached", logger.Ctx{"device": deviceName})
-			time.Sleep(time.Second * time.Duration(2))
+			time.Sleep(time.Second * 2)
+		}
+	}
+
+	return nil
+}
+
+// deviceDetachPCI detaches a generic PCI device from a running instance.
+func (d *qemu) deviceDetachPCI(deviceName string) error {
+	// Check if the agent is running.
+	monitor, err := qmp.Connect(d.monitorPath(), qemuSerialChardevName, d.getMonitorEventHandler())
+	if err != nil {
+		return err
+	}
+
+	escapedDeviceName := filesystem.PathNameEncode(deviceName)
+	deviceID := qemuDeviceIDPrefix + escapedDeviceName
+
+	// Request removal of device.
+	err = monitor.RemoveDevice(deviceID)
+	if err != nil {
+		return fmt.Errorf("Failed removing PCI device: %w", err)
+	}
+
+	_, qemuBus, err := d.qemuArchConfig(d.architecture)
+	if err != nil {
+		return err
+	}
+
+	if slices.Contains([]string{"pcie", "pci"}, qemuBus) {
+		// Wait until the device is actually removed (or we timeout waiting).
+		waitDuration := time.Second * 10
+		waitUntil := time.Now().Add(waitDuration)
+		for {
+			devExists, err := monitor.CheckPCIDevice(deviceID)
+			if err != nil {
+				return fmt.Errorf("Failed getting PCI devices to check for detach: %w", err)
+			}
+
+			if !devExists {
+				break
+			}
+
+			if time.Now().After(waitUntil) {
+				return fmt.Errorf("Failed detaching PCI device after %v", waitDuration)
+			}
+
+			d.logger.Debug("Waiting for PCI device to be detached", logger.Ctx{"device": deviceName})
+			time.Sleep(time.Second * 2)
 		}
 	}
 
@@ -2544,6 +3057,7 @@ func (d *qemu) monitorPath() string {
 	return filepath.Join(d.LogPath(), "qemu.monitor")
 }
 
+// nvramPath returns the path to the UEFI firmware variables file.
 func (d *qemu) nvramPath() string {
 	return filepath.Join(d.Path(), "qemu.nvram")
 }
@@ -2551,16 +3065,17 @@ func (d *qemu) nvramPath() string {
 // UEFIVars reads UEFI Variables for instance.
 func (d *qemu) UEFIVars() (*api.InstanceUEFIVars, error) {
 	if !d.architectureSupportsUEFI(d.architecture) {
-		return nil, fmt.Errorf("UEFI is not supported for this instance architecture")
+		return nil, errors.New("UEFI is not supported for this instance architecture")
 	}
 
-	if shared.IsTrue(d.expandedConfig["security.csm"]) {
-		return nil, fmt.Errorf("UEFI is disabled when CSM mode is active")
+	bootMode := d.effectiveBootMode()
+	if bootMode == instancetype.BootModeBIOS {
+		return nil, errors.New("UEFI is disabled when BIOS boot mode is active")
 	}
 
 	uefiVarsPath := d.nvramPath()
 
-	// Initialise the NVRAM file if doesn't exist so we return the default variables.
+	// Initialise the NVRAM file if it doesn't exist so we return the default variables.
 	if !shared.PathExists(uefiVarsPath) {
 		// Ensure that a VM start or update isn't in progress.
 		instOp, err := d.LockExclusive()
@@ -2568,12 +3083,16 @@ func (d *qemu) UEFIVars() (*api.InstanceUEFIVars, error) {
 			return nil, fmt.Errorf("Failed getting exclusive access instance: %w", err)
 		}
 
-		defer instOp.Done(err)
-
-		err = d.setupNvram()
-		if err != nil {
-			return nil, fmt.Errorf("Failed setting up NVRAM: %w", err)
+		// Re-check under lock to avoid racing with another goroutine.
+		if !shared.PathExists(uefiVarsPath) {
+			err = d.setupNvram()
+			if err != nil {
+				instOp.Done(err)
+				return nil, fmt.Errorf("Failed setting up NVRAM: %w", err)
+			}
 		}
+
+		instOp.Done(nil)
 	}
 
 	instanceUEFI, err := uefi.UEFIVars(d.state.OS, uefiVarsPath)
@@ -2587,15 +3106,16 @@ func (d *qemu) UEFIVars() (*api.InstanceUEFIVars, error) {
 // UEFIVarsUpdate updates UEFI Variables for instance.
 func (d *qemu) UEFIVarsUpdate(newUEFIVarsSet api.InstanceUEFIVars) error {
 	if d.IsRunning() {
-		return fmt.Errorf("UEFI variables editing is allowed for stopped VM instances only")
+		return errors.New("UEFI variables editing is allowed for stopped VM instances only")
 	}
 
 	if !d.architectureSupportsUEFI(d.architecture) {
-		return fmt.Errorf("UEFI is not supported for this instance architecture")
+		return errors.New("UEFI is not supported for this instance architecture")
 	}
 
-	if shared.IsTrue(d.expandedConfig["security.csm"]) {
-		return fmt.Errorf("UEFI is disabled when CSM mode is active")
+	bootMode := d.effectiveBootMode()
+	if bootMode == instancetype.BootModeBIOS {
+		return errors.New("UEFI is disabled when BIOS boot mode is active")
 	}
 
 	uefiVarsPath := d.nvramPath()
@@ -2617,14 +3137,25 @@ func (d *qemu) spicePath() string {
 }
 
 func (d *qemu) spiceCmdlineConfig() string {
-	return fmt.Sprintf("unix=on,disable-ticketing=on,addr=%s", d.spicePath())
+	return "unix=on,disable-ticketing=on,addr=" + d.spicePath()
+}
+
+// lxdAgentSourcePath returns the resolved path to the host lxd-agent binary, or an empty
+// string if it is not installed (the VM then starts without an up-to-date agent).
+func (d *qemu) lxdAgentSourcePath() (string, error) {
+	srcPath, err := exec.LookPath("lxd-agent")
+	if err != nil {
+		return "", nil
+	}
+
+	return filepath.EvalSymlinks(srcPath)
 }
 
 // generateConfigShare generates the config share directory that will be exported to the VM via
 // a 9P share. Due to the unknown size of templates inside the images this directory is created
 // inside the VM's config volume so that it can be restricted by quota.
 // Requires the instance be mounted before calling this function.
-func (d *qemu) generateConfigShare() error {
+func (d *qemu) generateConfigShare(lxdAgentSrcPath string) error {
 	configDrivePath := filepath.Join(d.Path(), "config")
 
 	// Create config drive dir if doesn't exist, if it does exist, leave it around so we don't regenerate all
@@ -2634,63 +3165,20 @@ func (d *qemu) generateConfigShare() error {
 		return err
 	}
 
-	// Add the VM agent.
-	lxdAgentSrcPath, err := exec.LookPath("lxd-agent")
-	if err != nil {
-		d.logger.Warn("lxd-agent not found, skipping its inclusion in the VM config drive", logger.Ctx{"err": err})
+	// Keep only a placeholder here; the real binary is bind-mounted over it in start() so it
+	// never occupies the quota'd config volume. Only touch it when a host agent exists to mount
+	// later, else leave any existing binary in place.
+	if lxdAgentSrcPath == "" {
+		d.logger.Warn("lxd-agent not found, skipping its inclusion in the VM config drive")
 	} else {
-		// Install agent into config drive dir if found.
-		lxdAgentSrcPath, err = filepath.EvalSymlinks(lxdAgentSrcPath)
-		if err != nil {
-			return err
-		}
-
-		lxdAgentSrcInfo, err := os.Stat(lxdAgentSrcPath)
-		if err != nil {
-			return fmt.Errorf("Failed getting info for lxd-agent source %q: %w", lxdAgentSrcPath, err)
-		}
-
+		// O_TRUNC reclaims the space used by a full binary copied by an older LXD version.
 		lxdAgentInstallPath := filepath.Join(configDrivePath, "lxd-agent")
-		lxdAgentNeedsInstall := true
-
-		if shared.PathExists(lxdAgentInstallPath) {
-			lxdAgentInstallInfo, err := os.Stat(lxdAgentInstallPath)
-			if err != nil {
-				return fmt.Errorf("Failed getting info for existing lxd-agent install %q: %w", lxdAgentInstallPath, err)
-			}
-
-			if lxdAgentInstallInfo.ModTime() == lxdAgentSrcInfo.ModTime() && lxdAgentInstallInfo.Size() == lxdAgentSrcInfo.Size() {
-				lxdAgentNeedsInstall = false
-			}
+		f, err := os.OpenFile(lxdAgentInstallPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0500)
+		if err != nil {
+			return fmt.Errorf("Failed creating lxd-agent placeholder %q: %w", lxdAgentInstallPath, err)
 		}
 
-		// Only install the lxd-agent into config drive if the existing one is different to the source one.
-		// Otherwise we would end up copying it again and this can cause unnecessary snapshot usage.
-		if lxdAgentNeedsInstall {
-			d.logger.Debug("Installing lxd-agent", logger.Ctx{"srcPath": lxdAgentSrcPath, "installPath": lxdAgentInstallPath})
-			err = shared.FileCopy(lxdAgentSrcPath, lxdAgentInstallPath)
-			if err != nil {
-				return err
-			}
-
-			err = os.Chmod(lxdAgentInstallPath, 0500)
-			if err != nil {
-				return err
-			}
-
-			err = os.Chown(lxdAgentInstallPath, 0, 0)
-			if err != nil {
-				return err
-			}
-
-			// Ensure we copy the source file's timestamps so they can be used for comparison later.
-			err = os.Chtimes(lxdAgentInstallPath, lxdAgentSrcInfo.ModTime(), lxdAgentSrcInfo.ModTime())
-			if err != nil {
-				return fmt.Errorf("Failed setting lxd-agent timestamps: %w", err)
-			}
-		} else {
-			d.logger.Debug("Skipping lxd-agent install as unchanged", logger.Ctx{"srcPath": lxdAgentSrcPath, "installPath": lxdAgentInstallPath})
-		}
+		_ = f.Close()
 	}
 
 	agentCert, agentKey, clientCert, _, err := d.generateAgentCert()
@@ -2714,24 +3202,33 @@ func (d *qemu) generateConfigShare() error {
 	}
 
 	// Systemd units.
-	err = os.MkdirAll(filepath.Join(configDrivePath, "systemd"), 0500)
+	systemdPath := filepath.Join(configDrivePath, "systemd")
+	err = os.MkdirAll(systemdPath, 0500)
 	if err != nil {
 		return err
 	}
 
-	// Systemd unit for lxd-agent. It ensures the lxd-agent is copied from the shared filesystem before it is
-	// started. The service is triggered dynamically via udev rules when certain virtio-ports are detected,
-	// rather than being enabled at boot.
-	lxdAgentServiceUnit := `[Unit]
+	lxdAgentServiceUnit := `# Systemd unit for lxd-agent. It ensures the lxd-agent is copied from the shared filesystem before
+# it is started. The service is triggered dynamically when the lxd-agent-generator is run inside a
+# LXD VM, rather than being enabled at boot.
+[Unit]
 Description=LXD - agent
-Documentation=https://documentation.ubuntu.com/lxd/en/latest/
-Before=multi-user.target cloud-init.target cloud-init.service cloud-init-local.service
+Documentation=https://canonical.com/lxd/docs/latest/
+Before=multi-user.target cloud-init-local.service shutdown.target umount.target
+After=local-fs.target systemd-journald.socket
+Conflicts=shutdown.target
 DefaultDependencies=no
+
+# Containers see their host's DMI information, so the generator may add
+# lxd-agent.service to the boot transaction if the container's host is a LXD VM
+# with systemd older than 251. Prevent this by requiring a VM (systemd 244+).
+ConditionVirtualization=vm
 
 [Service]
 Type=notify
+RuntimeDirectory=lxd_agent
 WorkingDirectory=-/run/lxd_agent
-ExecStartPre=/lib/systemd/lxd-agent-setup
+ExecStartPre=/usr/lib/systemd/lxd-agent-setup
 ExecStart=/run/lxd_agent/lxd-agent
 Restart=on-failure
 RestartSec=5s
@@ -2739,7 +3236,11 @@ StartLimitInterval=60
 StartLimitBurst=10
 `
 
-	err = os.WriteFile(filepath.Join(configDrivePath, "systemd", "lxd-agent.service"), []byte(lxdAgentServiceUnit), 0400)
+	// Service units are meant to be world-readable. Trying to restrict access
+	// is ineffective as there are other means to access their content. This is
+	// not an issue as the lxd-agent.service unit doesn't contain any sensitive
+	// information.
+	err = os.WriteFile(filepath.Join(systemdPath, "lxd-agent.service"), []byte(lxdAgentServiceUnit), 0644)
 	if err != nil {
 		return err
 	}
@@ -2775,7 +3276,7 @@ mount -t tmpfs tmpfs "${PREFIX}" -o mode=0700,nodev,nosuid,noatime,size=50M
 mkdir -p "${PREFIX}/.mnt"
 
 # Try virtiofs first.
-mount_virtiofs || mount_9p || fail "Couldn't mount virtiofs or 9p, failing."
+mount_virtiofs || mount_9p || fail "Could not mount virtiofs or 9p, failing."
 
 # Copy the data.
 cp -Ra --no-preserve=ownership "${PREFIX}/.mnt/"* "${PREFIX}"
@@ -2788,24 +3289,68 @@ rmdir "${PREFIX}/.mnt"
 restorecon -R "${PREFIX}" >/dev/null 2>&1 || true
 `
 
-	err = os.WriteFile(filepath.Join(configDrivePath, "systemd", "lxd-agent-setup"), []byte(lxdAgentSetupScript), 0500)
+	err = os.WriteFile(filepath.Join(systemdPath, "lxd-agent-setup"), []byte(lxdAgentSetupScript), 0500)
 	if err != nil {
 		return err
 	}
 
-	err = os.MkdirAll(filepath.Join(configDrivePath, "udev"), 0500)
+	// The `lxd-agent.service` unit needs to only start when executing inside a LXD VM.
+	// To achieve this, we use a systemd generator that checks for LXD-specific
+	// DMI information and only adds the `lxd-agent.service` to the boot
+	// transaction if it is running inside a LXD VM. However, some architectures
+	// (like s390x) do not support DMI, so udev rules are used to trigger
+	// the `lxd-agent.service` when either of the virtio ports is detected.
+	// Udev rules are deployed unconditionally as a fallback for all architectures.
+	udevPath := filepath.Join(configDrivePath, "udev")
+	err = os.MkdirAll(udevPath, 0500)
 	if err != nil {
 		return err
 	}
 
-	// Udev rules to start the lxd-agent.service when QEMU serial devices (symlinks in virtio-ports) appear.
-	lxdAgentRules := `SYMLINK=="virtio-ports/com.canonical.lxd", TAG+="systemd", ENV{SYSTEMD_WANTS}+="lxd-agent.service"
+	// udev conditions are evaluated sequentially so the order matters.
+	// The SUBSYSTEM is part of the event so it is the cheapest check to perform.
+	// The ATTR{name} requires a file read under `/sys`, so it should come last.
 
-# Legacy.
-SYMLINK=="virtio-ports/org.linuxcontainers.lxd", TAG+="systemd", ENV{SYSTEMD_WANTS}+="lxd-agent.service"
+	// Udev rules to start the lxd-agent.service when QEMU serial devices (virtio-ports) appear.
+	lxdAgentRules := `# This rule acts as the primary trigger for architectures without DMI
+# (where the systemd generator is skipped). On architectures with DMI, this
+# rule will also fire, but systemd will safely deduplicate the start request.
+SUBSYSTEM=="virtio-ports", \
+ATTR{name}=="com.canonical.lxd|org.linuxcontainers.lxd", \
+TAG+="systemd", \
+ENV{SYSTEMD_WANTS}+="lxd-agent.service"
 `
 
-	err = os.WriteFile(filepath.Join(configDrivePath, "udev", "99-lxd-agent.rules"), []byte(lxdAgentRules), 0400)
+	err = os.WriteFile(filepath.Join(udevPath, "99-lxd-agent.rules"), []byte(lxdAgentRules), 0400)
+	if err != nil {
+		return err
+	}
+
+	// system generator to start the lxd-agent.service when LXD VMs are detected via DMI `board_name`.
+	lxdAgentGenerator := `#!/bin/sh
+
+# $1 = normal, $2 = early, $3 = late
+OUT_DIR="${2}"
+UNIT_NAME="lxd-agent.service"
+SOURCE_UNIT="/usr/lib/systemd/system/${UNIT_NAME}"
+TARGET_DIR="${OUT_DIR}/multi-user.target.wants"
+
+# SYSTEMD_VIRTUALIZATION was added in version 251
+[ "${SYSTEMD_VIRTUALIZATION:-vm:kvm}" = "vm:kvm" ] || exit 0
+
+# In a LXD VM, the board name is set to "LXD"
+f="/sys/class/dmi/id/board_name"
+[ -r "${f}" ] || exit 0
+
+read -r board_name < "${f}" || true
+if [ "${board_name}" = "LXD" ]; then
+  [ -d "${TARGET_DIR}" ] || mkdir -p "${TARGET_DIR}"
+  ln -sf "${SOURCE_UNIT}" "${TARGET_DIR}/${UNIT_NAME}"
+fi
+`
+
+	// System generators need to be executable as they are executed directly by systemd to determine which units to enable.
+	err = os.WriteFile(filepath.Join(systemdPath, "lxd-agent-generator"), []byte(lxdAgentGenerator), 0500)
 	if err != nil {
 		return err
 	}
@@ -2813,7 +3358,7 @@ SYMLINK=="virtio-ports/org.linuxcontainers.lxd", TAG+="systemd", ENV{SYSTEMD_WAN
 	// Install script for manual installs.
 	lxdConfigShareInstall := `#!/bin/sh
 if [ ! -e "systemd" ] || [ ! -e "lxd-agent" ]; then
-    echo "This script must be run from within the 9p mount"
+    echo "This script must be run from within the config mount"
     exit 1
 fi
 
@@ -2823,7 +3368,7 @@ if [ ! -d "/run/systemd/system/" ]; then
     exit 1
 fi
 
-for path in "/lib/systemd" "/usr/lib/systemd"; do
+for path in "/usr/lib/systemd" "/lib/systemd"; do
     [ -d "${path}/system" ] || continue
     LIB_SYSTEMD="${path}"
     break
@@ -2834,7 +3379,7 @@ if [ ! -d "${LIB_SYSTEMD:-}" ]; then
     exit 1
 fi
 
-for path in "/lib/udev" "/usr/lib/udev"; do
+for path in "/usr/lib/udev" "/lib/udev"; do
     [ -d "${path}/rules.d/" ] || continue
     LIB_UDEV="${path}"
     break
@@ -2848,19 +3393,26 @@ fi
 # Cleanup former units.
 rm -f "${LIB_SYSTEMD}/system/lxd-agent-9p.service" \
     "${LIB_SYSTEMD}/system/lxd-agent-virtiofs.service" \
+    /usr/lib/udev/rules.d/99-lxd-agent.rules \
+    /lib/udev/rules.d/99-lxd-agent.rules \
     /etc/systemd/system/multi-user.target.wants/lxd-agent-9p.service \
     /etc/systemd/system/multi-user.target.wants/lxd-agent-virtiofs.service \
     /etc/systemd/system/multi-user.target.wants/lxd-agent.service
 
 # Install the units.
-cp udev/99-lxd-agent.rules "${LIB_UDEV}/rules.d/"
-cp systemd/lxd-agent-setup "${LIB_SYSTEMD}/"
-if [ "/lib/systemd" = "${LIB_SYSTEMD}" ]; then
-  cp systemd/lxd-agent.service "${LIB_SYSTEMD}/system/"
-else
-  # Adapt paths for systemd's lib location
-  sed "/=\/lib\/systemd/ s|=/lib/systemd|=${LIB_SYSTEMD}|" systemd/lxd-agent.service > "${LIB_SYSTEMD}/system/lxd-agent.service"
+if [ -e udev/99-lxd-agent.rules ]; then
+  cp udev/99-lxd-agent.rules "${LIB_UDEV}/rules.d/"
 fi
+cp systemd/lxd-agent-setup "${LIB_SYSTEMD}/"
+cp systemd/lxd-agent.service "${LIB_SYSTEMD}/system/"
+mkdir -p "${LIB_SYSTEMD}/system-generators"
+cp systemd/lxd-agent-generator "${LIB_SYSTEMD}/system-generators/"
+
+# Adapt paths for systemd's lib location if needed.
+if [ "/usr/lib/systemd" != "${LIB_SYSTEMD}" ]; then
+    sed -i "s|/usr/lib/systemd|${LIB_SYSTEMD}|g" "${LIB_SYSTEMD}/system/lxd-agent.service" "${LIB_SYSTEMD}/system-generators/lxd-agent-generator"
+fi
+
 systemctl daemon-reload
 
 # SELinux handling.
@@ -2894,7 +3446,7 @@ echo "To start it now, unmount this filesystem and run: systemctl start lxd-agen
 		// Run any template that needs running.
 		err = d.templateApplyNow(instance.TemplateTrigger(d.localConfig[key]), templateFilesPath)
 		if err != nil {
-			return err
+			return fmt.Errorf("Failed applying template: %w", err)
 		}
 
 		err := d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
@@ -2908,16 +3460,14 @@ echo "To start it now, unmount this filesystem and run: systemctl start lxd-agen
 
 	err = d.templateApplyNow("start", templateFilesPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("Failed applying template: %w", err)
 	}
 
 	// Copy the template metadata itself too.
 	metaPath := filepath.Join(d.Path(), "metadata.yaml")
-	if shared.PathExists(metaPath) {
-		err = shared.FileCopy(metaPath, filepath.Join(templateFilesPath, "metadata.yaml"))
-		if err != nil {
-			return err
-		}
+	err = shared.FileCopy(metaPath, filepath.Join(templateFilesPath, "metadata.yaml"))
+	if err != nil && !os.IsNotExist(err) {
+		return err
 	}
 
 	// Clear NICConfigDir to ensure that no leftover configuration is erroneously applied by the agent.
@@ -2946,22 +3496,28 @@ echo "To start it now, unmount this filesystem and run: systemctl start lxd-agen
 }
 
 func (d *qemu) templateApplyNow(trigger instance.TemplateTrigger, path string) error {
-	// If there's no metadata, just return.
-	fname := filepath.Join(d.Path(), "metadata.yaml")
-	if !shared.PathExists(fname) {
-		return nil
+	instanceRoot, err := d.OpenRoot()
+	if err != nil {
+		return err
 	}
 
-	// Parse the metadata.
-	content, err := os.ReadFile(fname)
+	defer func() { _ = instanceRoot.Close() }()
+
+	metadataFile, err := instanceRoot.Open("metadata.yaml")
 	if err != nil {
-		return fmt.Errorf("Failed to read metadata: %w", err)
+		// If there's no metadata, just return.
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+
+		return err
 	}
 
-	metadata := new(api.ImageMetadata)
-	err = yaml.Unmarshal(content, &metadata)
+	defer func() { _ = metadataFile.Close() }()
+
+	metadata, err := ParseImageMetadataFile(metadataFile)
 	if err != nil {
-		return fmt.Errorf("Could not parse %s: %w", fname, err)
+		return fmt.Errorf("Failed reading metadata: %w", err)
 	}
 
 	// Figure out the instance architecture.
@@ -2969,7 +3525,7 @@ func (d *qemu) templateApplyNow(trigger instance.TemplateTrigger, path string) e
 	if err != nil {
 		arch, err = osarch.ArchitectureName(d.state.OS.Architectures[0])
 		if err != nil {
-			return fmt.Errorf("Failed to detect system architecture: %w", err)
+			return fmt.Errorf("Failed detecting system architecture: %w", err)
 		}
 	}
 
@@ -2985,29 +3541,45 @@ func (d *qemu) templateApplyNow(trigger instance.TemplateTrigger, path string) e
 		instanceMeta["ephemeral"] = "false"
 	}
 
+	templatesRoot, err := d.OpenTemplates()
+	if err != nil {
+		return err
+	}
+
+	defer func() { _ = templatesRoot.Close() }()
+
+	// Open the output directory as a confined *os.Root so that a template's
+	// attacker-influenced source name cannot be used to escape the config
+	// drive's files directory when computing the ".out" target path.
+	outputRoot, err := os.OpenRoot(path)
+	if err != nil {
+		return err
+	}
+
+	defer func() { _ = outputRoot.Close() }()
+
 	// Go through the templates.
 	for tplPath, tpl := range metadata.Templates {
 		err = func(tplPath string, tpl *api.ImageMetadataTemplate) error {
 			var w *os.File
 
 			// Check if the template should be applied now.
-			found := false
-			for _, tplTrigger := range tpl.When {
-				if tplTrigger == string(trigger) {
-					found = true
-					break
-				}
-			}
+			found := slices.Contains(tpl.When, string(trigger))
 
 			if !found {
 				return nil
 			}
 
-			// Create the file itself.
-			w, err = os.Create(filepath.Join(path, fmt.Sprintf("%s.out", tpl.Template)))
+			// Create the file itself. The confined *os.Root prevents the target
+			// path from escaping the output directory.
+			relPath := filepath.Clean(tpl.Template + ".out")
+
+			w, err = outputRoot.OpenFile(relPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 			if err != nil {
-				return err
+				return fmt.Errorf("Failed creating template file %q: %w", tpl.Template, err)
 			}
+
+			defer func() { _ = w.Close() }()
 
 			// Fix ownership and mode.
 			err = w.Chmod(0644)
@@ -3015,19 +3587,10 @@ func (d *qemu) templateApplyNow(trigger instance.TemplateTrigger, path string) e
 				return err
 			}
 
-			defer func() { _ = w.Close() }()
-
 			// Read the template.
-			tplString, err := os.ReadFile(filepath.Join(d.TemplatesPath(), tpl.Template))
+			tplString, err := templatesRoot.ReadFile(tpl.Template)
 			if err != nil {
-				return fmt.Errorf("Failed to read template file: %w", err)
-			}
-
-			// Restrict filesystem access to within the instance's rootfs.
-			tplSet := pongo2.NewSet(fmt.Sprintf("%s-%s", d.name, tpl.Template), pongoTemplate.ChrootLoader{Path: d.TemplatesPath()})
-			tplRender, err := tplSet.FromString("{% autoescape off %}" + string(tplString) + "{% endautoescape %}")
-			if err != nil {
-				return fmt.Errorf("Failed to render template: %w", err)
+				return fmt.Errorf("Failed reading template file: %w", err)
 			}
 
 			configGet := func(confKey, confDefault *pongo2.Value) *pongo2.Value {
@@ -3040,16 +3603,18 @@ func (d *qemu) templateApplyNow(trigger instance.TemplateTrigger, path string) e
 			}
 
 			// Render the template.
-			err = tplRender.ExecuteWriter(pongo2.Context{"trigger": trigger,
+			err = shared.RenderTemplateFile(w, string(tplString), pongo2.Context{
+				"trigger":    trigger,
 				"path":       tplPath,
 				"instance":   instanceMeta,
 				"container":  instanceMeta, // FIXME: remove once most images have moved away.
 				"config":     d.expandedConfig,
 				"devices":    d.expandedDevices,
 				"properties": tpl.Properties,
-				"config_get": configGet}, w)
+				"config_get": configGet,
+			})
 			if err != nil {
-				return err
+				return fmt.Errorf("Failed rendering template: %w", err)
 			}
 
 			return w.Close()
@@ -3072,11 +3637,7 @@ func (d *qemu) deviceBootPriorities(base int) (map[string]int, error) {
 
 	devices := []devicePrios{}
 
-	for _, dev := range d.expandedDevices.Sorted() {
-		if dev.Config["type"] != "disk" && dev.Config["type"] != "nic" {
-			continue
-		}
-
+	for _, dev := range d.expandedDevices.Filter(filters.Or(filters.IsDisk, filters.IsNIC)).Sorted() {
 		bootPrio := uint32(0) // Default to lowest priority.
 		if dev.Config["boot.priority"] != "" {
 			prio, err := strconv.ParseInt(dev.Config["boot.priority"], 10, 32)
@@ -3129,7 +3690,7 @@ func (d *qemu) generateQemuConfigFile(cpuInfo *cpuTopology, mountInfo *storagePo
 	}
 
 	// Allow disabling the UEFI firmware.
-	if shared.ValueInSlice("-bios", rawOptions) || shared.ValueInSlice("-kernel", rawOptions) {
+	if slices.Contains(rawOptions, "-bios") || slices.Contains(rawOptions, "-kernel") {
 		d.logger.Warn("Starting VM without default firmware (-bios or -kernel in raw.qemu)")
 	} else if d.architectureSupportsUEFI(d.architecture) {
 		// Open the UEFI NVRAM file and pass it via file descriptor to QEMU.
@@ -3141,11 +3702,13 @@ func (d *qemu) generateQemuConfigFile(cpuInfo *cpuTopology, mountInfo *storagePo
 
 		// Determine expected firmware.
 		var firmwares []edk2.FirmwarePair
-		if shared.IsTrue(d.expandedConfig["security.csm"]) {
+		bootMode := d.effectiveBootMode()
+		switch bootMode {
+		case instancetype.BootModeBIOS:
 			firmwares = edk2.GetArchitectureFirmwarePairsForUsage(d.architecture, edk2.CSM)
-		} else if shared.IsTrueOrEmpty(d.expandedConfig["security.secureboot"]) {
+		case instancetype.BootModeUEFISecureBoot:
 			firmwares = edk2.GetArchitectureFirmwarePairsForUsage(d.architecture, edk2.SECUREBOOT)
-		} else {
+		default:
 			firmwares = edk2.GetArchitectureFirmwarePairsForUsage(d.architecture, edk2.GENERIC)
 		}
 
@@ -3158,26 +3721,19 @@ func (d *qemu) generateQemuConfigFile(cpuInfo *cpuTopology, mountInfo *storagePo
 		}
 
 		if efiCode == "" {
-			return "", nil, fmt.Errorf("Unable to locate matching VM firmware: %+v", firmwares)
+			return "", nil, fmt.Errorf("Cannot locate matching VM firmware: %+v", firmwares)
 		}
 
-		// As 2MB firmware was deprecated in the LXD snap we have to regenerate NVRAM for VMs which used the 2MB one.
-		// As EDK2-based CSM firmwares were deprecated in the LXD snap we want to force VMs to start using SeaBIOS directly.
-		isOVMF2MB := (strings.Contains(efiCode, "OVMF") && !strings.Contains(efiCode, "4MB"))
-		isOVMFCSM := (strings.Contains(efiCode, "OVMF") && strings.Contains(efiCode, "CSM"))
-		if shared.InSnap() && (isOVMF2MB || isOVMFCSM) {
-			err = d.setupNvram()
-			if err != nil {
-				return "", nil, err
+		// Use debug version of firmware when boot.debug_edk2 is set.
+		// The debug firmware path is derived by inserting ".debug" before the ".fd" extension.
+		// An error is returned if the debug firmware file does not exist.
+		if shared.IsTrue(d.expandedConfig["boot.debug_edk2"]) && strings.HasSuffix(efiCode, ".fd") {
+			debugCode := strings.TrimSuffix(efiCode, ".fd") + ".debug.fd"
+			if !shared.PathExists(debugCode) {
+				return "", nil, fmt.Errorf("Cannot find debug firmware %q", debugCode)
 			}
 
-			// force to use a top-priority firmware
-			efiCode = firmwares[0].Code
-		}
-
-		// Use debug version of firmware. (Only works for "preferred" (OVMF 4MB, no CSM) firmware flavor)
-		if shared.IsTrue(d.localConfig["boot.debug_edk2"]) && efiCode == firmwares[0].Code {
-			efiCode = filepath.Join(filepath.Dir(efiCode), edk2.OVMFDebugFirmware)
+			efiCode = debugCode
 		}
 
 		driveFirmwareOpts := qemuDriveFirmwareOpts{
@@ -3294,14 +3850,12 @@ func (d *qemu) generateQemuConfigFile(cpuInfo *cpuTopology, mountInfo *storagePo
 		cfg = append(cfg, qemuUSB(&usbOpts)...)
 	}
 
-	if shared.IsTrue(d.expandedConfig["security.csm"]) {
-		// Allocate a regular entry to keep things aligned normally (avoid NICs getting a different name).
-		_, _, _ = bus.allocate(busFunctionGroupNone)
-
+	// Allocate a regular entry to keep things aligned normally (avoid NICs getting a different name).
+	devBus, devAddr, multi = bus.allocate(busFunctionGroupNone)
+	bootMode := d.effectiveBootMode()
+	if bootMode == instancetype.BootModeBIOS {
 		// Allocate a direct entry so the SCSI controller can be seen by seabios.
 		devBus, devAddr, multi = bus.allocateDirect()
-	} else {
-		devBus, devAddr, multi = bus.allocate(busFunctionGroupNone)
 	}
 
 	scsiOpts := qemuDevOpts{
@@ -3315,7 +3869,7 @@ func (d *qemu) generateQemuConfigFile(cpuInfo *cpuTopology, mountInfo *storagePo
 
 	// Always export the config directory as a 9p config drive, in case the host or VM guest doesn't support
 	// virtio-fs.
-	devBus, devAddr, multi = bus.allocate(busFunctionGroup9p)
+	devBus, devAddr, multi = bus.allocate(busFunctionGroupConfig)
 	driveConfig9pOpts := qemuDriveConfigOpts{
 		dev: qemuDevOpts{
 			busName:       bus.name,
@@ -3328,6 +3882,51 @@ func (d *qemu) generateQemuConfigFile(cpuInfo *cpuTopology, mountInfo *storagePo
 	}
 
 	cfg = append(cfg, qemuDriveConfig(&driveConfig9pOpts)...)
+
+	// If virtiofsd is running for the config directory then export the config drive via virtio-fs.
+	// This is used by the lxd-agent in preference to 9p (due to its improved performance) and in scenarios
+	// where 9p isn't available in the VM guest OS.
+	configSockPath, _ := d.configVirtiofsdPaths()
+	if shared.PathExists(configSockPath) {
+		shortPath, err := d.shortenedFilePath(configSockPath, fdFiles)
+		if err != nil {
+			return "", nil, err
+		}
+
+		devBus, devAddr, multi = bus.allocate(busFunctionGroupConfig)
+		driveConfigVirtioOpts := qemuDriveConfigOpts{
+			dev: qemuDevOpts{
+				busName:       bus.name,
+				devBus:        devBus,
+				devAddr:       devAddr,
+				multifunction: multi,
+			},
+			protocol: "virtio-fs",
+			path:     shortPath,
+		}
+
+		cfg = append(cfg, qemuDriveConfig(&driveConfigVirtioOpts)...)
+	}
+
+	// Allocate a regular entry to keep things aligned normally (avoid NICs getting a different name).
+	devBus, devAddr, multi = bus.allocate(busFunctionGroupNone)
+	bootMode = d.effectiveBootMode()
+	if bootMode == instancetype.BootModeBIOS {
+		// Allocate a direct entry so the GPU can be seen by seabios.
+		devBus, devAddr, multi = bus.allocateDirect()
+	}
+
+	gpuOpts := qemuGpuOpts{
+		dev: qemuDevOpts{
+			busName:       bus.name,
+			devBus:        devBus,
+			devAddr:       devAddr,
+			multifunction: multi,
+		},
+		architecture: d.Architecture(),
+	}
+
+	cfg = append(cfg, qemuGPU(&gpuOpts)...)
 
 	// If user has requested AMD SEV, check if supported and add to QEMU config.
 	if shared.IsTrue(d.expandedConfig["security.sev"]) {
@@ -3348,56 +3947,9 @@ func (d *qemu) generateQemuConfigFile(cpuInfo *cpuTopology, mountInfo *storagePo
 		}
 	}
 
-	// If virtiofsd is running for the config directory then export the config drive via virtio-fs.
-	// This is used by the lxd-agent in preference to 9p (due to its improved performance) and in scenarios
-	// where 9p isn't available in the VM guest OS.
-	configSockPath, _ := d.configVirtiofsdPaths()
-	if shared.PathExists(configSockPath) {
-		shortPath, err := d.shortenedFilePath(configSockPath, fdFiles)
-		if err != nil {
-			return "", nil, err
-		}
-
-		devBus, devAddr, multi = bus.allocate(busFunctionGroup9p)
-		driveConfigVirtioOpts := qemuDriveConfigOpts{
-			dev: qemuDevOpts{
-				busName:       bus.name,
-				devBus:        devBus,
-				devAddr:       devAddr,
-				multifunction: multi,
-			},
-			protocol: "virtio-fs",
-			path:     shortPath,
-		}
-
-		cfg = append(cfg, qemuDriveConfig(&driveConfigVirtioOpts)...)
-	}
-
-	if shared.IsTrue(d.expandedConfig["security.csm"]) {
-		// Allocate a regular entry to keep things aligned normally (avoid NICs getting a different name).
-		_, _, _ = bus.allocate(busFunctionGroupNone)
-
-		// Allocate a direct entry so the GPU can be seen by seabios.
-		devBus, devAddr, multi = bus.allocateDirect()
-	} else {
-		devBus, devAddr, multi = bus.allocate(busFunctionGroupNone)
-	}
-
-	gpuOpts := qemuGpuOpts{
-		dev: qemuDevOpts{
-			busName:       bus.name,
-			devBus:        devBus,
-			devAddr:       devAddr,
-			multifunction: multi,
-		},
-		architecture: d.Architecture(),
-	}
-
-	cfg = append(cfg, qemuGPU(&gpuOpts)...)
-
 	// Dynamic devices.
 	base := 0
-	if shared.ValueInSlice("-kernel", rawOptions) {
+	if slices.Contains(rawOptions, "-kernel") {
 		base = 1
 	}
 
@@ -3406,51 +3958,109 @@ func (d *qemu) generateQemuConfigFile(cpuInfo *cpuTopology, mountInfo *storagePo
 		return "", nil, fmt.Errorf("Error calculating boot indexes: %w", err)
 	}
 
-	// Record the mounts we are going to do inside the VM using the agent.
-	agentMounts := []instancetype.VMAgentMount{}
+	// Setup a bus allocator for use with generating QEMU pre-boot config file.
+	volatileSet := make(map[string]string)
+	if d.localConfig["volatile.bus.mode"] == "" && bus.name == "pcie" {
+		volatileSet["volatile.bus.mode"] = qemuBusModePersistent // Enable persistent mode for PCIe bus.
+	}
+
+	lastBusName := ""                      // Use to detect when the main bus name changes from bus.allocate().
+	lastBusNum := qemuPCIDeviceIDStart - 1 // Initialise to last built-in device bus number.
+	usedSlots := 0                         // Calculate used PCI bus slots.
+
+	// Get maximum allowed number of PCI/PCIe slots.
+	pciSlotCountMax, err := d.getMaxPCISlotCount()
+	if err != nil {
+		return "", nil, fmt.Errorf("Failed getting PCI slot limit: %w", err)
+	}
+
+	// busAllocate allocates the next slot and records it into pending volatile for PCIe devices if needed.
+	// This function should be called in the correct order to maintain a device's persistent bus order.
+	busAllocate := func(deviceName string, enableMultifunction bool) (cleanup revert.Hook, busName string, busAddress string, multifunction bool, err error) {
+		if bus.name != "pci" && bus.name != "pcie" {
+			return nil, "", "", false, fmt.Errorf("Bus allocation not supported for bus type %q", bus.name)
+		}
+
+		if usedSlots >= int(pciSlotCountMax) {
+			return nil, "", "", false, fmt.Errorf("PCI devices limit reached: used %d of %d slots; increase %s to allow more devices", usedSlots, pciSlotCountMax, "limits.max_bus_ports")
+		}
+
+		multifunctionGroup := busFunctionGroupNone
+		if enableMultifunction {
+			multifunctionGroup = "lxd_" + deviceName
+		}
+
+		busName, busAddress, multifunction = bus.allocate(multifunctionGroup)
+		if busName != "" {
+			d.logger.Debug("Plugging device into bus", logger.Ctx{"device": deviceName, "busType": bus.name, "bus": busName})
+
+			if bus.name == "pcie" {
+				if lastBusName != busName {
+					lastBusName = busName
+					lastBusNum++ // Increment bus number when bus name changes.
+				}
+
+				// Only PCIe supports hotplugging and needs to store the bus order number in volatile.
+				volatileKey := "volatile." + deviceName + busDeviceVolatileSuffix
+				busNum := strings.TrimPrefix(busName, busDevicePortPrefix)
+				if d.localConfig[volatileKey] != busNum {
+					volatileSet[volatileKey] = busNum
+				}
+			}
+		}
+
+		usedSlots++
+
+		return nil, busName, busAddress, multifunction, nil
+	}
+
+	// Sort run configs by bus order (putting devices with no bus order after those with a bus order whilst
+	// retaining their current ordering within those devices).
+	slices.SortStableFunc(devConfs, func(a, b *deviceConfig.RunConfig) int {
+		if a.BusNum == 0 && b.BusNum > 0 {
+			return 1
+		} else if a.BusNum > 0 && b.BusNum == 0 {
+			return -1
+		}
+
+		return cmp.Compare(a.BusNum, b.BusNum)
+	})
+
+	// Number of spare hotplug ports to allocate.
+	// Could go negative by the time its used (below) if there are gaps in the bus numbers.
+	spareHotplugPorts := int(pciSlotCountMax)
 
 	// These devices are sorted so that NICs are added first to ensure that the first NIC can use the 5th
 	// PCIe bus port and will be consistently named enp5s0 for compatibility with network configuration in our
 	// existing VM images. Even on non-PCIe busses having NICs first means that their names won't change when
 	// other devices are added.
 	for _, runConf := range devConfs {
+		if bus.name == "pcie" && runConf.BusNum > lastBusNum {
+			// If device has an existing persistent bus number that is higher than current number,
+			// then allocate spare hotplug ports to fill any gap in the bus number sequence.
+			// Decrement any allocated ports against the spare hotplug count so less are added at end.
+			for i := lastBusNum + 1; i < runConf.BusNum; i++ {
+				busName, _, _ := bus.allocate(busFunctionGroupNone)
+				if lastBusName != busName {
+					lastBusName = busName
+					lastBusNum++        // Increment bus number when bus name changes.
+					spareHotplugPorts-- // Reduce number of spare hotplug ports we add at end.
+					d.logger.Debug("Allocating empty bus device", logger.Ctx{"bus": busName})
+				}
+			}
+		}
+
 		// Add drive devices.
 		if len(runConf.Mounts) > 0 {
 			for _, drive := range runConf.Mounts {
 				var monHook monitorHook
 
-				// Check if the user has overridden the bus.
-				busName := "virtio-scsi"
-				for _, opt := range drive.Opts {
-					if !strings.HasPrefix(opt, "bus=") {
-						continue
-					}
-
-					busName = strings.TrimPrefix(opt, "bus=")
-					break
-				}
-
-				qemuDev := make(map[string]string)
-				if shared.ValueInSlice(busName, []string{"nvme", "virtio-blk"}) {
-					// Allocate a PCI(e) port and write it to the config file so QMP can "hotplug" the
-					// drive into it later.
-					devBus, devAddr, multi := bus.allocate(busFunctionGroupNone)
-
-					// Populate the qemu device with port info.
-					qemuDev["bus"] = devBus
-					qemuDev["addr"] = devAddr
-
-					if multi {
-						qemuDev["multifunction"] = "on"
-					}
-				}
-
 				if drive.TargetPath == "/" {
-					monHook, err = d.addRootDriveConfig(qemuDev, mountInfo, bootIndexes, drive)
-				} else if drive.FSType == "9p" {
-					err = d.addDriveDirConfig(&cfg, bus, fdFiles, &agentMounts, drive)
+					monHook, err = d.addRootDriveConfig(busAllocate, mountInfo, bootIndexes, drive)
+				} else if drive.FSType == "virtiofs" {
+					err = d.addDriveDirConfig(&cfg, bus.name, busAllocate, fdFiles, drive)
 				} else {
-					monHook, err = d.addDriveConfig(qemuDev, bootIndexes, drive)
+					monHook, err = d.addDriveConfig(busAllocate, bootIndexes, drive)
 				}
 
 				if err != nil {
@@ -3465,22 +4075,7 @@ func (d *qemu) generateQemuConfigFile(cpuInfo *cpuTopology, mountInfo *storagePo
 
 		// Add network device.
 		if len(runConf.NetworkInterface) > 0 {
-			qemuDev := make(map[string]string)
-			if shared.ValueInSlice(bus.name, []string{"pcie", "pci"}) {
-				// Allocate a PCI(e) port and write it to the config file so QMP can "hotplug" the
-				// NIC into it later.
-				devBus, devAddr, multi := bus.allocate(busFunctionGroupNone)
-
-				// Populate the qemu device with port info.
-				qemuDev["bus"] = devBus
-				qemuDev["addr"] = devAddr
-
-				if multi {
-					qemuDev["multifunction"] = "on"
-				}
-			}
-
-			monHook, err := d.addNetDevConfig(bus.name, qemuDev, bootIndexes, runConf.NetworkInterface)
+			monHook, err := d.addNetDevConfig(bus.name, busAllocate, bootIndexes, runConf.NetworkInterface)
 			if err != nil {
 				return "", nil, err
 			}
@@ -3490,7 +4085,7 @@ func (d *qemu) generateQemuConfigFile(cpuInfo *cpuTopology, mountInfo *storagePo
 
 		// Add GPU device.
 		if len(runConf.GPUDevice) > 0 {
-			err = d.addGPUDevConfig(&cfg, bus, runConf.GPUDevice)
+			err = d.addGPUDevConfig(&cfg, bus.name, busAllocate, runConf.GPUDevice)
 			if err != nil {
 				return "", nil, err
 			}
@@ -3498,10 +4093,12 @@ func (d *qemu) generateQemuConfigFile(cpuInfo *cpuTopology, mountInfo *storagePo
 
 		// Add PCI device.
 		if len(runConf.PCIDevice) > 0 {
-			err = d.addPCIDevConfig(&cfg, bus, runConf.PCIDevice)
+			monHook, err := d.addPCIDevConfig(bus.name, busAllocate, runConf.PCIDevice)
 			if err != nil {
 				return "", nil, err
 			}
+
+			monHooks = append(monHooks, monHook)
 		}
 
 		// Add USB devices.
@@ -3523,6 +4120,19 @@ func (d *qemu) generateQemuConfigFile(cpuInfo *cpuTopology, mountInfo *storagePo
 		}
 	}
 
+	// Apply any volatile changes that need to be made.
+	if len(volatileSet) > 0 {
+		err = d.VolatileSet(volatileSet)
+		if err != nil {
+			return "", nil, err
+		}
+	}
+
+	err = d.generateAgentMountsFile()
+	if err != nil {
+		return "", nil, fmt.Errorf("Failed generating agent mounts file: %w", err)
+	}
+
 	// VM generation ID is only available on x86.
 	if d.architecture == osarch.ARCH_64BIT_INTEL_X86 {
 		err = d.addVmgenDeviceConfig(&cfg, d.localConfig["volatile.uuid.generation"])
@@ -3531,21 +4141,13 @@ func (d *qemu) generateQemuConfigFile(cpuInfo *cpuTopology, mountInfo *storagePo
 		}
 	}
 
-	// Allocate 4 PCI slots for hotplug devices.
-	for i := 0; i < 4; i++ {
-		bus.allocate(busFunctionGroupNone)
-	}
+	// Account for already used PCIe slots.
+	spareHotplugPorts -= usedSlots
 
-	// Write the agent mount config.
-	agentMountJSON, err := json.Marshal(agentMounts)
-	if err != nil {
-		return "", nil, fmt.Errorf("Failed marshalling agent mounts to JSON: %w", err)
-	}
-
-	agentMountFile := filepath.Join(d.Path(), "config", "agent-mounts.json")
-	err = os.WriteFile(agentMountFile, agentMountJSON, 0400)
-	if err != nil {
-		return "", nil, fmt.Errorf("Failed writing agent mounts file: %w", err)
+	// Allocate remaining empty PCIe slots for hotplug devices.
+	for range spareHotplugPorts {
+		busName, _, _ := bus.allocate(busFunctionGroupNone)
+		d.logger.Debug("Allocating empty bus device", logger.Ctx{"bus": busName})
 	}
 
 	// process any user-specified overrides
@@ -3559,18 +4161,9 @@ func (d *qemu) generateQemuConfigFile(cpuInfo *cpuTopology, mountInfo *storagePo
 // addCPUMemoryConfig adds the qemu config required for setting the number of virtualised CPUs and memory.
 // If sb is nil then no config is written.
 func (d *qemu) addCPUMemoryConfig(cfg *[]cfgSection, cpuInfo *cpuTopology) error {
-	// Figure out what memory object layout we're going to use.
-	// Before v6.0 or if version unknown, we use the "repeated" format, otherwise we use "indexed" format.
-	qemuMemObjectFormat := "repeated"
-	qemuVer6, _ := version.NewDottedVersion("6.0")
-	qemuVer, _ := d.version()
-	if qemuVer != nil && qemuVer.Compare(qemuVer6) >= 0 {
-		qemuMemObjectFormat = "indexed"
-	}
-
 	cpuOpts := qemuCPUOpts{
-		architecture:        d.architectureName,
-		qemuMemObjectFormat: qemuMemObjectFormat,
+		architecture:        d.architecture,
+		qemuMemObjectFormat: "indexed", // Supported by QEMU 6.0+
 	}
 
 	cpuPinning := false
@@ -3601,9 +4194,9 @@ func (d *qemu) addCPUMemoryConfig(cfg *[]cfgSection, cpuInfo *cpuTopology) error
 		vcpuCore := map[uint64]uint64{}
 		vcpuThread := map[uint64]uint64{}
 		vcpu := uint64(0)
-		for i := 0; i < cpuInfo.sockets; i++ {
-			for j := 0; j < cpuInfo.cores; j++ {
-				for k := 0; k < cpuInfo.threads; k++ {
+		for i := range cpuInfo.sockets {
+			for j := range cpuInfo.cores {
+				for k := range cpuInfo.threads {
 					vcpuSocket[vcpu] = uint64(i)
 					vcpuCore[vcpu] = uint64(j)
 					vcpuThread[vcpu] = uint64(k)
@@ -3613,10 +4206,18 @@ func (d *qemu) addCPUMemoryConfig(cfg *[]cfgSection, cpuInfo *cpuTopology) error
 		}
 
 		// Prepare the NUMA map.
+		//nolint:prealloc
 		numa := []qemuNumaEntry{}
+		//nolint:prealloc
 		numaIDs := []uint64{}
 		numaNode := uint64(0)
-		for hostNode, entry := range cpuInfo.nodes {
+
+		// Iterate the host NUMA nodes in a stable order so the generated QEMU
+		// config (node IDs, memory backends and vCPU mappings) stays consistent
+		// across runs. cpuInfo.nodes is a map, whose iteration order is random.
+		sortedHostNodes := slices.Sorted(maps.Keys(cpuInfo.nodes))
+		for _, hostNode := range sortedHostNodes {
+			entry := cpuInfo.nodes[hostNode]
 			hostNodes = append(hostNodes, hostNode)
 
 			numaIDs = append(numaIDs, numaNode)
@@ -3648,7 +4249,7 @@ func (d *qemu) addCPUMemoryConfig(cfg *[]cfgSection, cpuInfo *cpuTopology) error
 		memSize = QEMUDefaultMemSize // Default if no memory limit specified.
 	}
 
-	memSizeBytes, err := units.ParseByteSizeString(memSize)
+	memSizeBytes, err := parseMemoryStr(memSize)
 	if err != nil {
 		return fmt.Errorf("limits.memory invalid: %w", err)
 	}
@@ -3665,7 +4266,12 @@ func (d *qemu) addCPUMemoryConfig(cfg *[]cfgSection, cpuInfo *cpuTopology) error
 
 	// Determine per-node memory limit.
 	memSizeMB := memSizeBytes / 1024 / 1024
-	nodeMemory := int64(memSizeMB / int64(len(hostNodes)))
+	nodeMemory := memSizeMB
+	if d.architecture == osarch.ARCH_64BIT_INTEL_X86 {
+		// On x86_64 the memory is split across one backend per NUMA node.
+		nodeMemory = memSizeMB / int64(len(hostNodes))
+	}
+
 	cpuOpts.memory = nodeMemory
 
 	if cfg != nil {
@@ -3677,27 +4283,33 @@ func (d *qemu) addCPUMemoryConfig(cfg *[]cfgSection, cpuInfo *cpuTopology) error
 }
 
 // addRootDriveConfig adds the qemu config required for adding the root drive.
-func (d *qemu) addRootDriveConfig(qemuDev map[string]string, mountInfo *storagePools.MountInfo, bootIndexes map[string]int, rootDriveConf deviceConfig.MountEntryItem) (monitorHook, error) {
+func (d *qemu) addRootDriveConfig(busAllocate busAllocator, mountInfo *storagePools.MountInfo, bootIndexes map[string]int, rootDriveConf deviceConfig.MountEntryItem) (monitorHook, error) {
 	if rootDriveConf.TargetPath != "/" {
-		return nil, fmt.Errorf("Non-root drive config supplied")
+		return nil, errors.New("Non-root drive config supplied")
 	}
 
-	if !d.storagePool.Driver().Info().Remote && mountInfo.DiskPath == "" {
-		return nil, fmt.Errorf("No root disk path available from mount")
+	devSource, isPath := mountInfo.DevSource.(deviceConfig.DevSourcePath)
+	if !isPath {
+		return nil, fmt.Errorf("Unhandled DevSource type %T", mountInfo.DevSource)
+	}
+
+	if !d.storagePool.Driver().Info().Remote && devSource.Path == "" {
+		return nil, errors.New("No root disk path available from mount")
 	}
 
 	// Generate a new device config with the root device path expanded.
 	driveConf := deviceConfig.MountEntryItem{
 		DevName:    rootDriveConf.DevName,
-		DevPath:    mountInfo.DiskPath,
+		DevSource:  mountInfo.DevSource,
 		Opts:       rootDriveConf.Opts,
 		TargetPath: rootDriveConf.TargetPath,
+		Limits:     rootDriveConf.Limits,
 	}
 
 	if d.storagePool.Driver().Info().Remote {
 		vol := d.storagePool.GetVolume(storageDrivers.VolumeTypeVM, storageDrivers.ContentTypeBlock, project.Instance(d.project.Name, d.name), nil)
 
-		if shared.ValueInSlice(d.storagePool.Driver().Info().Name, []string{"ceph", "cephfs"}) {
+		if slices.Contains([]string{"ceph", "cephfs"}, d.storagePool.Driver().Info().Name) {
 			config := d.storagePool.ToAPI().Config
 
 			userName := config["ceph.user.name"]
@@ -3707,115 +4319,100 @@ func (d *qemu) addRootDriveConfig(qemuDev map[string]string, mountInfo *storageP
 
 			clusterName := config["ceph.cluster_name"]
 			if clusterName == "" {
-				clusterName = storageDrivers.CephDefaultUser
+				clusterName = storageDrivers.CephDefaultCluster
 			}
 
-			driveConf.DevPath = device.DiskGetRBDFormat(clusterName, userName, config["ceph.osd.pool_name"], vol.Name())
+			rbdImageName, snapName := storageDrivers.CephGetRBDImageName(vol, false)
+
+			driveConf.DevSource = deviceConfig.DevSourceRBD{
+				ClusterName: clusterName,
+				UserName:    userName,
+				PoolName:    config["ceph.osd.pool_name"],
+				ImageName:   rbdImageName,
+				Snapshot:    snapName,
+			}
 		}
 	}
 
-	return d.addDriveConfig(qemuDev, bootIndexes, driveConf)
+	return d.addDriveConfig(busAllocate, bootIndexes, driveConf)
 }
 
 // addDriveDirConfig adds the qemu config required for adding a supplementary drive directory share.
-func (d *qemu) addDriveDirConfig(cfg *[]cfgSection, bus *qemuBus, fdFiles *[]*os.File, agentMounts *[]instancetype.VMAgentMount, driveConf deviceConfig.MountEntryItem) error {
+func (d *qemu) addDriveDirConfig(cfg *[]cfgSection, busName string, busAllocate busAllocator, fdFiles *[]*os.File, driveConf deviceConfig.MountEntryItem) error {
 	mountTag := qemuDeviceNameOrID(qemuDeviceNamePrefix, driveConf.DevName, "", qemuDeviceNameMaxLength)
 
-	agentMount := instancetype.VMAgentMount{
-		Source: mountTag,
-		Target: driveConf.TargetPath,
-		FSType: driveConf.FSType,
-	}
-
-	// If mount type is 9p, we need to specify to use the virtio transport to support more VM guest OSes.
-	// Also set the msize to 32MB to allow for reasonably fast 9p access.
-	if agentMount.FSType == "9p" {
-		agentMount.Options = append(agentMount.Options, "trans=virtio,msize=33554432")
-	}
-
-	readonly := shared.ValueInSlice("ro", driveConf.Opts)
-
-	// Indicate to agent to mount this readonly. Note: This is purely to indicate to VM guest that this is
-	// readonly, it should *not* be used as a security measure, as the VM guest could remount it R/W.
-	if readonly {
-		agentMount.Options = append(agentMount.Options, "ro")
-	}
-
-	// Record the 9p mount for the agent.
-	*agentMounts = append(*agentMounts, agentMount)
-
 	// Check if the disk device has provided a virtiofsd socket path.
-	var virtiofsdSockPath string
-	for _, opt := range driveConf.Opts {
-		if strings.HasPrefix(opt, fmt.Sprintf("%s=", device.DiskVirtiofsdSockMountOpt)) {
-			parts := strings.SplitN(opt, "=", 2)
-			virtiofsdSockPath = parts[1]
-		}
+	virtiofsdSock, isPath := driveConf.DevSource.(deviceConfig.DevSourcePath)
+	if !isPath {
+		return fmt.Errorf("Unhandled DevSource type %T", driveConf.DevSource)
 	}
+
+	if virtiofsdSock.Path == "" {
+		return errors.New("No virtiofsd socket path provided")
+	}
+
+	shouldBusAllocate := busName == "pcie" || busName == "pci"
+
+	reverter := revert.New()
+	defer reverter.Fail()
 
 	// If there is a virtiofsd socket path setup the virtio-fs share.
-	if virtiofsdSockPath != "" {
-		if !shared.PathExists(virtiofsdSockPath) {
-			return fmt.Errorf("virtiofsd socket path %q doesn't exist", virtiofsdSockPath)
-		}
 
-		devBus, devAddr, multi := bus.allocate(busFunctionGroup9p)
-
-		shortPath, err := d.shortenedFilePath(virtiofsdSockPath, fdFiles)
-		if err != nil {
-			return err
-		}
-
-		// Add virtio-fs device as this will be preferred over 9p.
-		driveDirVirtioOpts := qemuDriveDirOpts{
-			dev: qemuDevOpts{
-				busName:       bus.name,
-				devBus:        devBus,
-				devAddr:       devAddr,
-				multifunction: multi,
-			},
-			devName:  driveConf.DevName,
-			mountTag: mountTag,
-			path:     shortPath,
-			protocol: "virtio-fs",
-		}
-		*cfg = append(*cfg, qemuDriveDir(&driveDirVirtioOpts)...)
-	}
-
-	// Add 9p share config.
-	devBus, devAddr, multi := bus.allocate(busFunctionGroup9p)
-
-	fd, err := strconv.Atoi(driveConf.DevPath)
+	shortPath, err := d.shortenedFilePath(virtiofsdSock.Path, fdFiles)
 	if err != nil {
-		return fmt.Errorf("Invalid file descriptor %q for drive %q: %w", driveConf.DevPath, driveConf.DevName, err)
+		return err
 	}
 
-	proxyFD := d.addFileDescriptor(fdFiles, os.NewFile(uintptr(fd), driveConf.DevName))
+	// Add virtio-fs device.
+	driveDirVirtioOpts := qemuDriveDirOpts{
+		devName:  driveConf.DevName,
+		mountTag: mountTag,
+		path:     shortPath,
+		protocol: "virtio-fs",
+	}
 
-	driveDir9pOpts := qemuDriveDirOpts{
-		dev: qemuDevOpts{
-			busName:       bus.name,
+	if shouldBusAllocate {
+		busCleanup, devBus, devAddr, multi, err := busAllocate(driveConf.DevName, true)
+		if err != nil {
+			return fmt.Errorf("Failed allocating bus for virtiofs disk device: %w", err)
+		}
+
+		if busCleanup != nil {
+			reverter.Add(busCleanup)
+		}
+
+		driveDirVirtioOpts.dev = qemuDevOpts{
 			devBus:        devBus,
 			devAddr:       devAddr,
 			multifunction: multi,
-		},
-		devName:  driveConf.DevName,
-		mountTag: mountTag,
-		proxyFD:  proxyFD, // Pass by file descriptor
-		readonly: readonly,
-		protocol: "9p",
+		}
 	}
-	*cfg = append(*cfg, qemuDriveDir(&driveDir9pOpts)...)
 
+	driveDirVirtioOpts.dev.busName = busName
+	*cfg = append(*cfg, qemuDriveDir(&driveDirVirtioOpts)...)
+
+	reverter.Success()
 	return nil
 }
 
 // addDriveConfig adds the qemu config required for adding a supplementary drive.
-func (d *qemu) addDriveConfig(qemuDev map[string]string, bootIndexes map[string]int, driveConf deviceConfig.MountEntryItem) (monitorHook, error) {
+func (d *qemu) addDriveConfig(busAllocate busAllocator, bootIndexes map[string]int, driveConf deviceConfig.MountEntryItem) (monitorHook, error) {
+	// Check if the user has overridden the bus.
+	busName := "virtio-scsi"
+	for _, opt := range driveConf.Opts {
+		name, found := strings.CutPrefix(opt, "bus=")
+		if found {
+			busName = name
+			break
+		}
+	}
+
 	aioMode := "native" // Use native kernel async IO and O_DIRECT by default.
 	cacheMode := "none" // Bypass host cache, use O_DIRECT semantics by default.
 	media := "disk"
-	isRBDImage := strings.HasPrefix(driveConf.DevPath, device.RBDFormatPrefix)
+	rbdSource, isRBDImage := driveConf.DevSource.(deviceConfig.DevSourceRBD)
+	fdSource, isFd := driveConf.DevSource.(deviceConfig.DevSourceFD)
+	pathSource, _ := driveConf.DevSource.(deviceConfig.DevSourcePath)
 
 	// Check supported features.
 	// Use io_uring over native for added performance (if supported by QEMU and kernel is recent enough).
@@ -3823,7 +4420,7 @@ func (d *qemu) addDriveConfig(qemuDev map[string]string, bootIndexes map[string]
 	info := DriverStatuses()[instancetype.VM].Info
 	minVer, _ := version.NewDottedVersion("5.13.0")
 	_, ioUring := info.Features["io_uring"]
-	if shared.ValueInSlice(device.DiskIOUring, driveConf.Opts) && ioUring && d.state.OS.KernelVersion.Compare(minVer) >= 0 {
+	if slices.Contains(driveConf.Opts, device.DiskIOUring) && ioUring && d.state.OS.KernelVersion.Compare(minVer) >= 0 {
 		aioMode = "io_uring"
 	}
 
@@ -3834,32 +4431,17 @@ func (d *qemu) addDriveConfig(qemuDev map[string]string, bootIndexes map[string]
 		// For RBD, we want writeback to allow for the system-configured "rbd cache" to take effect if present.
 		cacheMode = "writeback"
 	} else {
-		srcDevPath := driveConf.DevPath // This should not be used for passing to QEMU, only for probing.
+		// This should not be used for passing to QEMU, only for probing.
+		srcDevPath := pathSource.Path
 
-		// Detect if existing file descriptor format is being supplied.
-		if strings.HasPrefix(driveConf.DevPath, fmt.Sprintf("%s:", device.DiskFileDescriptorMountPrefix)) {
-			// Expect devPath in format "fd:<fdNum>:<devPath>".
-			devPathParts := strings.SplitN(driveConf.DevPath, ":", 3)
-			if len(devPathParts) != 3 || !strings.HasPrefix(driveConf.DevPath, fmt.Sprintf("%s:", device.DiskFileDescriptorMountPrefix)) {
-				return nil, fmt.Errorf("Unexpected devPath file descriptor format %q", driveConf.DevPath)
-			}
-
-			// Map the file descriptor to the file descriptor path it will be in the QEMU process.
-			fd, err := strconv.Atoi(devPathParts[1])
-			if err != nil {
-				return nil, fmt.Errorf("Invalid file descriptor %q: %w", devPathParts[1], err)
-			}
-
+		if isFd {
 			// Extract original dev path for additional probing below.
-			srcDevPath = devPathParts[2]
-			if srcDevPath == "" {
-				return nil, fmt.Errorf("Device source path is empty")
-			}
+			srcDevPath = fdSource.Path
 
-			driveConf.DevPath = fmt.Sprintf("/proc/self/fd/%d", fd)
+			pathSource.Path = fmt.Sprintf("/proc/self/fd/%d", fdSource.FD)
 		} else if driveConf.TargetPath != "/" {
 			// Only the root disk device is allowed to pass local devices to us without using an FD.
-			return nil, fmt.Errorf("Invalid device path format %q", driveConf.DevPath)
+			return nil, fmt.Errorf("Disk device %q was not a file descriptor", driveConf.DevName)
 		}
 
 		srcDevPathInfo, err := os.Stat(srcDevPath)
@@ -3889,7 +4471,7 @@ func (d *qemu) addDriveConfig(qemuDev map[string]string, bootIndexes map[string]
 				if err != nil {
 					cacheMode = "writeback"
 				} else {
-					_ = f.Close() // Don't leak FD.
+					_ = f.Close() // Do not leak FD.
 				}
 			}
 
@@ -3897,7 +4479,7 @@ func (d *qemu) addDriveConfig(qemuDev map[string]string, bootIndexes map[string]
 				// Only warn about using writeback cache if the drive image is writable.
 				d.logger.Warn("Using writeback cache I/O", logger.Ctx{"device": driveConf.DevName, "devPath": srcDevPath, "fsType": fsType})
 			}
-		} else if !shared.ValueInSlice(device.DiskDirectIO, driveConf.Opts) {
+		} else if !slices.Contains(driveConf.Opts, device.DiskDirectIO) {
 			// If drive config indicates we need to use unsafe I/O then use it.
 			d.logger.Warn("Using unsafe cache I/O", logger.Ctx{"device": driveConf.DevName, "devPath": srcDevPath})
 			aioMode = "threads"
@@ -3910,41 +4492,69 @@ func (d *qemu) addDriveConfig(qemuDev map[string]string, bootIndexes map[string]
 		media = "cdrom"
 	}
 
-	// Check if the user has overridden the bus.
-	bus := "virtio-scsi"
-	for _, opt := range driveConf.Opts {
-		if !strings.HasPrefix(opt, "bus=") {
-			continue
-		}
-
-		bus = strings.TrimPrefix(opt, "bus=")
-		break
-	}
-
 	// Check if the user has overridden the cache mode.
 	for _, opt := range driveConf.Opts {
-		if !strings.HasPrefix(opt, "cache=") {
-			continue
+		mode, found := strings.CutPrefix(opt, "cache=")
+		if found {
+			cacheMode = mode
+			break
 		}
-
-		cacheMode = strings.TrimPrefix(opt, "cache=")
-		break
 	}
 
 	// QMP uses two separate values for the cache.
-	directCache := true   // Bypass host cache, use O_DIRECT semantics by default.
-	noFlushCache := false // Don't ignore any flush requests for the device.
+	var directCache bool  // True to bypass host cache and use O_DIRECT semantics
+	var noFlushCache bool // True to ignore any flush requests for the device
+	// "writeback" not supported yet, see https://gitlab.com/qemu-project/qemu/-/issues/3103
+	// var writebackCache bool // True to complete writes once they are in the write page cache
 
-	if cacheMode == "unsafe" {
+	/*
+		qemu's cache= modes and their interpretation.
+
+		=============  ===============   ============   ==============
+		\              cache.writeback   cache.direct   cache.no-flush
+		=============  ===============   ============   ==============
+		writeback      on                off            off
+		none           on                on             off
+		writethrough   off               off            off
+		directsync     off               on             off
+		unsafe         on                off            on
+		=============  ===============   ============   ==============
+
+		LXD lets users select io.cache=, and this influences opened files' modes
+		we pass around as opened FD to qemu.
+		The expectation should be that LXD's cache= equals Qemu's behavior.
+	*/
+
+	switch cacheMode {
+	case "writeback":
+		// writebackCache = true
+		directCache = false
+		noFlushCache = false
+	case "none":
+		// writebackCache = true
+		directCache = true
+		noFlushCache = false
+	case "writethrough":
+		// writebackCache = false
+		directCache = false
+		noFlushCache = false
+	case "directsync":
+		// writebackCache = false
+		directCache = true
+		noFlushCache = false
+	case "unsafe":
+		// writebackCache = true
 		directCache = false
 		noFlushCache = true
-	} else if cacheMode == "writeback" {
-		directCache = false
+	default:
+		return nil, fmt.Errorf("Unsupported cache mode: %q", cacheMode)
 	}
 
 	blockDev := map[string]any{
 		"aio": aioMode,
+		// BlockdevCacheOptions, which somehow doesn't contain BlockdevCacheInfo's "writeback" (yet).
 		"cache": map[string]any{
+			// "writeback": writebackCache,
 			"direct":   directCache,
 			"no-flush": noFlushCache,
 		},
@@ -3963,88 +4573,45 @@ func (d *qemu) addDriveConfig(qemuDev map[string]string, bootIndexes map[string]
 	} else if isRBDImage {
 		blockDev["driver"] = "rbd"
 
-		_, volName, opts, err := device.DiskParseRBDFormat(driveConf.DevPath)
-		if err != nil {
-			return nil, fmt.Errorf("Failed parsing rbd string: %w", err)
+		if rbdSource.UserName == "" {
+			rbdSource.UserName = storageDrivers.CephDefaultUser
 		}
 
-		// Driver and pool name arguments can be ignored as CephGetRBDImageName doesn't need them.
-		volumeType := storageDrivers.VolumeTypeCustom
-		volumeName := project.StorageVolume(d.project.Name, volName)
-
-		// Handle different name for instance volumes.
-		if driveConf.TargetPath == "/" {
-			volumeType = storageDrivers.VolumeTypeVM
-			volumeName = volName
+		if rbdSource.ClusterName == "" {
+			rbdSource.ClusterName = storageDrivers.CephDefaultCluster
 		}
 
-		// Identify the right content type.
-		rbdContentType := storageDrivers.ContentTypeBlock
-		if driveConf.FSType == "iso9660" {
-			rbdContentType = storageDrivers.ContentTypeISO
-		}
-
-		// Get the RBD image name.
-		vol := storageDrivers.NewVolume(nil, "", volumeType, rbdContentType, volumeName, nil, nil)
-		rbdImageName := storageDrivers.CephGetRBDImageName(vol, "", false)
-
-		// Parse the options (ceph credentials).
-		userName := storageDrivers.CephDefaultUser
-		clusterName := storageDrivers.CephDefaultCluster
-		poolName := ""
-
-		for _, option := range opts {
-			fields := strings.Split(option, "=")
-			if len(fields) != 2 {
-				return nil, fmt.Errorf("Unexpected volume rbd option %q", option)
-			}
-
-			if fields[0] == "id" {
-				userName = fields[1]
-			} else if fields[0] == "pool" {
-				poolName = fields[1]
-			} else if fields[0] == "conf" {
-				baseName := filepath.Base(fields[1])
-				clusterName = strings.TrimSuffix(baseName, ".conf")
-			}
-		}
-
-		if poolName == "" {
-			return nil, fmt.Errorf("Missing pool name")
+		if rbdSource.PoolName == "" {
+			return nil, errors.New("Missing pool name")
 		}
 
 		// The aio option isn't available when using the rbd driver.
 		delete(blockDev, "aio")
-		blockDev["pool"] = poolName
-		blockDev["image"] = rbdImageName
-		blockDev["user"] = userName
-		blockDev["server"] = []map[string]string{}
-		blockDev["conf"] = fmt.Sprintf("/etc/ceph/%s.conf", clusterName)
+		blockDev["pool"] = rbdSource.PoolName
+		blockDev["image"] = rbdSource.ImageName
+		blockDev["user"] = rbdSource.UserName
 
-		// Setup the Ceph cluster config (monitors and keyring).
-		monitors, err := storageDrivers.CephMonitors(clusterName)
-		if err != nil {
-			return nil, err
+		// Dereference ceph config path in case it's a symlink (e.g. MicroCeph).
+		cephConfPath := "/etc/ceph/" + rbdSource.ClusterName + ".conf"
+		target, err := filepath.EvalSymlinks(cephConfPath)
+		if err == nil {
+			cephConfPath = target
 		}
 
-		for _, monitor := range monitors {
-			idx := strings.LastIndex(monitor, ":")
-			host := monitor[:idx]
-			port := monitor[idx+1:]
+		blockDev["conf"] = cephConfPath
 
-			blockDev["server"] = append(blockDev["server"].([]map[string]string), map[string]string{
-				"host": strings.Trim(host, "[]"),
-				"port": port,
-			})
+		if rbdSource.Snapshot != "" {
+			blockDev["snapshot"] = rbdSource.Snapshot
 		}
 
-		rbdSecret, err = storageDrivers.CephKeyring(clusterName, userName)
+		// Parse the secret (QEMU runs unprivileged and cannot read the keyring directly).
+		rbdSecret, err = storageDrivers.CephKeyring(context.TODO(), rbdSource.ClusterName, rbdSource.UserName)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	readonly := shared.ValueInSlice("ro", driveConf.Opts)
+	readonly := slices.Contains(driveConf.Opts, "ro")
 
 	if readonly {
 		blockDev["read-only"] = true
@@ -4054,65 +4621,70 @@ func (d *qemu) addDriveConfig(qemuDev map[string]string, bootIndexes map[string]
 		blockDev["locking"] = "off"
 	}
 
-	if qemuDev == nil {
-		qemuDev = map[string]string{}
-	}
-
 	escapedDeviceName := filesystem.PathNameEncode(driveConf.DevName)
 
-	qemuDev["id"] = fmt.Sprintf("%s%s", qemuDeviceIDPrefix, escapedDeviceName)
+	qemuDev := make(map[string]any)
+	qemuDev["id"] = qemuDeviceIDPrefix + escapedDeviceName
 	qemuDevDrive, ok := blockDev["node-name"].(string)
 	if !ok {
-		return nil, fmt.Errorf("Failed getting block device node-name")
+		return nil, errors.New("Failed getting block device node-name")
 	}
 
 	qemuDev["drive"] = qemuDevDrive
-	qemuDev["serial"] = fmt.Sprintf("%s%s", qemuDeviceNamePrefix, escapedDeviceName)
+	qemuDeviceSerial := qemuDeviceNamePrefix + escapedDeviceName
+	qemuDev["serial"] = qemuDeviceSerial
 
-	if bus == "virtio-scsi" {
-		qemuDev["channel"] = "0"
-		qemuDev["lun"] = "1"
+	// Trim the serial down to 36 characters if longer than that, since this is the max size of a serial in QEMU.
+	// Do not hash as to not break older guests that were relying on QEMU to reduce the size of the device serial.
+	// Related to https://gitlab.com/qemu-project/qemu/-/commit/75997e182b695f2e3f0a2d649734952af5caf3ee
+	if len(qemuDeviceSerial) > 36 {
+		qemuDev["serial"] = qemuDeviceSerial[:36]
+	}
+
+	var busCleanup revert.Hook
+	if busName == "virtio-scsi" {
+		qemuDev["device_id"] = qemuDeviceSerial
+		qemuDev["channel"] = 0
+		qemuDev["lun"] = 1
 		qemuDev["bus"] = "qemu_scsi.0"
 
-		if media == "disk" {
+		switch media {
+		case "disk":
 			qemuDev["driver"] = "scsi-hd"
-		} else if media == "cdrom" {
+		case "cdrom":
 			qemuDev["driver"] = "scsi-cd"
 		}
-	} else if shared.ValueInSlice(bus, []string{"nvme", "virtio-blk"}) {
-		if qemuDev["bus"] == "" {
-			// Figure out a hotplug slot.
-			pciDevID := qemuPCIDeviceIDStart
+	} else if slices.Contains([]string{"nvme", "virtio-blk"}, busName) {
+		qemuDev["driver"] = busName
 
-			// Iterate through all the instance devices in the same sorted order as is used when allocating the
-			// boot time devices in order to find the PCI bus slot device we would have used at boot time.
-			// Then attempt to use that same device, assuming it is available.
-			for _, dev := range d.expandedDevices.Sorted() {
-				if dev.Name == driveConf.DevName {
-					break // Found our device.
-				}
-
-				pciDevID++
-			}
-
-			pciDeviceName := fmt.Sprintf("%s%d", busDevicePortPrefix, pciDevID)
-			d.logger.Debug("Using PCI bus device to hotplug drive into", logger.Ctx{"device": driveConf.DevName, "port": pciDeviceName})
-			qemuDev["bus"] = pciDeviceName
-			qemuDev["addr"] = "00.0"
+		// Allocate a device port.
+		var devBus, devAddr string
+		var multi bool
+		var err error
+		busCleanup, devBus, devAddr, multi, err = busAllocate(driveConf.DevName, false)
+		if err != nil {
+			return nil, fmt.Errorf("Failed allocating bus for disk device %q: %w", driveConf.DevName, err)
 		}
 
-		qemuDev["driver"] = bus
+		// Populate the qemu device with port info.
+		qemuDev["bus"] = devBus
+		qemuDev["addr"] = devAddr
+		qemuDev["multifunction"] = multi
 	}
 
 	if bootIndexes != nil {
-		qemuDev["bootindex"] = strconv.Itoa(bootIndexes[driveConf.DevName])
+		qemuDev["bootindex"] = bootIndexes[driveConf.DevName]
 	}
 
 	monHook := func(m *qmp.Monitor) error {
-		revert := revert.New()
-		defer revert.Fail()
+		reverter := revert.New()
+		defer reverter.Fail()
 
-		nodeName := fmt.Sprintf("%s%s", qemuDeviceNamePrefix, escapedDeviceName)
+		if busCleanup != nil {
+			reverter.Add(busCleanup)
+		}
+
+		nodeName := qemuDeviceNameOrID(qemuDeviceNamePrefix, driveConf.DevName, "", qemuDeviceNameMaxLength)
 
 		if isRBDImage {
 			secretID := fmt.Sprintf("pool_%s_%s", blockDev["pool"], blockDev["user"])
@@ -4130,7 +4702,14 @@ func (d *qemu) addDriveConfig(qemuDev map[string]string, bootIndexes map[string]
 				permissions = unix.O_RDONLY
 			}
 
-			f, err := os.OpenFile(driveConf.DevPath, permissions, 0)
+			// only open the file with O_DIRECT when the QEMU caching configuration expects this.
+			// otherwise QEMU will error that the transferred FD has the wrong flags.
+			// qemu checks this since 99c147e2f53726290bbdde795b6efbb4d9138657
+			if directCache {
+				permissions |= unix.O_DIRECT
+			}
+
+			f, err := os.OpenFile(pathSource.Path, permissions, 0)
 			if err != nil {
 				return fmt.Errorf("Failed opening file descriptor for disk device %q: %w", driveConf.DevName, err)
 			}
@@ -4142,7 +4721,7 @@ func (d *qemu) addDriveConfig(qemuDev map[string]string, bootIndexes map[string]
 				return fmt.Errorf("Failed sending file descriptor of %q for disk device %q: %w", f.Name(), driveConf.DevName, err)
 			}
 
-			revert.Add(func() {
+			reverter.Add(func() {
 				_ = m.RemoveFDFromFDSet(nodeName)
 			})
 
@@ -4155,13 +4734,18 @@ func (d *qemu) addDriveConfig(qemuDev map[string]string, bootIndexes map[string]
 		}
 
 		if driveConf.Limits != nil {
-			err = m.SetBlockThrottle(qemuDev["id"], int(driveConf.Limits.ReadBytes), int(driveConf.Limits.WriteBytes), int(driveConf.Limits.ReadIOps), int(driveConf.Limits.WriteIOps))
+			qemuDevID, ok := qemuDev["id"].(string)
+			if !ok {
+				return errors.New("Failed getting QEMU device id")
+			}
+
+			err = m.SetBlockThrottle(qemuDevID, int(driveConf.Limits.ReadBytes), int(driveConf.Limits.WriteBytes), int(driveConf.Limits.ReadIOps), int(driveConf.Limits.WriteIOps))
 			if err != nil {
 				return fmt.Errorf("Failed applying limits for disk device %q: %w", driveConf.DevName, err)
 			}
 		}
 
-		revert.Success()
+		reverter.Success()
 		return nil
 	}
 
@@ -4170,31 +4754,29 @@ func (d *qemu) addDriveConfig(qemuDev map[string]string, bootIndexes map[string]
 
 // addNetDevConfig adds the qemu config required for adding a network device.
 // The qemuDev map is expected to be preconfigured with the settings for an existing port to use for the device.
-func (d *qemu) addNetDevConfig(busName string, qemuDev map[string]string, bootIndexes map[string]int, nicConfig []deviceConfig.RunConfigItem) (monitorHook, error) {
-	reverter := revert.New()
-	defer reverter.Fail()
-
+func (d *qemu) addNetDevConfig(busName string, busAllocate busAllocator, bootIndexes map[string]int, nicConfig []deviceConfig.RunConfigItem) (monitorHook, error) {
 	var devName, nicName, devHwaddr, pciSlotName, pciIOMMUGroup, vDPADevName, vhostVDPAPath, maxVQP, mtu, name string
 	for _, nicItem := range nicConfig {
-		if nicItem.Key == "devName" {
+		switch nicItem.Key {
+		case "devName":
 			devName = nicItem.Value
-		} else if nicItem.Key == "link" {
+		case "link":
 			nicName = nicItem.Value
-		} else if nicItem.Key == "hwaddr" {
+		case "hwaddr":
 			devHwaddr = nicItem.Value
-		} else if nicItem.Key == "pciSlotName" {
+		case "pciSlotName":
 			pciSlotName = nicItem.Value
-		} else if nicItem.Key == "pciIOMMUGroup" {
+		case "pciIOMMUGroup":
 			pciIOMMUGroup = nicItem.Value
-		} else if nicItem.Key == "vDPADevName" {
+		case "vDPADevName":
 			vDPADevName = nicItem.Value
-		} else if nicItem.Key == "vhostVDPAPath" {
+		case "vhostVDPAPath":
 			vhostVDPAPath = nicItem.Value
-		} else if nicItem.Key == "maxVQP" {
+		case "maxVQP":
 			maxVQP = nicItem.Value
-		} else if nicItem.Key == "mtu" {
+		case "mtu":
 			mtu = nicItem.Value
-		} else if nicItem.Key == "name" {
+		case "name":
 			name = nicItem.Value
 		}
 	}
@@ -4206,13 +4788,34 @@ func (d *qemu) addNetDevConfig(busName string, qemuDev map[string]string, bootIn
 		}
 	}
 
+	qemuDev := make(map[string]any)
+
+	var busCleanup revert.Hook
+
+	// PCIe and PCI require a port device name to hotplug the NIC into.
+	if slices.Contains([]string{"pcie", "pci"}, busName) {
+		// Allocate a device port.
+		var devBus, devAddr string
+		var multi bool
+		var err error
+		busCleanup, devBus, devAddr, multi, err = busAllocate(devName, false)
+		if err != nil {
+			return nil, fmt.Errorf("Failed allocating bus for NIC device %q: %w", devName, err)
+		}
+
+		// Populate the qemu device with port info.
+		qemuDev["bus"] = devBus
+		qemuDev["addr"] = devAddr
+		qemuDev["multifunction"] = multi
+	}
+
 	escapedDeviceName := filesystem.PathNameEncode(devName)
-	qemuDev["id"] = fmt.Sprintf("%s%s", qemuDeviceIDPrefix, escapedDeviceName)
+	qemuDev["id"] = qemuDeviceIDPrefix + escapedDeviceName
 
 	if len(bootIndexes) > 0 {
 		bootIndex, found := bootIndexes[devName]
 		if found {
-			qemuDev["bootindex"] = strconv.Itoa(bootIndex)
+			qemuDev["bootindex"] = bootIndex
 		}
 	}
 
@@ -4222,17 +4825,14 @@ func (d *qemu) addNetDevConfig(busName string, qemuDev map[string]string, bootIn
 	// Returns the number of queues to use with NIC.
 	configureQueues := func(cpuCount int) int {
 		// Number of queues is the same as number of vCPUs. Run with a minimum of two queues.
-		queueCount := cpuCount
-		if queueCount < 2 {
-			queueCount = 2
-		}
+		queueCount := max(cpuCount, 2)
 
 		// Number of vectors is number of vCPUs * 2 (RX/TX) + 2 (config/control MSI-X).
 		vectors := 2*queueCount + 2
 		if vectors > 0 {
-			qemuDev["mq"] = "on"
-			if shared.ValueInSlice(busName, []string{"pcie", "pci"}) {
-				qemuDev["vectors"] = strconv.Itoa(vectors)
+			qemuDev["mq"] = true
+			if slices.Contains([]string{"pcie", "pci"}, busName) {
+				qemuDev["vectors"] = vectors
 			}
 		}
 
@@ -4246,9 +4846,13 @@ func (d *qemu) addNetDevConfig(busName string, qemuDev map[string]string, bootIn
 			reverter := revert.New()
 			defer reverter.Fail()
 
+			if busCleanup != nil {
+				reverter.Add(busCleanup)
+			}
+
 			cpus, err := m.QueryCPUs()
 			if err != nil {
-				return fmt.Errorf("Failed getting CPU list for NIC queues")
+				return errors.New("Failed getting CPU list for NIC queues")
 			}
 
 			queueCount := configureQueues(len(cpus))
@@ -4260,7 +4864,7 @@ func (d *qemu) addNetDevConfig(busName string, qemuDev map[string]string, bootIn
 			// Open the device once for each queue and pass to QEMU.
 			fds := make([]string, 0, queueCount)
 			vhostfds := make([]string, 0, queueCount)
-			for i := 0; i < queueCount; i++ {
+			for i := range queueCount {
 				devFile, err := deviceFile()
 				if err != nil {
 					return fmt.Errorf("Error opening netdev file for queue %d: %w", i, err)
@@ -4271,7 +4875,7 @@ func (d *qemu) addNetDevConfig(busName string, qemuDev map[string]string, bootIn
 				devFDName := fmt.Sprintf("%s.%d", devFile.Name(), i)
 				err = m.SendFile(devFDName, devFile)
 				if err != nil {
-					return fmt.Errorf("Failed to send %q file descriptor for queue %d: %w", devFDName, i, err)
+					return fmt.Errorf("Failed sending %q file descriptor for queue %d: %w", devFDName, i, err)
 				}
 
 				reverter.Add(func() { _ = m.CloseFile(devFDName) })
@@ -4293,7 +4897,7 @@ func (d *qemu) addNetDevConfig(busName string, qemuDev map[string]string, bootIn
 					vhostFDName := fmt.Sprintf("%s.%d", vhostFile.Name(), i)
 					err = m.SendFile(vhostFDName, vhostFile)
 					if err != nil {
-						return fmt.Errorf("Failed to send %q file descriptor for queue %d: %w", vhostFDName, i, err)
+						return fmt.Errorf("Failed sending %q file descriptor for queue %d: %w", vhostFDName, i, err)
 					}
 
 					err = vhostFile.Close()
@@ -4308,13 +4912,19 @@ func (d *qemu) addNetDevConfig(busName string, qemuDev map[string]string, bootIn
 			}
 
 			qemuNetDev := map[string]any{
-				"id":    fmt.Sprintf("%s%s", qemuDeviceNamePrefix, escapedDeviceName),
+				"id":    qemuDeviceNamePrefix + escapedDeviceName,
 				"type":  "tap",
 				"vhost": vhostNetEnabled,
 			}
 
-			if shared.ValueInSlice(busName, []string{"pcie", "pci"}) {
+			if slices.Contains([]string{"pcie", "pci"}, busName) {
 				qemuDev["driver"] = "virtio-net-pci"
+				// QEMU hard codes using efi-virtio.rom.
+				// But that file contains only x86 code.
+				if d.architecture != osarch.ARCH_32BIT_INTEL_X86 &&
+					d.architecture != osarch.ARCH_64BIT_INTEL_X86 {
+					qemuDev["romfile"] = ""
+				}
 			} else if busName == "ccw" {
 				qemuDev["driver"] = "virtio-net-ccw"
 			}
@@ -4327,11 +4937,22 @@ func (d *qemu) addNetDevConfig(busName string, qemuDev map[string]string, bootIn
 
 			qemuNetDevID, ok := qemuNetDev["id"].(string)
 			if !ok {
-				return fmt.Errorf("Failed getting QEMU netdev id")
+				return errors.New("Failed getting QEMU netdev id")
 			}
 
 			qemuDev["netdev"] = qemuNetDevID
 			qemuDev["mac"] = devHwaddr
+
+			if mtu != "" {
+				mtuUint, err := strconv.ParseUint(mtu, 10, 32)
+				if err != nil {
+					return fmt.Errorf("Failed parsing MTU %q: %w", mtu, err)
+				}
+
+				if mtuUint > 0 {
+					qemuDev["host_mtu"] = mtuUint
+				}
+			}
 
 			err = m.AddNIC(qemuNetDev, qemuDev)
 			if err != nil {
@@ -4345,8 +4966,15 @@ func (d *qemu) addNetDevConfig(busName string, qemuDev map[string]string, bootIn
 
 	// Detect MACVTAP interface types and figure out which tap device is being used.
 	// This is so we can open a file handle to the tap device and pass it to the qemu process.
-	if shared.PathExists(fmt.Sprintf("/sys/class/net/%s/macvtap", nicName)) {
-		content, err := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/ifindex", nicName))
+	if shared.PathExists("/sys/class/net/" + nicName + "/macvtap") {
+		reverter := revert.New()
+		defer reverter.Fail()
+
+		if busCleanup != nil {
+			reverter.Add(busCleanup)
+		}
+
+		content, err := os.ReadFile("/sys/class/net/" + nicName + "/ifindex")
 		if err != nil {
 			return nil, fmt.Errorf("Error getting tap device ifindex: %w", err)
 		}
@@ -4356,12 +4984,14 @@ func (d *qemu) addNetDevConfig(busName string, qemuDev map[string]string, bootIn
 			return nil, fmt.Errorf("Error parsing tap device ifindex: %w", err)
 		}
 
+		reverter.Success()
+
 		devFile := func() (*os.File, error) {
 			return os.OpenFile(fmt.Sprintf("/dev/tap%d", ifindex), os.O_RDWR, 0)
 		}
 
 		monHook = tapMonHook(devFile)
-	} else if shared.PathExists(fmt.Sprintf("/sys/class/net/%s/tun_flags", nicName)) {
+	} else if shared.PathExists("/sys/class/net/" + nicName + "/tun_flags") {
 		// Detect TAP interface and use IOCTL TUNSETIFF on /dev/net/tun to get the file handle to it.
 		// This is so we can open a file handle to the tap device and pass it to the qemu process.
 		devFile := func() (*os.File, error) {
@@ -4400,6 +5030,10 @@ func (d *qemu) addNetDevConfig(busName string, qemuDev map[string]string, bootIn
 			reverter := revert.New()
 			defer reverter.Fail()
 
+			if busCleanup != nil {
+				reverter.Add(busCleanup)
+			}
+
 			vdpaDevFile, err := os.OpenFile(vhostVDPAPath, os.O_RDWR, 0)
 			if err != nil {
 				return fmt.Errorf("Error opening vDPA device file %q: %w", vdpaDevFile.Name(), err)
@@ -4407,41 +5041,47 @@ func (d *qemu) addNetDevConfig(busName string, qemuDev map[string]string, bootIn
 
 			defer func() { _ = vdpaDevFile.Close() }() // Close file after device has been added.
 
-			vDPADevFDName := fmt.Sprintf("%s.0", vdpaDevFile.Name())
+			vDPADevFDName := vdpaDevFile.Name() + ".0"
 			err = m.SendFile(vDPADevFDName, vdpaDevFile)
 			if err != nil {
-				return fmt.Errorf("Failed to send %q file descriptor: %w", vDPADevFDName, err)
+				return fmt.Errorf("Failed sending %q file descriptor: %w", vDPADevFDName, err)
 			}
 
 			reverter.Add(func() { _ = m.CloseFile(vDPADevFDName) })
 
 			queues, err := strconv.Atoi(maxVQP)
 			if err != nil {
-				return fmt.Errorf("Failed to convert maxVQP (%q) to int: %w", maxVQP, err)
+				return fmt.Errorf("Failed converting maxVQP (%q) to int: %w", maxVQP, err)
 			}
 
 			qemuNetDev := map[string]any{
-				"id":      fmt.Sprintf("vhost-%s", vDPADevName),
+				"id":      "vhost-" + vDPADevName,
 				"type":    "vhost-vdpa",
 				"vhostfd": vDPADevFDName,
 				"queues":  queues,
 			}
 
-			if shared.ValueInSlice(busName, []string{"pcie", "pci"}) {
+			if slices.Contains([]string{"pcie", "pci"}, busName) {
 				qemuDev["driver"] = "virtio-net-pci"
+				// QEMU hard codes using efi-virtio.rom.
+				// But that file contains only x86 code.
+				if d.architecture != osarch.ARCH_32BIT_INTEL_X86 &&
+					d.architecture != osarch.ARCH_64BIT_INTEL_X86 {
+					qemuDev["romfile"] = ""
+				}
 			} else if busName == "ccw" {
 				qemuDev["driver"] = "virtio-net-ccw"
 			}
 
 			qemuNetDevID, ok := qemuNetDev["id"].(string)
 			if !ok {
-				return fmt.Errorf("Failed getting QEMU netdev id")
+				return errors.New("Failed getting QEMU netdev id")
 			}
 
 			qemuDev["netdev"] = qemuNetDevID
-			qemuDev["page-per-vq"] = "on"
-			qemuDev["iommu_platform"] = "on"
-			qemuDev["disable-legacy"] = "on"
+			qemuDev["page-per-vq"] = true
+			qemuDev["iommu_platform"] = true
+			qemuDev["disable-legacy"] = true
 
 			err = m.AddNIC(qemuNetDev, qemuDev)
 			if err != nil {
@@ -4452,44 +5092,51 @@ func (d *qemu) addNetDevConfig(busName string, qemuDev map[string]string, bootIn
 			return nil
 		}
 	} else if pciSlotName != "" {
-		// Detect physical passthrough device.
-		if shared.ValueInSlice(busName, []string{"pcie", "pci"}) {
-			qemuDev["driver"] = "vfio-pci"
-		} else if busName == "ccw" {
-			qemuDev["driver"] = "vfio-ccw"
-		}
-
-		qemuDev["host"] = pciSlotName
-
-		if d.state.OS.UnprivUser != "" {
-			if pciIOMMUGroup == "" {
-				return nil, fmt.Errorf("No PCI IOMMU group supplied")
-			}
-
-			vfioGroupFile := fmt.Sprintf("/dev/vfio/%s", pciIOMMUGroup)
-			err := os.Chown(vfioGroupFile, int(d.state.OS.UnprivUID), -1)
-			if err != nil {
-				return nil, fmt.Errorf("Failed to chown vfio group device %q: %w", vfioGroupFile, err)
-			}
-
-			reverter.Add(func() { _ = os.Chown(vfioGroupFile, 0, -1) })
-		}
-
 		monHook = func(m *qmp.Monitor) error {
+			reverter := revert.New()
+			defer reverter.Fail()
+
+			if busCleanup != nil {
+				reverter.Add(busCleanup)
+			}
+
+			// Detect physical passthrough device.
+			if slices.Contains([]string{"pcie", "pci"}, busName) {
+				qemuDev["driver"] = "vfio-pci"
+			} else if busName == "ccw" {
+				qemuDev["driver"] = "vfio-ccw"
+			}
+
+			qemuDev["host"] = pciSlotName
+
+			if d.state.OS.UnprivUser != "" {
+				if pciIOMMUGroup == "" {
+					return errors.New("No PCI IOMMU group supplied")
+				}
+
+				vfioGroupFile := "/dev/vfio/" + pciIOMMUGroup
+				err := os.Chown(vfioGroupFile, int(d.state.OS.UnprivUID), -1)
+				if err != nil {
+					return fmt.Errorf("Failed chowning vfio group device %q: %w", vfioGroupFile, err)
+				}
+
+				reverter.Add(func() { _ = os.Chown(vfioGroupFile, 0, -1) })
+			}
+
 			err := m.AddNIC(nil, qemuDev)
 			if err != nil {
 				return fmt.Errorf("Failed setting up device %q: %w", devName, err)
 			}
 
+			reverter.Success()
 			return nil
 		}
 	}
 
 	if monHook == nil {
-		return nil, fmt.Errorf("Unrecognised device type")
+		return nil, errors.New("Unrecognised device type")
 	}
 
-	reverter.Success()
 	return monHook, nil
 }
 
@@ -4522,7 +5169,7 @@ func (d *qemu) writeNICDevConfig(mtuStr string, devName string, nicName string, 
 		return fmt.Errorf("Failed encoding NIC config: %w", err)
 	}
 
-	nicFile := filepath.Join(d.Path(), "config", deviceConfig.NICConfigDir, fmt.Sprintf("%s.json", filesystem.PathNameEncode(nicConfig.DeviceName)))
+	nicFile := filepath.Join(d.Path(), "config", deviceConfig.NICConfigDir, filesystem.PathNameEncode(nicConfig.DeviceName)+".json")
 
 	err = os.WriteFile(nicFile, nicConfigBytes, 0700)
 	if err != nil {
@@ -4533,44 +5180,90 @@ func (d *qemu) writeNICDevConfig(mtuStr string, devName string, nicName string, 
 }
 
 // addPCIDevConfig adds the qemu config required for adding a raw PCI device.
-func (d *qemu) addPCIDevConfig(cfg *[]cfgSection, bus *qemuBus, pciConfig []deviceConfig.RunConfigItem) error {
-	var devName, pciSlotName string
+func (d *qemu) addPCIDevConfig(busName string, busAllocate busAllocator, pciConfig []deviceConfig.RunConfigItem) (monitorHook, error) {
+	var devName, pciSlotName, pciIOMMUGroup string
 	for _, pciItem := range pciConfig {
-		if pciItem.Key == "devName" {
+		switch pciItem.Key {
+		case "devName":
 			devName = pciItem.Value
-		} else if pciItem.Key == "pciSlotName" {
+		case "pciSlotName":
 			pciSlotName = pciItem.Value
+		case "pciIOMMUGroup":
+			pciIOMMUGroup = pciItem.Value
+		default:
+			return nil, errors.New("Unexpected PCI configuration key: " + pciItem.Key)
 		}
 	}
 
-	devBus, devAddr, multi := bus.allocate(fmt.Sprintf("lxd_%s", devName))
-	pciPhysicalOpts := qemuPCIPhysicalOpts{
-		dev: qemuDevOpts{
-			busName:       bus.name,
-			devBus:        devBus,
-			devAddr:       devAddr,
-			multifunction: multi,
-		},
-		devName:     devName,
-		pciSlotName: pciSlotName,
+	if !slices.Contains([]string{"pcie", "pci"}, busName) {
+		return nil, errors.New("Attempting PCI passthrough on a non-PCI system")
 	}
-	*cfg = append(*cfg, qemuPCIPhysical(&pciPhysicalOpts)...)
 
-	return nil
+	// Try to get a PCI address for hotplugging.
+	busCleanup, devBus, devAddr, multi, err := busAllocate(devName, false)
+	if err != nil {
+		return nil, fmt.Errorf("Failed allocating bus for PCI device %q: %w", devName, err)
+	}
+
+	escapedDeviceName := filesystem.PathNameEncode(devName)
+	qemuDev := map[string]any{
+		"driver":        "vfio-pci",
+		"bus":           devBus,
+		"addr":          devAddr,
+		"id":            qemuDeviceIDPrefix + escapedDeviceName,
+		"host":          pciSlotName,
+		"multifunction": multi,
+	}
+
+	monHook := func(m *qmp.Monitor) error {
+		reverter := revert.New()
+		defer reverter.Fail()
+
+		if busCleanup != nil {
+			reverter.Add(busCleanup)
+		}
+
+		if d.state.OS.UnprivUser != "" {
+			if pciIOMMUGroup == "" {
+				return errors.New("No PCI IOMMU group supplied")
+			}
+
+			vfioGroupFile := "/dev/vfio/" + pciIOMMUGroup
+			err := os.Chown(vfioGroupFile, int(d.state.OS.UnprivUID), -1)
+			if err != nil {
+				return fmt.Errorf("Failed chowning vfio group device %q: %w", vfioGroupFile, err)
+			}
+
+			reverter.Add(func() { _ = os.Chown(vfioGroupFile, 0, -1) })
+		}
+
+		err = m.AddDevice(qemuDev)
+		if err != nil {
+			return fmt.Errorf("Failed setting up device %q: %w", devName, err)
+		}
+
+		reverter.Success()
+		return nil
+	}
+
+	return monHook, nil
 }
 
 // addGPUDevConfig adds the qemu config required for adding a GPU device.
-func (d *qemu) addGPUDevConfig(cfg *[]cfgSection, bus *qemuBus, gpuConfig []deviceConfig.RunConfigItem) error {
+func (d *qemu) addGPUDevConfig(cfg *[]cfgSection, busName string, busAllocate busAllocator, gpuConfig []deviceConfig.RunConfigItem) error {
 	var devName, pciSlotName, vgpu string
 	for _, gpuItem := range gpuConfig {
-		if gpuItem.Key == "devName" {
+		switch gpuItem.Key {
+		case "devName":
 			devName = gpuItem.Value
-		} else if gpuItem.Key == "pciSlotName" {
+		case "pciSlotName":
 			pciSlotName = gpuItem.Value
-		} else if gpuItem.Key == "vgpu" {
+		case "vgpu":
 			vgpu = gpuItem.Value
 		}
 	}
+
+	pciDevPath := filepath.Join("/sys/bus/pci/devices", pciSlotName)
 
 	vgaMode := func() bool {
 		// No VGA mode on mdev.
@@ -4584,22 +5277,26 @@ func (d *qemu) addGPUDevConfig(cfg *[]cfgSection, bus *qemuBus, gpuConfig []devi
 		}
 
 		// Only enable if present on the card.
-		if !shared.PathExists(filepath.Join("/sys/bus/pci/devices", pciSlotName, "boot_vga")) {
+		if !shared.PathExists(filepath.Join(pciDevPath, "boot_vga")) {
 			return false
 		}
 
 		// Skip SRIOV VFs as those are shared with the host card.
-		if shared.PathExists(filepath.Join("/sys/bus/pci/devices", pciSlotName, "physfn")) {
+		if shared.PathExists(filepath.Join(pciDevPath, "physfn")) {
 			return false
 		}
 
 		return true
 	}()
 
-	devBus, devAddr, multi := bus.allocate(fmt.Sprintf("lxd_%s", devName))
+	_, devBus, devAddr, multi, err := busAllocate(devName, true)
+	if err != nil {
+		return fmt.Errorf("Failed allocating bus for GPU device %q: %w", devName, err)
+	}
+
 	gpuDevPhysicalOpts := qemuGPUDevPhysicalOpts{
 		dev: qemuDevOpts{
-			busName:       bus.name,
+			busName:       busName,
 			devBus:        devBus,
 			devAddr:       devAddr,
 			multifunction: multi,
@@ -4619,56 +5316,57 @@ func (d *qemu) addGPUDevConfig(cfg *[]cfgSection, bus *qemuBus, gpuConfig []devi
 		iommuGroupPath = filepath.Join("/sys/bus/mdev/devices", vgpu, "iommu_group", "devices")
 	} else {
 		// Add any other related IOMMU VFs as generic PCI devices.
-		iommuGroupPath = filepath.Join("/sys/bus/pci/devices", pciSlotName, "iommu_group", "devices")
+		iommuGroupPath = filepath.Join(pciDevPath, "iommu_group", "devices")
 	}
 
-	if shared.PathExists(iommuGroupPath) {
-		// Extract parent slot name by removing any virtual function ID.
-		parts := strings.SplitN(pciSlotName, ".", 2)
-		prefix := parts[0]
+	// Extract parent slot name by removing any virtual function ID.
+	prefix, _, _ := strings.Cut(pciSlotName, ".")
 
-		// Iterate the members of the IOMMU group and override any that match the parent slot name prefix.
-		err := filepath.Walk(iommuGroupPath, func(path string, _ os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-
-			iommuSlotName := filepath.Base(path) // Virtual function's address is dir name.
-
-			// Match any VFs that are related to the GPU device (but not the GPU device itself).
-			if strings.HasPrefix(iommuSlotName, prefix) && iommuSlotName != pciSlotName {
-				// Add VF device without VGA mode to qemu config.
-				devBus, devAddr, multi := bus.allocate(fmt.Sprintf("lxd_%s", devName))
-				gpuDevPhysicalOpts := qemuGPUDevPhysicalOpts{
-					dev: qemuDevOpts{
-						busName:       bus.name,
-						devBus:        devBus,
-						devAddr:       devAddr,
-						multifunction: multi,
-					},
-					// Generate associated device name by combining main device name and VF ID.
-					devName:     fmt.Sprintf("%s_%s", devName, devAddr),
-					pciSlotName: iommuSlotName,
-					vga:         false,
-					vgpu:        "",
-				}
-
-				*cfg = append(*cfg, qemuGPUDevPhysical(&gpuDevPhysicalOpts)...)
-			}
-
-			return nil
-		})
+	// Iterate the members of the IOMMU group and override any that match the parent slot name prefix.
+	err = filepath.Walk(iommuGroupPath, func(path string, _ os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
+
+		iommuSlotName := filepath.Base(path) // Virtual function's address is dir name.
+
+		// Match any VFs that are related to the GPU device (but not the GPU device itself).
+		if strings.HasPrefix(iommuSlotName, prefix) && iommuSlotName != pciSlotName {
+			// Add VF device without VGA mode to qemu config.
+			_, devBus, devAddr, multi, err := busAllocate(devName, true)
+			if err != nil {
+				return fmt.Errorf("Failed allocating bus for GPU VF device %q: %w", devName, err)
+			}
+
+			gpuDevPhysicalOpts := qemuGPUDevPhysicalOpts{
+				dev: qemuDevOpts{
+					busName:       busName,
+					devBus:        devBus,
+					devAddr:       devAddr,
+					multifunction: multi,
+				},
+				// Generate associated device name by combining main device name and VF ID.
+				devName:     devName + "_" + devAddr,
+				pciSlotName: iommuSlotName,
+				vga:         false,
+				vgpu:        "",
+			}
+
+			*cfg = append(*cfg, qemuGPUDevPhysical(&gpuDevPhysicalOpts)...)
+		}
+
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		return err
 	}
 
 	return nil
 }
 
 func (d *qemu) addUSBDeviceConfig(usbDev deviceConfig.USBDeviceItem) (monitorHook, error) {
-	device := map[string]string{
-		"id":     fmt.Sprintf("%s%s", qemuDeviceIDPrefix, usbDev.DeviceName),
+	qemuDev := map[string]any{
+		"id":     qemuDeviceIDPrefix + usbDev.DeviceName,
 		"driver": "usb-host",
 		"bus":    "qemu_usb.0",
 	}
@@ -4679,25 +5377,30 @@ func (d *qemu) addUSBDeviceConfig(usbDev deviceConfig.USBDeviceItem) (monitorHoo
 
 		f, err := os.OpenFile(usbDev.HostDevicePath, unix.O_RDWR, 0)
 		if err != nil {
-			return fmt.Errorf("Failed to open host device: %w", err)
+			return fmt.Errorf("Failed opening host device: %w", err)
 		}
 
 		defer func() { _ = f.Close() }()
 
-		info, err := m.SendFileWithFDSet(device["id"], f, false)
+		qemuDevID, ok := qemuDev["id"].(string)
+		if !ok {
+			return errors.New("Failed getting QEMU device id")
+		}
+
+		info, err := m.SendFileWithFDSet(qemuDevID, f, false)
 		if err != nil {
-			return fmt.Errorf("Failed to send file descriptor: %w", err)
+			return fmt.Errorf("Failed sending file descriptor: %w", err)
 		}
 
 		revert.Add(func() {
-			_ = m.RemoveFDFromFDSet(device["id"])
+			_ = m.RemoveFDFromFDSet(qemuDevID)
 		})
 
-		device["hostdevice"] = fmt.Sprintf("/dev/fdset/%d", info.ID)
+		qemuDev["hostdevice"] = fmt.Sprintf("/dev/fdset/%d", info.ID)
 
-		err = m.AddDevice(device)
+		err = m.AddDevice(qemuDev)
 		if err != nil {
-			return fmt.Errorf("Failed to add device: %w", err)
+			return fmt.Errorf("Failed adding device: %w", err)
 		}
 
 		revert.Success()
@@ -4711,9 +5414,10 @@ func (d *qemu) addTPMDeviceConfig(cfg *[]cfgSection, tpmConfig []deviceConfig.Ru
 	var devName, socketPath string
 
 	for _, tpmItem := range tpmConfig {
-		if tpmItem.Key == "path" {
+		switch tpmItem.Key {
+		case "path":
 			socketPath = tpmItem.Value
-		} else if tpmItem.Key == "devName" {
+		case "devName":
 			devName = tpmItem.Value
 		}
 	}
@@ -4749,11 +5453,11 @@ func (d *qemu) pidFilePath() string {
 // pid gets the PID of the running qemu process. Returns 0 if PID file or process not found, and -1 if err non-nil.
 func (d *qemu) pid() (int, error) {
 	pidStr, err := os.ReadFile(d.pidFilePath())
-	if os.IsNotExist(err) {
-		return 0, nil // PID file has gone.
-	}
-
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil // PID file has gone.
+		}
+
 		return -1, err
 	}
 
@@ -4771,7 +5475,7 @@ func (d *qemu) pid() (int, error) {
 	qemuSearchString := []byte("qemu-system")
 	instUUID := []byte(d.localConfig["volatile.uuid"])
 	if !bytes.Contains(cmdLine, qemuSearchString) || !bytes.Contains(cmdLine, instUUID) {
-		return -1, fmt.Errorf("PID doesn't match the running process")
+		return -1, errors.New("PID does not match the running process")
 	}
 
 	return pid, nil
@@ -4783,7 +5487,7 @@ func (d *qemu) forceStop() error {
 	if pid > 0 {
 		err := d.killQemuProcess(pid)
 		if err != nil {
-			return fmt.Errorf("Failed to stop VM process %d: %w", pid, err)
+			return fmt.Errorf("Failed stopping VM process %d: %w", pid, err)
 		}
 	}
 
@@ -4791,7 +5495,7 @@ func (d *qemu) forceStop() error {
 }
 
 // Stop the VM.
-func (d *qemu) Stop(stateful bool) error {
+func (d *qemu) Stop(ctx context.Context, stateful bool) error {
 	d.logger.Debug("Stop started", logger.Ctx{"stateful": stateful})
 	defer d.logger.Debug("Stop finished", logger.Ctx{"stateful": stateful})
 
@@ -4806,7 +5510,7 @@ func (d *qemu) Stop(stateful bool) error {
 	// Check for stateful.
 	if stateful {
 		if shared.IsFalseOrEmpty(d.expandedConfig["migration.stateful"]) {
-			return fmt.Errorf("Stateful stop requires migration.stateful to be set to true")
+			return errors.New("Stateful stop requires migration.stateful to be set to true")
 		}
 
 		err := d.validateRootDiskStatefulStop()
@@ -4820,9 +5524,9 @@ func (d *qemu) Stop(stateful bool) error {
 	// Don't allow reuse when creating a new stop operation. This prevents other operations from intefering.
 	// Allow reuse of a reusable ongoing stop operation as Shutdown() may be called first, which allows reuse
 	// of its operations. This allow for Stop() to inherit from Shutdown() where instance is stuck.
-	op, err := operationlock.CreateWaitGet(d.Project().Name, d.Name(), operationlock.ActionStop, []operationlock.Action{operationlock.ActionRestart, operationlock.ActionRestore}, false, true)
+	op, err := operationlock.CreateWaitGet(d.Project().Name, d.Name(), operationlock.ActionStop, []operationlock.Action{operationlock.ActionRestart, operationlock.ActionRestore, operationlock.ActionMigrate}, false, true)
 	if err != nil {
-		if errors.Is(err, operationlock.ErrNonReusuableSucceeded) {
+		if errors.Is(err, operationlock.ErrNonReusableSucceeded) {
 			// An existing matching operation has now succeeded, return.
 			return nil
 		}
@@ -4844,13 +5548,13 @@ func (d *qemu) Stop(stateful bool) error {
 		}
 
 		// Wait for QEMU process to exit and perform device cleanup.
-		err = d.onStop("stop")
+		err = d.onStop(ctx, "stop")
 		if err != nil {
 			op.Done(err)
 			return err
 		}
 
-		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceStopped.Event(d, nil))
+		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceStopped.Event(ctx, d, nil))
 
 		op.Done(nil)
 		return nil
@@ -4935,14 +5639,14 @@ func (d *qemu) Stop(stateful bool) error {
 		return err
 	}
 
-	// Trigger a rebalance
-	cgroup.TaskSchedulerTrigger("virtual-machine", d.name, "stopped")
+	// Trigger a scheduler rebalance after DB changes made.
+	cgroup.TaskSchedulerTrigger(d.dbType, d.name, "stopped")
 
 	return nil
 }
 
 // Unfreeze restores the instance to running.
-func (d *qemu) Unfreeze() error {
+func (d *qemu) Unfreeze(ctx context.Context) error {
 	// Connect to the monitor.
 	monitor, err := qmp.Connect(d.monitorPath(), qemuSerialChardevName, d.getMonitorEventHandler())
 	if err != nil {
@@ -4955,7 +5659,7 @@ func (d *qemu) Unfreeze() error {
 		return err
 	}
 
-	d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceResumed.Event(d, nil))
+	d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceResumed.Event(ctx, d, nil))
 	return nil
 }
 
@@ -4965,7 +5669,7 @@ func (d *qemu) IsPrivileged() bool {
 }
 
 // snapshot creates a snapshot of the instance.
-func (d *qemu) snapshot(name string, expiry time.Time, stateful bool) error {
+func (d *qemu) snapshot(ctx context.Context, name string, expiry *time.Time, stateful bool, diskVolumesMode string, progressReporter ioprogress.ProgressReporter) error {
 	var err error
 	var monitor *qmp.Monitor
 
@@ -4973,12 +5677,12 @@ func (d *qemu) snapshot(name string, expiry time.Time, stateful bool) error {
 	if stateful {
 		// Confirm the instance has stateful migration enabled.
 		if shared.IsFalseOrEmpty(d.expandedConfig["migration.stateful"]) {
-			return fmt.Errorf("Stateful snapshot requires migration.stateful to be set to true")
+			return errors.New("Stateful snapshot requires migration.stateful to be set to true")
 		}
 
 		// Quick checks.
 		if !d.IsRunning() {
-			return fmt.Errorf("Unable to create a stateful snapshot. The instance isn't running")
+			return errors.New("Cannot create a stateful snapshot. The instance is not running")
 		}
 
 		// Connect to the monitor.
@@ -4995,7 +5699,7 @@ func (d *qemu) snapshot(name string, expiry time.Time, stateful bool) error {
 	}
 
 	// Create the snapshot.
-	err = d.snapshotCommon(d, name, expiry, stateful)
+	err = d.snapshotCommon(ctx, d, name, expiry, stateful, diskVolumesMode, progressReporter)
 	if err != nil {
 		return err
 	}
@@ -5018,7 +5722,7 @@ func (d *qemu) snapshot(name string, expiry time.Time, stateful bool) error {
 }
 
 // Snapshot takes a new snapshot.
-func (d *qemu) Snapshot(name string, expiry time.Time, stateful bool) error {
+func (d *qemu) Snapshot(ctx context.Context, name string, expiry *time.Time, stateful bool, diskVolumesMode string, progressReporter ioprogress.ProgressReporter) error {
 	unlock, err := d.updateBackupFileLock(context.Background())
 	if err != nil {
 		return err
@@ -5026,107 +5730,21 @@ func (d *qemu) Snapshot(name string, expiry time.Time, stateful bool) error {
 
 	defer unlock()
 
-	return d.snapshot(name, expiry, stateful)
+	return d.snapshot(ctx, name, expiry, stateful, diskVolumesMode, progressReporter)
 }
 
 // Restore restores an instance snapshot.
-func (d *qemu) Restore(source instance.Instance, stateful bool) error {
-	op, err := operationlock.Create(d.Project().Name, d.Name(), operationlock.ActionRestore, false, false)
-	if err != nil {
-		return fmt.Errorf("Failed to create instance restore operation: %w", err)
-	}
-
-	defer op.Done(nil)
-
-	var ctxMap logger.Ctx
-
-	// Stop the instance.
-	wasRunning := false
-	if d.IsRunning() {
-		wasRunning = true
-
-		ephemeral := d.IsEphemeral()
-		if ephemeral {
-			// Unset ephemeral flag.
-			args := db.InstanceArgs{
-				Architecture: d.Architecture(),
-				Config:       d.LocalConfig(),
-				Description:  d.Description(),
-				Devices:      d.LocalDevices(),
-				Ephemeral:    false,
-				Profiles:     d.Profiles(),
-				Project:      d.Project().Name,
-				Type:         d.Type(),
-				Snapshot:     d.IsSnapshot(),
-			}
-
-			err := d.Update(args, false)
-			if err != nil {
-				op.Done(err)
-				return err
-			}
-
-			// On function return, set the flag back on.
-			defer func() {
-				args.Ephemeral = ephemeral
-				_ = d.Update(args, false)
-			}()
-		}
-
-		// This will unmount the instance storage.
-		err := d.Stop(false)
-		if err != nil {
-			op.Done(err)
-			return err
-		}
-
-		// Refresh the operation as that one is now complete.
-		op, err = operationlock.Create(d.Project().Name, d.Name(), operationlock.ActionRestore, false, false)
-		if err != nil {
-			return fmt.Errorf("Failed to create instance restore operation: %w", err)
-		}
-
-		defer op.Done(nil)
-	}
-
-	ctxMap = logger.Ctx{
+func (d *qemu) Restore(ctx context.Context, source instance.Instance, stateful bool, diskVolumesMode string, progressReporter ioprogress.ProgressReporter) error {
+	ctxMap := logger.Ctx{
 		"created":   d.creationDate,
 		"ephemeral": d.ephemeral,
 		"used":      d.lastUsedDate,
-		"source":    source.Name()}
+		"source":    source.Name(),
+	}
 
 	d.logger.Info("Restoring instance", ctxMap)
 
-	// Load the storage driver.
-	pool, err := storagePools.LoadByInstance(d.state, d)
-	if err != nil {
-		op.Done(err)
-		return err
-	}
-
-	// Restore the rootfs.
-	err = pool.RestoreInstanceSnapshot(d, source, nil)
-	if err != nil {
-		op.Done(err)
-		return err
-	}
-
-	// Restore the configuration.
-	args := db.InstanceArgs{
-		Architecture: source.Architecture(),
-		Config:       source.LocalConfig(),
-		Description:  source.Description(),
-		Devices:      source.LocalDevices(),
-		Ephemeral:    source.IsEphemeral(),
-		Profiles:     source.Profiles(),
-		Project:      source.Project().Name,
-		Type:         source.Type(),
-		Snapshot:     source.IsSnapshot(),
-	}
-
-	// Don't pass as user-requested as there's no way to fix a bad config.
-	// This will call d.UpdateBackupFile() to ensure snapshot list is up to date.
-	err = d.Update(args, false)
+	wasRunning, op, err := d.restoreCommon(ctx, d, source, diskVolumesMode, progressReporter)
 	if err != nil {
 		op.Done(err)
 		return err
@@ -5137,20 +5755,20 @@ func (d *qemu) Restore(source instance.Instance, stateful bool) error {
 	// Restart the instance.
 	if wasRunning || stateful {
 		d.logger.Debug("Starting instance after snapshot restore")
-		err := d.Start(stateful)
+		err := d.Start(ctx, stateful, progressReporter)
 		if err != nil {
 			op.Done(err)
 			return err
 		}
 	}
 
-	d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceRestored.Event(d, map[string]any{"snapshot": source.Name()}))
+	d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceRestored.Event(ctx, d, map[string]any{"snapshot": source.Name()}))
 	d.logger.Info("Restored instance", ctxMap)
 	return nil
 }
 
 // Rename the instance. Accepts an argument to enable applying deferred TemplateTriggerRename.
-func (d *qemu) Rename(newName string, applyTemplateTrigger bool) error {
+func (d *qemu) Rename(ctx context.Context, newName string, applyTemplateTrigger bool) error {
 	unlock, err := d.updateBackupFileLock(context.Background())
 	if err != nil {
 		return err
@@ -5173,8 +5791,13 @@ func (d *qemu) Rename(newName string, applyTemplateTrigger bool) error {
 		return err
 	}
 
+	err = d.checkRootVolumeNotInUse()
+	if err != nil {
+		return err
+	}
+
 	if d.IsRunning() {
-		return fmt.Errorf("Renaming of running instance not allowed")
+		return errors.New("Renaming of running instance not allowed")
 	}
 
 	// Clean things up.
@@ -5214,13 +5837,13 @@ func (d *qemu) Rename(newName string, applyTemplateTrigger bool) error {
 			// Rename all the instance snapshot database entries.
 			results, err = tx.GetInstanceSnapshotsNames(ctx, d.project.Name, oldName)
 			if err != nil {
-				d.logger.Error("Failed to get instance snapshots", ctxMap)
-				return fmt.Errorf("Failed to get instance snapshots: Failed getting instance snapshot names: %w", err)
+				d.logger.Error("Failed getting instance snapshots", ctxMap)
+				return fmt.Errorf("Failed getting instance snapshots: Failed getting instance snapshot names: %w", err)
 			}
 
 			for _, sname := range results {
 				// Rename the snapshot.
-				oldSnapName := strings.SplitN(sname, shared.SnapshotDelimiter, 2)[1]
+				_, oldSnapName, _ := strings.Cut(sname, shared.SnapshotDelimiter)
 				baseSnapName := filepath.Base(sname)
 
 				err := dbCluster.RenameInstanceSnapshot(ctx, tx.Tx(), d.project.Name, oldName, oldSnapName, baseSnapName)
@@ -5240,9 +5863,9 @@ func (d *qemu) Rename(newName string, applyTemplateTrigger bool) error {
 	// Rename the instance database entry.
 	err = d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		if d.IsSnapshot() {
-			oldParts := strings.SplitN(oldName, shared.SnapshotDelimiter, 2)
-			newParts := strings.SplitN(newName, shared.SnapshotDelimiter, 2)
-			return dbCluster.RenameInstanceSnapshot(ctx, tx.Tx(), d.project.Name, oldParts[0], oldParts[1], newParts[1])
+			oldParent, oldSnap, _ := strings.Cut(oldName, shared.SnapshotDelimiter)
+			_, newSnap, _ := strings.Cut(newName, shared.SnapshotDelimiter)
+			return dbCluster.RenameInstanceSnapshot(ctx, tx.Tx(), d.project.Name, oldParent, oldSnap, newSnap)
 		}
 
 		return dbCluster.RenameInstance(ctx, tx.Tx(), d.project.Name, oldName, newName)
@@ -5255,20 +5878,10 @@ func (d *qemu) Rename(newName string, applyTemplateTrigger bool) error {
 	// Rename the logging path.
 	newFullName := project.Instance(d.Project().Name, d.Name())
 	_ = os.RemoveAll(shared.LogPath(newFullName))
-	if shared.PathExists(d.LogPath()) {
-		err := os.Rename(d.LogPath(), shared.LogPath(newFullName))
-		if err != nil {
-			d.logger.Error("Failed renaming instance", ctxMap)
-			return err
-		}
-	}
-
-	// Rename the MAAS entry.
-	if !d.IsSnapshot() {
-		err = d.maasRename(d, newName)
-		if err != nil {
-			return err
-		}
+	err = os.Rename(d.LogPath(), shared.LogPath(newFullName))
+	if err != nil && !os.IsNotExist(err) {
+		d.logger.Error("Failed renaming instance", ctxMap)
+		return err
 	}
 
 	revert := revert.New()
@@ -5287,15 +5900,15 @@ func (d *qemu) Rename(newName string, applyTemplateTrigger bool) error {
 	for _, backup := range backups {
 		b := backup
 		oldName := b.Name()
-		backupName := strings.Split(oldName, "/")[1]
-		newName := fmt.Sprintf("%s/%s", newName, backupName)
+		_, backupName, _ := strings.Cut(oldName, "/")
+		newName := newName + "/" + backupName
 
-		err = b.Rename(newName)
+		err = b.Rename(ctx, newName)
 		if err != nil {
 			return err
 		}
 
-		revert.Add(func() { _ = b.Rename(oldName) })
+		revert.Add(func() { _ = b.Rename(context.Background(), oldName) })
 	}
 
 	// Update lease files.
@@ -5321,17 +5934,58 @@ func (d *qemu) Rename(newName string, applyTemplateTrigger bool) error {
 	d.logger.Info("Renamed instance", ctxMap)
 
 	if d.isSnapshot {
-		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceSnapshotRenamed.Event(d, map[string]any{"old_name": oldName}))
+		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceSnapshotRenamed.Event(ctx, d, map[string]any{"old_name": oldName}))
 	} else {
-		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceRenamed.Event(d, map[string]any{"old_name": oldName}))
+		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceRenamed.Event(ctx, d, map[string]any{"old_name": oldName}))
 	}
 
 	revert.Success()
 	return nil
 }
 
+// allowRemoveSecurityProtectionStart: security.protection.start can be removed
+// from a VM when the root disk device has security.shared=true OR it is not
+// attached to any other VMs.
+func allowRemoveSecurityProtectionStart(state *state.State, poolName string, volumeType dbCluster.StoragePoolVolumeType, volumeName string, proj *api.Project) error {
+	pool, err := storagePools.LoadByName(state, poolName)
+	if err != nil {
+		return err
+	}
+
+	volumeProject := project.StorageVolumeProjectFromRecord(proj, volumeType)
+
+	var dbVolume *db.StorageVolume
+	err = state.DB.Cluster.Transaction(state.ShutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+		dbVolume, err = tx.GetStoragePoolVolume(ctx, pool.ID(), volumeProject, volumeType, volumeName, true)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf(`Failed loading "%s/%s" from project %q: %w`, volumeType, volumeName, volumeProject, err)
+	}
+
+	if shared.IsFalseOrEmpty(dbVolume.Config["security.shared"]) {
+		// Only check instances here, as a VM root volume cannot be part of a profile
+		// when not using security.shared
+		err := storagePools.VolumeUsedByInstanceDevices(state, pool.Name(), volumeProject, &dbVolume.StorageVolume, true, func(inst db.InstanceArgs, _ api.Project, _ []string) error {
+			// The volume is always attached to its instance
+			if proj.Name == inst.Project && volumeName == inst.Name {
+				return nil
+			}
+
+			return errors.New("Cannot unset security.protection.start while the root device is attached to another instance")
+		})
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // Update the instance config.
-func (d *qemu) Update(args db.InstanceArgs, userRequested bool) error {
+func (d *qemu) Update(ctx context.Context, args db.InstanceArgs, actionType instance.UpdateAction) error {
+	userRequested := d.isUserRequested(actionType)
+
 	unlock, err := d.updateBackupFileLock(context.Background())
 	if err != nil {
 		return err
@@ -5342,7 +5996,7 @@ func (d *qemu) Update(args db.InstanceArgs, userRequested bool) error {
 	// Setup a new operation.
 	op, err := operationlock.CreateWaitGet(d.Project().Name, d.Name(), operationlock.ActionUpdate, []operationlock.Action{operationlock.ActionRestart, operationlock.ActionRestore}, false, false)
 	if err != nil {
-		return fmt.Errorf("Failed to create instance update operation: %w", err)
+		return fmt.Errorf("Failed creating instance update operation: %w", err)
 	}
 
 	defer op.Done(nil)
@@ -5395,17 +6049,17 @@ func (d *qemu) Update(args db.InstanceArgs, userRequested bool) error {
 		return err
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to get profiles: %w", err)
+		return fmt.Errorf("Failed getting profiles: %w", err)
 	}
 
 	checkedProfiles := []string{}
 	for _, profile := range args.Profiles {
-		if !shared.ValueInSlice(profile.Name, profiles) {
-			return fmt.Errorf("Requested profile '%s' doesn't exist", profile.Name)
+		if !slices.Contains(profiles, profile.Name) {
+			return fmt.Errorf("Requested profile %q does not exist", profile.Name)
 		}
 
-		if shared.ValueInSlice(profile.Name, checkedProfiles) {
-			return fmt.Errorf("Duplicate profile found in request")
+		if slices.Contains(checkedProfiles, profile.Name) {
+			return errors.New("Duplicate profile found in request")
 		}
 
 		checkedProfiles = append(checkedProfiles, profile.Name)
@@ -5415,7 +6069,7 @@ func (d *qemu) Update(args db.InstanceArgs, userRequested bool) error {
 	if args.Architecture != 0 {
 		_, err = osarch.ArchitectureName(args.Architecture)
 		if err != nil {
-			return fmt.Errorf("Invalid architecture ID: %s", err)
+			return fmt.Errorf("Invalid architecture ID: %w", err)
 		}
 	}
 
@@ -5497,7 +6151,7 @@ func (d *qemu) Update(args db.InstanceArgs, userRequested bool) error {
 	changedConfig := []string{}
 	for key := range oldExpandedConfig {
 		if oldExpandedConfig[key] != d.expandedConfig[key] {
-			if !shared.ValueInSlice(key, changedConfig) {
+			if !slices.Contains(changedConfig, key) {
 				changedConfig = append(changedConfig, key)
 			}
 		}
@@ -5505,86 +6159,38 @@ func (d *qemu) Update(args db.InstanceArgs, userRequested bool) error {
 
 	for key := range d.expandedConfig {
 		if oldExpandedConfig[key] != d.expandedConfig[key] {
-			if !shared.ValueInSlice(key, changedConfig) {
+			if !slices.Contains(changedConfig, key) {
 				changedConfig = append(changedConfig, key)
 			}
 		}
 	}
 
 	// Diff the devices.
-	removeDevices, addDevices, updateDevices, allUpdatedKeys := oldExpandedDevices.Update(d.expandedDevices, func(oldDevice deviceConfig.Device, newDevice deviceConfig.Device) []string {
+	removeDevices, addDevices, updateDevices, allUpdatedDeviceKeys := oldExpandedDevices.Update(d.expandedDevices, func(oldDevice deviceConfig.Device, newDevice deviceConfig.Device) []string {
 		// This function needs to return a list of fields that are excluded from differences
 		// between oldDevice and newDevice. The result of this is that as long as the
 		// devices are otherwise identical except for the fields returned here, then the
 		// device is considered to be being "updated" rather than "added & removed".
 		oldDevType, err := device.LoadByType(d.state, d.Project().Name, oldDevice)
 		if err != nil {
-			return []string{} // Couldn't create Device, so this cannot be an update.
+			return []string{} // Could not create Device, so this cannot be an update.
 		}
 
 		newDevType, err := device.LoadByType(d.state, d.Project().Name, newDevice)
 		if err != nil {
-			return []string{} // Couldn't create Device, so this cannot be an update.
+			return []string{} // Could not create Device, so this cannot be an update.
 		}
 
 		return newDevType.UpdatableFields(oldDevType)
 	})
 
-	// Prevent adding or updating device initial configuration.
-	if shared.StringPrefixInSlice("initial.", allUpdatedKeys) {
-		for devName, newDev := range addDevices {
-			for k, newVal := range newDev {
-				if !strings.HasPrefix(k, "initial.") {
-					continue
-				}
-
-				oldDev, ok := removeDevices[devName]
-				if !ok {
-					return fmt.Errorf("New device with initial configuration cannot be added once the instance is created")
-				}
-
-				oldVal, ok := oldDev[k]
-				if !ok {
-					return fmt.Errorf("Device initial configuration cannot be added once the instance is created")
-				}
-
-				// If newVal is an empty string it means the initial configuration
-				// has been removed.
-				if newVal != "" && newVal != oldVal {
-					return fmt.Errorf("Device initial configuration cannot be modified once the instance is created")
-				}
-			}
-		}
-	}
-
-	if userRequested {
-		// Do some validation of the config diff (allows mixed instance types for profiles).
-		err = instance.ValidConfig(d.state.OS, d.expandedConfig, true, instancetype.Any)
-		if err != nil {
-			return fmt.Errorf("Invalid expanded config: %w", err)
-		}
-
-		// Do full expanded validation of the devices diff.
-		err = instance.ValidDevices(d.state, d.project, d.Type(), d.localDevices, d.expandedDevices)
-		if err != nil {
-			return fmt.Errorf("Invalid expanded devices: %w", err)
-		}
-
-		// Validate root device
-		_, oldRootDev, oldErr := instancetype.GetRootDiskDevice(oldExpandedDevices.CloneNative())
-		_, newRootDev, newErr := instancetype.GetRootDiskDevice(d.expandedDevices.CloneNative())
-		if oldErr == nil && newErr == nil && oldRootDev["pool"] != newRootDev["pool"] {
-			return fmt.Errorf("Cannot update root disk device pool name to %q", newRootDev["pool"])
-		}
-
-		// Ensure the instance has a root disk.
-		if newErr != nil {
-			return fmt.Errorf("Invalid root disk device: %w", newErr)
-		}
+	err = d.validateConfig(allUpdatedDeviceKeys, addDevices, removeDevices, oldExpandedDevices, changedConfig, oldExpandedConfig, actionType)
+	if err != nil {
+		return err
 	}
 
 	// If apparmor changed, re-validate the apparmor profile (even if not running).
-	if shared.ValueInSlice("raw.apparmor", changedConfig) {
+	if slices.Contains(changedConfig, "raw.apparmor") {
 		err = apparmor.InstanceValidate(d.state.OS, d)
 		if err != nil {
 			return fmt.Errorf("Parse AppArmor profile: %w", err)
@@ -5602,14 +6208,24 @@ func (d *qemu) Update(args db.InstanceArgs, userRequested bool) error {
 	cpuLimitWasChanged := false
 
 	if isRunning {
+		// Re-generate the agent mounts file so that it reflects the current devices set.
+		// This way if a directory disk is added immediately after VM start but before the lxd-agent has
+		// started in the guest (such that it misses the devlxd notification event), the agent will still
+		// be able to see the mount config for the new disk when it starts.
+		err = d.generateAgentMountsFile()
+		if err != nil {
+			return fmt.Errorf("Failed generating agent mounts file: %w", err)
+		}
+
 		// Only certain keys can be changed on a running VM.
 		liveUpdateKeys := []string{
 			"cluster.evacuate",
 			"limits.memory",
 			"security.agent.metrics",
-			"security.csm",
+			"boot.mode",
 			"security.devlxd",
-			"security.secureboot",
+			"security.devlxd.images",
+			"security.devlxd.management.volumes",
 		}
 
 		liveUpdateKeyPrefixes := []string{
@@ -5633,7 +6249,7 @@ func (d *qemu) Update(args db.InstanceArgs, userRequested bool) error {
 				return d.architectureSupportsCPUHotplug()
 			}
 
-			if shared.ValueInSlice(key, liveUpdateKeys) {
+			if slices.Contains(liveUpdateKeys, key) {
 				return true
 			}
 
@@ -5655,7 +6271,8 @@ func (d *qemu) Update(args db.InstanceArgs, userRequested bool) error {
 		for _, key := range changedConfig {
 			value := d.expandedConfig[key]
 
-			if key == "limits.cpu" {
+			switch key {
+			case "limits.cpu":
 				oldValue := oldExpandedConfig["limits.cpu"]
 
 				if oldValue != "" {
@@ -5672,7 +6289,7 @@ func (d *qemu) Update(args db.InstanceArgs, userRequested bool) error {
 
 				limit, err := strconv.Atoi(value)
 				if err != nil {
-					return fmt.Errorf("Cannot change CPU pinning when VM is running")
+					return errors.New("Cannot change CPU pinning when VM is running")
 				}
 
 				err = d.setCPUs(limit)
@@ -5681,20 +6298,17 @@ func (d *qemu) Update(args db.InstanceArgs, userRequested bool) error {
 				}
 
 				cpuLimitWasChanged = true
-			} else if key == "limits.memory" {
+			case "limits.memory":
 				err = d.updateMemoryLimit(value)
 				if err != nil {
 					if err != nil {
 						return fmt.Errorf("Failed updating memory limit: %w", err)
 					}
 				}
-			} else if key == "security.csm" {
+			case "boot.mode":
 				// Defer rebuilding nvram until next start.
 				d.localConfig["volatile.apply_nvram"] = "true"
-			} else if key == "security.secureboot" {
-				// Defer rebuilding nvram until next start.
-				d.localConfig["volatile.apply_nvram"] = "true"
-			} else if key == "security.devlxd" {
+			case "security.devlxd":
 				err = d.advertiseVsockAddress()
 				if err != nil {
 					return err
@@ -5703,23 +6317,7 @@ func (d *qemu) Update(args db.InstanceArgs, userRequested bool) error {
 		}
 	}
 
-	// Update MAAS (must run after the MAC addresses have been generated).
-	updateMAAS := false
-	for _, key := range []string{"maas.subnet.ipv4", "maas.subnet.ipv6", "ipv4.address", "ipv6.address"} {
-		if shared.ValueInSlice(key, allUpdatedKeys) {
-			updateMAAS = true
-			break
-		}
-	}
-
-	if !d.IsSnapshot() && updateMAAS {
-		err = d.maasUpdate(d, oldExpandedDevices.CloneNative())
-		if err != nil {
-			return err
-		}
-	}
-
-	if d.architectureSupportsUEFI(d.architecture) && (shared.ValueInSlice("security.secureboot", changedConfig) || shared.ValueInSlice("security.csm", changedConfig)) {
+	if d.architectureSupportsUEFI(d.architecture) && slices.Contains(changedConfig, "boot.mode") {
 		// setupNvram() requires instance's config volume to be mounted.
 		// The easiest way to detect that is to check if instance is running.
 		// TODO: extend storage API to be able to check if volume is already mounted?
@@ -5745,6 +6343,14 @@ func (d *qemu) Update(args db.InstanceArgs, userRequested bool) error {
 		err = d.resetInstanceID()
 		if err != nil {
 			return err
+		}
+	}
+
+	// If the instance is now assigned to a "placement.group", remove any previous "volatile.cluster.group".
+	// This ensures the placement group takes precedence and avoids stale cluster group targeting during evacuation.
+	if d.expandedConfig["placement.group"] != "" {
+		if oldLocalConfig["volatile.cluster.group"] != "" {
+			delete(d.localConfig, "volatile.cluster.group")
 		}
 	}
 
@@ -5775,6 +6381,10 @@ func (d *qemu) Update(args db.InstanceArgs, userRequested bool) error {
 			return err
 		}
 
+		// Do not store initial.* device config keys in database.
+		initialDevicesConfig := d.localDevices.CutInitialConfig()
+		defer func() { initialDevicesConfig.Copy(d.localDevices) }() // Restore after DB transaction.
+
 		devices, err := dbCluster.APIToDevices(d.localDevices.CloneNative())
 		if err != nil {
 			return err
@@ -5793,20 +6403,20 @@ func (d *qemu) Update(args db.InstanceArgs, userRequested bool) error {
 		return dbCluster.UpdateInstanceProfiles(ctx, tx.Tx(), object.ID, object.Project, profileNames)
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to update database: %w", err)
+		return fmt.Errorf("Failed updating database: %w", err)
 	}
 
 	err = d.UpdateBackupFile()
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("Failed to write backup file: %w", err)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("Failed writing backup file: %w", err)
 	}
 
 	// Changes have been applied and recorded, do not revert if an error occurs from here.
 	revert.Success()
 
 	if cpuLimitWasChanged {
-		// Trigger a scheduler re-run
-		cgroup.TaskSchedulerTrigger("virtual-machine", d.name, "changed")
+		// Trigger a scheduler rebalance after DB changes made.
+		cgroup.TaskSchedulerTrigger(d.dbType, d.name, "changed")
 	}
 
 	if isRunning {
@@ -5839,9 +6449,9 @@ func (d *qemu) Update(args db.InstanceArgs, userRequested bool) error {
 
 	if userRequested {
 		if d.isSnapshot {
-			d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceSnapshotUpdated.Event(d, nil))
+			d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceSnapshotUpdated.Event(ctx, d, nil))
 		} else {
-			d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceUpdated.Event(d, nil))
+			d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceUpdated.Event(ctx, d, nil))
 		}
 	}
 
@@ -5855,11 +6465,11 @@ func (d *qemu) updateMemoryLimit(newLimit string) error {
 	}
 
 	if shared.IsTrue(d.expandedConfig["limits.memory.hugepages"]) {
-		return fmt.Errorf("Cannot live update memory limit when using huge pages")
+		return errors.New("Cannot live update memory limit when using huge pages")
 	}
 
 	// Check new size string is valid and convert to bytes.
-	newSizeBytes, err := units.ParseByteSizeString(newLimit)
+	newSizeBytes, err := parseMemoryStr(newLimit)
 	if err != nil {
 		return fmt.Errorf("Invalid memory size: %w", err)
 	}
@@ -5869,7 +6479,7 @@ func (d *qemu) updateMemoryLimit(newLimit string) error {
 	// Connect to the monitor.
 	monitor, err := qmp.Connect(d.monitorPath(), qemuSerialChardevName, d.getMonitorEventHandler())
 	if err != nil {
-		return err // The VM isn't running as no monitor socket available.
+		return err // The VM is not running as no monitor socket available.
 	}
 
 	baseSizeBytes, err := monitor.GetMemorySizeBytes()
@@ -5900,7 +6510,7 @@ func (d *qemu) updateMemoryLimit(newLimit string) error {
 
 	// Changing the memory balloon can take time, so poll the effectice size to check it has shrunk within 1%
 	// of the target size, which we then take as success (it may still continue to shrink closer to target).
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		curSizeBytes, err = monitor.GetMemoryBalloonSizeBytes()
 		if err != nil {
 			return err
@@ -5973,7 +6583,7 @@ func (d *qemu) cleanupDevices() {
 		if dev != nil {
 			err = d.deviceStop(dev, false, "")
 			if err != nil {
-				d.logger.Error("Failed to stop device", logger.Ctx{"device": dev.Name(), "err": err})
+				d.logger.Error("Failed stopping device", logger.Ctx{"device": dev.Name(), "err": err})
 			}
 		}
 	}
@@ -5990,53 +6600,12 @@ func (d *qemu) init() error {
 }
 
 // Delete the instance.
-func (d *qemu) Delete(force bool) error {
-	unlock, err := d.updateBackupFileLock(context.Background())
-	if err != nil {
-		return err
-	}
-
-	defer unlock()
-
-	// Setup a new operation.
-	op, err := operationlock.CreateWaitGet(d.Project().Name, d.Name(), operationlock.ActionDelete, nil, false, false)
-	if err != nil {
-		return fmt.Errorf("Failed to create instance delete operation: %w", err)
-	}
-
-	defer op.Done(nil)
-
-	if d.IsRunning() {
-		return api.StatusErrorf(http.StatusBadRequest, "Instance is running")
-	}
-
-	err = d.delete(force)
-	if err != nil {
-		return err
-	}
-
-	// If dealing with a snapshot, refresh the backup file on the parent.
-	if d.IsSnapshot() {
-		parentName, _, _ := api.GetParentAndSnapshotName(d.name)
-
-		// Load the parent.
-		parent, err := instance.LoadByProjectAndName(d.state, d.project.Name, parentName)
-		if err != nil {
-			return fmt.Errorf("Invalid parent: %w", err)
-		}
-
-		// Update the backup file.
-		err = parent.UpdateBackupFile()
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+func (d *qemu) Delete(ctx context.Context, force bool, diskVolumesMode string, progressReporter ioprogress.ProgressReporter) error {
+	return d.deleteCommon(ctx, d, force, diskVolumesMode, progressReporter)
 }
 
 // Delete the instance without creating an operation lock.
-func (d *qemu) delete(force bool) error {
+func (d *qemu) delete(ctx context.Context, force bool) error {
 	ctxMap := logger.Ctx{
 		"created":   d.creationDate,
 		"ephemeral": d.ephemeral,
@@ -6050,11 +6619,16 @@ func (d *qemu) delete(force bool) error {
 
 	// Check if instance is delete protected.
 	if !force && shared.IsTrue(d.expandedConfig["security.protection.delete"]) && !d.IsSnapshot() {
-		return fmt.Errorf("Instance is protected from being deleted")
+		return errors.New("Instance is protected from being deleted")
+	}
+
+	err := d.checkRootVolumeNotInUse()
+	if err != nil {
+		return err
 	}
 
 	// Delete any persistent warnings for instance.
-	err := d.warningsDelete()
+	err = d.warningsDelete()
 	if err != nil {
 		return err
 	}
@@ -6073,7 +6647,7 @@ func (d *qemu) delete(force bool) error {
 		} else {
 			// Remove all snapshots.
 			err := d.deleteSnapshots(func(snapInst instance.Instance) error {
-				return snapInst.(*qemu).delete(true) // Internal delete function that doesn't lock.
+				return snapInst.(*qemu).delete(ctx, true) // Internal delete function that does not lock.
 			})
 			if err != nil {
 				return fmt.Errorf("Failed deleting instance snapshots: %w", err)
@@ -6096,17 +6670,10 @@ func (d *qemu) delete(force bool) error {
 		}
 
 		for _, backup := range backups {
-			err = backup.Delete()
+			err = backup.Delete(ctx)
 			if err != nil {
 				return err
 			}
-		}
-
-		// Delete the MAAS entry.
-		err = d.maasDelete(d)
-		if err != nil {
-			d.logger.Error("Failed deleting instance MAAS record", logger.Ctx{"err": err})
-			return err
 		}
 
 		// Run device removal function for each device.
@@ -6114,6 +6681,10 @@ func (d *qemu) delete(force bool) error {
 
 		// Clean things up.
 		d.cleanup()
+
+		// Remove the log directory. Not handled by cleanup() as that is
+		// also called during Rename() where logs should be preserved.
+		_ = os.RemoveAll(d.LogPath())
 	}
 
 	err = d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
@@ -6132,16 +6703,16 @@ func (d *qemu) delete(force bool) error {
 	}
 
 	if d.isSnapshot {
-		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceSnapshotDeleted.Event(d, nil))
+		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceSnapshotDeleted.Event(ctx, d, nil))
 	} else {
-		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceDeleted.Event(d, nil))
+		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceDeleted.Event(ctx, d, nil))
 	}
 
 	return nil
 }
 
 // Export publishes the instance.
-func (d *qemu) Export(w io.Writer, properties map[string]string, expiration time.Time) (api.ImageMetadata, error) {
+func (d *qemu) Export(w io.Writer, properties map[string]string, expiration time.Time, tracker *ioprogress.ProgressTracker) (api.ImageMetadata, error) {
 	ctxMap := logger.Ctx{
 		"created":   d.creationDate,
 		"ephemeral": d.ephemeral,
@@ -6150,7 +6721,7 @@ func (d *qemu) Export(w io.Writer, properties map[string]string, expiration time
 	meta := api.ImageMetadata{}
 
 	if d.IsRunning() {
-		return meta, fmt.Errorf("Cannot export a running instance as an image")
+		return meta, errors.New("Cannot export a running instance as an image")
 	}
 
 	d.logger.Info("Exporting instance", ctxMap)
@@ -6185,9 +6756,40 @@ func (d *qemu) Export(w io.Writer, properties map[string]string, expiration time
 		return nil
 	}
 
-	// Look for metadata.yaml.
-	fnam := filepath.Join(cDir, "metadata.yaml")
-	if !shared.PathExists(fnam) {
+	instanceRoot, err := d.OpenRoot()
+	if err != nil {
+		_ = tarWriter.Close()
+		d.logger.Error("Failed exporting instance", ctxMap)
+		return meta, err
+	}
+
+	defer func() { _ = instanceRoot.Close() }()
+
+	metadataFile, err := instanceRoot.Open("metadata.yaml")
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		_ = tarWriter.Close()
+		d.logger.Error("Failed exporting instance", ctxMap)
+		return meta, err
+	}
+
+	var fnam string
+	var existingMetadata *api.ImageMetadata
+
+	if metadataFile != nil {
+		defer func() { _ = metadataFile.Close() }()
+
+		// Parse the metadata file.
+		existingMetadata, err = ParseImageMetadataFile(metadataFile)
+		if err != nil {
+			_ = tarWriter.Close()
+			d.logger.Error("Failed exporting instance", ctxMap)
+			return meta, err
+		}
+
+		fnam = filepath.Join(instanceRoot.Name(), "metadata.yaml")
+	}
+
+	if existingMetadata == nil {
 		// Generate a new metadata.yaml.
 		tempDir, err := os.MkdirTemp("", "lxd_lxd_metadata_")
 		if err != nil {
@@ -6253,28 +6855,14 @@ func (d *qemu) Export(w io.Writer, properties map[string]string, expiration time
 			return meta, err
 		}
 
-		tmpOffset := len(filepath.Dir(fnam)) + 1
-		err = tarWriter.WriteFile(fnam[tmpOffset:], fnam, fi, false)
+		err = tarWriter.WriteFile("metadata.yaml", fnam, fi, false)
 		if err != nil {
 			_ = tarWriter.Close()
 			d.logger.Error("Failed exporting instance", ctxMap)
 			return meta, err
 		}
 	} else {
-		// Parse the metadata.
-		content, err := os.ReadFile(fnam)
-		if err != nil {
-			_ = tarWriter.Close()
-			d.logger.Error("Failed exporting instance", ctxMap)
-			return meta, err
-		}
-
-		err = yaml.Unmarshal(content, &meta)
-		if err != nil {
-			_ = tarWriter.Close()
-			d.logger.Error("Failed exporting instance", ctxMap)
-			return meta, err
-		}
+		meta = *existingMetadata
 
 		if !expiration.IsZero() {
 			meta.ExpiryDate = expiration.UTC().Unix()
@@ -6313,7 +6901,13 @@ func (d *qemu) Export(w io.Writer, properties map[string]string, expiration time
 		}
 
 		// Include metadata.yaml in the tarball.
-		fi, err := os.Lstat(fnam)
+		var fi fs.FileInfo
+		if properties != nil || !expiration.IsZero() {
+			fi, err = os.Lstat(fnam)
+		} else {
+			fi, err = metadataFile.Stat()
+		}
+
 		if err != nil {
 			_ = tarWriter.Close()
 			d.logger.Debug("Error statting during export", logger.Ctx{"fileName": fnam})
@@ -6321,13 +6915,8 @@ func (d *qemu) Export(w io.Writer, properties map[string]string, expiration time
 			return meta, err
 		}
 
-		if properties != nil || !expiration.IsZero() {
-			tmpOffset := len(filepath.Dir(fnam)) + 1
-			err = tarWriter.WriteFile(fnam[tmpOffset:], fnam, fi, false)
-		} else {
-			err = tarWriter.WriteFile(fnam[offset:], fnam, fi, false)
-		}
-
+		// In both sub-cases the desired tar entry name is always "metadata.yaml".
+		err = tarWriter.WriteFile("metadata.yaml", fnam, fi, false)
 		if err != nil {
 			_ = tarWriter.Close()
 			d.logger.Debug("Error writing to tarfile", logger.Ctx{"err": err})
@@ -6337,30 +6926,36 @@ func (d *qemu) Export(w io.Writer, properties map[string]string, expiration time
 	}
 
 	// Convert from raw to qcow2 and add to tarball.
-	tmpPath, err := os.MkdirTemp(shared.VarPath("images"), "lxd_export_")
+	tmpPath, err := os.MkdirTemp(d.state.ImagesStoragePath(d.project.Name), "lxd_export_")
 	if err != nil {
 		return meta, err
 	}
 
 	defer func() { _ = os.RemoveAll(tmpPath) }()
 
-	if mountInfo.DiskPath == "" {
-		return meta, fmt.Errorf("No disk path available from mount")
+	devSource, isPath := mountInfo.DevSource.(deviceConfig.DevSourcePath)
+
+	if !isPath {
+		return meta, fmt.Errorf("Unhandled DevSource type %T", mountInfo.DevSource)
 	}
 
-	fPath := fmt.Sprintf("%s/rootfs.img", tmpPath)
+	if devSource.Path == "" {
+		return meta, errors.New("No disk path available from mount")
+	}
+
+	fPath := tmpPath + "/rootfs.img"
 
 	// Convert to qcow2 image.
 	cmd := []string{
 		"nice", "-n19", // Run with low priority to reduce CPU impact on other processes.
-		"qemu-img", "convert", "-f", "raw", "-O", "qcow2", "-c",
+		"qemu-img", "convert", "-p", "-f", "raw", "-O", "qcow2", "-c",
 	}
 
 	revert := revert.New()
 	defer revert.Fail()
 
 	// Check for Direct I/O support.
-	from, err := os.OpenFile(mountInfo.DiskPath, unix.O_DIRECT|unix.O_RDONLY, 0)
+	from, err := os.OpenFile(devSource.Path, unix.O_DIRECT|unix.O_RDONLY, 0)
 	if err == nil {
 		cmd = append(cmd, "-T", "none")
 		_ = from.Close()
@@ -6374,9 +6969,9 @@ func (d *qemu) Export(w io.Writer, properties map[string]string, expiration time
 
 	revert.Add(func() { _ = os.Remove(fPath) })
 
-	cmd = append(cmd, mountInfo.DiskPath, fPath)
+	cmd = append(cmd, devSource.Path, fPath)
 
-	_, err = apparmor.QemuImg(d.state.OS, cmd, mountInfo.DiskPath, fPath, nil)
+	_, err = apparmor.QemuImg(d.state.OS, cmd, devSource.Path, fPath, tracker)
 	if err != nil {
 		return meta, fmt.Errorf("Failed converting instance to qcow2: %w", err)
 	}
@@ -6394,13 +6989,19 @@ func (d *qemu) Export(w io.Writer, properties map[string]string, expiration time
 	}
 
 	// Include all the templates.
-	fnam = d.TemplatesPath()
-	if shared.PathExists(fnam) {
-		err = filepath.Walk(fnam, writeToTar)
-		if err != nil {
-			d.logger.Error("Failed exporting instance", ctxMap)
-			return meta, err
-		}
+	templatesExportRoot, err := d.OpenTemplates()
+	if err != nil {
+		d.logger.Error("Failed exporting instance", ctxMap)
+		return meta, err
+	}
+
+	_ = templatesExportRoot.Close()
+	fnam = templatesExportRoot.Name()
+
+	err = filepath.Walk(fnam, writeToTar)
+	if err != nil {
+		d.logger.Error("Failed exporting instance", ctxMap)
+		return meta, err
 	}
 
 	err = tarWriter.Close()
@@ -6415,13 +7016,19 @@ func (d *qemu) Export(w io.Writer, properties map[string]string, expiration time
 }
 
 // MigrateSend controls the sending side of a migration.
-func (d *qemu) MigrateSend(args instance.MigrateSendArgs) error {
+func (d *qemu) MigrateSend(ctx context.Context, args instance.MigrateSendArgs, progressReporter ioprogress.ProgressReporter) (err error) {
 	d.logger.Info("Migration send starting")
 	defer d.logger.Info("Migration send stopped")
 
 	// Check for stateful support.
 	if args.Live && shared.IsFalseOrEmpty(d.expandedConfig["migration.stateful"]) {
-		return fmt.Errorf("Stateful migration requires migration.stateful to be set to true")
+		return errors.New("Stateful migration requires migration.stateful to be set to true")
+	}
+
+	// Setup a new operation.
+	op, err := operationlock.CreateWaitGet(d.Project().Name, d.Name(), operationlock.ActionMigrate, nil, false, true)
+	if err != nil {
+		return err
 	}
 
 	// Wait for essential migration connections before negotiation.
@@ -6430,12 +7037,15 @@ func (d *qemu) MigrateSend(args instance.MigrateSendArgs) error {
 
 	filesystemConn, err := args.FilesystemConn(connectionsCtx)
 	if err != nil {
+		op.Done(err)
 		return err
 	}
 
 	pool, err := storagePools.LoadByInstance(d.state, d)
 	if err != nil {
-		return fmt.Errorf("Failed loading instance: %w", err)
+		err := fmt.Errorf("Failed loading instance: %w", err)
+		op.Done(err)
+		return err
 	}
 
 	// The refresh argument passed to MigrationTypes() is always set
@@ -6444,7 +7054,9 @@ func (d *qemu) MigrateSend(args instance.MigrateSendArgs) error {
 	// this, and adjust the migration types accordingly.
 	poolMigrationTypes := pool.MigrationTypes(storagePools.InstanceContentType(d), false, args.Snapshots)
 	if len(poolMigrationTypes) == 0 {
-		return fmt.Errorf("No source migration types available")
+		err := errors.New("No source migration types available")
+		op.Done(err)
+		return err
 	}
 
 	// Convert the pool's migration type options to an offer header to target.
@@ -6456,17 +7068,35 @@ func (d *qemu) MigrateSend(args instance.MigrateSendArgs) error {
 	offerHeader.IndexHeaderVersion = &indexHeaderVersion
 
 	// For VMs, send block device size hint in offer header so that target can create the volume the same size.
-	blockSize, err := storagePools.InstanceDiskBlockSize(pool, d, d.op)
+	blockSize, err := storagePools.InstanceDiskBlockSize(pool, d, progressReporter)
 	if err != nil {
-		return fmt.Errorf("Failed getting source disk size: %w", err)
+		err := fmt.Errorf("Failed getting source disk size: %w", err)
+		op.Done(err)
+		return err
 	}
 
 	d.logger.Debug("Set migration offer volume size", logger.Ctx{"blockSize": blockSize})
 	offerHeader.VolumeSize = &blockSize
 
-	srcConfig, err := pool.GenerateInstanceBackupConfig(d, args.Snapshots, d.op)
+	// The index frame lists the custom volumes that will follow the root volume, so the target can check the
+	// devices it deferred before any data moves. In root mode the list is empty and the frame is unchanged.
+	// A live request never carries custom volumes, so it lists none whatever the mode.
+	diskVolumesMode := args.DiskVolumesMode
+	if args.Live {
+		diskVolumesMode = api.DiskVolumesModeRoot
+	}
+
+	volsConfig, err := d.migrationCustomVolumes(d, pool, diskVolumesMode, args.Snapshots, progressReporter)
 	if err != nil {
-		return fmt.Errorf("Failed generating instance migration config: %w", err)
+		op.Done(err)
+		return err
+	}
+
+	srcConfig, err := pool.GenerateInstanceBackupConfig(d, args.Snapshots, volsConfig, progressReporter)
+	if err != nil {
+		err := fmt.Errorf("Failed generating instance migration config: %w", err)
+		op.Done(err)
+		return err
 	}
 
 	// If we are copying snapshots, retrieve a list of snapshots from source volume.
@@ -6475,6 +7105,12 @@ func (d *qemu) MigrateSend(args instance.MigrateSendArgs) error {
 		offerHeader.Snapshots = make([]*migration.Snapshot, 0, len(srcConfig.Snapshots))
 
 		for i := range srcConfig.Snapshots {
+			if srcConfig.Snapshots[i] == nil {
+				err := fmt.Errorf("Invalid snapshot information for snapshot index %d", i)
+				op.Done(err)
+				return err
+			}
+
 			offerHeader.SnapshotNames = append(offerHeader.SnapshotNames, srcConfig.Snapshots[i].Name)
 			offerHeader.Snapshots = append(offerHeader.Snapshots, instance.SnapshotToProtobuf(srcConfig.Snapshots[i]))
 		}
@@ -6492,7 +7128,9 @@ func (d *qemu) MigrateSend(args instance.MigrateSendArgs) error {
 	d.logger.Debug("Sending migration offer to target")
 	err = args.ControlSend(offerHeader)
 	if err != nil {
-		return fmt.Errorf("Failed sending migration offer header: %w", err)
+		err := fmt.Errorf("Failed sending migration offer header: %w", err)
+		op.Done(err)
+		return err
 	}
 
 	// Receive response from target.
@@ -6500,7 +7138,9 @@ func (d *qemu) MigrateSend(args instance.MigrateSendArgs) error {
 	respHeader := &migration.MigrationHeader{}
 	err = args.ControlReceive(respHeader)
 	if err != nil {
-		return fmt.Errorf("Failed receiving migration offer response: %w", err)
+		err := fmt.Errorf("Failed receiving migration offer response: %w", err)
+		op.Done(err)
+		return err
 	}
 
 	d.logger.Debug("Got migration offer response from target")
@@ -6508,7 +7148,9 @@ func (d *qemu) MigrateSend(args instance.MigrateSendArgs) error {
 	// Negotiated migration types.
 	migrationTypes, err := migration.MatchTypes(respHeader, migration.MigrationFSType_RSYNC, poolMigrationTypes)
 	if err != nil {
-		return fmt.Errorf("Failed to negotiate migration type: %w", err)
+		err := fmt.Errorf("Failed negotiating migration type: %w", err)
+		op.Done(err)
+		return err
 	}
 
 	volSourceArgs := &migration.VolumeSourceArgs{
@@ -6526,14 +7168,19 @@ func (d *qemu) MigrateSend(args instance.MigrateSendArgs) error {
 
 	// Only send the snapshots that the target requests when refreshing.
 	if respHeader.GetRefresh() {
+		rootVol, err := volSourceArgs.Info.Config.RootVolume()
+		if err != nil {
+			return fmt.Errorf("Failed getting the root volume: %w", err)
+		}
+
 		volSourceArgs.Snapshots = respHeader.GetSnapshotNames()
-		allSnapshots := volSourceArgs.Info.Config.VolumeSnapshots
+		allSnapshots := rootVol.Snapshots
 
 		// Ensure that only the requested snapshots are included in the migration index header.
-		volSourceArgs.Info.Config.VolumeSnapshots = make([]*api.StorageVolumeSnapshot, 0, len(volSourceArgs.Snapshots))
+		rootVol.Snapshots = make([]*api.StorageVolumeSnapshot, 0, len(volSourceArgs.Snapshots))
 		for i := range allSnapshots {
-			if shared.ValueInSlice(allSnapshots[i].Name, volSourceArgs.Snapshots) {
-				volSourceArgs.Info.Config.VolumeSnapshots = append(volSourceArgs.Info.Config.VolumeSnapshots, allSnapshots[i])
+			if slices.Contains(volSourceArgs.Snapshots, allSnapshots[i].Name) {
+				rootVol.Snapshots = append(rootVol.Snapshots, allSnapshots[i])
 			}
 		}
 	}
@@ -6544,11 +7191,12 @@ func (d *qemu) MigrateSend(args instance.MigrateSendArgs) error {
 	if args.Live && respHeader.Criu != nil && *respHeader.Criu == migration.CRIUType_VM_QEMU {
 		stateConn, err = args.StateConn(connectionsCtx)
 		if err != nil {
+			op.Done(err)
 			return err
 		}
 	}
 
-	g, ctx := errgroup.WithContext(context.Background())
+	g, ctx := errgroup.WithContext(ctx)
 
 	// Start control connection monitor.
 	g.Go(func() error {
@@ -6612,22 +7260,33 @@ func (d *qemu) MigrateSend(args instance.MigrateSendArgs) error {
 				defer instanceRefClear(d)
 			}
 
-			err = d.migrateSendLive(pool, args.ClusterMoveSourceName, blockSize, filesystemConn, stateConn, volSourceArgs)
+			err = d.migrateSendLive(ctx, pool, args.ClusterMoveSourceName, blockSize, filesystemConn, stateConn, volSourceArgs, progressReporter)
 			if err != nil {
 				return err
 			}
 		} else {
 			// Perform stateful stop if live state transfer is not supported by target.
 			if args.Live {
-				err = d.Stop(true)
+				err = d.Stop(ctx, true)
 				if err != nil {
 					return fmt.Errorf("Failed statefully stopping instance: %w", err)
 				}
 			}
 
-			err = pool.MigrateInstance(d, filesystemConn, volSourceArgs, d.op)
+			err = pool.MigrateInstance(ctx, d, filesystemConn, volSourceArgs, progressReporter)
 			if err != nil {
 				return err
+			}
+
+			// A live request keeps writing to the volumes, and a live request that falls back to a
+			// stateful stop still skips the device deferral on the target, so custom volumes never
+			// travel with a live migration.
+			if respHeader.GetIndexHeaderVersion() >= migration.IndexHeaderVersionCustomVolumes && args.ClusterMoveSourceName == "" && !args.Live {
+				// The same list the index frame announced, so the target receives exactly what it was told to expect.
+				err := d.migrateSendCustomVolumes(filesystemConn, respHeader.GetIndexHeaderVersion(), args.Snapshots, volsConfig, progressReporter)
+				if err != nil {
+					return err
+				}
 			}
 		}
 
@@ -6638,15 +7297,23 @@ func (d *qemu) MigrateSend(args instance.MigrateSendArgs) error {
 	{
 		err := g.Wait()
 		if err != nil {
+			op.Done(err)
 			return err
 		}
 
+		err = d.postMigrateSendCommon(d, args.ClusterMoveSourceName)
+		if err != nil {
+			d.logger.Error("Post-migration steps failed on source", logger.Ctx{"err": err})
+		}
+
+		op.Done(nil)
+		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceMigrated.Event(ctx, d, nil))
 		return nil
 	}
 }
 
 // migrateSendLive performs live migration send process.
-func (d *qemu) migrateSendLive(pool storagePools.Pool, clusterMoveSourceName string, rootDiskSize int64, filesystemConn io.ReadWriteCloser, stateConn io.ReadWriteCloser, volSourceArgs *migration.VolumeSourceArgs) error {
+func (d *qemu) migrateSendLive(ctx context.Context, pool storagePools.Pool, clusterMoveSourceName string, rootDiskSize int64, filesystemConn io.ReadWriteCloser, stateConn io.ReadWriteCloser, volSourceArgs *migration.VolumeSourceArgs, progressReporter ioprogress.ProgressReporter) error {
 	monitor, err := qmp.Connect(d.monitorPath(), qemuSerialChardevName, d.getMonitorEventHandler())
 	if err != nil {
 		return err
@@ -6695,15 +7362,16 @@ func (d *qemu) migrateSendLive(pool storagePools.Pool, clusterMoveSourceName str
 			return err
 		}
 
+		// Always remove the snapshotFile so that if qemu-img fails the partially written file is removed.
+		defer func() { _ = os.Remove(snapshotFile) }()
+
 		// Create qcow2 disk image with the maximum size set to the instance's root disk size for use as
 		// a CoW target for the migration snapshot. This will be used during migration to store writes in
 		// the guest whilst the storage driver is transferring the root disk and snapshots to the taget.
-		_, err = shared.RunCommand("qemu-img", "create", "-f", "qcow2", snapshotFile, fmt.Sprintf("%d", rootDiskSize))
+		_, err = shared.RunCommand(d.state.ShutdownCtx, "qemu-img", "create", "-f", "qcow2", snapshotFile, strconv.FormatInt(rootDiskSize, 10))
 		if err != nil {
 			return fmt.Errorf("Failed opening file image for migration storage snapshot %q: %w", snapshotFile, err)
 		}
-
-		defer func() { _ = os.Remove(snapshotFile) }()
 
 		// Pass the snapshot file to the running QEMU process.
 		snapFile, err := os.OpenFile(snapshotFile, unix.O_RDWR, 0)
@@ -6726,7 +7394,7 @@ func (d *qemu) migrateSendLive(pool storagePools.Pool, clusterMoveSourceName str
 
 		defer func() { _ = monitor.RemoveFDFromFDSet(rootSnapshotDiskName) }()
 
-		_ = snapFile.Close() // Don't prevent clean unmount when instance is stopped.
+		_ = snapFile.Close() // Do not prevent clean unmount when instance is stopped.
 
 		// Add the snapshot file as a block device (not visible to the guest OS).
 		err = monitor.AddBlockDevice(map[string]any{
@@ -6788,7 +7456,7 @@ func (d *qemu) migrateSendLive(pool storagePools.Pool, clusterMoveSourceName str
 	// We enable AllowInconsistent mode as this allows for transferring the VM storage whilst it is running
 	// and the snapshot we took earlier is designed to provide consistency anyway.
 	volSourceArgs.AllowInconsistent = true
-	err = pool.MigrateInstance(d, filesystemConn, volSourceArgs, d.op)
+	err = pool.MigrateInstance(ctx, d, filesystemConn, volSourceArgs, progressReporter)
 	if err != nil {
 		return err
 	}
@@ -6801,16 +7469,8 @@ func (d *qemu) migrateSendLive(pool storagePools.Pool, clusterMoveSourceName str
 
 	// Notify the shared disks that they're going to be accessed from another system.
 	diskPools := make(map[string]storagePools.Pool, len(d.expandedDevices))
-	for _, dev := range d.expandedDevices.Sorted() {
-		if dev.Config["type"] != "disk" || dev.Config["path"] == "/" {
-			continue
-		}
-
+	for _, dev := range d.expandedDevices.Filter(filters.IsCustomVolumeDisk).Sorted() {
 		poolName := dev.Config["pool"]
-		if poolName == "" {
-			continue
-		}
-
 		diskPool, ok := diskPools[poolName]
 		if !ok {
 			// Load the pool for the disk.
@@ -6821,6 +7481,12 @@ func (d *qemu) migrateSendLive(pool storagePools.Pool, clusterMoveSourceName str
 
 			// Save it to the pools map to avoid loading it from the DB multiple times.
 			diskPools[poolName] = diskPool
+		}
+
+		// Check that we're on shared storage and doing a cluster move.
+		isRemoteClusterMove := clusterMoveSourceName != "" && diskPool.Driver().Info().Remote
+		if !isRemoteClusterMove {
+			continue
 		}
 
 		// Setup the volume entry.
@@ -6834,7 +7500,7 @@ func (d *qemu) migrateSendLive(pool storagePools.Pool, clusterMoveSourceName str
 		// Call MigrateVolume on the source.
 		err = diskPool.Driver().MigrateVolume(volCopy, nil, extraSourceArgs, nil)
 		if err != nil {
-			return fmt.Errorf("Failed to prepare device %q for migration: %w", dev.Name, err)
+			return fmt.Errorf("Failed preparing device %q for migration: %w", dev.Name, err)
 		}
 	}
 
@@ -6971,7 +7637,7 @@ func (d *qemu) migrateSendLive(pool storagePools.Pool, clusterMoveSourceName str
 	if clusterMoveSourceName != "" {
 		// If doing an intra-cluster member move then we will be deleting the instance on the source,
 		// so lets just stop it after migration is completed.
-		err = d.Stop(false)
+		err = d.Stop(ctx, false)
 		if err != nil {
 			return fmt.Errorf("Failed stopping instance: %w", err)
 		}
@@ -7008,7 +7674,7 @@ func (d *qemu) migrateSendLive(pool storagePools.Pool, clusterMoveSourceName str
 
 // MigrateReceive receives the migration offer from the source and negotiates the migration options.
 // It establishes the necessary connections and transfers the filesystem and snapshots if required.
-func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
+func (d *qemu) MigrateReceive(ctx context.Context, args instance.MigrateReceiveArgs, progressReporter ioprogress.ProgressReporter) error {
 	d.logger.Info("Migration receive starting")
 	defer d.logger.Info("Migration receive stopped")
 
@@ -7039,7 +7705,7 @@ func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
 		}
 
 		if rootDiskDevice["pool"] == "" {
-			return fmt.Errorf("The instance's root device is missing the pool property")
+			return errors.New("The instance's root device is missing the pool property")
 		}
 
 		// Initialize the storage pool cache.
@@ -7072,10 +7738,7 @@ func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
 
 	// Respond with our maximum supported header version if the requested version is higher than ours.
 	// Otherwise just return the requested header version to the source.
-	indexHeaderVersion := offerHeader.GetIndexHeaderVersion()
-	if indexHeaderVersion > migration.IndexHeaderVersion {
-		indexHeaderVersion = migration.IndexHeaderVersion
-	}
+	indexHeaderVersion := min(offerHeader.GetIndexHeaderVersion(), migration.IndexHeaderVersion)
 
 	respHeader.IndexHeaderVersion = &indexHeaderVersion
 	respHeader.SnapshotNames = offerHeader.SnapshotNames
@@ -7114,7 +7777,7 @@ func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
 
 		// Delete the extra local snapshots first.
 		for _, deleteTargetSnapshotIndex := range deleteTargetSnapshotIndexes {
-			err := targetSnapshots[deleteTargetSnapshotIndex].Delete(true)
+			err := targetSnapshots[deleteTargetSnapshotIndex].Delete(ctx, true, "", progressReporter)
 			if err != nil {
 				return err
 			}
@@ -7166,7 +7829,7 @@ func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
 	revert := revert.New()
 	defer revert.Fail()
 
-	g, ctx := errgroup.WithContext(context.Background())
+	g, ctx := errgroup.WithContext(ctx)
 
 	// Start control connection monitor.
 	g.Go(func() error {
@@ -7206,15 +7869,15 @@ func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
 		args.Disconnect()
 	}()
 
-	// Start filesystem transfer routine and initialise a channel that is closed when the routine finishes.
-	fsTransferDone := make(chan struct{})
-	g.Go(func() error {
-		defer close(fsTransferDone)
+	// Start filesystem transfer routine and initialise a channel that carries its result. The routine's
+	// error reaches the error group only after the routine has returned, so a waiter woken by the routine
+	// finishing can still see an uncancelled context and mistake a failed transfer for a completed one.
+	fsTransferDone := make(chan error, 1)
+	g.Go(func() (err error) {
+		defer func() { fsTransferDone <- err }()
 
 		d.logger.Debug("Migrate receive transfer started")
 		defer d.logger.Debug("Migrate receive transfer finished")
-
-		var err error
 
 		snapshots := make([]*migration.Snapshot, 0)
 
@@ -7242,7 +7905,6 @@ func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
 			}
 
 			for _, name := range offerHeader.SnapshotNames {
-				name := name // Local var.
 				base := instance.SnapshotToProtobuf(apiInstSnap)
 				baseName := name
 				base.Name = &baseName
@@ -7258,10 +7920,12 @@ func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
 			MigrationType:         respTypes[0],
 			Refresh:               args.Refresh,                // Indicate to receiver volume should exist.
 			TrackProgress:         true,                        // Use a progress tracker on receiver to get in-cluster progress information.
-			Live:                  false,                       // Indicates we won't get a final rootfs sync.
+			Live:                  false,                       // Indicates we will not get a final rootfs sync.
 			VolumeSize:            offerHeader.GetVolumeSize(), // Block size setting override.
 			VolumeOnly:            !args.Snapshots,
 			ClusterMoveSourceName: args.ClusterMoveSourceName,
+			DeferredCustomVolumes: args.DeferredVolumes,
+			AttachedCustomVolumes: args.AttachedVolumes,
 		}
 
 		// At this point we have already figured out the parent instances's root
@@ -7292,14 +7956,14 @@ func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
 					// comes from a profile on the new instance as well we don't need to do
 					// anything.
 					if snapArgs.Devices != nil {
-						snapLocalRootDiskDeviceKey, _, _ := instancetype.GetRootDiskDevice(snapArgs.Devices.CloneNative())
+						snapLocalRootDiskDeviceKey, _, _ := api.GetRootDiskDevice(snapArgs.Devices.CloneNative())
 						if snapLocalRootDiskDeviceKey != "" {
 							snapArgs.Devices[snapLocalRootDiskDeviceKey]["pool"] = parentStoragePool
 						}
 					}
 
 					// Create the snapshot instance.
-					_, snapInstOp, cleanup, err := instance.CreateInternal(d.state, *snapArgs, true)
+					_, snapInstOp, cleanup, err := instance.CreateInternal(ctx, d.state, *snapArgs, true)
 					if err != nil {
 						return fmt.Errorf("Failed creating instance snapshot record %q: %w", snapArgs.Name, err)
 					}
@@ -7314,7 +7978,7 @@ func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
 			}
 		}
 
-		err = pool.CreateInstanceFromMigration(d, filesystemConn, volTargetArgs, d.op)
+		err = pool.CreateInstanceFromMigration(ctx, d, filesystemConn, volTargetArgs, progressReporter)
 		if err != nil {
 			return fmt.Errorf("Failed creating instance on target: %w", err)
 		}
@@ -7327,16 +7991,8 @@ func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
 
 		// Notify the shared disks that they're going to be accessed from another system.
 		diskPools := make(map[string]storagePools.Pool, len(d.expandedDevices))
-		for _, dev := range d.expandedDevices.Sorted() {
-			if dev.Config["type"] != "disk" || dev.Config["path"] == "/" {
-				continue
-			}
-
+		for _, dev := range d.expandedDevices.Filter(filters.IsCustomVolumeDisk).Sorted() {
 			poolName := dev.Config["pool"]
-			if poolName == "" {
-				continue
-			}
-
 			diskPool, ok := diskPools[poolName]
 			if !ok {
 				// Load the pool for the disk.
@@ -7349,6 +8005,12 @@ func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
 				diskPools[poolName] = diskPool
 			}
 
+			// Check that we're on shared storage and doing a cluster move.
+			isRemoteClusterMove := args.ClusterMoveSourceName != "" && diskPool.Driver().Info().Remote
+			if !isRemoteClusterMove {
+				continue
+			}
+
 			// Setup the volume entry.
 			extraTargetArgs := migration.VolumeTargetArgs{
 				ClusterMoveSourceName: args.ClusterMoveSourceName,
@@ -7357,10 +8019,11 @@ func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
 			vol := diskPool.GetVolume(storageDrivers.VolumeTypeCustom, storageDrivers.ContentTypeBlock, project.StorageVolume(storageProjectName, dev.Config["source"]), nil)
 			volCopy := storageDrivers.NewVolumeCopy(vol)
 
-			// Create a volume from the migration.
+			// Notify shared storage driver to setup volume on cluster member.
+			// This is needed to ensure that mount path exists and the volume is mounted.
 			err = diskPool.Driver().CreateVolumeFromMigration(volCopy, nil, extraTargetArgs, nil, nil)
 			if err != nil {
-				return fmt.Errorf("Failed to prepare device %q for migration: %w", dev.Name, err)
+				return fmt.Errorf("Failed preparing device %q for migration: %w", dev.Name, err)
 			}
 		}
 
@@ -7379,6 +8042,16 @@ func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
 
 				_ = pool.DeleteInstance(d, nil)
 			})
+		}
+
+		// Registered after the instance revert so the reverter removes the custom volumes first.
+		// A live request keeps writing to the volumes, so those never travel with the instance. The
+		// condition matches the source so both sides agree on whether the frames are coming.
+		if respHeader.GetIndexHeaderVersion() >= migration.IndexHeaderVersionCustomVolumes && args.ClusterMoveSourceName == "" && !args.Live {
+			err = d.migrateReceiveCustomVolumes(ctx, d, filesystemConn, respHeader.GetIndexHeaderVersion(), args.Snapshots, args.AttachedVolumes, revert, progressReporter)
+			if err != nil {
+				return err
+			}
 		}
 
 		if args.ClusterMoveSourceName != d.name {
@@ -7406,7 +8079,7 @@ func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
 			// starting from the migrated state file or migration state connection.
 			d.stateful = true
 
-			err = d.start(true, args.InstanceOperation)
+			err = d.start(ctx, true, args.InstanceOperation, progressReporter)
 			if err != nil {
 				return err
 			}
@@ -7416,25 +8089,31 @@ func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
 			op.Done(nil)
 		}
 
+		// Update the backup file after all mutations have completed.
+		err = d.UpdateBackupFile()
+		if err != nil {
+			return fmt.Errorf("Failed writing backup file: %w", err)
+		}
+
 		return nil
 	})
 
 	{
 		// Wait until the filesystem transfer routine has finished.
-		<-fsTransferDone
+		fsTransferErr := <-fsTransferDone
 
-		// If context is cancelled by this stage, then an error has occurred.
+		// If the transfer failed or the context is cancelled by this stage, then an error has occurred.
 		// Wait for all routines to finish and collect the first error that occurred.
-		if ctx.Err() != nil {
+		if fsTransferErr != nil || ctx.Err() != nil {
 			err := g.Wait()
 
 			// Send failure response to source.
 			msg := migration.MigrationControl{
-				Success: proto.Bool(err == nil),
+				Success: new(err == nil),
 			}
 
 			if err != nil {
-				msg.Message = proto.String(err.Error())
+				msg.Message = new(err.Error())
 			}
 
 			d.logger.Debug("Sending migration failure response to source", logger.Ctx{"err": err})
@@ -7448,7 +8127,7 @@ func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
 
 		// Send success response to source to control as nothing has gone wrong so far.
 		msg := migration.MigrationControl{
-			Success: proto.Bool(true),
+			Success: new(true),
 		}
 
 		d.logger.Debug("Sending migration success response to source", logger.Ctx{"success": msg.GetSuccess()})
@@ -7469,7 +8148,7 @@ func (d *qemu) MigrateReceive(args instance.MigrateReceiveArgs) error {
 
 // ConversionReceive establishes the filesystem connection, transfers the filesystem / block volume,
 // and creates an instance from it.
-func (d *qemu) ConversionReceive(args instance.ConversionReceiveArgs) error {
+func (d *qemu) ConversionReceive(args instance.ConversionReceiveArgs, progressReporter ioprogress.ProgressReporter) error {
 	d.logger.Info("Conversion receive starting")
 	defer d.logger.Info("Conversion receive stopped")
 
@@ -7500,7 +8179,7 @@ func (d *qemu) ConversionReceive(args instance.ConversionReceiveArgs) error {
 		ConversionOptions: args.ConversionOptions, // Non-nil options indicate image conversion.
 	}
 
-	err = pool.CreateInstanceFromConversion(d, filesystemConn, volTargetArgs, d.op)
+	err = pool.CreateInstanceFromConversion(d, filesystemConn, volTargetArgs, progressReporter)
 	if err != nil {
 		return fmt.Errorf("Failed creating instance on target: %w", err)
 	}
@@ -7525,7 +8204,7 @@ func (d *qemu) SetAffinity(set []string) error {
 	// Get the list of PIDs from the VM.
 	pids, err := monitor.GetCPUs()
 	if err != nil {
-		return fmt.Errorf("Failed to get VM instance's QEMU process list: %w", err)
+		return fmt.Errorf("Failed getting VM instance's QEMU process list: %w", err)
 	}
 
 	// Confirm nothing weird is going on.
@@ -7541,7 +8220,7 @@ func (d *qemu) SetAffinity(set []string) error {
 		// Apply the pin.
 		err := unix.SchedSetaffinity(pid, &affinitySet)
 		if err != nil {
-			return fmt.Errorf("Failed to set QEMU process affinity: %w", err)
+			return fmt.Errorf("Failed setting QEMU process affinity: %w", err)
 		}
 	}
 
@@ -7552,7 +8231,7 @@ func (d *qemu) SetAffinity(set []string) error {
 func (d *qemu) FileSFTPConn() (net.Conn, error) {
 	// VMs, unlike containers, cannot perform file operations if not running and using the lxd-agent.
 	if !d.IsRunning() {
-		return nil, fmt.Errorf("Instance is not running")
+		return nil, errors.New("Instance is not running")
 	}
 
 	// Connect to the agent.
@@ -7564,7 +8243,7 @@ func (d *qemu) FileSFTPConn() (net.Conn, error) {
 	// Get the HTTP transport.
 	httpTransport, ok := client.Transport.(*http.Transport)
 	if !ok {
-		return nil, fmt.Errorf("FileSFTP transport is an invalid HTTP transport")
+		return nil, errors.New("FileSFTP transport is an invalid HTTP transport")
 	}
 
 	// Send the upgrade request.
@@ -7612,7 +8291,7 @@ func (d *qemu) FileSFTPConn() (net.Conn, error) {
 	}
 
 	if resp.Header.Get("Upgrade") != "sftp" {
-		return nil, fmt.Errorf("Missing or unexpected Upgrade header in response")
+		return nil, errors.New("Missing or unexpected Upgrade header in response")
 	}
 
 	return tlsConn, nil
@@ -7643,7 +8322,7 @@ func (d *qemu) FileSFTP() (*sftp.Client, error) {
 }
 
 // Console gets access to the instance's console.
-func (d *qemu) Console(protocol string) (*os.File, chan error, error) {
+func (d *qemu) Console(ctx context.Context, protocol string) (*os.File, chan error, error) {
 	var path string
 	switch protocol {
 	case instance.ConsoleTypeConsole:
@@ -7670,13 +8349,13 @@ func (d *qemu) Console(protocol string) (*os.File, chan error, error) {
 
 	_ = conn.Close()
 
-	d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceConsole.Event(d, logger.Ctx{"type": protocol}))
+	d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceConsole.Event(ctx, d, logger.Ctx{"type": protocol}))
 
 	return file, chDisconnect, nil
 }
 
 // Exec a command inside the instance.
-func (d *qemu) Exec(req api.InstanceExecPost, stdin *os.File, stdout *os.File, stderr *os.File) (instance.Cmd, error) {
+func (d *qemu) Exec(ctx context.Context, req api.InstanceExecPost, stdin *os.File, stdout *os.File, stderr *os.File) (instance.Cmd, error) {
 	revert := revert.New()
 	defer revert.Fail()
 
@@ -7687,8 +8366,8 @@ func (d *qemu) Exec(req api.InstanceExecPost, stdin *os.File, stdout *os.File, s
 
 	agent, err := lxd.ConnectLXDHTTP(nil, client)
 	if err != nil {
-		d.logger.Error("Failed to connect to lxd-agent", logger.Ctx{"err": err})
-		return nil, fmt.Errorf("Failed to connect to lxd-agent")
+		d.logger.Error("Failed connecting to lxd-agent", logger.Ctx{"err": err})
+		return nil, errors.New("Failed connecting to lxd-agent")
 	}
 
 	revert.Add(agent.Disconnect)
@@ -7741,7 +8420,7 @@ func (d *qemu) Exec(req api.InstanceExecPost, stdin *os.File, stdout *os.File, s
 		controlResCh:     controlResCh,
 	}
 
-	d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceExec.Event(d, logger.Ctx{"command": req.Command}))
+	d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceExec.Event(ctx, d, logger.Ctx{"command": req.Command}))
 
 	revert.Success()
 	return instCmd, nil
@@ -7759,21 +8438,23 @@ func (d *qemu) Render(options ...func(response any) error) (state any, etag any,
 		etag := []any{d.expiryDate}
 
 		snapState := api.InstanceSnapshot{
-			CreatedAt:       d.creationDate,
-			ExpandedConfig:  d.expandedConfig,
-			ExpandedDevices: d.expandedDevices.CloneNative(),
-			LastUsedAt:      d.lastUsedDate,
 			Name:            strings.SplitN(d.name, "/", 2)[1],
+			Architecture:    d.architectureName,
+			Profiles:        profileNames,
+			Config:          d.localConfig,
+			ExpandedConfig:  d.expandedConfig,
+			Devices:         d.localDevices.CloneNative(),
+			ExpandedDevices: d.expandedDevices.CloneNative(),
+			CreatedAt:       d.creationDate,
+			LastUsedAt:      d.lastUsedDate,
+			ExpiresAt:       d.expiryDate,
+			Ephemeral:       d.ephemeral,
 			Stateful:        d.stateful,
-			Size:            -1, // Default to uninitialised/error state (0 means no CoW usage).
-		}
 
-		snapState.Architecture = d.architectureName
-		snapState.Config = d.localConfig
-		snapState.Devices = d.localDevices.CloneNative()
-		snapState.Ephemeral = d.ephemeral
-		snapState.Profiles = profileNames
-		snapState.ExpiresAt = d.expiryDate
+			// Default to uninitialised/error state (0 means no CoW usage).
+			// The size can then be populated optionally via the options argument.
+			Size: -1,
+		}
 
 		for _, option := range options {
 			err := option(&snapState)
@@ -7787,28 +8468,32 @@ func (d *qemu) Render(options ...func(response any) error) (state any, etag any,
 
 	// Prepare the ETag
 	etag = []any{d.architecture, d.localConfig, d.localDevices, d.ephemeral, d.profiles}
-	statusCode := d.statusCode()
 
 	instState := api.Instance{
-		ExpandedConfig:  d.expandedConfig,
-		ExpandedDevices: d.expandedDevices.CloneNative(),
 		Name:            d.name,
-		Status:          statusCode.String(),
-		StatusCode:      statusCode,
+		Description:     d.description,
+		Architecture:    d.architectureName,
+		Profiles:        profileNames,
+		Config:          d.localConfig,
+		ExpandedConfig:  d.expandedConfig,
+		Devices:         d.localDevices.CloneNative(),
+		ExpandedDevices: d.expandedDevices.CloneNative(),
+		CreatedAt:       d.creationDate,
+		LastUsedAt:      d.lastUsedDate,
+		Ephemeral:       d.ephemeral,
+		Stateful:        d.stateful,
+		Project:         d.project.Name,
 		Location:        d.node,
 		Type:            d.Type().String(),
+		StatusCode:      api.Error, // Default to error status for remote instances that are unreachable.
 	}
 
-	instState.Description = d.description
-	instState.Architecture = d.architectureName
-	instState.Config = d.localConfig
-	instState.CreatedAt = d.creationDate
-	instState.Devices = d.localDevices.CloneNative()
-	instState.Ephemeral = d.ephemeral
-	instState.LastUsedAt = d.lastUsedDate
-	instState.Profiles = profileNames
-	instState.Stateful = d.stateful
-	instState.Project = d.project.Name
+	// If instance is local then request status.
+	if d.state.ServerName == d.Location() {
+		instState.StatusCode = d.statusCode()
+	}
+
+	instState.Status = instState.StatusCode.String()
 
 	for _, option := range options {
 		err := option(&instState)
@@ -7821,9 +8506,9 @@ func (d *qemu) Render(options ...func(response any) error) (state any, etag any,
 }
 
 // RenderFull returns all info about the instance.
-func (d *qemu) RenderFull(hostInterfaces []net.Interface) (*api.InstanceFull, any, error) {
+func (d *qemu) RenderFull(_ []net.Interface, opts ...instance.StateRenderOptions) (*api.InstanceFull, any, error) {
 	if d.IsSnapshot() {
-		return nil, nil, fmt.Errorf("RenderFull doesn't work with snapshots")
+		return nil, nil, errors.New("RenderFull does not work with snapshots")
 	}
 
 	// Get the Instance struct.
@@ -7835,8 +8520,8 @@ func (d *qemu) RenderFull(hostInterfaces []net.Interface) (*api.InstanceFull, an
 	// Convert to InstanceFull.
 	vmState := api.InstanceFull{Instance: *base.(*api.Instance)}
 
-	// Add the InstanceState.
-	vmState.State, err = d.renderState(vmState.StatusCode)
+	// Add the InstanceState (pass through opts).
+	vmState.State, err = d.renderState(vmState.StatusCode, opts...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -7880,8 +8565,14 @@ func (d *qemu) RenderFull(hostInterfaces []net.Interface) (*api.InstanceFull, an
 }
 
 // renderState returns just state info about the instance.
-func (d *qemu) renderState(statusCode api.StatusCode) (*api.InstanceState, error) {
+func (d *qemu) renderState(statusCode api.StatusCode, opts ...instance.StateRenderOptions) (*api.InstanceState, error) {
 	var err error
+
+	// Determine which fields to include
+	options := instance.DefaultStateRenderOptions()
+	if len(opts) > 0 {
+		options = opts[0]
+	}
 
 	status := &api.InstanceState{}
 	pid, _ := d.pid()
@@ -7899,40 +8590,59 @@ func (d *qemu) renderState(statusCode api.StatusCode) (*api.InstanceState, error
 				status = &api.InstanceState{}
 				status.Processes = -1
 
-				status.Network, err = d.getNetworkState()
-				if err != nil {
-					return nil, err
+				if options.IncludeNetwork {
+					status.Network, err = d.getNetworkState()
+					if err != nil {
+						return nil, err
+					}
+				} else {
+					status.Network = nil
+				}
+			} else {
+				// Agent returned state - apply selective recursion filtering
+				if !options.IncludeNetwork {
+					status.Network = nil
+				}
+
+				if !options.IncludeDisk {
+					status.Disk = nil
 				}
 			}
 		} else {
 			status.Processes = -1
 
-			status.Network, err = d.getNetworkState()
-			if err != nil {
-				return nil, err
+			if options.IncludeNetwork {
+				status.Network, err = d.getNetworkState()
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				status.Network = nil
 			}
 		}
 
-		// Populate host_name for network devices.
-		for k, m := range d.ExpandedDevices() {
-			// We only care about nics.
-			if m["type"] != "nic" {
-				continue
-			}
+		// Populate host_name for network devices (only if network is included).
+		if options.IncludeNetwork && status.Network != nil {
+			for k, m := range d.ExpandedDevices() {
+				// We only care about nics.
+				if m["type"] != "nic" {
+					continue
+				}
 
-			// Get hwaddr from static or volatile config.
-			hwaddr := m["hwaddr"]
-			if hwaddr == "" {
-				hwaddr = d.localConfig[fmt.Sprintf("volatile.%s.hwaddr", k)]
-			}
+				// Get hwaddr from static or volatile config.
+				hwaddr := m["hwaddr"]
+				if hwaddr == "" {
+					hwaddr = d.localConfig["volatile."+k+".hwaddr"]
+				}
 
-			// We have to match on hwaddr as device name can be different from the configured device
-			// name when reported from the lxd-agent inside the VM (due to the guest OS choosing name).
-			for netName, netStatus := range status.Network {
-				if netStatus.Hwaddr == hwaddr {
-					if netStatus.HostName == "" {
-						netStatus.HostName = d.localConfig[fmt.Sprintf("volatile.%s.host_name", k)]
-						status.Network[netName] = netStatus
+				// We have to match on hwaddr as device name can be different from the configured device
+				// name when reported from the lxd-agent inside the VM (due to the guest OS choosing name).
+				for netName, netStatus := range status.Network {
+					if netStatus.Hwaddr == hwaddr {
+						if netStatus.HostName == "" {
+							netStatus.HostName = d.localConfig["volatile."+k+".host_name"]
+							status.Network[netName] = netStatus
+						}
 					}
 				}
 			}
@@ -7942,17 +8652,23 @@ func (d *qemu) renderState(statusCode api.StatusCode) (*api.InstanceState, error
 	status.Pid = int64(pid)
 	status.Status = statusCode.String()
 	status.StatusCode = statusCode
-	status.Disk, err = d.diskState()
-	if err != nil && !errors.Is(err, storageDrivers.ErrNotSupported) {
-		d.logger.Warn("Error getting disk usage", logger.Ctx{"err": err})
+
+	// Disk - conditionally fetch (expensive operation)
+	if options.IncludeDisk {
+		status.Disk, err = d.diskState()
+		if err != nil && !errors.Is(err, storageDrivers.ErrNotSupported) {
+			d.logger.Info("Cannot get disk usage", logger.Ctx{"err": err})
+		}
+	} else {
+		status.Disk = nil
 	}
 
 	return status, nil
 }
 
 // RenderState returns just state info about the instance.
-func (d *qemu) RenderState(hostInterfaces []net.Interface) (*api.InstanceState, error) {
-	return d.renderState(d.statusCode())
+func (d *qemu) RenderState(_ []net.Interface, opts ...instance.StateRenderOptions) (*api.InstanceState, error) {
+	return d.renderState(d.statusCode(), opts...)
 }
 
 // diskState gets disk usage info.
@@ -7990,7 +8706,10 @@ func (d *qemu) agentGetState() (*api.InstanceState, error) {
 		return nil, err
 	}
 
-	agent, err := lxd.ConnectLXDHTTP(nil, client)
+	ctx, cancel := context.WithTimeout(context.Background(), agentConnectTimeout)
+	defer cancel()
+
+	agent, err := lxd.ConnectLXDHTTPWithContext(ctx, nil, client)
 	if err != nil {
 		return nil, fmt.Errorf("Failed connecting to agent: %w", err)
 	}
@@ -8020,10 +8739,10 @@ func (d *qemu) CanMigrate() (canMigrate bool, live bool) {
 	return d.canMigrate(d)
 }
 
-// LockExclusive attempts to get exlusive access to the instance's root volume.
+// LockExclusive attempts to get exclusive access to the instance's root volume.
 func (d *qemu) LockExclusive() (*operationlock.InstanceOperation, error) {
 	if d.IsRunning() {
-		return nil, fmt.Errorf("Instance is running")
+		return nil, errors.New("Instance is running")
 	}
 
 	// Prevent concurrent operations the instance.
@@ -8044,13 +8763,13 @@ func (d *qemu) DeviceEventHandler(runConf *deviceConfig.RunConfig) error {
 	// Handle uevents.
 	for _, uevent := range runConf.Uevents {
 		for _, event := range uevent {
-			fields := strings.SplitN(event, "=", 2)
+			key, value, found := strings.Cut(event, "=")
 
-			if fields[0] != "ACTION" {
+			if !found || key != "ACTION" {
 				continue
 			}
 
-			switch fields[1] {
+			switch value {
 			case "add":
 				for _, usbDev := range runConf.USBDevice {
 					// This ensures that the device is actually removed from QEMU before adding it again.
@@ -8092,7 +8811,7 @@ func (d *qemu) DeviceEventHandler(runConf *deviceConfig.RunConfig) error {
 		}
 
 		// Figure out the QEMU device ID.
-		devID := fmt.Sprintf("%s%s", qemuDeviceIDPrefix, filesystem.PathNameEncode(mount.DevName))
+		devID := qemuDeviceIDPrefix + filesystem.PathNameEncode(mount.DevName)
 
 		// Apply the limits.
 		err = m.SetBlockThrottle(devID, int(mount.Limits.ReadBytes), int(mount.Limits.WriteBytes), int(mount.Limits.ReadIOps), int(mount.Limits.WriteIOps))
@@ -8114,16 +8833,16 @@ func (d *qemu) reservedVsockID(vsockID uint32) bool {
 func (d *qemu) getVsockID() (uint32, error) {
 	existingVsockID, ok := d.localConfig["volatile.vsock_id"]
 	if !ok {
-		return 0, fmt.Errorf("Context ID not set in volatile.vsock_id")
+		return 0, errors.New("Context ID not set in volatile.vsock_id")
 	}
 
 	vsockID, err := strconv.ParseUint(existingVsockID, 10, 32)
 	if err != nil {
-		return 0, fmt.Errorf("Failed to parse volatile.vsock_id: %q: %w", existingVsockID, err)
+		return 0, fmt.Errorf("Failed parsing volatile.vsock_id: %q: %w", existingVsockID, err)
 	}
 
 	if d.reservedVsockID(uint32(vsockID)) {
-		return 0, fmt.Errorf("Failed to use reserved vsock Context ID: %q", vsockID)
+		return 0, fmt.Errorf("Failed using reserved vsock Context ID: %d", vsockID)
 	}
 
 	return uint32(vsockID), nil
@@ -8137,7 +8856,7 @@ func (d *qemu) acquireVsockID(vsockID uint32) (*os.File, error) {
 
 	vsockF, err := os.OpenFile("/dev/vhost-vsock", os.O_RDWR, 0)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to open vhost socket: %w", err)
+		return nil, fmt.Errorf("Failed opening vhost socket: %w", err)
 	}
 
 	revert.Add(func() { _ = vsockF.Close() })
@@ -8192,7 +8911,7 @@ func (d *qemu) nextVsockID() (uint32, *os.File, error) {
 	// Ignore the error from before and start to acquire a new Context ID.
 	instanceUUID, err := uuid.Parse(d.localConfig["volatile.uuid"])
 	if err != nil {
-		return 0, nil, fmt.Errorf("Failed to parse instance UUID from volatile.uuid: %w", err)
+		return 0, nil, fmt.Errorf("Failed parsing instance UUID from volatile.uuid: %w", err)
 	}
 
 	r, err := util.GetStableRandomGenerator(instanceUUID.String())
@@ -8205,7 +8924,7 @@ func (d *qemu) nextVsockID() (uint32, *os.File, error) {
 	// Try to find a new Context ID.
 	for {
 		if time.Now().After(timeout) {
-			return 0, nil, fmt.Errorf("Timeout exceeded whilst trying to acquire the next vsock Context ID")
+			return 0, nil, errors.New("Timeout exceeded whilst trying to acquire the next vsock Context ID")
 		}
 
 		candidateVsockID := r.Uint32()
@@ -8233,19 +8952,9 @@ func (d *qemu) InitPID() int {
 
 func (d *qemu) statusCode() api.StatusCode {
 	// Shortcut to avoid spamming QMP during ongoing operations.
-	op := operationlock.Get(d.Project().Name, d.Name())
-	if op != nil {
-		if op.Action() == operationlock.ActionStart {
-			return api.Stopped
-		}
-
-		if op.Action() == operationlock.ActionStop {
-			if shared.IsTrue(d.LocalConfig()["volatile.last_state.ready"]) {
-				return api.Ready
-			}
-
-			return api.Running
-		}
+	operationStatus := d.operationStatusCode()
+	if operationStatus != nil {
+		return *operationStatus
 	}
 
 	// Connect to the monitor.
@@ -8325,8 +9034,8 @@ func (d *qemu) FillNetworkDevice(name string, m deviceConfig.Device) (deviceConf
 	}
 
 	// Fill in the MAC address.
-	if !shared.ValueInSlice(nicType, []string{"physical", "ipvlan", "sriov"}) && m["hwaddr"] == "" {
-		configKey := fmt.Sprintf("volatile.%s.hwaddr", name)
+	if !slices.Contains([]string{"physical", "ipvlan", "sriov"}, nicType) && m["hwaddr"] == "" {
+		configKey := "volatile." + name + ".hwaddr"
 		volatileHwaddr := d.localConfig[configKey]
 		if volatileHwaddr == "" {
 			// Generate a new MAC address.
@@ -8363,7 +9072,13 @@ func (d *qemu) UpdateBackupFile() error {
 		return err
 	}
 
-	return pool.UpdateInstanceBackupFile(d, true, nil)
+	volBackupConf, err := pool.GenerateInstanceCustomVolumeBackupConfig(d, nil, true, nil)
+	if err != nil {
+		return fmt.Errorf("Failed generating instance custom volume config: %w", err)
+	}
+
+	// Use the global metadata version.
+	return pool.UpdateInstanceBackupFile(d, true, volBackupConf, config.DefaultMetadataVersion, nil)
 }
 
 type cpuTopology struct {
@@ -8390,6 +9105,36 @@ func (d *qemu) cpuTopology(limit string) (*cpuTopology, error) {
 		topology.sockets = 1
 		topology.cores = nrLimit
 		topology.threads = 1
+
+		// Check for NUMA node assignment without pinning
+		if d.expandedConfig["limits.cpu.nodes"] != "" {
+			numaNodeIDs, err := resources.ParseNumaNodeSet(d.expandedConfig["limits.cpu.nodes"])
+			if err != nil {
+				return nil, fmt.Errorf("Invalid NUMA node selection: %v", err)
+			}
+
+			topology.vcpus = map[uint64]uint64{}
+			topology.nodes = map[uint64][]uint64{}
+
+			// Assign all vCPUs to the first specified node if a single NUMA node is specified
+			// (Note: virtual to physical mapping doesn't matter in non-pinned mode)
+			if len(numaNodeIDs) == 1 {
+				node := numaNodeIDs[0]
+				topology.nodes[uint64(node)] = []uint64{}
+				for i := uint64(0); i < uint64(nrLimit); i++ {
+					topology.vcpus[i] = i
+					topology.nodes[uint64(node)] = append(topology.nodes[uint64(node)], i)
+				}
+			} else {
+				// If multiple NUMA nodes are given, distribute vCPUs evenly across specified nodes.
+				node := numaNodeIDs[0]
+				topology.nodes[uint64(node)] = []uint64{}
+				for i := uint64(0); i < uint64(nrLimit); i++ {
+					topology.vcpus[i] = i
+					topology.nodes[uint64(node)] = append(topology.nodes[uint64(node)], i)
+				}
+			}
+		}
 
 		return topology, nil
 	}
@@ -8428,7 +9173,7 @@ func (d *qemu) cpuTopology(limit string) (*cpuTopology, error) {
 							sockets[cpu.Socket] = []uint64{}
 						}
 
-						if !shared.ValueInSlice(core.Core, sockets[cpu.Socket]) {
+						if !slices.Contains(sockets[cpu.Socket], core.Core) {
 							sockets[cpu.Socket] = append(sockets[cpu.Socket], core.Core)
 						}
 
@@ -8438,7 +9183,7 @@ func (d *qemu) cpuTopology(limit string) (*cpuTopology, error) {
 							cores[core.Core] = []uint64{}
 						}
 
-						if !shared.ValueInSlice(thread.Thread, cores[core.Core]) {
+						if !slices.Contains(cores[core.Core], thread.Thread) {
 							cores[core.Core] = append(cores[core.Core], thread.Thread)
 						}
 
@@ -8501,7 +9246,7 @@ func (d *qemu) cpuTopology(limit string) (*cpuTopology, error) {
 		nrCores = countCores
 		nrThreads = countThreads
 	} else {
-		d.logger.Warn("Instance uses a CPU pinning profile which doesn't match hardware layout")
+		d.logger.Warn("Instance uses a CPU pinning profile which does not match hardware layout")
 
 		// Fallback on pretending everything are cores.
 		nrSockets = 1
@@ -8535,15 +9280,18 @@ func (d *qemu) devlxdEventSend(eventType string, eventMessage map[string]any) er
 		return err
 	}
 
-	agent, err := lxd.ConnectLXDHTTP(nil, client)
+	ctx, cancel := context.WithTimeout(context.Background(), agentConnectTimeout)
+	defer cancel()
+
+	agent, err := lxd.ConnectLXDHTTPWithContext(ctx, nil, client)
 	if err != nil {
-		d.logger.Error("Failed to connect to lxd-agent", logger.Ctx{"err": err})
-		return fmt.Errorf("Failed to connect to lxd-agent")
+		d.logger.Error("Failed connecting to lxd-agent", logger.Ctx{"err": err})
+		return errors.New("Failed connecting to lxd-agent")
 	}
 
 	defer agent.Disconnect()
 
-	_, _, err = agent.RawQuery("POST", "/1.0/events", &event, "")
+	_, _, err = agent.RawQuery(http.MethodPost, "/1.0/events", &event, "")
 	if err != nil {
 		return err
 	}
@@ -8557,49 +9305,51 @@ func (d *qemu) Info() instance.Info {
 		Name:     "qemu",
 		Features: make(map[string]any),
 		Type:     instancetype.VM,
-		Error:    fmt.Errorf("Unknown error"),
+		Error:    errors.New("Unknown error"),
 	}
 
 	if !shared.PathExists("/dev/kvm") {
-		data.Error = fmt.Errorf("KVM support is missing (no /dev/kvm)")
+		data.Error = errors.New("KVM support is missing (no /dev/kvm)")
 		return data
 	}
 
 	err := util.LoadModule("vhost_vsock")
 	if err != nil {
-		data.Error = fmt.Errorf("vhost_vsock kernel module not loaded")
+		data.Error = errors.New("vhost_vsock kernel module not loaded")
 		return data
 	}
 
 	if !shared.PathExists("/dev/vsock") {
-		data.Error = fmt.Errorf("Vsock support is missing (no /dev/vsock)")
+		data.Error = errors.New("Vsock support is missing (no /dev/vsock)")
 		return data
 	}
 
 	hostArch, err := osarch.ArchitectureGetLocalID()
 	if err != nil {
 		logger.Errorf("Failed getting CPU architecture during QEMU initialization: %v", err)
-		data.Error = fmt.Errorf("Failed getting CPU architecture")
+		data.Error = errors.New("Failed getting CPU architecture")
 		return data
 	}
 
 	qemuPath, _, err := d.qemuArchConfig(hostArch)
 	if err != nil {
-		data.Error = fmt.Errorf("QEMU command not available for CPU architecture")
+		data.Error = errors.New("QEMU command not available for CPU architecture")
 		return data
 	}
 
-	out, err := exec.Command(qemuPath, "--version").Output()
+	stdout, err := shared.RunCommandCLocale(qemuPath, "--version")
 	if err != nil {
 		logger.Errorf("Failed getting version during QEMU initialization: %v", err)
-		data.Error = fmt.Errorf("Failed getting QEMU version")
+		data.Error = errors.New("Failed getting QEMU version")
 		return data
 	}
 
-	qemuOutput := strings.Fields(string(out))
+	// $ qemu-system-x86_64 --version
+	// QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.11)
+	// Copyright (c) 2003-2023 Fabrice Bellard and the QEMU Project developers
+	qemuOutput := strings.Fields(stdout)
 	if len(qemuOutput) >= 4 {
-		qemuVersion := strings.Fields(string(out))[3]
-		data.Version = qemuVersion
+		data.Version = qemuOutput[3]
 	} else {
 		data.Version = "unknown" // Not necessarily an error that should prevent us using driver.
 	}
@@ -8610,8 +9360,8 @@ func (d *qemu) Info() instance.Info {
 
 	data.Features, err = d.checkFeatures(hostArch, qemuPath)
 	if err != nil {
-		logger.Errorf("Unable to run feature checks during QEMU initialization: %v", err)
-		data.Error = fmt.Errorf("QEMU failed to run feature checks")
+		logger.Errorf("Cannot run feature checks during QEMU initialization: %v", err)
+		data.Error = errors.New("QEMU failed running feature checks")
 		return data
 	}
 
@@ -8634,7 +9384,7 @@ func (d *qemu) checkFeatures(hostArch int, qemuPath string) (map[string]any, err
 		"-nographic",
 		"-nodefaults",
 		"-no-user-config",
-		"-chardev", fmt.Sprintf("socket,id=monitor,path=%s,server=on,wait=off", monitorPath.Name()),
+		"-chardev", "socket,id=monitor,path=" + monitorPath.Name() + ",server=on,wait=off",
 		"-mon", "chardev=monitor,mode=control",
 		"-machine", qemuMachineType(hostArch),
 	}
@@ -8659,10 +9409,10 @@ func (d *qemu) checkFeatures(hostArch int, qemuPath string) (map[string]any, err
 		}
 
 		if efiPath == "" {
-			return nil, fmt.Errorf("Unable to locate a VM UEFI firmware")
+			return nil, errors.New("Cannot locate a VM UEFI firmware")
 		}
 
-		qemuArgs = append(qemuArgs, "-drive", fmt.Sprintf("if=pflash,format=raw,readonly=on,file=%s", efiPath))
+		qemuArgs = append(qemuArgs, "-drive", "if=pflash,format=raw,readonly=on,file="+efiPath)
 	}
 
 	var stderr bytes.Buffer
@@ -8739,7 +9489,7 @@ func (d *qemu) checkFeatures(hostArch int, qemuPath string) (map[string]any, err
 
 	// Check io_uring feature.
 	blockDev := map[string]any{
-		"node-name": fmt.Sprintf("%s%s", qemuDeviceNamePrefix, "feature-check"),
+		"node-name": qemuDeviceNamePrefix + "feature-check",
 		"driver":    "file",
 		"filename":  blockDevPath.Name(),
 		"aio":       "io_uring",
@@ -8767,10 +9517,10 @@ func (d *qemu) checkFeatures(hostArch int, qemuPath string) (map[string]any, err
 			return nil, err
 		}
 
-		parts := strings.Split(string(cmdline), " ")
+		parts := strings.Fields(string(cmdline))
 
 		// Check if SME is enabled in the kernel command line.
-		if shared.ValueInSlice("mem_encrypt=on", parts) {
+		if slices.Contains(parts, "mem_encrypt=on") {
 			features["sme"] = struct{}{}
 		}
 
@@ -8808,10 +9558,9 @@ func (d *qemu) checkFeatures(hostArch int, qemuPath string) (map[string]any, err
 
 // version returns the QEMU version.
 func (d *qemu) version() (*version.DottedVersion, error) {
-	info := DriverStatuses()[instancetype.VM].Info
-	qemuVer, err := version.NewDottedVersion(info.Version)
-	if err != nil {
-		return nil, fmt.Errorf("Failed parsing QEMU version: %w", err)
+	qemuVer := DriverStatuses()[instancetype.VM].Version
+	if qemuVer == nil {
+		return nil, errors.New("QEMU version unavailable")
 	}
 
 	return qemuVer, nil
@@ -8821,7 +9570,7 @@ func (d *qemu) version() (*version.DottedVersion, error) {
 // If the instance is not running, it returns ErrInstanceIsStopped.
 // If agent metrics are enabled, it tries to get the metrics from the agent.
 // If the agent is not reachable, it falls back to getting the metrics directly from QEMU.
-func (d *qemu) Metrics(hostInterfaces []net.Interface) (*metrics.MetricSet, error) {
+func (d *qemu) Metrics(_ []net.Interface) (*metrics.MetricSet, error) {
 	if !d.IsRunning() {
 		return nil, ErrInstanceIsStopped
 	}
@@ -8851,13 +9600,13 @@ func (d *qemu) getAgentMetrics() (*metrics.MetricSet, error) {
 
 	agent, err := lxd.ConnectLXDHTTP(nil, client)
 	if err != nil {
-		d.logger.Error("Failed to connect to lxd-agent", logger.Ctx{"project": d.Project().Name, "instance": d.Name(), "err": err})
-		return nil, fmt.Errorf("Failed to connect to lxd-agent")
+		d.logger.Error("Failed connecting to lxd-agent", logger.Ctx{"project": d.Project().Name, "instance": d.Name(), "err": err})
+		return nil, errors.New("Failed connecting to lxd-agent")
 	}
 
 	defer agent.Disconnect()
 
-	resp, _, err := agent.RawQuery("GET", "/1.0/metrics", nil, "")
+	resp, _, err := agent.RawQuery(http.MethodGet, "/1.0/metrics", nil, "")
 	if err != nil {
 		return nil, err
 	}
@@ -8932,7 +9681,7 @@ func (d *qemu) deviceAttachUSB(usbConf deviceConfig.USBDeviceItem) error {
 
 	err = monHook(monitor)
 	if err != nil {
-		return err
+		return fmt.Errorf("Failed setting up device via monitor: %w", err)
 	}
 
 	return nil
@@ -8945,7 +9694,7 @@ func (d *qemu) deviceDetachUSB(usbDev deviceConfig.USBDeviceItem) error {
 		return err
 	}
 
-	deviceID := fmt.Sprintf("%s%s", qemuDeviceIDPrefix, usbDev.DeviceName)
+	deviceID := qemuDeviceIDPrefix + usbDev.DeviceName
 
 	err = monitor.RemoveDevice(deviceID)
 	if err != nil && !api.StatusErrorCheck(err, http.StatusNotFound) {
@@ -8973,7 +9722,7 @@ func (d *qemu) setCPUs(count int) error {
 
 	cpus, err := monitor.QueryHotpluggableCPUs()
 	if err != nil {
-		return fmt.Errorf("Failed to query hotpluggable CPUs: %w", err)
+		return fmt.Errorf("Failed querying hotpluggable CPUs: %w", err)
 	}
 
 	var availableCPUs []qmp.HotpluggableCPU
@@ -9004,80 +9753,79 @@ func (d *qemu) setCPUs(count int) error {
 	if count > totalReservedCPUs {
 		// Cannot allocate more CPUs than the system provides.
 		if count > len(cpus) {
-			return fmt.Errorf("Cannot allocate more CPUs than available")
+			return errors.New("Cannot allocate more CPUs than available")
 		}
 
 		// This shouldn't trigger, but if it does, don't panic.
 		if count-totalReservedCPUs > len(availableCPUs) {
-			return fmt.Errorf("Unable to allocate more CPUs, not enough hotpluggable CPUs available")
+			return errors.New("Cannot allocate more CPUs, not enough hotpluggable CPUs available")
 		}
 
 		// Only allocate the difference in CPUs.
-		for i := 0; i < count-totalReservedCPUs; i++ {
+		for i := range count - totalReservedCPUs {
 			cpu := availableCPUs[i]
 
 			devID := fmt.Sprintf("cpu%d%d%d", cpu.Props.SocketID, cpu.Props.CoreID, cpu.Props.ThreadID)
 
-			dev := map[string]string{
+			qemuDev := map[string]any{
 				"id":      devID,
 				"driver":  cpu.Type,
-				"core-id": fmt.Sprintf("%d", cpu.Props.CoreID),
+				"core-id": cpu.Props.CoreID,
 			}
 
 			// No such thing as sockets and threads on s390x.
 			if d.architecture != osarch.ARCH_64BIT_S390_BIG_ENDIAN {
-				dev["socket-id"] = fmt.Sprintf("%d", cpu.Props.SocketID)
-				dev["thread-id"] = fmt.Sprintf("%d", cpu.Props.ThreadID)
+				qemuDev["socket-id"] = cpu.Props.SocketID
+				qemuDev["thread-id"] = cpu.Props.ThreadID
 			}
 
-			err := monitor.AddDevice(dev)
+			err := monitor.AddDevice(qemuDev)
 			if err != nil {
-				return fmt.Errorf("Failed to add device: %w", err)
+				return fmt.Errorf("Failed adding device: %w", err)
 			}
 
 			revert.Add(func() {
 				err := monitor.RemoveDevice(devID)
-				d.logger.Warn("Failed to remove CPU device", logger.Ctx{"err": err})
+				d.logger.Warn("Failed removing CPU device", logger.Ctx{"err": err})
 			})
 		}
 	} else {
 		if totalReservedCPUs-count > len(hotpluggedCPUs) {
 			// This shouldn't trigger, but if it does, don't panic.
-			return fmt.Errorf("Unable to remove CPUs, not enough hotpluggable CPUs available")
+			return errors.New("Cannot remove CPUs, not enough hotpluggable CPUs available")
 		}
 
 		// Less CPUs requested.
-		for i := 0; i < totalReservedCPUs-count; i++ {
+		for i := range totalReservedCPUs - count {
 			cpu := hotpluggedCPUs[i]
 
-			fields := strings.Split(cpu.QOMPath, "/")
-			devID := fields[len(fields)-1]
+			devID := filepath.Base(cpu.QOMPath)
 
 			err := monitor.RemoveDevice(devID)
 			if err != nil {
-				return fmt.Errorf("Failed to remove CPU: %w", err)
+				return fmt.Errorf("Failed removing CPU: %w", err)
 			}
 
 			revert.Add(func() {
-				err := monitor.AddDevice(map[string]string{
+				err := monitor.AddDevice(map[string]any{
 					"id":        devID,
 					"driver":    cpu.Type,
-					"socket-id": fmt.Sprintf("%d", cpu.Props.SocketID),
-					"core-id":   fmt.Sprintf("%d", cpu.Props.CoreID),
-					"thread-id": fmt.Sprintf("%d", cpu.Props.ThreadID),
+					"socket-id": cpu.Props.SocketID,
+					"core-id":   cpu.Props.CoreID,
+					"thread-id": cpu.Props.ThreadID,
 				})
-				d.logger.Warn("Failed to add CPU device", logger.Ctx{"err": err})
+				d.logger.Warn("Failed adding CPU device", logger.Ctx{"err": err})
 			})
 		}
 	}
 
 	var pids []int
 	cpusWereSeen := false
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		// Get the list of PIDs from the VM.
 		pids, err = monitor.GetCPUs()
 		if err != nil {
-			return fmt.Errorf("Failed to get VM instance's QEMU process list: %w", err)
+			return fmt.Errorf("Failed getting VM instance's QEMU process list: %w", err)
 		}
 
 		if count == len(pids) {
@@ -9089,13 +9837,13 @@ func (d *qemu) setCPUs(count int) error {
 	}
 
 	if !cpusWereSeen {
-		return fmt.Errorf("Failed to wait until all vCPUs (%d) come online", count)
+		return fmt.Errorf("Failed waiting until all vCPUs (%d) come online", count)
 	}
 
 	// actualize core scheduling data
 	err = d.setCoreSched(pids)
 	if err != nil {
-		return fmt.Errorf("Failed to allocate new core scheduling domain for vCPU threads: %w", err)
+		return fmt.Errorf("Failed allocating new core scheduling domain for vCPU threads: %w", err)
 	}
 
 	revert.Success()
@@ -9125,8 +9873,56 @@ func (d *qemu) shortenedFilePath(originalSockPath string, fdFiles *[]*os.File) (
 	// Open a file descriptor to the socket file through O_PATH to avoid acessing the file descriptor to the sockfs inode.
 	socketFile, err := os.OpenFile(originalSockPath, unix.O_PATH|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return "", fmt.Errorf("Failed to open device socket file %q: %w", originalSockPath, err)
+		return "", fmt.Errorf("Failed opening device socket file %q: %w", originalSockPath, err)
 	}
 
 	return fmt.Sprintf("/dev/fd/%d", d.addFileDescriptor(fdFiles, socketFile)), nil
+}
+
+// generateAgentMountsFile generates the agent mounts file for the QEMU instance (if disk config has changed).
+// This file is used by the agent to mount custom volumes and host filesystem shares into the VM.
+func (d *qemu) generateAgentMountsFile() error {
+	drives := d.expandedDevices.Filter(filters.Or(filters.IsCustomVolumeFilesystemDisk, filters.IsHostFilesystemShareDisk)).Sorted()
+	agentMounts := make([]instancetype.VMAgentMount, 0, len(drives))
+
+	for _, drive := range drives {
+		agentMount := instancetype.VMAgentMount{
+			Source: qemuDeviceNameOrID(qemuDeviceNamePrefix, drive.Name, "", qemuDeviceNameMaxLength),
+			Target: drive.Config["path"],
+
+			// Used by the agent to determine the type of mount (but it tries mounting virtiofs first).
+			FSType: "virtiofs",
+		}
+
+		// Indicate to agent to mount this readonly. Note: This is purely to indicate to VM guest that this
+		// is readonly, it should *not* be used as a security measure, as the VM guest could remount it R/W.
+		// However this same option is used when adding the device to the VM to enforce readonly access.
+		if shared.IsTrue(drive.Config["readonly"]) {
+			agentMount.Options = append(agentMount.Options, "ro")
+		}
+
+		agentMounts = append(agentMounts, agentMount)
+	}
+
+	newAgentMountJSON, err := json.Marshal(agentMounts)
+	if err != nil {
+		return fmt.Errorf("Failed marshalling agent mounts to JSON: %w", err)
+	}
+
+	agentMountFile := filepath.Join(d.Path(), "config", "agent-mounts.json")
+
+	// Check if agent mounts file already exists and if it matches the new one.
+	curAgentMountJSON, _ := os.ReadFile(agentMountFile)
+	if bytes.Equal(curAgentMountJSON, newAgentMountJSON) {
+		return nil // No change, nothing to do.
+	}
+
+	// Write the agent mount config.
+	d.logger.Debug("Writing agent mounts config", logger.Ctx{"file": agentMountFile})
+	err = os.WriteFile(agentMountFile, newAgentMountJSON, 0400)
+	if err != nil {
+		return fmt.Errorf("Failed writing agent mounts file: %w", err)
+	}
+
+	return nil
 }

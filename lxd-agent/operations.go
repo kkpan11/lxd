@@ -2,16 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
-	"github.com/gorilla/mux"
-
-	"github.com/canonical/lxd/lxd/operations"
+	"github.com/canonical/lxd/lxd-agent/operations"
 	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared"
@@ -43,27 +41,28 @@ var operationWait = APIEndpoint{
 }
 
 func operationDelete(d *Daemon, r *http.Request) response.Response {
-	id, err := url.PathUnescape(mux.Vars(r)["id"])
+	id, err := url.PathUnescape(r.PathValue("id"))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	// First check if the query is for a local operation from this node
-	op, err := operations.OperationGetInternal(id)
+	op, err := operations.Get(id)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	_, err = op.Cancel()
-	if err != nil {
-		return response.BadRequest(err)
+	if !op.IsRunning() {
+		return response.BadRequest(errors.New("Only running operations can be cancelled"))
 	}
 
+	op.Cancel()
+	_ = op.Wait(r.Context())
 	return response.EmptySyncResponse
 }
 
 func operationGet(d *Daemon, r *http.Request) response.Response {
-	id, err := url.PathUnescape(mux.Vars(r)["id"])
+	id, err := url.PathUnescape(r.PathValue("id"))
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -71,21 +70,17 @@ func operationGet(d *Daemon, r *http.Request) response.Response {
 	var body *api.Operation
 
 	// First check if the query is for a local operation from this node
-	op, err := operations.OperationGetInternal(id)
+	op, err := operations.Get(id)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	_, body, err = op.Render()
-	if err != nil {
-		log.Println(fmt.Errorf("Failed to handle operations request: %w", err))
-	}
-
+	_, body = op.Render()
 	return response.SyncResponse(true, body)
 }
 
 func operationsGet(d *Daemon, r *http.Request) response.Response {
-	recursion := util.IsRecursionRequest(r)
+	recursion, _ := util.IsRecursionRequest(r)
 
 	localOperationURLs := func() (shared.Jmap, error) {
 		// Get all the operations
@@ -121,11 +116,7 @@ func operationsGet(d *Daemon, r *http.Request) response.Response {
 				body[status] = make([]*api.Operation, 0)
 			}
 
-			_, op, err := v.Render()
-			if err != nil {
-				return nil, err
-			}
-
+			_, op := v.Render()
 			body[status] = append(body[status].([]*api.Operation), op)
 		}
 
@@ -136,7 +127,7 @@ func operationsGet(d *Daemon, r *http.Request) response.Response {
 	var md shared.Jmap
 	var err error
 
-	if recursion {
+	if recursion > 0 {
 		md, err = localOperations()
 		if err != nil {
 			return response.InternalError(err)
@@ -152,29 +143,29 @@ func operationsGet(d *Daemon, r *http.Request) response.Response {
 }
 
 func operationWebsocketGet(d *Daemon, r *http.Request) response.Response {
-	id, err := url.PathUnescape(mux.Vars(r)["id"])
+	id, err := url.PathUnescape(r.PathValue("id"))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	// First check if the query is for a local operation from this node
-	op, err := operations.OperationGetInternal(id)
+	op, err := operations.Get(id)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	return operations.OperationWebSocket(op)
+	return response.OperationWebSocket(op)
 }
 
 func operationWaitGet(d *Daemon, r *http.Request) response.Response {
-	id, err := url.PathUnescape(mux.Vars(r)["id"])
+	id, err := url.PathUnescape(r.PathValue("id"))
 	if err != nil {
-		return response.InternalError(fmt.Errorf("Failed to extract operation ID from URL: %w", err))
+		return response.InternalError(fmt.Errorf("Failed extracting operation ID from URL: %w", err))
 	}
 
 	timeoutSecs, err := shared.AtoiEmptyDefault(r.FormValue("timeout"), -1)
 	if err != nil {
-		return response.InternalError(fmt.Errorf("Failed to extract operation wait timeout from URL: %w", err))
+		return response.InternalError(fmt.Errorf("Failed extracting operation wait timeout from URL: %w", err))
 	}
 
 	var ctx context.Context
@@ -187,7 +178,7 @@ func operationWaitGet(d *Daemon, r *http.Request) response.Response {
 
 	defer cancel()
 
-	op, err := operations.OperationGetInternal(id)
+	op, err := operations.Get(id)
 	if err != nil {
 		return response.NotFound(err)
 	}
@@ -197,10 +188,6 @@ func operationWaitGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	_, opAPI, err := op.Render()
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+	_, opAPI := op.Render()
 	return response.SyncResponse(true, opAPI)
 }

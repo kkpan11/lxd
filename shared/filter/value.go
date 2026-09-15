@@ -8,18 +8,27 @@ import (
 // ValueOf returns the value of the given field.
 func ValueOf(obj any, field string) any {
 	value := reflect.ValueOf(obj)
-	typ := value.Type()
-	parts := strings.Split(field, ".")
+	valueKind := value.Kind()
 
-	key := parts[0]
-	rest := strings.Join(parts[1:], ".")
+	if valueKind == reflect.Pointer {
+		if value.IsNil() {
+			return nil
+		}
 
-	var parent any
+		value = value.Elem()
+		valueKind = value.Kind()
+	}
 
-	if value.Kind() == reflect.Map {
+	key, rest, found := strings.Cut(field, ".")
+
+	if valueKind == reflect.Map {
 		switch reflect.TypeOf(obj).Elem().Kind() {
 		case reflect.String:
-			m := value.Interface().(map[string]string)
+			m, ok := value.Interface().(map[string]string)
+			if !ok {
+				return nil
+			}
+
 			return m[field]
 		case reflect.Map:
 			for _, entry := range value.MapKeys() {
@@ -34,7 +43,14 @@ func ValueOf(obj any, field string) any {
 		return nil
 	}
 
-	for i := 0; i < value.NumField(); i++ {
+	if valueKind != reflect.Struct {
+		return nil
+	}
+
+	typ := value.Type()
+	var parent any
+
+	for i := range value.NumField() {
 		fieldValue := value.Field(i)
 		fieldType := typ.Field(i)
 		yaml := fieldType.Tag.Get("yaml")
@@ -46,7 +62,7 @@ func ValueOf(obj any, field string) any {
 		yamlKey, _, _ := strings.Cut(yaml, ",")
 		if yamlKey == key {
 			v := fieldValue.Interface()
-			if len(parts) == 1 {
+			if !found {
 				return v
 			}
 

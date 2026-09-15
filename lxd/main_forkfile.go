@@ -25,12 +25,6 @@ void forkfile(void)
 	char *listenfd = NULL;
 	pid_t pid = 0;
 
-	// Check that we're root.
-	if (geteuid() != 0) {
-		fprintf(stderr, "Error: forkfile requires root privileges\n");
-		_exit(1);
-	}
-
 	// Check the first argument.
 	listenfd = advance_arg(false);
 	if (listenfd == NULL)
@@ -41,6 +35,12 @@ void forkfile(void)
 
 	if (listenfd == NULL || (strcmp(listenfd, "--help") == 0 || strcmp(listenfd, "--version") == 0 || strcmp(listenfd, "-h") == 0))
 		return;
+
+	// Check that we're root.
+	if (geteuid() != 0) {
+		fprintf(stderr, "Error: forkfile requires root privileges\n");
+		_exit(1);
+	}
 
 	// Get the container rootfs.
 	rootfs_fd = atoi(advance_arg(true));
@@ -101,7 +101,7 @@ type cmdForkfile struct {
 	global *cmdGlobal
 }
 
-func (c *cmdForkfile) Command() *cobra.Command {
+func (c *cmdForkfile) command() *cobra.Command {
 	// Main subcommand
 	cmd := &cobra.Command{}
 	cmd.Use = "forkfile <listen fd> <rootfs fd> <PIDFd> <PID>"
@@ -118,12 +118,12 @@ func (c *cmdForkfile) Command() *cobra.Command {
 `
 	cmd.Hidden = true
 	cmd.Args = cobra.ExactArgs(4)
-	cmd.RunE = c.Run
+	cmd.RunE = c.run
 
 	return cmd
 }
 
-func (c *cmdForkfile) Run(cmd *cobra.Command, args []string) error {
+func (c *cmdForkfile) run(cmd *cobra.Command, args []string) error {
 	var mu sync.RWMutex
 	var connections uint64
 	var transactions uint64
@@ -172,7 +172,7 @@ func (c *cmdForkfile) Run(cmd *cobra.Command, args []string) error {
 				mu.RUnlock()
 
 				// Daemon has been inactive for 10s, exit.
-				os.Exit(0)
+				os.Exit(0) //nolint:revive
 			}
 
 			mu.RUnlock()
@@ -202,7 +202,7 @@ func (c *cmdForkfile) Run(cmd *cobra.Command, args []string) error {
 			time.Sleep(time.Second)
 		}
 
-		os.Exit(0)
+		os.Exit(0) //nolint:revive
 	}()
 
 	// Connection handler.

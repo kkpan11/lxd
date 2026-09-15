@@ -3,32 +3,15 @@ package endpoints
 import (
 	"fmt"
 	"net"
-	"strings"
 	"time"
 
-	"github.com/canonical/lxd/lxd/endpoints/listeners"
 	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/logger"
 )
 
 func metricsCreateListener(address string, cert *shared.CertInfo) (net.Listener, error) {
-	// Listening on `tcp` network with address 0.0.0.0 will end up with listening
-	// on both IPv4 and IPv6 interfaces. Pass `tcp4` to make it
-	// work only on 0.0.0.0. https://go-review.googlesource.com/c/go/+/45771/
-	listenAddress := util.CanonicalNetworkAddress(address, shared.HTTPSMetricsDefaultPort)
-	protocol := "tcp"
-
-	if strings.HasPrefix(listenAddress, "0.0.0.0") {
-		protocol = "tcp4"
-	}
-
-	listener, err := net.Listen(protocol, listenAddress)
-	if err != nil {
-		return nil, fmt.Errorf("Bind network address: %w", err)
-	}
-
-	return listeners.NewFancyTLSListener(listener, cert), nil
+	return createTLSListener(address, shared.HTTPSMetricsDefaultPort, cert)
 }
 
 // MetricsAddress returns the network address of the metrics endpoint, or an
@@ -56,7 +39,7 @@ func (e *Endpoints) MetricsUpdateAddress(address string, cert *shared.CertInfo) 
 		return nil
 	}
 
-	logger.Infof("Update metrics address")
+	logger.Info("Update metrics address", logger.Ctx{"address": address, "oldAddress": oldAddress})
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -70,11 +53,11 @@ func (e *Endpoints) MetricsUpdateAddress(address string, cert *shared.CertInfo) 
 	}
 
 	// Attempt to setup the new listening socket
-	getListener := func(address string) (*net.Listener, error) {
+	getListener := func(address string) (net.Listener, error) {
 		var err error
 		var listener net.Listener
 
-		for i := 0; i < 10; i++ { // Ten retries over a second seems reasonable.
+		for range 10 { // Ten retries over a second seems reasonable.
 			listener, err = metricsCreateListener(address, cert)
 			if err == nil {
 				break
@@ -87,7 +70,7 @@ func (e *Endpoints) MetricsUpdateAddress(address string, cert *shared.CertInfo) 
 			return nil, fmt.Errorf("Cannot listen on http socket: %w", err)
 		}
 
-		return &listener, nil
+		return listener, nil
 	}
 
 	// If setting a new address, setup the listener
@@ -97,14 +80,14 @@ func (e *Endpoints) MetricsUpdateAddress(address string, cert *shared.CertInfo) 
 			// Attempt to revert to the previous address
 			listener, err1 := getListener(oldAddress)
 			if err1 == nil {
-				e.listeners[metrics] = *listener
+				e.listeners[metrics] = listener
 				e.serve(metrics)
 			}
 
 			return err
 		}
 
-		e.listeners[metrics] = *listener
+		e.listeners[metrics] = listener
 		e.serve(metrics)
 	}
 

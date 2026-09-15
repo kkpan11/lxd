@@ -1,7 +1,7 @@
 package main
 
 import (
-	"fmt"
+	"errors"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -16,7 +16,7 @@ type cmdShift struct {
 	flagTestMode bool
 }
 
-func (c *cmdShift) Command() *cobra.Command {
+func (c *cmdShift) command() *cobra.Command {
 	cmd := &cobra.Command{}
 	cmd.Use = "fuidshift <directory> <range> [<range>...]"
 	cmd.Short = "UID/GID shifter"
@@ -36,28 +36,22 @@ func (c *cmdShift) Command() *cobra.Command {
   Where "u" means shift uid, "g" means shift gid and "b" means shift uid and gid.
 `
 	cmd.Example = `  fuidshift my-dir/ b:0:100000:65536 u:10000:1000:1`
-	cmd.RunE = c.Run
+	cmd.RunE = c.run
 	cmd.Flags().BoolVarP(&c.flagTestMode, "test", "t", false, "Test mode (no change to files)")
 	cmd.Flags().BoolVarP(&c.flagReverse, "reverse", "r", false, "Perform a reverse mapping")
 
 	return cmd
 }
 
-func (c *cmdShift) Run(cmd *cobra.Command, args []string) error {
-	// Help and usage
-	if len(args) == 0 {
+func (c *cmdShift) run(cmd *cobra.Command, args []string) error {
+	// Show help if mandatory arguments aren't provided.
+	if len(args) < 2 {
 		return cmd.Help()
 	}
 
 	// Quick checks.
 	if !c.flagTestMode && os.Geteuid() != 0 {
-		return fmt.Errorf("This tool must be run as root")
-	}
-
-	// Handle mandatory arguments
-	if len(args) < 2 {
-		_ = cmd.Help()
-		return fmt.Errorf("Missing required arguments")
+		return errors.New("This tool must be run as root")
 	}
 
 	directory := args[0]
@@ -74,7 +68,7 @@ func (c *cmdShift) Run(cmd *cobra.Command, args []string) error {
 
 	// Reverse shifting
 	if c.flagReverse {
-		err := idmapSet.UidshiftFromContainer(directory, c.flagTestMode)
+		err := idmapSet.UidShiftFromContainer(directory, c.flagTestMode)
 		if err != nil {
 			return err
 		}
@@ -83,7 +77,7 @@ func (c *cmdShift) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Normal shifting
-	err := idmapSet.UidshiftIntoContainer(directory, c.flagTestMode)
+	err := idmapSet.UidShiftIntoContainer(directory, c.flagTestMode)
 	if err != nil {
 		return err
 	}

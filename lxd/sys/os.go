@@ -3,17 +3,22 @@
 package sys
 
 import (
+	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/canonical/lxd/lxd/cgroup"
 	"github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/idmap"
+	"github.com/canonical/lxd/lxd/node"
 	"github.com/canonical/lxd/lxd/storage/filesystem"
 	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared"
@@ -58,9 +63,9 @@ type OS struct {
 	ExecPath        string          // Absolute path to the LXD executable
 	IdmapSet        *idmap.IdmapSet // Information about user/group ID mapping
 	InotifyWatch    InotifyInfo
-	LxcPath         string // Path to the $LXD_DIR/containers directory
-	MockMode        bool   // If true some APIs will be mocked (for testing)
-	Nodev           bool
+	LxcPath         string      // Path to the $LXD_DIR/containers directory
+	MockMode        bool        // If true some APIs will be mocked (for testing)
+	Nodev           atomic.Bool // Set when the devices path is mounted nodev.
 	RunningInUserNS bool
 
 	// Privilege dropping
@@ -76,34 +81,45 @@ type OS struct {
 	AppArmorStacked   bool
 	AppArmorStacking  bool
 	AppArmorFeatures  AppArmorFeaturesInfo
+	AppArmorCacheLoc  string
+	AppArmorCacheDir  string // Based on AppArmorCacheLoc, but may also point to a subdirectory influenced by features.
 
 	// Cgroup features
 	CGInfo cgroup.Info
 
 	// Kernel features
-	CloseRange              bool // CloseRange indicates support for the close_range syscall.
-	ContainerCoreScheduling bool // ContainerCoreScheduling indicates LXC and kernel support for core scheduling.
-	CoreScheduling          bool // CoreScheduling indicates support for core scheduling syscalls.
-	IdmappedMounts          bool // IdmappedMounts indicates kernel support for VFS idmap.
-	NativeTerminals         bool // NativeTerminals indicates support for TIOGPTPEER ioctl.
-	NetnsGetifaddrs         bool // NetnsGetifaddrs indicates support for NETLINK_GET_STRICT_CHK.
-	PidFds                  bool // PidFds indicates support for PID fds.
-	PidFdSetns              bool // PidFdSetns indicates support for setns through PID fds.
-	SeccompListenerAddfd    bool // SeccompListenerAddfd indicates support for passing new FD to process through seccomp notify.
-	SeccompListener         bool // SeccompListener indicates support for seccomp notify.
-	SeccompListenerContinue bool // SeccompListenerContinue indicates support continuing syscalls path for process through seccomp notify.
-	UeventInjection         bool // UeventInjection indicates support for injecting uevents to a specific netns.
-	UnprivBinfmt            bool // UnprivBinfmt indicates support for mounting binfmt_misc inside of a user namespace.
-	VFS3Fscaps              bool // VFS3FScaps indicates support for v3 filesystem capabilities.
+	BPFToken                bool        // BPFToken indicates support for BPF token delegation mechanism.
+	CloseRange              bool        // CloseRange indicates support for the close_range syscall.
+	CoreScheduling          atomic.Bool // CoreScheduling indicates support for core scheduling syscalls.
+	IdmappedMounts          bool        // IdmappedMounts indicates kernel support for VFS idmap.
+	NativeTerminals         bool        // NativeTerminals indicates support for TIOGPTPEER ioctl.
+	NetnsGetifaddrs         bool        // NetnsGetifaddrs indicates support for NETLINK_GET_STRICT_CHK.
+	PidFds                  atomic.Bool // PidFds indicates support for PID fds.
+	PidFdSetns              bool        // PidFdSetns indicates support for setns through PID fds.
+	SeccompListenerAddfd    bool        // SeccompListenerAddfd indicates support for passing new FD to process through seccomp notify.
+	SeccompListener         bool        // SeccompListener indicates support for seccomp notify.
+	SeccompListenerContinue bool        // SeccompListenerContinue indicates support continuing syscalls path for process through seccomp notify.
+	UeventInjection         bool        // UeventInjection indicates support for injecting uevents to a specific netns.
+	UnprivBinfmt            bool        // UnprivBinfmt indicates support for mounting binfmt_misc inside of a user namespace.
+	VFS3Fscaps              bool        // VFS3FScaps indicates support for v3 filesystem capabilities.
 
 	// LXC features
 	LXCFeatures map[string]bool
 
 	// OS info
-	ReleaseInfo   map[string]string
-	KernelVersion version.DottedVersion
-	Uname         *shared.Utsname
-	BootTime      time.Time
+	ReleaseInfo map[string]string
+	Uname       *shared.Utsname
+	BootTime    time.Time
+
+	// Version info
+	KernelVersion   version.DottedVersion
+	AppArmorVersion *version.DottedVersion // AppArmorVersion is nil if AppArmorAvailable is false.
+
+	// Storage capabilities
+	CephModernMountSyntax bool
+
+	// LXD server UUID
+	ServerUUID string
 }
 
 // DefaultOS returns a fresh uninitialized OS instance with default values.
@@ -125,6 +141,11 @@ func (s *OS) Init() ([]cluster.Warning, error) {
 	var dbWarnings []cluster.Warning
 
 	err := s.initDirs()
+	if err != nil {
+		return nil, err
+	}
+
+	err = s.initServerUUID()
 	if err != nil {
 		return nil, err
 	}
@@ -202,6 +223,10 @@ func (s *OS) Init() ([]cluster.Warning, error) {
 		s.KernelVersion = *kernelVersion
 	}
 
+	// Check if the kernel supports the modern CephFS mount syntax (>= 5.17.0).
+	minCephMountVer, _ := version.NewDottedVersion("5.17.0")
+	s.CephModernMountSyntax = s.KernelVersion.Compare(minCephMountVer) >= 0
+
 	// Fill in the boot time.
 	out, err := os.ReadFile("/proc/stat")
 	if err != nil {
@@ -209,7 +234,7 @@ func (s *OS) Init() ([]cluster.Warning, error) {
 	}
 
 	btime := int64(0)
-	for _, line := range strings.Split(string(out), "\n") {
+	for line := range strings.SplitSeq(string(out), "\n") {
 		if !strings.HasPrefix(line, "btime ") {
 			continue
 		}
@@ -230,7 +255,62 @@ func (s *OS) Init() ([]cluster.Warning, error) {
 	return dbWarnings, nil
 }
 
+// initServerUUID checks if there is a server.uuid file in OS.VarDir. If it is present, the contents are set as
+// OS.ServerUUID. If it is not present, a new v7 UUID is created and written to the file, and then set as OS.ServerUUID.
+func (s *OS) initServerUUID() error {
+	uuidPath := filepath.Join(s.VarDir, "server.uuid")
+
+	uuidBytes, err := os.ReadFile(uuidPath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("Failed reading server.uuid file: %w", err)
+	}
+
+	if err == nil {
+		s.ServerUUID = string(uuidBytes)
+		return nil
+	}
+
+	// File doesn't exist; generate a new UUID and write it.
+	newServerUUID, err := uuid.NewV7()
+	if err != nil {
+		return fmt.Errorf("Failed generating a new server UUID: %w", err)
+	}
+
+	serverUUID := newServerUUID.String()
+
+	err = os.WriteFile(uuidPath, []byte(serverUUID), 0600)
+	if err != nil {
+		return fmt.Errorf("Failed creating server.uuid file: %w", err)
+	}
+
+	s.ServerUUID = serverUUID
+	return nil
+}
+
 // InitStorage initialises the storage layer after it has been mounted.
-func (s *OS) InitStorage() error {
-	return s.initStorageDirs()
+func (s *OS) InitStorage(config *node.Config) error {
+	return s.initStorageDirs(config)
+}
+
+// InUbuntuCore returns true if we're running on Ubuntu Core.
+func (s *OS) InUbuntuCore() bool {
+	if !shared.InSnap() {
+		return false
+	}
+
+	if s.ReleaseInfo["NAME"] == "Ubuntu Core" {
+		return true
+	}
+
+	return false
+}
+
+// GetUnixSocket returns the full path to the unix.socket file that this daemon is listening on. Used by tests.
+func (s *OS) GetUnixSocket() string {
+	path := os.Getenv("LXD_SOCKET")
+	if path != "" {
+		return path
+	}
+
+	return filepath.Join(s.VarDir, "unix.socket")
 }

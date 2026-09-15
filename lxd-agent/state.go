@@ -3,7 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -43,34 +43,11 @@ func renderState() *api.InstanceState {
 }
 
 func cpuState() api.InstanceStateCPU {
-	var value []byte
-	var err error
 	cpu := api.InstanceStateCPU{}
 
-	if shared.PathExists("/sys/fs/cgroup/cpuacct/cpuacct.usage") {
-		// CPU usage in seconds
-		value, err = os.ReadFile("/sys/fs/cgroup/cpuacct/cpuacct.usage")
-		if err != nil {
-			cpu.Usage = -1
-			return cpu
-		}
-
-		valueInt, err := strconv.ParseInt(strings.TrimSpace(string(value)), 10, 64)
-		if err != nil {
-			cpu.Usage = -1
-			return cpu
-		}
-
-		cpu.Usage = valueInt
-
-		return cpu
-	} else if shared.PathExists("/sys/fs/cgroup/cpu.stat") {
-		stats, err := os.ReadFile("/sys/fs/cgroup/cpu.stat")
-		if err != nil {
-			cpu.Usage = -1
-			return cpu
-		}
-
+	// Try cgroup v2.
+	stats, err := os.ReadFile("/sys/fs/cgroup/cpu.stat")
+	if err == nil {
 		scanner := bufio.NewScanner(bytes.NewReader(stats))
 
 		for scanner.Scan() {
@@ -90,6 +67,20 @@ func cpuState() api.InstanceStateCPU {
 		}
 	}
 
+	// Try cgroup v1.
+	value, err := os.ReadFile("/sys/fs/cgroup/cpuacct/cpuacct.usage")
+	if err == nil {
+		valueInt, err := strconv.ParseInt(strings.TrimSpace(string(value)), 10, 64)
+		if err != nil {
+			cpu.Usage = -1
+			return cpu
+		}
+
+		cpu.Usage = valueInt
+
+		return cpu
+	}
+
 	cpu.Usage = -1
 	return cpu
 }
@@ -102,8 +93,19 @@ func memoryState() api.InstanceStateMemory {
 		return memory
 	}
 
-	memory.Usage = int64(stats.MemTotalBytes) - int64(stats.MemFreeBytes)
-	memory.Total = int64(stats.MemTotalBytes)
+	// Bound checking before converting from uint64 to int64
+	if stats.MemTotalBytes > math.MaxInt64 {
+		memory.Total = math.MaxInt64
+	} else {
+		memory.Total = int64(stats.MemTotalBytes)
+	}
+
+	usage := stats.MemTotalBytes - stats.MemFreeBytes
+	if usage > math.MaxInt64 {
+		memory.Usage = math.MaxInt64
+	} else {
+		memory.Usage = int64(usage)
+	}
 
 	// Memory peak in bytes
 	value, err := os.ReadFile("/sys/fs/cgroup/memory/memory.max_usage_in_bytes")
@@ -120,7 +122,7 @@ func networkState() map[string]api.InstanceStateNetwork {
 
 	ifs, err := net.Interfaces()
 	if err != nil {
-		logger.Errorf("Failed to retrieve network interfaces: %v", err)
+		logger.Errorf("Failed retrieving network interfaces: %v", err)
 		return result
 	}
 
@@ -150,26 +152,26 @@ func networkState() map[string]api.InstanceStateNetwork {
 		}
 
 		// Counters
-		value, err := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/statistics/tx_bytes", iface.Name))
-		valueInt, err1 := strconv.ParseInt(strings.TrimSpace(string(value)), 10, 64)
+		value, err := os.ReadFile("/sys/class/net/" + iface.Name + "/statistics/tx_bytes")
+		valueInt, err1 := strconv.ParseUint(strings.TrimSpace(string(value)), 10, 64)
 		if err == nil && err1 == nil {
 			network.Counters.BytesSent = valueInt
 		}
 
-		value, err = os.ReadFile(fmt.Sprintf("/sys/class/net/%s/statistics/rx_bytes", iface.Name))
-		valueInt, err1 = strconv.ParseInt(strings.TrimSpace(string(value)), 10, 64)
+		value, err = os.ReadFile("/sys/class/net/" + iface.Name + "/statistics/rx_bytes")
+		valueInt, err1 = strconv.ParseUint(strings.TrimSpace(string(value)), 10, 64)
 		if err == nil && err1 == nil {
 			network.Counters.BytesReceived = valueInt
 		}
 
-		value, err = os.ReadFile(fmt.Sprintf("/sys/class/net/%s/statistics/tx_packets", iface.Name))
-		valueInt, err1 = strconv.ParseInt(strings.TrimSpace(string(value)), 10, 64)
+		value, err = os.ReadFile("/sys/class/net/" + iface.Name + "/statistics/tx_packets")
+		valueInt, err1 = strconv.ParseUint(strings.TrimSpace(string(value)), 10, 64)
 		if err == nil && err1 == nil {
 			network.Counters.PacketsSent = valueInt
 		}
 
-		value, err = os.ReadFile(fmt.Sprintf("/sys/class/net/%s/statistics/rx_packets", iface.Name))
-		valueInt, err1 = strconv.ParseInt(strings.TrimSpace(string(value)), 10, 64)
+		value, err = os.ReadFile("/sys/class/net/" + iface.Name + "/statistics/rx_packets")
+		valueInt, err1 = strconv.ParseUint(strings.TrimSpace(string(value)), 10, 64)
 		if err == nil && err1 == nil {
 			network.Counters.PacketsReceived = valueInt
 		}
@@ -178,36 +180,20 @@ func networkState() map[string]api.InstanceStateNetwork {
 		addrs, _ := iface.Addrs()
 
 		for _, addr := range addrs {
-			addressFields := strings.Split(addr.String(), "/")
+			address, netmask, found := strings.Cut(addr.String(), "/")
+			if !found {
+				continue
+			}
 
 			networkAddress := api.InstanceStateNetworkAddress{
-				Address: addressFields[0],
-				Netmask: addressFields[1],
+				Address: address,
+				Family:  "inet",
+				Netmask: netmask,
+				Scope:   shared.GetIPScope(address),
 			}
 
-			scope := "global"
-			if strings.HasPrefix(addressFields[0], "127") {
-				scope = "local"
-			}
-
-			if addressFields[0] == "::1" {
-				scope = "local"
-			}
-
-			if strings.HasPrefix(addressFields[0], "169.254") {
-				scope = "link"
-			}
-
-			if strings.HasPrefix(addressFields[0], "fe80:") {
-				scope = "link"
-			}
-
-			networkAddress.Scope = scope
-
-			if strings.Contains(addressFields[0], ":") {
+			if strings.Contains(address, ":") {
 				networkAddress.Family = "inet6"
-			} else {
-				networkAddress.Family = "inet"
 			}
 
 			network.Addresses = append(network.Addresses, networkAddress)
@@ -223,8 +209,9 @@ func processesState() int64 {
 	pids := []int64{1}
 
 	// Go through the pid list, adding new pids at the end so we go through them all
-	for i := 0; i < len(pids); i++ {
-		fname := fmt.Sprintf("/proc/%d/task/%d/children", pids[i], pids[i])
+	for i := range pids {
+		pid := strconv.FormatInt(pids[i], 10)
+		fname := "/proc/" + pid + "/task/" + pid + "/children"
 		fcont, err := os.ReadFile(fname)
 		if err != nil {
 			// the process terminated during execution of this loop
@@ -232,7 +219,7 @@ func processesState() int64 {
 		}
 
 		content := strings.Split(string(fcont), " ")
-		for j := 0; j < len(content); j++ {
+		for j := range content {
 			pid, err := strconv.ParseInt(content[j], 10, 64)
 			if err == nil {
 				pids = append(pids, pid)

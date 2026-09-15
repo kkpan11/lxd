@@ -1,56 +1,175 @@
 test_server_config() {
-  LXD_SERVERCONFIG_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
-  spawn_lxd "${LXD_SERVERCONFIG_DIR}" true
   ensure_has_localhost_remote "${LXD_ADDR}"
 
   _server_config_access
   _server_config_storage
+  _server_config_auth
+  _server_config_cluster_uuid
+  _server_config_user_microcloud
+  _server_config_ui_serving
+}
 
-  kill_lxd "${LXD_SERVERCONFIG_DIR}"
+_server_config_cluster_uuid() {
+  # Validate that the cluster UUID cannot be changed
+
+  # PUT
+  ! lxc config unset volatile.uuid || false
+  ! lxc config set volatile.uuid="$(uuidgen)" || false
+  cluster_uuid="$(lxc config get volatile.uuid)"
+  lxc config set volatile.uuid="${cluster_uuid}"
+
+  # PATCH
+  my_curl -X PATCH "https://${LXD_ADDR}/1.0" -d '{"config":{"core.https_address":"'"${LXD_ADDR}"'"}}' | jq --exit-status '.status == "Success" and .status_code == 200'
+  my_curl -X PATCH "https://${LXD_ADDR}/1.0" -d '{"config":{"core.https_address":"'"${LXD_ADDR}"'","volatile.uuid":""}}' | jq --exit-status '.error == "The cluster UUID cannot be changed" and .error_code == 400'
+  my_curl -X PATCH "https://${LXD_ADDR}/1.0" -d '{"config":{"core.https_address":"'"${LXD_ADDR}"'","volatile.uuid":"'"$(uuidgen)"'"}}' | jq --exit-status '.error == "The cluster UUID cannot be changed" and .error_code == 400'
+  my_curl -X PATCH "https://${LXD_ADDR}/1.0" -d '{"config":{"core.https_address":"'"${LXD_ADDR}"'","volatile.uuid":"'"${cluster_uuid}"'"}}' | jq --exit-status '.status == "Success" and .status_code == 200'
+
+  # Check that the cluster UUID matches the server UUID
+  [ "$(< "${LXD_DIR}/server.uuid")" = "${cluster_uuid}" ]
+}
+
+_server_config_auth() {
+  # Validate oidc.session.expiry cannot be set to less than one hour
+  lxc config set oidc.session.expiry='1H'
+  ! lxc config set oidc.session.expiry='59M 59S' || false
+  lxc config set oidc.session.expiry='59M 60S'
+  ! lxc config set oidc.session.expiry='3599S' || false
+  lxc config set oidc.session.expiry='3600S'
+  lxc config unset oidc.session.expiry
+
+  # Validate core.auth_secret_expiry cannot be set to less than oidc.session.expiry
+  # oidc.session.expiry is currently unset and defaults to one week.
+  lxc config set core.auth_secret_expiry='1w'
+  ! lxc config set core.auth_secret_expiry='6d 23H 59M 59S' || false
+  lxc config set core.auth_secret_expiry='6d 23H 59M 60S'
+  ! lxc config set core.auth_secret_expiry='1439M 59S' || false
+
+  # Lower the oidc session expiry to one hour, then check that the auth secret expiry still
+  # cannot be set to less than one day.
+  lxc config set oidc.session.expiry='1H' core.auth_secret_expiry='1d'
+  ! lxc config set core.auth_secret_expiry='23H 59M 59S' || false
+  lxc config set core.auth_secret_expiry='23H 59M 60S'
+  ! lxc config set core.auth_secret_expiry='1439M 59S' || false
+  lxc config set core.auth_secret_expiry='1439M 60S'
+  ! lxc config set core.auth_secret_expiry='86399S' || false
+  lxc config set core.auth_secret_expiry='86400S'
+
+  # Cleanup
+  lxc config set oidc.session.expiry="" core.auth_secret_expiry=""
 }
 
 _server_config_access() {
   # test untrusted server GET
-  my_curl -X GET "https://$(cat "${LXD_SERVERCONFIG_DIR}/lxd.addr")/1.0" | grep -v -q environment
+  local UNTRUSTED_GET
+  UNTRUSTED_GET="$(curl --insecure --silent --fail-with-body "https://${LXD_ADDR}/1.0")"
 
-  # test authentication type
-  curl --unix-socket "$LXD_DIR/unix.socket" "lxd/1.0" | jq .metadata.auth_methods | grep tls
+  if [ -z "${UNTRUSTED_GET}" ]; then
+    echo "Untrusted server GET returned an empty response"
+    false
+  fi
 
-  # only tls is enabled by default
-  ! curl --unix-socket "$LXD_DIR/unix.socket" "lxd/1.0" | jq .metadata.auth_methods | grep oidc || false
+  if grep -wF "environment" <<< "${UNTRUSTED_GET}"; then
+    echo "Untrusted server GET returned environment"
+    false
+  fi
+
+  # test authentication type, only tls and bearer are enabled by default
+  curl --silent --unix-socket "$LXD_DIR/unix.socket" "lxd/1.0" | jq --exit-status '.metadata.auth_methods == ["tls","bearer"]'
+
+  # test Sec-Fetch-Site header validation.
+  # We use PATCH request here because Go's stdlib CSRF protection only examines unsafe state-changing requests (e.g. PATCH, POST, PUT, DELETE).
+  [ "$(curl --silent --unix-socket "$LXD_DIR/unix.socket" -w "%{http_code}" -o /dev/null -X PATCH -H 'Sec-Fetch-Site: same-origin' -d '{"config": {"core.shutdown_timeout": "10"}}' "lxd/1.0")" = "200" ]
+  [ "$(curl --silent --unix-socket "$LXD_DIR/unix.socket" -w "%{http_code}" -o /dev/null -X PATCH -H 'Sec-Fetch-Site: cross-site' -d '{"config": {"core.shutdown_timeout": "10"}}' "lxd/1.0")" = "403" ]
+  [ "$(curl --silent --unix-socket "$LXD_DIR/unix.socket" -w "%{http_code}" -o /dev/null -X PATCH -H 'Sec-Fetch-Site: same-site' -d '{"config": {"core.shutdown_timeout": "10"}}' "lxd/1.0")" = "403" ]
+
+  # test content type validation.
+  [ "$(curl --silent --unix-socket "$LXD_DIR/unix.socket" -w "%{http_code}" -o /dev/null -H "User-Agent: Mozilla/5.0" -H "Content-Type: application/json" "lxd/1.0")" = "200" ]
+  [ "$(curl --silent --unix-socket "$LXD_DIR/unix.socket" -w "%{http_code}" -o /dev/null -H "User-Agent: Mozilla/5.0" -H "Content-Type: foo" "lxd/1.0")" = "415" ]
+  [ "$(curl --silent --unix-socket "$LXD_DIR/unix.socket" -w "%{http_code}" -o /dev/null -H "User-Agent: LXD" -H "Content-Type: foo" "lxd/1.0")" = "200" ]
+
+  # test that the /ui redirect works
+  [ "$(curl --silent --unix-socket "$LXD_DIR/unix.socket" -w "%{url_effective}" -o /dev/null --location -H "User-Agent: Mozilla/5.0" "lxd/")" = "http://lxd/ui/" ]
+
+  sub_test "Verify /ui and /documentation return correct Content-Type when not served"
+  # When LXD_UI is not set, /ui/ returns 503 with text/html, not application/json.
+  [ "$(curl --silent --unix-socket "$LXD_DIR/unix.socket" -o /dev/null -w "%{http_code}" "lxd/ui/")" = "503" ]
+  [ "$(curl --silent --unix-socket "$LXD_DIR/unix.socket" -o /dev/null -w "%{content_type}" "lxd/ui/")" = "text/html" ]
+
+  # When LXD_DOCUMENTATION is not set, /documentation/ returns 404 with application/json.
+  [ "$(curl --silent --unix-socket "$LXD_DIR/unix.socket" -o /dev/null -w "%{http_code}" "lxd/documentation/")" = "404" ]
+  [ "$(curl --silent --unix-socket "$LXD_DIR/unix.socket" -o /dev/null -w "%{content_type}" "lxd/documentation/")" = "application/json" ]
+}
+
+_server_config_ui_serving() {
+  # Regression test: LXD_UI and LXD_DOCUMENTATION files must be served as text/html,
+  # not as application/json (which createCmd pre-sets before dispatching to handlers).
+  local ui_dir doc_dir
+  ui_dir="$(mktemp -d)"
+  doc_dir="$(mktemp -d)"
+  echo "<html><body>UI</body></html>" > "${ui_dir}/app.html"
+  echo "<html><body>Docs</body></html>" > "${doc_dir}/guide.html"
+
+  shutdown_lxd "${LXD_DIR}"
+  LXD_UI="${ui_dir}" LXD_DOCUMENTATION="${doc_dir}" respawn_lxd "${LXD_DIR}" true
+
+  sub_test "Verify /ui files are served as text/html (not application/json)"
+  [ "$(curl --silent --unix-socket "$LXD_DIR/unix.socket" -o /dev/null -w "%{http_code}" "lxd/ui/app.html")" = "200" ]
+  [ "$(curl --silent --unix-socket "$LXD_DIR/unix.socket" -o /dev/null -w "%{content_type}" "lxd/ui/app.html")" = "text/html; charset=utf-8" ]
+
+  sub_test "Verify /documentation files are served as text/html (not application/json)"
+  [ "$(curl --silent --unix-socket "$LXD_DIR/unix.socket" -o /dev/null -w "%{http_code}" "lxd/documentation/guide.html")" = "200" ]
+  [ "$(curl --silent --unix-socket "$LXD_DIR/unix.socket" -o /dev/null -w "%{content_type}" "lxd/documentation/guide.html")" = "text/html; charset=utf-8" ]
+
+  shutdown_lxd "${LXD_DIR}"
+  respawn_lxd "${LXD_DIR}" true
+
+  rm -rf "${ui_dir}" "${doc_dir}"
 }
 
 _server_config_storage() {
-  local lxd_backend
+  local lxd_backend output
 
   lxd_backend=$(storage_backend "$LXD_DIR")
   if [ "$lxd_backend" = "ceph" ]; then
+    # The volume doesn't have to be present as the check errors after testing for the remote storage pool.
+    ! output=$(lxc config set storage.backups_volume "${pool}/foo" 2>&1) || false
+    [[ "${output}" == "Error: Failed validation of \"storage.backups_volume\": Remote storage pool \"${pool}\" cannot be used" ]]
+    ! output=$(lxc config set storage.images_volume "${pool}/foo" 2>&1) || false
+    [[ "${output}" == "Error: Failed validation of \"storage.images_volume\": Remote storage pool \"${pool}\" cannot be used" ]]
+
     return
   fi
 
   ensure_import_testimage
-  pool=$(lxc profile device get default root pool)
+  local pool
+  pool="lxdtest-$(basename "${LXD_DIR}")"
 
   lxc init testimage foo
-  lxc query --wait /1.0/containers/foo/backups -X POST -d '{\"expires_at\": \"2100-01-01T10:00:00-05:00\"}'
+  lxc query --wait /1.0/instances/foo/backups -X POST -d '{"expires_at": "2100-01-01T10:00:00-05:00"}'
 
   # Record before
-  BACKUPS_BEFORE=$(find "${LXD_DIR}/backups/" | sort)
-  IMAGES_BEFORE=$(find "${LXD_DIR}/images/" | sort)
+  BACKUPS_BEFORE=$(cd "${LXD_DIR}/backups/" && find . | sort)
+  IMAGES_BEFORE=$(cd "${LXD_DIR}/images/" && find . | sort)
 
   lxc storage volume create "${pool}" backups
   lxc storage volume create "${pool}" images
 
   # Validate errors
-  ! lxc config set storage.backups_volume foo/bar
-  ! lxc config set storage.images_volume foo/bar
-  ! lxc config set storage.backups_volume "${pool}/bar"
-  ! lxc config set storage.images_volume "${pool}/bar"
+  ! output=$(lxc config set storage.backups_volume foo/bar 2>&1) || false
+  [[ "${output}" == *"Storage pool not found" ]]
+  ! output=$(lxc config set storage.images_volume foo/bar 2>&1) || false
+  [[ "${output}" == *"Storage pool not found" ]]
+  ! output=$(lxc config set storage.backups_volume "${pool}/bar" 2>&1) || false
+  [[ "${output}" == *"Storage volume not found" ]]
+  ! output=$(lxc config set storage.images_volume "${pool}/bar" 2>&1) || false
+  [[ "${output}" == *"Storage volume not found" ]]
 
   lxc storage volume snapshot "${pool}" backups
   lxc storage volume snapshot "${pool}" images
-  ! lxc config set storage.backups_volume "${pool}/backups"
-  ! lxc config set storage.images_volume "${pool}/images"
+  ! output=$(lxc config set storage.backups_volume "${pool}/backups" 2>&1) || false
+  [[ "${output}" == *"Storage volumes for use by LXD itself cannot have snapshots" ]]
+  ! output=$(lxc config set storage.images_volume "${pool}/images" 2>&1) || false
+  [[ "${output}" == *"Storage volumes for use by LXD itself cannot have snapshots" ]]
 
   lxc storage volume delete "${pool}" backups/snap0
   lxc storage volume delete "${pool}" images/snap0
@@ -59,9 +178,18 @@ _server_config_storage() {
   lxc config set storage.backups_volume "${pool}/backups"
   lxc config set storage.images_volume "${pool}/images"
 
+  # Regression test for the case where project deletion unmounted the daemon storage volume.
+  lxc project create foo
+  lxc project delete foo
+  [ -d "${LXD_DIR}/storage-pools/${pool}/custom/default_images/images" ]
+
+  # Validate the old location is really gone
+  [ ! -e "${LXD_DIR}/backups" ]
+  [ ! -e "${LXD_DIR}/images" ]
+
   # Record after
-  BACKUPS_AFTER=$(find "${LXD_DIR}/backups/" | sort)
-  IMAGES_AFTER=$(find "${LXD_DIR}/images/" | sort)
+  BACKUPS_AFTER=$(cd "${LXD_DIR}/storage-pools/${pool}/custom/default_backups/backups" && find . | sort)
+  IMAGES_AFTER=$(cd "${LXD_DIR}/storage-pools/${pool}/custom/default_images/images" && find . | sort)
 
   # Validate content
   if [ "${BACKUPS_BEFORE}" != "${BACKUPS_AFTER}" ]; then
@@ -75,12 +203,18 @@ _server_config_storage() {
   fi
 
   # Validate more errors
-  ! lxc storage volume delete "${pool}" backups
-  ! lxc storage volume delete "${pool}" images
-  ! lxc storage volume rename "${pool}" backups backups1
-  ! lxc storage volume rename "${pool}" images images1
-  ! lxc storage volume snapshot "${pool}" backups
-  ! lxc storage volume snapshot "${pool}" images
+  ! output=$(lxc storage volume delete "${pool}" backups 2>&1) || false
+  [[ "${output}" == *"Error: The storage volume is still in use" ]]
+  ! output=$(lxc storage volume delete "${pool}" images 2>&1) || false
+  [[ "${output}" == *"Error: The storage volume is still in use" ]]
+  ! output=$(lxc storage volume rename "${pool}" backups backups1 2>&1) || false
+  [[ "${output}" == *"Error: Volume is used by LXD itself and cannot be renamed" ]]
+  ! output=$(lxc storage volume rename "${pool}" images images1 2>&1) || false
+  [[ "${output}" == *"Error: Volume is used by LXD itself and cannot be renamed" ]]
+  ! output=$(lxc storage volume snapshot "${pool}" backups 2>&1) || false
+  [[ "${output}" == *"Error: Volumes used by LXD itself cannot have snapshots" ]]
+  ! output=$(lxc storage volume snapshot "${pool}" images 2>&1) || false
+  [[ "${output}" == *"Error: Volumes used by LXD itself cannot have snapshots" ]]
 
   # Modify container and publish to image on custom volume.
   lxc start foo
@@ -88,15 +222,56 @@ _server_config_storage() {
   lxc stop -f foo
   lxc publish foo --alias fooimage
 
-  # Launch container from published image on custom volume.
+  # Init container from published image on custom volume.
   lxc init fooimage foo2
-  lxc delete -f foo2
+  lxc delete foo2
   lxc image delete fooimage
 
-  # Reset and cleanup
-  lxc config unset storage.backups_volume
-  lxc config unset storage.images_volume
+  # Put both storages on the same shared volume
+  lxc storage volume create "${pool}" shared
+  lxc config set storage.backups_volume="" storage.images_volume=""
+  lxc config set storage.backups_volume "${pool}/shared"
+  lxc config set storage.images_volume "${pool}/shared"
+
+  # Unset the config and remove the volumes
+  lxc config set storage.backups_volume="" storage.images_volume=""
   lxc storage volume delete "${pool}" backups
   lxc storage volume delete "${pool}" images
-  lxc delete -f foo
+  lxc storage volume delete "${pool}" shared
+
+  # Record again after unsetting
+  BACKUPS_AFTER=$(cd "${LXD_DIR}/backups/" && find . | sort)
+  IMAGES_AFTER=$(cd "${LXD_DIR}/images/" && find . | sort)
+
+  # Validate content
+  if [ "${BACKUPS_BEFORE}" != "${BACKUPS_AFTER}" ]; then
+    echo "Backups dir content mismatch"
+    false
+  fi
+
+  if [ "${IMAGES_BEFORE}" != "${IMAGES_AFTER}" ]; then
+    echo "Images dir content mismatch"
+    false
+  fi
+
+  # Cleanup
+  lxc delete foo
+}
+
+_server_config_user_microcloud() {
+  # Set config key user.microcloud, which is readable by untrusted clients
+  lxc config set user.microcloud true
+  [ "$(lxc config get user.microcloud)" = "true" ]
+  curl --silent --insecure "https://${LXD_ADDR}/1.0" | jq --exit-status '.metadata.config["user.microcloud"] == "true"'
+
+  # Set config key user.foo, which is not exposed to untrusted clients
+  lxc config set user.foo bar
+  [ "$(lxc config get user.foo)" = "bar" ]
+  curl --silent --insecure "https://${LXD_ADDR}/1.0" | jq --exit-status '.metadata.config["user.foo"] == null'
+
+  # Unset all config and check it worked
+  lxc config set user.microcloud="" user.foo=""
+  [ "$(lxc config get user.microcloud || echo fail)" = "" ]
+  [ "$(lxc config get user.foo || echo fail)" = "" ]
+  curl --silent --insecure "https://${LXD_ADDR}/1.0" | jq --exit-status '.metadata.config == null'
 }

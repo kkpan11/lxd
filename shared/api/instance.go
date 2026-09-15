@@ -1,18 +1,15 @@
 package api
 
 import (
+	"errors"
+	"maps"
 	"strings"
 	"time"
 )
 
 // GetParentAndSnapshotName returns the parent name, snapshot name, and whether it actually was a snapshot name.
 func GetParentAndSnapshotName(name string) (parentName string, snapshotName string, isSnapshot bool) {
-	fields := strings.SplitN(name, "/", 2)
-	if len(fields) == 1 {
-		return name, "", false
-	}
-
-	return fields[0], fields[1], true
+	return strings.Cut(name, "/")
 }
 
 // InstanceType represents the type if instance being returned or requested via the API.
@@ -26,6 +23,24 @@ const InstanceTypeContainer = InstanceType("container")
 
 // InstanceTypeVM defines the instance type value for a virtual-machine.
 const InstanceTypeVM = InstanceType("virtual-machine")
+
+// SourceType represents source of the instance creation.
+type SourceType string
+
+// SourceTypeMigration represents instance creation from migration.
+const SourceTypeMigration = SourceType("migration")
+
+// SourceTypeConversion represents instance creation from conversion.
+const SourceTypeConversion = SourceType("conversion")
+
+// SourceTypeImage represents instance creation from an image.
+const SourceTypeImage = SourceType("image")
+
+// SourceTypeCopy represents instance creation from a copy operation.
+const SourceTypeCopy = SourceType("copy")
+
+// SourceTypeNone represents an unknown source type for instance creation.
+const SourceTypeNone = SourceType("none")
 
 // InstancesPost represents the fields available for a new LXD instance.
 //
@@ -91,7 +106,9 @@ type InstancePost struct {
 
 	// Whether snapshots should be discarded (migration only, deprecated, use instance_only)
 	// Example: false
-	ContainerOnly bool `json:"container_only" yaml:"container_only"` // Deprecated, use InstanceOnly.
+	//
+	// Deprecated: use InstanceOnly.
+	ContainerOnly bool `json:"container_only" yaml:"container_only"`
 
 	// Target for the migration, will use pull mode if not set (migration only)
 	Target *InstancePostTarget `json:"target" yaml:"target"`
@@ -118,19 +135,31 @@ type InstancePost struct {
 	// Example: {"security.nesting": "true"}
 	//
 	// API extension: instance_move_config
-	Config map[string]string
+	Config map[string]string `json:"Config" yaml:"config"`
 
 	// Instance devices.
 	// Example: {"root": {"type": "disk", "pool": "default", "path": "/"}}
 	//
 	// API extension: instance_move_config
-	Devices map[string]map[string]string
+	Devices map[string]map[string]string `json:"Devices" yaml:"devices"`
 
 	// List of profiles applied to the instance.
 	// Example: ["default"]
 	//
 	// API extension: instance_move_config
-	Profiles []string
+	Profiles []string `json:"Profiles" yaml:"profiles"`
+
+	// Which disk volumes are transferred with the instance (migration only)
+	// Example: all-exclusive
+	//
+	// API extension: replicator_custom_volumes
+	DiskVolumesMode string `json:"disk_volumes_mode,omitempty" yaml:"disk_volumes_mode,omitempty"`
+
+	// Whether the instances's snapshot should receive target instances profile on copy
+	// Example: true
+	//
+	// API extension: override_snapshot_profiles_on_copy
+	OverrideSnapshotProfiles bool `json:"override_snapshot_profiles" yaml:"override_snapshot_profiles"`
 }
 
 // InstancePostTarget represents the migration target host and operation.
@@ -148,9 +177,19 @@ type InstancePostTarget struct {
 	Operation string `json:"operation,omitempty" yaml:"operation,omitempty"`
 
 	// Migration websockets credentials
-	// Example: {"migration": "random-string", "criu": "random-string"}
+	// Example: {"migration": "random-string"}
 	Websockets map[string]string `json:"secrets,omitempty" yaml:"secrets,omitempty"`
 }
+
+const (
+	// DiskVolumesModeRoot represents the "root" disk volumes mode.
+	// This mode performs an action on the root disk only.
+	DiskVolumesModeRoot = "root"
+
+	// DiskVolumesModeAllExclusive represents the "all-exclusive" disk volumes mode.
+	// This mode performs an action on the root disk and all exclusive (non-shared) disk volumes.
+	DiskVolumesModeAllExclusive = "all-exclusive"
+)
 
 // InstancePut represents the modifiable fields of a LXD instance.
 //
@@ -182,6 +221,12 @@ type InstancePut struct {
 	// Example: snap0
 	Restore string `json:"restore,omitempty" yaml:"restore,omitempty"`
 
+	// Which disk volumes to restore from an instance snapshot. Possible values are "root" or "all-exclusive".
+	// Example: all-exclusive
+	//
+	// API extension: instance_snapshot_multi_volume
+	RestoreDiskVolumesMode string `json:"restore_disk_volumes_mode,omitempty" yaml:"restore_disk_volumes_mode,omitempty"`
+
 	// Whether the instance currently has saved state on disk
 	// Example: false
 	Stateful bool `json:"stateful" yaml:"stateful"`
@@ -207,6 +252,8 @@ type InstanceRebuildPost struct {
 //
 // API extension: instances.
 type Instance struct {
+	WithEntitlements `yaml:",inline"` //nolint:musttag
+
 	// Instance name
 	// Example: foo
 	Name string `json:"name" yaml:"name"`
@@ -322,6 +369,149 @@ func (c *Instance) SetWritable(put InstancePut) {
 	c.Description = put.Description
 }
 
+// ConfigKeyPolicy stores key rules used when transforming config maps.
+type ConfigKeyPolicy struct {
+	// Immutable is a list of keys whose values should be preserved from the source config.
+	Immutable []string
+
+	// Remove is a list of exact keys to remove.
+	Remove []string
+
+	// RemoveVolatile indicates whether to remove all volatile keys (keys with "volatile." prefix).
+	RemoveVolatile bool
+}
+
+// Apply applies the policy transformations to config.
+// It removes keys in Remove, optionally removes volatile keys, and preserves Immutable keys.
+// If immutableSource is nil, immutable keys are preserved from config itself.
+// If immutableSource is non-nil, immutable keys are preserved from immutableSource.
+func (p ConfigKeyPolicy) Apply(config map[string]string, immutableSource map[string]string) {
+	for _, key := range p.Remove {
+		delete(config, key)
+	}
+
+	if p.RemoveVolatile {
+		// Save immutable values before removing.
+		saved := make(map[string]string, len(p.Immutable))
+		for _, key := range p.Immutable {
+			value, exists := config[key]
+			if exists {
+				saved[key] = value
+			}
+		}
+
+		for key := range config {
+			if strings.HasPrefix(key, "volatile.") {
+				delete(config, key)
+			}
+		}
+
+		// Restore immutable keys.
+		maps.Copy(config, saved)
+	}
+
+	if immutableSource != nil {
+		for _, key := range p.Immutable {
+			value, exists := immutableSource[key]
+			if exists {
+				config[key] = value
+			} else {
+				delete(config, key)
+			}
+		}
+	}
+}
+
+// InstanceCreateConfigKeyPolicy is used for preparing config for new instance creation.
+var InstanceCreateConfigKeyPolicy = ConfigKeyPolicy{
+	Remove: []string{"volatile.last_state.power"},
+}
+
+// InstanceRefreshConfigKeyPolicy is used for preserving target-only keys during refresh.
+var InstanceRefreshConfigKeyPolicy = ConfigKeyPolicy{
+	Remove: []string{"volatile.apply_template"},
+	Immutable: []string{
+		"volatile.idmap.base",
+		"volatile.idmap.current",
+		"volatile.idmap.next",
+		"volatile.last_state.idmap",
+		"volatile.last_state.power",
+	},
+}
+
+// InstanceRemoteCopyConfigKeyPolicy is used for preparing config for remote instance copy.
+var InstanceRemoteCopyConfigKeyPolicy = ConfigKeyPolicy{
+	RemoveVolatile: true,
+	Immutable: []string{
+		"volatile.base_image", // Include volatile.base_image always as it can help optimize copies.
+	},
+}
+
+// ErrNoRootDisk means there is no root disk device found.
+var ErrNoRootDisk = errors.New("No root disk device found")
+
+// ErrMultipleRootDisks means more than one root disk device exists.
+var ErrMultipleRootDisks = errors.New("More than one root disk device found")
+
+// GetRootDiskDevice returns the local root disk device from a device map.
+// The returned values are the device name and its config map.
+// It returns [ErrNoRootDisk] when no root disk device exists.
+// It returns [ErrMultipleRootDisks] when more than one root disk device exists.
+func GetRootDiskDevice(devices map[string]map[string]string) (string, map[string]string, error) {
+	var devName string
+	var dev map[string]string
+
+	for n, d := range devices {
+		if d["type"] == "disk" && d["path"] == "/" && d["source"] == "" {
+			if devName != "" {
+				return "", nil, ErrMultipleRootDisks
+			}
+
+			devName = n
+			dev = d
+		}
+	}
+
+	if devName != "" {
+		return devName, dev, nil
+	}
+
+	return "", nil, ErrNoRootDisk
+}
+
+// ApplyRefreshConfig adjusts this instance config so it can be used as the body of a
+// refresh request against an existing target instance. The receiver is taken as the base
+// (source) and then selectively patched with values from the target that must not change
+// during a refresh. This helper is intended for clients constructing refresh requests.
+func (i *InstancePut) ApplyRefreshConfig(target Instance) {
+	if i.Config == nil {
+		i.Config = map[string]string{}
+	}
+
+	// Carry forward volatile keys that are specific to the target so the server does not reject the update for deleting protected keys.
+	InstanceRefreshConfigKeyPolicy.Apply(i.Config, target.Config)
+
+	srcRootDiskDeviceKey, _, srcRootErr := GetRootDiskDevice(i.Devices)
+	destRootDiskDeviceKey, destRootDiskDevice, destRootErr := GetRootDiskDevice(target.Devices)
+	if srcRootErr == nil && destRootErr == nil && srcRootDiskDeviceKey == destRootDiskDeviceKey {
+		if i.Devices == nil {
+			i.Devices = map[string]map[string]string{}
+		}
+
+		if i.Devices[destRootDiskDeviceKey] == nil {
+			i.Devices[destRootDiskDeviceKey] = map[string]string{}
+		}
+
+		// Keep the target's root disk pool (source and target may live on different storage pools)
+		pool, poolExists := destRootDiskDevice["pool"]
+		if poolExists {
+			i.Devices[destRootDiskDeviceKey]["pool"] = pool
+		} else {
+			delete(i.Devices[destRootDiskDeviceKey], "pool")
+		}
+	}
+}
+
 // IsActive checks whether the instance state indicates the instance is active.
 //
 // API extension: instances.
@@ -349,7 +539,7 @@ func (c *Instance) URL(apiVersion string, project string) *URL {
 type InstanceSource struct {
 	// Source type
 	// Example: image
-	Type string `json:"type" yaml:"type"`
+	Type SourceType `json:"type" yaml:"type"`
 
 	// Certificate (for remote images or migration)
 	// Example: X509 PEM certificate
@@ -362,6 +552,12 @@ type InstanceSource struct {
 	// Image fingerprint (for image source)
 	// Example: ed56997f7c5b48e8d78986d2467a26109be6fb9f2d92e8c7b08eb8b6cec7629a
 	Fingerprint string `json:"fingerprint,omitempty" yaml:"fingerprint,omitempty"`
+
+	// Image registry name
+	// Example: ubuntu
+	//
+	// API extension: image_registries
+	ImageRegistry string `json:"image_registry" yaml:"image_registry"`
 
 	// Image filters (for image source)
 	// Example: {"os": "Ubuntu", "release": "jammy", "variant": "cloud"}
@@ -409,7 +605,9 @@ type InstanceSource struct {
 
 	// Whether the copy should skip the snapshots (for copy, deprecated, use instance_only)
 	// Example: false
-	ContainerOnly bool `json:"container_only,omitempty" yaml:"container_only,omitempty"` // Deprecated, use InstanceOnly.
+	//
+	// Deprecated: Use InstanceOnly.
+	ContainerOnly bool `json:"container_only,omitempty" yaml:"container_only,omitempty"`
 
 	// Whether this is refreshing an existing instance (for migration and copy)
 	// Example: false
@@ -437,6 +635,18 @@ type InstanceSource struct {
 	//
 	// API extension: instance_import_conversion
 	ConversionOptions []string `json:"conversion_options" yaml:"conversion_options"`
+
+	// Whether the instances's snapshot should receive target instances profile on copy
+	// Example: true
+	//
+	// API extension: override_snapshot_profiles_on_copy
+	OverrideSnapshotProfiles bool `json:"override_snapshot_profiles" yaml:"override_snapshot_profiles"`
+
+	// Which disk volumes the migration transfers with the instance (for migration)
+	// Example: all-exclusive
+	//
+	// API extension: replicator_custom_volumes
+	DiskVolumesMode string `json:"disk_volumes_mode,omitempty" yaml:"disk_volumes_mode,omitempty"`
 }
 
 // InstanceUEFIVars represents the UEFI variables of a LXD virtual machine.

@@ -1,5 +1,5 @@
 ---
-relatedlinks: '[How&#32;to&#32;install&#32;a&#32;Windows&#32;11&#32;VM&#32;using&#32;LXD](https://ubuntu.com/tutorials/how-to-install-a-windows-11-vm-using-lxd)'
+relatedlinks: "[How&#32;to&#32;install&#32;a&#32;Windows&#32;11&#32;VM&#32;using&#32;LXD](https://ubuntu.com/tutorials/how-to-install-a-windows-11-vm-using-lxd)"
 ---
 
 (images-create)=
@@ -69,7 +69,7 @@ See [`POST /1.0/images`](swagger:/images/images_post) for more information.
 The UI does not currently support publishing an image from an instance, but you can publish from a snapshot.
 
 To do so, go to the instance detail page and switch to the {guilabel}`Snapshots` tab.
-Then click the {guilabel}`Create image` button ({{create_image_button}}) and optionally enter an alias for the new image.
+Then click the create image button {{create_image_button}} and optionally enter an alias for the new image.
 You can also choose whether the image should be publicly available.
 
 Publishing the image might take a few minutes.

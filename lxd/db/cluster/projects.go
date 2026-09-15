@@ -5,7 +5,9 @@ package cluster
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
+	"net/http"
 
 	"github.com/canonical/lxd/lxd/db/query"
 	"github.com/canonical/lxd/shared"
@@ -26,13 +28,65 @@ import (
 //go:generate mapper stmt -e project update struct=Project
 //go:generate mapper stmt -e project delete-by-Name
 //
-//go:generate mapper method -i -e project GetMany references=Config
+//go:generate mapper method -i -e project GetMany
 //go:generate mapper method -i -e project GetOne struct=Project
-//go:generate mapper method -i -e project Exists struct=Project
 //go:generate mapper method -i -e project Create references=Config
 //go:generate mapper method -i -e project ID struct=Project
 //go:generate mapper method -i -e project Rename
 //go:generate mapper method -i -e project DeleteOne-by-Name
+//go:generate goimports -w projects.mapper.go
+//go:generate goimports -w projects.interface.mapper.go
+
+// ProjectReplicaMode represents the replica mode of a project stored as an integer in the database.
+//
+// This type implements the [sql.Scanner] and [driver.Valuer] interfaces to automatically handle
+// conversion between API constants and their int64 representation in the database.
+// When reading from the database, int64 values are converted back to their API constant.
+// When writing to the database, API constants are converted to their int64 representation.
+type ProjectReplicaMode string
+
+const (
+	projectReplicaModeNone    int64 = 0
+	projectReplicaModeLeader  int64 = 1
+	projectReplicaModeStandby int64 = 2
+)
+
+// ScanInteger implements [query.IntegerScanner] for [ProjectReplicaMode].
+func (p *ProjectReplicaMode) ScanInteger(code int64) error {
+	switch code {
+	case projectReplicaModeNone:
+		*p = ""
+	case projectReplicaModeLeader:
+		*p = api.ReplicatorProjectModeLeader
+	case projectReplicaModeStandby:
+		*p = api.ReplicatorProjectModeStandby
+	default:
+		return fmt.Errorf("Unknown project replica mode %d", code)
+	}
+
+	return nil
+}
+
+// Scan implements [sql.Scanner] for [ProjectReplicaMode]. This converts the database integer value
+// back into the correct API constant or returns an error.
+func (p *ProjectReplicaMode) Scan(value any) error {
+	return query.ScanValue(value, p, false)
+}
+
+// Value implements [driver.Valuer] for [ProjectReplicaMode]. This converts the API constant into
+// its integer database representation or returns an error.
+func (p ProjectReplicaMode) Value() (driver.Value, error) {
+	switch p {
+	case "":
+		return projectReplicaModeNone, nil
+	case api.ReplicatorProjectModeLeader:
+		return projectReplicaModeLeader, nil
+	case api.ReplicatorProjectModeStandby:
+		return projectReplicaModeStandby, nil
+	}
+
+	return nil, fmt.Errorf("Invalid project replica mode %q", p)
+}
 
 // ProjectFeature indicates the behaviour of a project feature.
 type ProjectFeature struct {
@@ -69,7 +123,8 @@ var ProjectFeatures = map[string]ProjectFeature{
 type Project struct {
 	ID          int
 	Description string
-	Name        string `db:"omit=update"`
+	Name        string             `db:"omit=update"`
+	ReplicaMode ProjectReplicaMode `db:"omit=update"`
 }
 
 // ProjectFilter specifies potential query parameter fields.
@@ -83,15 +138,34 @@ func (p *Project) ToAPI(ctx context.Context, tx *sql.Tx) (*api.Project, error) {
 	apiProject := &api.Project{
 		Name:        p.Name,
 		Description: p.Description,
+		ReplicaMode: string(p.ReplicaMode),
 	}
 
 	var err error
-	apiProject.Config, err = GetProjectConfig(ctx, tx, p.ID)
+	apiProject.Config, err = GetProjectConfig(ctx, tx, p.Name)
 	if err != nil {
 		return nil, fmt.Errorf("Failed loading project config: %w", err)
 	}
 
 	return apiProject, nil
+}
+
+// GetProjectByID returns the project with the given ID.
+func GetProjectByID(ctx context.Context, tx *sql.Tx, id int) (*Project, error) {
+	projectFilter := ProjectFilter{ID: &id}
+	projects, err := GetProjects(ctx, tx, projectFilter)
+	if err != nil {
+		return nil, err
+	}
+
+	switch len(projects) {
+	case 0:
+		return nil, api.NewStatusError(http.StatusNotFound, "No project found with given ID")
+	case 1:
+		return &projects[0], nil
+	default:
+		return nil, fmt.Errorf("Multiple projects found with ID %d", id)
+	}
 }
 
 // ProjectHasProfiles is a helper to check if a project has the profiles
@@ -115,7 +189,35 @@ SELECT projects_config.value
 	return shared.IsTrue(values[0]), nil
 }
 
-// GetProjectNames returns the names of all availablprojects.
+// GetProjectConfig is a helper to return a config of a project.
+func GetProjectConfig(ctx context.Context, tx *sql.Tx, projectName string) (map[string]string, error) {
+	projectID, err := GetProjectID(ctx, tx, projectName)
+	if err != nil {
+		return nil, fmt.Errorf("Failed loading project: %w", err)
+	}
+
+	stmt := `SELECT projects_config.key, projects_config.value FROM projects_config WHERE projects_config.project_id = ?
+	`
+
+	result := make(map[string]string)
+	err = query.Scan(ctx, tx, stmt, func(scan func(dest ...any) error) error {
+		var key, value string
+		err := scan(&key, &value)
+		if err != nil {
+			return err
+		}
+
+		result[key] = value
+		return nil
+	}, projectID)
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// GetProjectNames returns the names of all available projects.
 func GetProjectNames(ctx context.Context, tx *sql.Tx) ([]string, error) {
 	stmt := "SELECT name FROM projects"
 
@@ -127,34 +229,52 @@ func GetProjectNames(ctx context.Context, tx *sql.Tx) ([]string, error) {
 	return names, nil
 }
 
-// GetProjectIDsToNames returns a map associating each prect ID to its
+// GetProjectsSharingDefaultImages returns the names of all projects using
+// images stored in the "default" project. That is, it returns all projects
+// with "features.images=false" and the "default" project itself.
+func GetProjectsSharingDefaultImages(ctx context.Context, tx *sql.Tx) ([]string, error) {
+	// Here we filter for the "default" project and all other projects
+	// which do not have "features.images=true". This latter part is because
+	// we treat the absence of "features.images" key the same as "features.images=false".
+	stmt := `
+	SELECT name FROM projects
+	WHERE (
+		name='default' OR
+		id NOT IN (
+			SELECT project_id
+			FROM projects_config
+			WHERE key = 'features.images' AND value = 'true'
+		)
+	)`
+
+	projectNames, err := query.SelectStrings(ctx, tx, stmt)
+	if err != nil {
+		return nil, fmt.Errorf("Failed fetching project names: %w", err)
+	}
+
+	return projectNames, nil
+}
+
+// GetProjectIDsToNames returns a map associating each project ID to its
 // project name.
 func GetProjectIDsToNames(ctx context.Context, tx *sql.Tx) (map[int64]string, error) {
 	stmt := "SELECT id, name FROM projects"
 
-	rows, err := tx.QueryContext(ctx, stmt)
-	if err != nil {
-		return nil, err
-	}
-
-	defer func() { _ = rows.Close() }()
-
 	result := map[int64]string{}
-	for i := 0; rows.Next(); i++ {
+	err := query.Scan(ctx, tx, stmt, func(scan func(dest ...any) error) error {
 		var id int64
 		var name string
 
-		err := rows.Scan(&id, &name)
+		err := scan(&id, &name)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		result[id] = name
-	}
-
-	err = rows.Err()
+		return nil
+	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Fetch project IDs to names: %w", err)
 	}
 
 	return result, nil
@@ -163,12 +283,7 @@ func GetProjectIDsToNames(ctx context.Context, tx *sql.Tx) (map[int64]string, er
 // ProjectHasImages is a helper to check if a project has the images
 // feature enabled.
 func ProjectHasImages(ctx context.Context, tx *sql.Tx, name string) (bool, error) {
-	project, err := GetProject(ctx, tx, name)
-	if err != nil {
-		return false, fmt.Errorf("fetch project: %w", err)
-	}
-
-	config, err := GetProjectConfig(ctx, tx, project.ID)
+	config, err := GetProjectConfig(ctx, tx, name)
 	if err != nil {
 		return false, err
 	}
@@ -187,7 +302,7 @@ func UpdateProject(ctx context.Context, tx *sql.Tx, name string, object api.Proj
 
 	stmt, err := Stmt(tx, projectUpdate)
 	if err != nil {
-		return fmt.Errorf("Failed to get \"projectUpdate\" prepared statement: %w", err)
+		return fmt.Errorf("Failed getting \"projectUpdate\" prepared statement: %w", err)
 	}
 
 	result, err := stmt.Exec(object.Description, id)
@@ -233,4 +348,49 @@ func InitProjectWithoutImages(ctx context.Context, tx *sql.Tx, project string) e
 	SELECT images.id, ? FROM images WHERE project_id=1`
 	_, err = tx.Exec(stmt, defaultProfileID)
 	return err
+}
+
+// GetAllProjectsConfig returns a map of project name to config map.
+func GetAllProjectsConfig(ctx context.Context, tx *sql.Tx) (map[string]map[string]string, error) {
+	projectConfigs := make(map[string]map[string]string)
+	err := query.Scan(ctx, tx, "SELECT projects.name, projects_config.key, projects_config.value FROM projects JOIN projects_config ON projects.id = projects_config.project_id", func(scan func(dest ...any) error) error {
+		var projectName, key, value string
+		err := scan(&projectName, &key, &value)
+		if err != nil {
+			return err
+		}
+
+		projectConfig, ok := projectConfigs[projectName]
+		if !ok {
+			projectConfigs[projectName] = map[string]string{key: value}
+			return nil
+		}
+
+		projectConfig[key] = value
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return projectConfigs, nil
+}
+
+// UpdateProjectReplicaMode updates the replica_mode field for the project with the given name.
+func UpdateProjectReplicaMode(ctx context.Context, tx *sql.Tx, projectName string, replicaMode string) error {
+	result, err := tx.ExecContext(ctx, `UPDATE projects SET replica_mode = ? WHERE name = ?`, ProjectReplicaMode(replicaMode), projectName)
+	if err != nil {
+		return err
+	}
+
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+
+	if n != 1 {
+		return fmt.Errorf("Query updated %d rows instead of 1", n)
+	}
+
+	return nil
 }

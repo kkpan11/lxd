@@ -12,7 +12,6 @@ import (
 
 	"github.com/canonical/lxd/shared"
 	cli "github.com/canonical/lxd/shared/cmd"
-	"github.com/canonical/lxd/shared/i18n"
 	"github.com/canonical/lxd/shared/termios"
 )
 
@@ -24,9 +23,8 @@ type cmdConfigTemplate struct {
 func (c *cmdConfigTemplate) command() *cobra.Command {
 	cmd := &cobra.Command{}
 	cmd.Use = usage("template")
-	cmd.Short = i18n.G("Manage instance file templates")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Manage instance file templates`))
+	cmd.Short = "Manage instance file templates"
+	cmd.Long = cli.FormatSection("Description", cmd.Short)
 
 	// Create
 	configTemplateCreateCmd := cmdConfigTemplateCreate{global: c.global, config: c.config, configTemplate: c}
@@ -63,16 +61,15 @@ type cmdConfigTemplateCreate struct {
 
 func (c *cmdConfigTemplateCreate) command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("create", i18n.G("[<remote>:]<instance> <template>"))
-	cmd.Short = i18n.G("Create new instance file templates")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Create new instance file templates`))
+	cmd.Use = usage("create", "[<remote>:]<instance> <template>")
+	cmd.Short = "Create new instance file template"
+	cmd.Long = cli.FormatSection("Description", cmd.Short)
 
 	cmd.RunE = c.run
 
 	cmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		if len(args) == 0 {
-			return c.global.cmpInstances(toComplete)
+			return c.global.cmpTopLevelResource("instance", toComplete)
 		}
 
 		return nil, cobra.ShellCompDirectiveNoFileComp
@@ -97,7 +94,7 @@ func (c *cmdConfigTemplateCreate) run(cmd *cobra.Command, args []string) error {
 	resource := resources[0]
 
 	if resource.name == "" {
-		return errors.New(i18n.G("Missing instance name"))
+		return errors.New("Missing instance name")
 	}
 
 	// Create instance file template
@@ -113,17 +110,15 @@ type cmdConfigTemplateDelete struct {
 
 func (c *cmdConfigTemplateDelete) command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("delete", i18n.G("[<remote>:]<instance> <template>"))
+	cmd.Use = usage("delete", "[<remote>:]<instance> <template>")
 	cmd.Aliases = []string{"rm"}
-	cmd.Short = i18n.G("Delete instance file templates")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Delete instance file templates`))
-
+	cmd.Short = "Delete instance file template"
+	cmd.Long = cli.FormatSection("Description", cmd.Short)
 	cmd.RunE = c.run
 
 	cmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		if len(args) == 0 {
-			return c.global.cmpInstances(toComplete)
+			return c.global.cmpTopLevelResource("instance", toComplete)
 		}
 
 		if len(args) == 1 {
@@ -152,7 +147,7 @@ func (c *cmdConfigTemplateDelete) run(cmd *cobra.Command, args []string) error {
 	resource := resources[0]
 
 	if resource.name == "" {
-		return errors.New(i18n.G("Missing instance name"))
+		return errors.New("Missing instance name")
 	}
 
 	// Delete instance file template
@@ -168,16 +163,15 @@ type cmdConfigTemplateEdit struct {
 
 func (c *cmdConfigTemplateEdit) command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("edit", i18n.G("[<remote>:]<instance> <template>"))
-	cmd.Short = i18n.G("Edit instance file templates")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Edit instance file templates`))
+	cmd.Use = usage("edit", "[<remote>:]<instance> <template>")
+	cmd.Short = "Edit instance file template"
+	cmd.Long = cli.FormatSection("Description", cmd.Short)
 
 	cmd.RunE = c.run
 
 	cmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		if len(args) == 0 {
-			return c.global.cmpInstances(toComplete)
+			return c.global.cmpTopLevelResource("instance", toComplete)
 		}
 
 		if len(args) == 1 {
@@ -206,7 +200,7 @@ func (c *cmdConfigTemplateEdit) run(cmd *cobra.Command, args []string) error {
 	resource := resources[0]
 
 	if resource.name == "" {
-		return errors.New(i18n.G("Missing instance name"))
+		return errors.New("Missing instance name")
 	}
 
 	// Edit instance file template
@@ -235,8 +229,8 @@ func (c *cmdConfigTemplateEdit) run(cmd *cobra.Command, args []string) error {
 		err := resource.server.CreateInstanceTemplateFile(resource.name, args[1], reader)
 		// Respawn the editor
 		if err != nil {
-			fmt.Fprintf(os.Stderr, i18n.G("Error updating template file: %s")+"\n", err)
-			fmt.Println(i18n.G("Press enter to open the editor again or ctrl+c to abort change"))
+			fmt.Fprintf(os.Stderr, "Error updating template file: %s\n", err)
+			fmt.Println("Press enter to open the editor again or ctrl+c to abort change")
 
 			_, err := os.Stdin.Read(make([]byte, 1))
 			if err != nil {
@@ -263,22 +257,30 @@ type cmdConfigTemplateList struct {
 	config         *cmdConfig
 	configTemplate *cmdConfigTemplate
 
-	flagFormat string
+	flagFormat  string
+	flagColumns string
+}
+
+// columns returns the ordered column definitions for config template list.
+func (c *cmdConfigTemplateList) columns() []cli.ShorthandColumn[string] {
+	return []cli.ShorthandColumn[string]{
+		{Shorthand: 'f', Name: "FILENAME", Data: c.filenameColumnData},
+	}
 }
 
 func (c *cmdConfigTemplateList) command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("list", i18n.G("[<remote>:]<instance>"))
-	cmd.Short = i18n.G("List instance file templates")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`List instance file templates`))
-	cmd.Flags().StringVarP(&c.flagFormat, "format", "f", "table", i18n.G("Format (csv|json|table|yaml|compact)")+"``")
+	cmd.Use = usage("list", "[<remote>:]<instance>")
+	cmd.Short = "List instance file templates"
+	cmd.Long = cli.FormatSection("Description", cmd.Short)
+	cmd.Flags().StringVarP(&c.flagFormat, "format", "f", "table", cli.FormatStringFlagLabel("Format (csv|json|table|yaml|compact)"))
+	cmd.Flags().StringVarP(&c.flagColumns, "columns", "c", cli.DefaultColumnString(c.columns()), cli.FormatStringFlagLabel("Columns"))
 
 	cmd.RunE = c.run
 
 	cmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		if len(args) == 0 {
-			return c.global.cmpInstances(toComplete)
+			return c.global.cmpTopLevelResource("instance", toComplete)
 		}
 
 		return nil, cobra.ShellCompDirectiveNoFileComp
@@ -303,7 +305,7 @@ func (c *cmdConfigTemplateList) run(cmd *cobra.Command, args []string) error {
 	resource := resources[0]
 
 	if resource.name == "" {
-		return errors.New(i18n.G("Missing instance name"))
+		return errors.New("Missing instance name")
 	}
 
 	// List the templates
@@ -313,18 +315,21 @@ func (c *cmdConfigTemplateList) run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Render the table
-	data := [][]string{}
-	for _, template := range templates {
-		data = append(data, []string{template})
+	// Parse column flags.
+	columns, err := cli.ParseShorthandColumns(c.flagColumns, c.columns())
+	if err != nil {
+		return err
 	}
 
+	data := cli.ColumnData(columns, templates)
 	sort.Sort(cli.SortColumnsNaturally(data))
-
-	header := []string{
-		i18n.G("FILENAME"),
-	}
+	header := cli.ColumnHeaders(columns)
 
 	return cli.RenderTable(c.flagFormat, header, data, templates)
+}
+
+func (c *cmdConfigTemplateList) filenameColumnData(template string) string {
+	return template
 }
 
 // Show.
@@ -336,16 +341,15 @@ type cmdConfigTemplateShow struct {
 
 func (c *cmdConfigTemplateShow) command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("show", i18n.G("[<remote>:]<instance> <template>"))
-	cmd.Short = i18n.G("Show content of instance file templates")
-	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Show content of instance file templates`))
+	cmd.Use = usage("show", "[<remote>:]<instance> <template>")
+	cmd.Short = "Show content of instance file template"
+	cmd.Long = cli.FormatSection("Description", cmd.Short)
 
 	cmd.RunE = c.run
 
 	cmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		if len(args) == 0 {
-			return c.global.cmpInstances(toComplete)
+			return c.global.cmpTopLevelResource("instance", toComplete)
 		}
 
 		if len(args) == 1 {
@@ -374,7 +378,7 @@ func (c *cmdConfigTemplateShow) run(cmd *cobra.Command, args []string) error {
 	resource := resources[0]
 
 	if resource.name == "" {
-		return errors.New(i18n.G("Missing instance name"))
+		return errors.New("Missing instance name")
 	}
 
 	// Show the template

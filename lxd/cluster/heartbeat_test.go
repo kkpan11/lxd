@@ -4,10 +4,12 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
-	"github.com/canonical/go-dqlite/driver"
+	"github.com/canonical/go-dqlite/v3/driver"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -86,6 +88,7 @@ type heartbeatFixture struct {
 func (f *heartbeatFixture) Bootstrap() *cluster.Gateway {
 	f.t.Logf("create bootstrap node for test cluster")
 	state, gateway, _ := f.node()
+	state.ServerClustered = true
 
 	err := cluster.Bootstrap(state, gateway, "buzz")
 	require.NoError(f.t, err)
@@ -123,7 +126,7 @@ func (f *heartbeatFixture) Leader() *cluster.Gateway {
 		for _, gateway := range f.gateways {
 			isLeader, err := gateway.IsLeader()
 			if err != nil {
-				f.t.Errorf("failed to check leadership: %v", err)
+				f.t.Errorf("failed checking leadership: %v", err)
 			}
 
 			if isLeader {
@@ -152,7 +155,7 @@ func (f *heartbeatFixture) Follower() *cluster.Gateway {
 		for _, gateway := range f.gateways {
 			isLeader, err := gateway.IsLeader()
 			if err != nil {
-				f.t.Errorf("failed to check leadership: %v", err)
+				f.t.Errorf("failed checking leadership: %v", err)
 			}
 
 			if !isLeader {
@@ -221,11 +224,13 @@ func (f *heartbeatFixture) node() (*state.State, *cluster.Gateway, string) {
 	mf := &membershipFixtures{t: f.t, state: state}
 	mf.ClusterAddress(address)
 
-	var err error
+	serverUUID, err := uuid.NewV7()
+	require.NoError(f.t, err)
+
 	require.NoError(f.t, state.DB.Cluster.Close())
 	store := gateway.NodeStore()
 	dial := gateway.DialFunc()
-	state.DB.Cluster, err = db.OpenCluster(context.Background(), "db.bin", store, address, "/unused/db/dir", 5*time.Second, nil, driver.WithDialFunc(dial))
+	state.DB.Cluster, err = db.OpenCluster(context.Background(), "db.bin", store, address, "/unused/db/dir", 5*time.Second, serverUUID.String(), driver.WithDialFunc(dial))
 	require.NoError(f.t, err)
 
 	err = state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
@@ -259,8 +264,8 @@ func (f *heartbeatFixture) node() (*state.State, *cluster.Gateway, string) {
 
 func (f *heartbeatFixture) Cleanup() {
 	// Run the cleanups in reverse order
-	for i := len(f.cleanups) - 1; i >= 0; i-- {
-		f.cleanups[i]()
+	for _, v := range slices.Backward(f.cleanups) {
+		v()
 	}
 
 	for _, server := range f.servers {

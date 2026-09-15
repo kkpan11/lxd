@@ -8,13 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/canonical/lxd/lxd/metrics"
 	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/lxd/storage/filesystem"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/logger"
 )
 
@@ -22,7 +22,7 @@ import (
 // /var/lib/docker/* subdirectories are excluded for this reason: https://github.com/prometheus/node_exporter/pull/1003
 var defMountPointsExcluded = regexp.MustCompile(`^/(?:dev|proc|sys|var/lib/docker/.+)(?:$|/)`)
 var defFSTypesExcluded = []string{
-	"autofs", "binfmt_misc", "bpf", "cgroup", "cgroup2", "configfs", "debugfs", "devpts", "devtmpfs", "fusectl", "hugetlbfs", "iso9660", "mqueue", "nsfs", "overlay", "proc", "procfs", "pstore", "rpc_pipefs", "securityfs", "selinuxfs", "squashfs", "sysfs", "tracefs"}
+	"autofs", "binfmt_misc", "bpf", "cgroup", "cgroup2", "configfs", "debugfs", "devpts", "devtmpfs", "fusectl", "fuse.lxcfs", "hugetlbfs", "iso9660", "mqueue", "nsfs", "overlay", "proc", "procfs", "pstore", "rpc_pipefs", "securityfs", "selinuxfs", "squashfs", "sysfs", "tracefs"}
 
 var metricsCmd = APIEndpoint{
 	Path: "metrics",
@@ -35,40 +35,40 @@ func metricsGet(d *Daemon, r *http.Request) response.Response {
 
 	diskStats, err := getDiskMetrics()
 	if err != nil {
-		logger.Warn("Failed to get disk metrics", logger.Ctx{"err": err})
+		logger.Warn("Failed getting disk metrics", logger.Ctx{"err": err})
 	} else {
 		out.Disk = diskStats
 	}
 
 	filesystemStats, err := getFilesystemMetrics()
 	if err != nil {
-		logger.Warn("Failed to get filesystem metrics", logger.Ctx{"err": err})
+		logger.Warn("Failed getting filesystem metrics", logger.Ctx{"err": err})
 	} else {
 		out.Filesystem = filesystemStats
 	}
 
 	memStats, err := getMemoryMetrics()
 	if err != nil {
-		logger.Warn("Failed to get memory metrics", logger.Ctx{"err": err})
+		logger.Warn("Failed getting memory metrics", logger.Ctx{"err": err})
 	} else {
 		out.Memory = memStats
 	}
 
 	netStats, err := getNetworkMetrics()
 	if err != nil {
-		logger.Warn("Failed to get network metrics", logger.Ctx{"err": err})
+		logger.Warn("Failed getting network metrics", logger.Ctx{"err": err})
 	} else {
 		out.Network = netStats
 	}
 
 	out.ProcessesTotal, err = getTotalProcesses()
 	if err != nil {
-		logger.Warn("Failed to get total processes", logger.Ctx{"err": err})
+		logger.Warn("Failed getting total processes", logger.Ctx{"err": err})
 	}
 
 	cpuStats, err := getCPUMetrics()
 	if err != nil {
-		logger.Warn("Failed to get CPU metrics", logger.Ctx{"err": err})
+		logger.Warn("Failed getting CPU metrics", logger.Ctx{"err": err})
 	} else {
 		out.CPU = cpuStats
 	}
@@ -79,7 +79,7 @@ func metricsGet(d *Daemon, r *http.Request) response.Response {
 func getCPUMetrics() (map[string]metrics.CPUMetrics, error) {
 	stats, err := os.ReadFile("/proc/stat")
 	if err != nil {
-		return nil, fmt.Errorf("Failed to read /proc/stat: %w", err)
+		return nil, fmt.Errorf("Failed reading /proc/stat: %w", err)
 	}
 
 	out := map[string]metrics.CPUMetrics{}
@@ -104,61 +104,65 @@ func getCPUMetrics() (map[string]metrics.CPUMetrics, error) {
 
 		stats.SecondsUser, err = strconv.ParseFloat(fields[1], 64)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to parse %q: %w", fields[1], err)
+			return nil, fmt.Errorf("Failed parsing %q: %w", fields[1], err)
 		}
 
 		stats.SecondsUser /= 100
 
 		stats.SecondsNice, err = strconv.ParseFloat(fields[2], 64)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to parse %q: %w", fields[2], err)
+			return nil, fmt.Errorf("Failed parsing %q: %w", fields[2], err)
 		}
 
 		stats.SecondsNice /= 100
 
 		stats.SecondsSystem, err = strconv.ParseFloat(fields[3], 64)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to parse %q: %w", fields[3], err)
+			return nil, fmt.Errorf("Failed parsing %q: %w", fields[3], err)
 		}
 
 		stats.SecondsSystem /= 100
 
 		stats.SecondsIdle, err = strconv.ParseFloat(fields[4], 64)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to parse %q: %w", fields[4], err)
+			return nil, fmt.Errorf("Failed parsing %q: %w", fields[4], err)
 		}
 
 		stats.SecondsIdle /= 100
 
 		stats.SecondsIOWait, err = strconv.ParseFloat(fields[5], 64)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to parse %q: %w", fields[5], err)
+			return nil, fmt.Errorf("Failed parsing %q: %w", fields[5], err)
 		}
 
 		stats.SecondsIOWait /= 100
 
 		stats.SecondsIRQ, err = strconv.ParseFloat(fields[6], 64)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to parse %q: %w", fields[6], err)
+			return nil, fmt.Errorf("Failed parsing %q: %w", fields[6], err)
 		}
 
 		stats.SecondsIRQ /= 100
 
 		stats.SecondsSoftIRQ, err = strconv.ParseFloat(fields[7], 64)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to parse %q: %w", fields[7], err)
+			return nil, fmt.Errorf("Failed parsing %q: %w", fields[7], err)
 		}
 
 		stats.SecondsSoftIRQ /= 100
 
 		stats.SecondsSteal, err = strconv.ParseFloat(fields[8], 64)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to parse %q: %w", fields[8], err)
+			return nil, fmt.Errorf("Failed parsing %q: %w", fields[8], err)
 		}
 
 		stats.SecondsSteal /= 100
 
 		out[fields[0]] = stats
+	}
+
+	if scanner.Err() != nil {
+		return nil, fmt.Errorf("Failed scanning /proc/stat: %w", scanner.Err())
 	}
 
 	return out, nil
@@ -167,7 +171,7 @@ func getCPUMetrics() (map[string]metrics.CPUMetrics, error) {
 func getTotalProcesses() (uint64, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
-		return 0, fmt.Errorf("Failed to read dir %q: %w", "/proc", err)
+		return 0, fmt.Errorf("Failed reading dir %q: %w", "/proc", err)
 	}
 
 	pidCount := uint64(0)
@@ -206,7 +210,7 @@ func getTotalProcesses() (uint64, error) {
 func getDiskMetrics() (map[string]metrics.DiskMetrics, error) {
 	diskStats, err := os.ReadFile("/proc/diskstats")
 	if err != nil {
-		return nil, fmt.Errorf("Failed to read /proc/diskstats: %w", err)
+		return nil, fmt.Errorf("Failed reading /proc/diskstats: %w", err)
 	}
 
 	out := map[string]metrics.DiskMetrics{}
@@ -228,29 +232,33 @@ func getDiskMetrics() (map[string]metrics.DiskMetrics, error) {
 
 		stats.ReadsCompleted, err = strconv.ParseUint(fields[3], 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to parse %q: %w", fields[3], err)
+			return nil, fmt.Errorf("Failed parsing %q: %w", fields[3], err)
 		}
 
 		sectorsRead, err := strconv.ParseUint(fields[5], 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to parse %q: %w", fields[3], err)
+			return nil, fmt.Errorf("Failed parsing %q: %w", fields[5], err)
 		}
 
 		stats.ReadBytes = sectorsRead * 512
 
 		stats.WritesCompleted, err = strconv.ParseUint(fields[7], 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to parse %q: %w", fields[3], err)
+			return nil, fmt.Errorf("Failed parsing %q: %w", fields[7], err)
 		}
 
 		sectorsWritten, err := strconv.ParseUint(fields[9], 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to parse %q: %w", fields[3], err)
+			return nil, fmt.Errorf("Failed parsing %q: %w", fields[9], err)
 		}
 
 		stats.WrittenBytes = sectorsWritten * 512
 
 		out[fields[2]] = stats
+	}
+
+	if scanner.Err() != nil {
+		return nil, fmt.Errorf("Failed scanning /proc/diskstats: %w", scanner.Err())
 	}
 
 	return out, nil
@@ -259,7 +267,7 @@ func getDiskMetrics() (map[string]metrics.DiskMetrics, error) {
 func getFilesystemMetrics() (map[string]metrics.FilesystemMetrics, error) {
 	mounts, err := os.ReadFile("/proc/mounts")
 	if err != nil {
-		return nil, fmt.Errorf("Failed to read /proc/mounts: %w", err)
+		return nil, fmt.Errorf("Failed reading /proc/mounts: %w", err)
 	}
 
 	out := map[string]metrics.FilesystemMetrics{}
@@ -274,7 +282,7 @@ func getFilesystemMetrics() (map[string]metrics.FilesystemMetrics, error) {
 		}
 
 		// Skip uninteresting mounts
-		if shared.ValueInSlice(fields[2], defFSTypesExcluded) || defMountPointsExcluded.MatchString(fields[1]) {
+		if slices.Contains(defFSTypesExcluded, fields[2]) || defMountPointsExcluded.MatchString(fields[1]) {
 			continue
 		}
 
@@ -284,7 +292,7 @@ func getFilesystemMetrics() (map[string]metrics.FilesystemMetrics, error) {
 
 		statfs, err := filesystem.StatVFS(stats.Mountpoint)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to stat %s: %w", stats.Mountpoint, err)
+			return nil, fmt.Errorf("Failed statting %s: %w", stats.Mountpoint, err)
 		}
 
 		fsType, err := filesystem.FSTypeToName(int32(statfs.Type))
@@ -299,13 +307,17 @@ func getFilesystemMetrics() (map[string]metrics.FilesystemMetrics, error) {
 		out[fields[0]] = stats
 	}
 
+	if scanner.Err() != nil {
+		return nil, fmt.Errorf("Failed scanning /proc/mounts: %w", scanner.Err())
+	}
+
 	return out, nil
 }
 
 func getMemoryMetrics() (metrics.MemoryMetrics, error) {
 	content, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
-		return metrics.MemoryMetrics{}, fmt.Errorf("Failed to read /proc/meminfo: %w", err)
+		return metrics.MemoryMetrics{}, fmt.Errorf("Failed reading /proc/meminfo: %w", err)
 	}
 
 	out := metrics.MemoryMetrics{}
@@ -323,7 +335,7 @@ func getMemoryMetrics() (metrics.MemoryMetrics, error) {
 
 		value, err := strconv.ParseUint(fields[1], 10, 64)
 		if err != nil {
-			return metrics.MemoryMetrics{}, fmt.Errorf("Failed to parse %q: %w", fields[1], err)
+			return metrics.MemoryMetrics{}, fmt.Errorf("Failed parsing %q: %w", fields[1], err)
 		}
 
 		// Multiply suffix (kB)
@@ -331,7 +343,7 @@ func getMemoryMetrics() (metrics.MemoryMetrics, error) {
 			value *= 1024
 		}
 
-		// FIXME: Missing RSS
+		// Parse fields for metrics collection
 		switch fields[0] {
 		case "Active":
 			out.ActiveBytes = value
@@ -339,6 +351,8 @@ func getMemoryMetrics() (metrics.MemoryMetrics, error) {
 			out.ActiveAnonBytes = value
 		case "Active(file)":
 			out.ActiveFileBytes = value
+		case "Buffers":
+			// No dedicated field in MemoryMetrics for Buffers
 		case "Cached":
 			out.CachedBytes = value
 		case "Dirty":
@@ -363,6 +377,8 @@ func getMemoryMetrics() (metrics.MemoryMetrics, error) {
 			out.MemTotalBytes = value
 		case "Shmem":
 			out.ShmemBytes = value
+		case "SReclaimable":
+			out.SReclaimableBytes = value
 		case "SwapCached":
 			out.SwapBytes = value
 		case "Unevictable":
@@ -370,6 +386,17 @@ func getMemoryMetrics() (metrics.MemoryMetrics, error) {
 		case "Writeback":
 			out.WritebackBytes = value
 		}
+	}
+
+	// Calculate RSS using the simpler and more modern approach
+	if out.MemTotalBytes > out.MemAvailableBytes {
+		// Formula: RSS = MemTotal - MemAvailable
+		// This is how modern tools like 'free' calculate used memory
+		out.RSSBytes = out.MemTotalBytes - out.MemAvailableBytes
+	}
+
+	if scanner.Err() != nil {
+		return metrics.MemoryMetrics{}, fmt.Errorf("Failed scanning /proc/meminfo: %w", scanner.Err())
 	}
 
 	return out, nil
@@ -381,14 +408,14 @@ func getNetworkMetrics() (map[string]metrics.NetworkMetrics, error) {
 	for dev, state := range networkState() {
 		stats := metrics.NetworkMetrics{}
 
-		stats.ReceiveBytes = uint64(state.Counters.BytesReceived)
-		stats.ReceiveDrop = uint64(state.Counters.PacketsDroppedInbound)
-		stats.ReceiveErrors = uint64(state.Counters.ErrorsReceived)
-		stats.ReceivePackets = uint64(state.Counters.PacketsReceived)
-		stats.TransmitBytes = uint64(state.Counters.BytesSent)
-		stats.TransmitDrop = uint64(state.Counters.PacketsDroppedOutbound)
-		stats.TransmitErrors = uint64(state.Counters.ErrorsSent)
-		stats.TransmitPackets = uint64(state.Counters.PacketsSent)
+		stats.ReceiveBytes = state.Counters.BytesReceived
+		stats.ReceiveDrop = state.Counters.PacketsDroppedInbound
+		stats.ReceiveErrors = state.Counters.ErrorsReceived
+		stats.ReceivePackets = state.Counters.PacketsReceived
+		stats.TransmitBytes = state.Counters.BytesSent
+		stats.TransmitDrop = state.Counters.PacketsDroppedOutbound
+		stats.TransmitErrors = state.Counters.ErrorsSent
+		stats.TransmitPackets = state.Counters.PacketsSent
 
 		out[dev] = stats
 	}

@@ -2,35 +2,27 @@ package validate
 
 import (
 	"bytes"
-	"crypto/x509"
-	"encoding/pem"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
 	"github.com/kballard/go-shellquote"
 	"github.com/robfig/cron/v3"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
+	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/osarch"
 	"github.com/canonical/lxd/shared/units"
+	"github.com/canonical/lxd/shared/version"
 )
-
-// stringInSlice checks whether the supplied string is present in the supplied slice.
-func stringInSlice(key string, list []string) bool {
-	for _, entry := range list {
-		if entry == key {
-			return true
-		}
-	}
-	return false
-}
 
 // Required returns function that runs one or more validators, all must pass without error.
 func Required(validators ...func(value string) error) func(value string) error {
@@ -77,6 +69,16 @@ func IsUint8(value string) error {
 	return nil
 }
 
+// IsUint16 validates whether the string can be converted to an uint16.
+func IsUint16(value string) error {
+	_, err := strconv.ParseUint(value, 10, 16)
+	if err != nil {
+		return fmt.Errorf("Invalid value for uint16 %q: %w", value, err)
+	}
+
+	return nil
+}
+
 // IsUint32 validates whether the string can be converted to an uint32.
 func IsUint32(value string) error {
 	_, err := strconv.ParseUint(value, 10, 32)
@@ -87,24 +89,30 @@ func IsUint32(value string) error {
 	return nil
 }
 
-// ParseUint32Range parses a uint32 range in the form "number" or "start-end".
-// Returns the start number and the size of the range.
-func ParseUint32Range(value string) (uint32, uint32, error) {
-	rangeParts := strings.SplitN(value, "-", 2)
-	rangeLen := len(rangeParts)
-	if rangeLen != 1 && rangeLen != 2 {
-		return 0, 0, fmt.Errorf("Range must contain a single number or start and end numbers")
+// IsUint64 validates whether the string can be converted to an uint64.
+func IsUint64(value string) error {
+	_, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return fmt.Errorf("Invalid value for uint64 %q: %w", value, err)
 	}
 
-	startNum, err := strconv.ParseUint(rangeParts[0], 10, 32)
+	return nil
+}
+
+// ParseUint32Range parses a uint32 range in the form "number" or "start-end".
+// Returns the start number and the size of the range.
+func ParseUint32Range(value string) (start uint32, rangeSize uint32, err error) {
+	startStr, endStr, found := strings.Cut(value, "-")
+
+	startNum, err := strconv.ParseUint(startStr, 10, 32)
 	if err != nil {
 		return 0, 0, fmt.Errorf("Invalid number %q", value)
 	}
 
-	var rangeSize uint32 = 1
+	rangeSize = 1
 
-	if rangeLen == 2 {
-		endNum, err := strconv.ParseUint(rangeParts[1], 10, 32)
+	if found {
+		endNum, err := strconv.ParseUint(endStr, 10, 32)
 		if err != nil {
 			return 0, 0, fmt.Errorf("Invalid end number %q", value)
 		}
@@ -116,7 +124,9 @@ func ParseUint32Range(value string) (uint32, uint32, error) {
 		rangeSize += uint32(endNum) - uint32(startNum)
 	}
 
-	return uint32(startNum), rangeSize, nil
+	start = uint32(startNum)
+
+	return start, rangeSize, nil
 }
 
 // IsUint32Range validates whether the string is a uint32 range in the form "number" or "start-end".
@@ -126,15 +136,15 @@ func IsUint32Range(value string) error {
 }
 
 // IsInRange checks whether an integer is within a specific range.
-func IsInRange(min int64, max int64) func(value string) error {
+func IsInRange(minVal int64, maxVal int64) func(value string) error {
 	return func(value string) error {
 		valueInt, err := strconv.ParseInt(value, 10, 64)
 		if err != nil {
 			return fmt.Errorf("Invalid value for an integer %q", value)
 		}
 
-		if valueInt < min || valueInt > max {
-			return fmt.Errorf("Value isn't within valid range. Must be between %d and %d", min, max)
+		if valueInt < minVal || valueInt > maxVal {
+			return fmt.Errorf("Value is not within valid range. Must be between %d and %d", minVal, maxVal)
 		}
 
 		return nil
@@ -143,7 +153,7 @@ func IsInRange(min int64, max int64) func(value string) error {
 
 // IsPriority validates priority number.
 func IsPriority(value string) error {
-	valueInt, err := strconv.ParseInt(value, 10, 64)
+	valueInt, err := strconv.Atoi(value)
 	if err != nil {
 		return fmt.Errorf("Invalid value for an integer %q", value)
 	}
@@ -157,7 +167,7 @@ func IsPriority(value string) error {
 
 // IsBool validates if string can be understood as a bool.
 func IsBool(value string) error {
-	if !stringInSlice(strings.ToLower(value), []string{"true", "false", "yes", "no", "1", "0", "on", "off"}) {
+	if !slices.Contains([]string{"true", "false", "yes", "no", "1", "0", "on", "off"}, strings.ToLower(value)) {
 		return fmt.Errorf("Invalid value for a boolean %q", value)
 	}
 
@@ -167,7 +177,7 @@ func IsBool(value string) error {
 // IsOneOf checks whether the string is present in the supplied slice of strings.
 func IsOneOf(valid ...string) func(value string) error {
 	return func(value string) error {
-		if !stringInSlice(value, valid) {
+		if !slices.Contains(valid, value) {
 			return fmt.Errorf("Invalid value %q (not one of %s)", value, valid)
 		}
 
@@ -183,7 +193,7 @@ func IsAny(value string) error {
 // IsListOf returns a validator for a comma separated list of values.
 func IsListOf(validator func(value string) error) func(value string) error {
 	return func(value string) error {
-		for _, v := range strings.Split(value, ",") {
+		for v := range strings.SplitSeq(value, ",") {
 			v = strings.TrimSpace(v)
 
 			err := validator(v)
@@ -199,7 +209,7 @@ func IsListOf(validator func(value string) error) func(value string) error {
 // IsNotEmpty requires a non-empty string.
 func IsNotEmpty(value string) error {
 	if value == "" {
-		return fmt.Errorf("Required value")
+		return errors.New("Required value")
 	}
 
 	return nil
@@ -219,7 +229,7 @@ func IsSize(value string) error {
 func IsDeviceID(value string) error {
 	match, _ := regexp.MatchString(`^[0-9a-f]{4}$`, value)
 	if !match {
-		return fmt.Errorf("Invalid value, must be four lower case hex characters")
+		return errors.New("Invalid value, must be four lower case hex characters")
 	}
 
 	return nil
@@ -229,17 +239,22 @@ func IsDeviceID(value string) error {
 func IsInterfaceName(value string) error {
 	// Validate the length.
 	if len(value) < 2 {
-		return fmt.Errorf("Network interface is too short (minimum 2 characters)")
+		return errors.New("Network interface is too short (minimum 2 characters)")
 	}
 
 	if len(value) > 15 {
-		return fmt.Errorf("Network interface is too long (maximum 15 characters)")
+		return errors.New("Network interface is too long (maximum 15 characters)")
+	}
+
+	// Reject known bad names that might cause problem when dealing with paths.
+	if strings.Contains(value, "..") {
+		return errors.New("Network interface name must not contain '..'")
 	}
 
 	// Validate the character set.
 	match, _ := regexp.MatchString(`^[-_a-zA-Z0-9.]+$`, value)
 	if !match {
-		return fmt.Errorf("Network interface contains invalid characters")
+		return errors.New("Network interface contains invalid characters")
 	}
 
 	return nil
@@ -251,7 +266,7 @@ func IsNetworkMAC(value string) error {
 
 	// Check is valid Ethernet MAC length and delimiter.
 	if err != nil || len(value) != 17 || strings.ContainsAny(value, "-.") {
-		return fmt.Errorf("Invalid MAC address, must be 6 bytes of hex separated by colons")
+		return errors.New("Invalid MAC address, must be 6 bytes of hex separated by colons")
 	}
 
 	return nil
@@ -293,27 +308,27 @@ func IsNetworkAddressCIDR(value string) error {
 
 // IsNetworkRange validates an IP range in the format "start-end".
 func IsNetworkRange(value string) error {
-	ips := strings.SplitN(value, "-", 2)
-	if len(ips) != 2 {
-		return fmt.Errorf("IP range must contain start and end IP addresses")
+	start, end, found := strings.Cut(value, "-")
+	if !found {
+		return errors.New("IP range must contain start and end IP addresses")
 	}
 
-	startIP := net.ParseIP(ips[0])
+	startIP := net.ParseIP(start)
 	if startIP == nil {
-		return fmt.Errorf("Start not an IP address %q", ips[0])
+		return fmt.Errorf("Start not an IP address %q", start)
 	}
 
-	endIP := net.ParseIP(ips[1])
+	endIP := net.ParseIP(end)
 	if endIP == nil {
-		return fmt.Errorf("End not an IP address %q", ips[1])
+		return fmt.Errorf("End not an IP address %q", end)
 	}
 
 	if (startIP.To4() != nil) != (endIP.To4() != nil) {
-		return fmt.Errorf("Start and end IP addresses are not in same family")
+		return errors.New("Start and end IP addresses are not in same family")
 	}
 
 	if bytes.Compare(startIP, endIP) > 0 {
-		return fmt.Errorf("Start IP address must be before or equal to end IP address")
+		return errors.New("Start IP address must be before or equal to end IP address")
 	}
 
 	return nil
@@ -367,19 +382,22 @@ func IsNetworkAddressCIDRV4(value string) error {
 
 // IsNetworkRangeV4 validates an IPv4 range in the format "start-end".
 func IsNetworkRangeV4(value string) error {
-	ips := strings.SplitN(value, "-", 2)
-	if len(ips) != 2 {
-		return fmt.Errorf("IP range must contain start and end IP addresses")
+	start, end, found := strings.Cut(value, "-")
+	if !found {
+		return errors.New("IP range must contain start and end IP addresses")
 	}
 
-	for _, ip := range ips {
-		err := IsNetworkAddressV4(ip)
-		if err != nil {
-			return err
-		}
+	err := IsNetworkAddressV4(start)
+	if err != nil {
+		return err
 	}
 
-	return nil
+	err = IsNetworkAddressV4(end)
+	if err != nil {
+		return err
+	}
+
+	return IsNetworkRange(value)
 }
 
 // IsNetworkV6 validates an IPv6 CIDR string.
@@ -430,19 +448,22 @@ func IsNetworkAddressCIDRV6(value string) error {
 
 // IsNetworkRangeV6 validates an IPv6 range in the format "start-end".
 func IsNetworkRangeV6(value string) error {
-	ips := strings.SplitN(value, "-", 2)
-	if len(ips) != 2 {
-		return fmt.Errorf("IP range must contain start and end IP addresses")
+	start, end, found := strings.Cut(value, "-")
+	if !found {
+		return errors.New("IP range must contain start and end IP addresses")
 	}
 
-	for _, ip := range ips {
-		err := IsNetworkAddressV6(ip)
-		if err != nil {
-			return err
-		}
+	err := IsNetworkAddressV6(start)
+	if err != nil {
+		return err
 	}
 
-	return nil
+	err = IsNetworkAddressV6(end)
+	if err != nil {
+		return err
+	}
+
+	return IsNetworkRange(value)
 }
 
 // IsNetworkVLAN validates a VLAN ID.
@@ -459,17 +480,17 @@ func IsNetworkVLAN(value string) error {
 	return nil
 }
 
-// IsNetworkMTU validates MTU number >= 1280 and <= 16384.
+// IsNetworkMTU validates MTU number >= 68 and <= 16384.
 // Anything below 68 and the kernel doesn't allow IPv4, anything below 1280 and the kernel doesn't allow IPv6.
-// So require an IPv6-compatible MTU as the low value and cap at the max ethernet jumbo frame size.
+// So require an IPv4-compatible MTU as the low value and cap at the max ethernet jumbo frame size.
 func IsNetworkMTU(value string) error {
 	mtu, err := strconv.ParseUint(value, 10, 32)
 	if err != nil {
 		return fmt.Errorf("Invalid MTU %q", value)
 	}
 
-	if mtu < 1280 || mtu > 16384 {
-		return fmt.Errorf("Out of MTU range (1280-16384) %q", value)
+	if mtu < 68 || mtu > 16384 {
+		return fmt.Errorf("Out of MTU range (68-16384) %q", value)
 	}
 
 	return nil
@@ -477,13 +498,9 @@ func IsNetworkMTU(value string) error {
 
 // IsNetworkPort validates an IP port number >= 0 and <= 65535.
 func IsNetworkPort(value string) error {
-	port, err := strconv.ParseUint(value, 10, 32)
+	_, err := strconv.ParseUint(value, 10, 16)
 	if err != nil {
 		return fmt.Errorf("Invalid port number %q", value)
-	}
-
-	if port > 65535 {
-		return fmt.Errorf("Out of port number range (0-65535) %q", value)
 	}
 
 	return nil
@@ -491,19 +508,15 @@ func IsNetworkPort(value string) error {
 
 // IsNetworkPortRange validates an IP port range in the format "port" or "start-end".
 func IsNetworkPortRange(value string) error {
-	ports := strings.SplitN(value, "-", 2)
-	portsLen := len(ports)
-	if portsLen != 1 && portsLen != 2 {
-		return fmt.Errorf("Port range must contain either a single port or start and end port numbers")
-	}
+	startPortStr, endPortStr, found := strings.Cut(value, "-")
 
-	startPort, err := strconv.ParseUint(ports[0], 10, 32)
+	startPort, err := strconv.ParseUint(startPortStr, 10, 16)
 	if err != nil {
-		return fmt.Errorf("Invalid port number %q", value)
+		return fmt.Errorf("Invalid start port number %q", value)
 	}
 
-	if portsLen == 2 {
-		endPort, err := strconv.ParseUint(ports[1], 10, 32)
+	if found {
+		endPort, err := strconv.ParseUint(endPortStr, 10, 16)
 		if err != nil {
 			return fmt.Errorf("Invalid end port number %q", value)
 		}
@@ -531,7 +544,7 @@ func IsURLSegmentSafe(value string) error {
 func IsUUID(value string) error {
 	_, err := uuid.Parse(value)
 	if err != nil {
-		return fmt.Errorf("Invalid UUID")
+		return errors.New("Invalid UUID")
 	}
 
 	return nil
@@ -541,10 +554,22 @@ func IsUUID(value string) error {
 func IsPCIAddress(value string) error {
 	match, _ := regexp.MatchString(`^(?:[0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]$`, value)
 	if !match {
-		return fmt.Errorf("Invalid PCI address")
+		return errors.New("Invalid PCI address")
 	}
 
 	return nil
+}
+
+// validCompressionCommands is a list of compression command names supported by LXD.
+var validCompressionCommands = []string{
+	"bzip2",
+	"gzip",
+	"lzma",
+	"pigz",
+	"pzstd",
+	"squashfs",
+	"xz",
+	"zstd",
 }
 
 // IsCompressionAlgorithm validates whether a value is a valid compression algorithm and is available on the system.
@@ -553,18 +578,29 @@ func IsCompressionAlgorithm(value string) error {
 		return nil
 	}
 
-	// Going to look up tar2sqfs executable binary
-	if value == "squashfs" {
-		value = "tar2sqfs"
-	}
-
 	// Parse the command.
 	fields, err := shellquote.Split(value)
 	if err != nil {
 		return err
 	}
 
-	_, err = exec.LookPath(fields[0])
+	if len(fields) == 0 {
+		return errors.New("No compression algorithm specified")
+	}
+
+	// Trim arguments and just look at the command name.
+	cmd := fields[0]
+
+	if !slices.Contains(validCompressionCommands, cmd) {
+		return fmt.Errorf("Invalid compression algorithm %q", cmd)
+	}
+
+	// Going to look up tar2sqfs executable binary
+	if cmd == "squashfs" {
+		cmd = "tar2sqfs"
+	}
+
+	_, err = exec.LookPath(cmd)
 	return err
 }
 
@@ -578,14 +614,12 @@ func IsCron(aliases []string) func(value string) error {
 	return func(value string) error {
 		isValid := func(value string) error {
 			// Accept valid aliases.
-			for _, alias := range aliases {
-				if alias == value {
-					return nil
-				}
+			if slices.Contains(aliases, value) {
+				return nil
 			}
 
 			if len(strings.Split(value, " ")) != 5 {
-				return fmt.Errorf("Schedule must be of the form: <minute> <hour> <day-of-month> <month> <day-of-week>")
+				return errors.New("Schedule must be of the form: <minute> <hour> <day-of-month> <month> <day-of-week>")
 			}
 
 			_, err := cron.ParseStandard(value)
@@ -598,8 +632,8 @@ func IsCron(aliases []string) func(value string) error {
 
 		// Can be comma+space separated (just commas are valid cron pattern).
 		value = strings.ToLower(value)
-		triggers := strings.Split(value, ", ")
-		for _, trigger := range triggers {
+		triggers := strings.SplitSeq(value, ", ")
+		for trigger := range triggers {
 			err := isValid(trigger)
 			if err != nil {
 				return err
@@ -617,16 +651,16 @@ func IsListenAddress(allowDNS bool, allowWildcard bool, requirePort bool) func(v
 		host, _, err := net.SplitHostPort(value)
 		if err != nil {
 			if requirePort {
-				return fmt.Errorf("A port is required as part of the address")
+				return errors.New("A port is required as part of the address")
 			}
 
 			host = value
 		}
 
 		// Validate wildcard.
-		if stringInSlice(host, []string{"", "::", "[::]", "0.0.0.0"}) {
+		if slices.Contains([]string{"", "::", "[::]", "0.0.0.0"}, host) {
 			if !allowWildcard {
-				return fmt.Errorf("Wildcard addresses aren't allowed")
+				return errors.New("Wildcard addresses are not allowed")
 			}
 
 			return nil
@@ -639,12 +673,12 @@ func IsListenAddress(allowDNS bool, allowWildcard bool, requirePort bool) func(v
 		}
 
 		if !allowDNS {
-			return fmt.Errorf("DNS names not allowed in address")
+			return errors.New("DNS names not allowed in address")
 		}
 
 		_, err = net.LookupHost(host)
 		if err != nil {
-			return fmt.Errorf("Couldn't resolve %q", host)
+			return fmt.Errorf("Could not resolve %q", host)
 		}
 
 		return nil
@@ -653,12 +687,7 @@ func IsListenAddress(allowDNS bool, allowWildcard bool, requirePort bool) func(v
 
 // IsX509Certificate checks if the value is a valid x509 PEM Certificate.
 func IsX509Certificate(value string) error {
-	certBlock, _ := pem.Decode([]byte(value))
-	if certBlock == nil {
-		return fmt.Errorf("Invalid certificate")
-	}
-
-	_, err := x509.ParseCertificate(certBlock.Bytes)
+	_, err := shared.ParseCert([]byte(value))
 
 	return err
 }
@@ -666,7 +695,7 @@ func IsX509Certificate(value string) error {
 // IsAbsFilePath checks if value is an absolute file path.
 func IsAbsFilePath(value string) error {
 	if !filepath.IsAbs(value) {
-		return fmt.Errorf("Must be absolute file path")
+		return errors.New("Must be absolute file path")
 	}
 
 	return nil
@@ -674,8 +703,8 @@ func IsAbsFilePath(value string) error {
 
 // ParseNetworkVLANRange parses a VLAN range in the form "number" or "start-end".
 // Returns the start number and the number of items in the range.
-func ParseNetworkVLANRange(vlan string) (int, int, error) {
-	err := IsNetworkVLAN(vlan)
+func ParseNetworkVLANRange(vlan string) (vlanRangeStart int, rangeSize int, err error) {
+	err = IsNetworkVLAN(vlan)
 	if err == nil {
 		vlanRangeStart, err := strconv.Atoi(vlan)
 		if err != nil {
@@ -685,21 +714,21 @@ func ParseNetworkVLANRange(vlan string) (int, int, error) {
 		return vlanRangeStart, 1, nil
 	}
 
-	vlanRange := strings.Split(vlan, "-")
-	if len(vlanRange) != 2 {
+	startStr, endStr, found := strings.Cut(vlan, "-")
+	if !found {
 		return -1, -1, fmt.Errorf("Invalid VLAN range input: %s", vlan)
 	}
 
-	if IsNetworkVLAN(vlanRange[0]) != nil || IsNetworkVLAN(vlanRange[1]) != nil {
-		return -1, -1, fmt.Errorf("Invalid VLAN range boundary. start:%s, end:%s", vlanRange[0], vlanRange[1])
+	if IsNetworkVLAN(startStr) != nil || IsNetworkVLAN(endStr) != nil {
+		return -1, -1, fmt.Errorf("Invalid VLAN range boundary. start:%s, end:%s", startStr, endStr)
 	}
 
-	vlanRangeStart, err := strconv.Atoi(vlanRange[0])
+	vlanRangeStart, err = strconv.Atoi(startStr)
 	if err != nil {
 		return -1, -1, err
 	}
 
-	vlanRangeEnd, err := strconv.Atoi(vlanRange[1])
+	vlanRangeEnd, err := strconv.Atoi(endStr)
 	if err != nil {
 		return -1, -1, err
 	}
@@ -708,29 +737,31 @@ func ParseNetworkVLANRange(vlan string) (int, int, error) {
 		return -1, -1, fmt.Errorf("Invalid VLAN range boundary. start:%d is higher than end:%d", vlanRangeStart, vlanRangeEnd)
 	}
 
-	return vlanRangeStart, vlanRangeEnd - vlanRangeStart + 1, nil
+	rangeSize = vlanRangeEnd - vlanRangeStart + 1
+
+	return vlanRangeStart, rangeSize, nil
 }
 
 // IsHostname checks the string is valid DNS hostname.
 func IsHostname(name string) error {
 	// Validate length
 	if len(name) < 1 || len(name) > 63 {
-		return fmt.Errorf("Name must be 1-63 characters long")
+		return errors.New("Name must be 1-63 characters long")
 	}
 
 	// Validate first character
 	if strings.HasPrefix(name, "-") {
-		return fmt.Errorf(`Name must not start with "-" character`)
+		return errors.New(`Name must not start with "-" character`)
 	}
 
 	// Validate last character
 	if strings.HasSuffix(name, "-") {
-		return fmt.Errorf(`Name must not end with "-" character`)
+		return errors.New(`Name must not end with "-" character`)
 	}
 
 	_, err := strconv.ParseUint(name, 10, 64)
 	if err == nil {
-		return fmt.Errorf("Name cannot be a number")
+		return errors.New("Name cannot be a number")
 	}
 
 	match, err := regexp.MatchString(`^[\-a-zA-Z0-9]+$`, name)
@@ -739,7 +770,19 @@ func IsHostname(name string) error {
 	}
 
 	if !match {
-		return fmt.Errorf("Name can only contain alphanumeric and hyphen characters")
+		return errors.New("Name can only contain alphanumeric and hyphen characters")
+	}
+
+	return nil
+}
+
+// IsDomainName checks that value is a valid domain name by validating each label with [IsHostname].
+func IsDomainName(value string) error {
+	for label := range strings.SplitSeq(value, ".") {
+		err := IsHostname(label)
+		if err != nil {
+			return fmt.Errorf("Invalid domain name %q: %w", value, err)
+		}
 	}
 
 	return nil
@@ -749,11 +792,11 @@ func IsHostname(name string) error {
 // forward slash, hyphen, colon, underscore and full stop characters.
 func IsDeviceName(name string) error {
 	if len(name) < 1 || len(name) > 63 {
-		return fmt.Errorf("Name must be 1-63 characters long")
+		return errors.New("Name must be 1-63 characters long")
 	}
 
-	if string(name[0]) == "." {
-		return fmt.Errorf(`Name must not start with "." character`)
+	if name[0] == '.' {
+		return errors.New(`Name must not start with "." character`)
 	}
 
 	match, err := regexp.MatchString(`^[\/\.\-:_a-zA-Z0-9]+$`, name)
@@ -762,21 +805,41 @@ func IsDeviceName(name string) error {
 	}
 
 	if !match {
-		return fmt.Errorf("Name can only contain alphanumeric, forward slash, hyphen, colon, underscore and full stop characters")
+		return errors.New("Name can only contain alphanumeric, forward slash, hyphen, colon, underscore and full stop characters")
 	}
 
 	return nil
 }
 
-// IsRequestURL checks value is a valid HTTP/HTTPS request URL.
-func IsRequestURL(value string) error {
+// parseRequestURL parses value as an HTTP/HTTPS request URL and returns the parsed URL.
+func parseRequestURL(value string) (*url.URL, error) {
 	if value == "" {
-		return fmt.Errorf("Empty URL")
+		return nil, errors.New("Empty URL")
 	}
 
-	_, err := url.ParseRequestURI(value)
+	u, err := url.ParseRequestURI(value)
 	if err != nil {
-		return fmt.Errorf("Invalid URL: %w", err)
+		return nil, fmt.Errorf("Invalid URL: %w", err)
+	}
+
+	return u, nil
+}
+
+// IsRequestURL checks value is a valid HTTP/HTTPS request URL.
+func IsRequestURL(value string) error {
+	_, err := parseRequestURL(value)
+	return err
+}
+
+// IsHTTPSURL checks value is a valid HTTPS URL.
+func IsHTTPSURL(value string) error {
+	u, err := parseRequestURL(value)
+	if err != nil {
+		return err
+	}
+
+	if u.Scheme != "https" {
+		return errors.New("URL scheme must be HTTPS")
 	}
 
 	return nil
@@ -784,18 +847,33 @@ func IsRequestURL(value string) error {
 
 // IsCloudInitUserData checks value is valid cloud-init user data.
 func IsCloudInitUserData(value string) error {
-	if value == "#cloud-config" || strings.HasPrefix(value, "#cloud-config\n") {
-		lines := strings.SplitN(value, "\n", 2)
-
-		// If value only contains the cloud-config header, it is valid.
-		if len(lines) == 1 {
-			return nil
-		}
-
-		return IsYAML(lines[1])
+	content, found := strings.CutPrefix(value, "#cloud-config\n")
+	if found {
+		return IsYAML(content)
 	}
 
 	// Since there are various other user-data formats besides cloud-config, consider those valid.
+	return nil
+}
+
+// IsUserSSHKey checks value is a valid SSH public key for cloud-init.ssh-keys.
+// This should take the format {user}:{key}, and neither part can be empty.
+func IsUserSSHKey(value string) error {
+	// A "none" value can be used to avoid inheriting an SSH key from a profile.
+	if value == "none" {
+		return nil
+	}
+
+	user, key, _ := strings.Cut(value, ":")
+
+	if key == "" {
+		return errors.New("Key part must not be empty")
+	}
+
+	if user == "" {
+		return errors.New("User part must not be empty")
+	}
+
 	return nil
 }
 
@@ -816,26 +894,22 @@ func IsValidCPUSet(value string) error {
 	// Validate the CPU set syntax.
 	match, _ := regexp.MatchString(`^(?:[0-9]+(?:[,-][0-9]+)?)(?:,[0-9]+(?:[,-][0-9]+)*)?$`, value)
 	if !match {
-		return fmt.Errorf("Invalid CPU limit syntax")
+		return errors.New("Invalid CPU limit syntax")
 	}
 
-	cpus := make(map[int64]int)
-	chunks := strings.Split(value, ",")
+	cpus := make(map[int]int)
+	chunks := strings.SplitSeq(value, ",")
 
-	for _, chunk := range chunks {
-		if strings.Contains(chunk, "-") {
+	for chunk := range chunks {
+		lowStr, highStr, found := strings.Cut(chunk, "-")
+		if found {
 			// Range
-			fields := strings.SplitN(chunk, "-", 2)
-			if len(fields) != 2 {
-				return fmt.Errorf("Invalid cpuset value: %s", value)
-			}
-
-			low, err := strconv.ParseInt(fields[0], 10, 64)
+			low, err := strconv.Atoi(lowStr)
 			if err != nil {
 				return fmt.Errorf("Invalid cpuset value: %s", value)
 			}
 
-			high, err := strconv.ParseInt(fields[1], 10, 64)
+			high, err := strconv.Atoi(highStr)
 			if err != nil {
 				return fmt.Errorf("Invalid cpuset value: %s", value)
 			}
@@ -845,7 +919,7 @@ func IsValidCPUSet(value string) error {
 			}
 		} else {
 			// Simple entry
-			nr, err := strconv.ParseInt(chunk, 10, 64)
+			nr, err := strconv.Atoi(chunk)
 			if err != nil {
 				return fmt.Errorf("Invalid cpuset value: %s", value)
 			}
@@ -857,7 +931,7 @@ func IsValidCPUSet(value string) error {
 	for i := range cpus {
 		// The CPU was specified more than once, e.g. 1-3,3.
 		if cpus[i] > 1 {
-			return fmt.Errorf("Cannot define CPU multiple times")
+			return errors.New("Cannot define CPU multiple times")
 		}
 	}
 
@@ -883,4 +957,88 @@ func IsMultipleOfUnit(unit string) func(value string) error {
 
 		return nil
 	}
+}
+
+// IsStaticCPUPinning validates a static CPU pinning strategy.
+func IsStaticCPUPinning(value string) error {
+	if strings.ContainsAny(value, ",-") {
+		return nil
+	}
+
+	return fmt.Errorf("Invalid static CPU pinning strategy: %s", value)
+}
+
+// IsClusterGroupName validates a cluster group name.
+func IsClusterGroupName(name string) error {
+	if name == "" {
+		return errors.New("No name provided")
+	}
+
+	if name == "*" {
+		return errors.New("Reserved cluster group name")
+	}
+
+	if name == "." || name == ".." {
+		return fmt.Errorf("Invalid cluster group name %q", name)
+	}
+
+	if strings.Contains(name, "\\") {
+		return errors.New("Cluster group names may not contain back slashes")
+	}
+
+	if strings.Contains(name, "/") {
+		return errors.New("Cluster group names may not contain slashes")
+	}
+
+	if strings.Contains(name, " ") {
+		return errors.New("Cluster group names may not contain spaces")
+	}
+
+	if strings.Contains(name, "_") {
+		return errors.New("Cluster group names may not contain underscores")
+	}
+
+	if strings.ContainsAny(name, `'"`) {
+		return errors.New("Cluster group names may not contain quotes")
+	}
+
+	// Validate ASCII-only.
+	err := IsEntityName(name)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// IsEntityName validates that a name contains only ASCII characters.
+// This is important for entity names that are used in system-level operations like cgroups,
+// which don't support Unicode characters.
+func IsEntityName(name string) error {
+	for _, r := range name {
+		if r > 127 {
+			return fmt.Errorf("Name contains non-ASCII character %q", r)
+		}
+	}
+
+	return nil
+}
+
+// IsDottedVersion validates that a string is a valid dotted version.
+func IsDottedVersion(dottedVersion string) error {
+	_, err := version.NewDottedVersion(dottedVersion)
+	return err
+}
+
+// IsLowercaseHex returns an error if the given hash contains any characters that are not lowercase hexadecimal.
+func IsLowercaseHex(hash string) error {
+	isNotHex := func(r rune) bool {
+		return (r < '0' || r > '9') && (r < 'a' || r > 'f')
+	}
+
+	if strings.ContainsFunc(hash, isNotHex) {
+		return errors.New("Hash must contain only lowercase hexadecimal characters")
+	}
+
+	return nil
 }

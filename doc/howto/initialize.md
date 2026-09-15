@@ -1,6 +1,13 @@
 (initialize)=
 # How to initialize LXD
 
+````{only} integrated
+```{admonition} For MicroCloud users
+:class: note
+The MicroCloud setup process initializes LXD on cluster members. Thus, you do not need to follow the steps on this page.
+```
+````
+
 Before you can create a LXD instance, you must configure and initialize LXD.
 
 ## Interactive configuration
@@ -19,18 +26,12 @@ The tool asks a series of questions to determine the required configuration.
 The questions are dynamically adapted to the answers that you give.
 They cover the following areas:
 
-Clustering (see {ref}`exp-clustering` and {ref}`cluster-form`)
+Clustering (see {ref}`exp-clusters` and {ref}`cluster-form`)
 : A cluster combines several LXD servers.
   The cluster members share the same distributed database and can be managed uniformly using the LXD client ([`lxc`](lxc.md)) or the REST API.
 
   The default answer is `no`, which means clustering is not enabled.
   If you answer `yes`, you can either connect to an existing cluster or create one.
-
-MAAS support (see [`maas.io`](https://maas.io/) and [MAAS - Setting up LXD for VMs](https://maas.io/docs/setting-up-lxd-for-vms))
-: MAAS is an open-source tool that lets you build a data center from bare-metal servers.
-
-  The default answer is `no`, which means MAAS support is not enabled.
-  If you answer `yes`, you can connect to an existing MAAS server and specify the `name`, `URL` and `API key`.
 
 Networking (see {ref}`networks` and {ref}`Network devices <devices-nic>`)
 : Provides network access for the instances.
@@ -39,11 +40,16 @@ Networking (see {ref}`networks` and {ref}`Network devices <devices-nic>`)
 
   You can create additional bridges and assign them to instances later.
 
+  ```{warning}
+  Creating a managed bridge (or a Fan overlay) enables IPv4 forwarding (`net.ipv4.ip_forward=1`) on the host; if the bridge also has an IPv6 subnet, IPv6 forwarding is enabled on every interface (`net.ipv6.conf.<iface>.forwarding=1`).
+  This is a global toggle: it affects *all* interfaces, not just the LXD bridge, effectively making a multi-homed host an IP router.
+  ```
+
 Storage pools (see {ref}`exp-storage` and  {ref}`storage-drivers`)
 : Instances (and other data) are stored in storage pools.
 
   For testing purposes, you can create a loop-backed storage pool.
-  For production use, however, you should use an empty partition (or full disk) instead of loop-backed storage (because loop-backed pools are slower and their size can't be reduced).
+  For production use, however, you should use an empty partition (or full disk) instead of loop-backed storage (because loop-backed pools are slower and their size/quota can't be reduced).
 
   The recommended backends are `zfs` and `btrfs`.
 
@@ -74,7 +80,7 @@ To create a minimal setup with default options, you can skip the configuration s
 
 ```{note}
 The minimal setup provides a basic configuration, but the configuration is not optimized for speed or functionality.
-Especially the [`dir` storage driver](storage-dir), which is used by default, is slower than other drivers and doesn't provide fast snapshots, fast copy/launch, quotas and optimized backups.
+The [`dir` storage driver](storage-dir), which is chosen by default in the minimal setup using `--minimal`, is slower than other drivers and doesn't provide fast snapshots, fast copy/launch, quotas and optimized backups.
 
 If you want to use an optimized setup, go through the interactive configuration process instead.
 ```
@@ -101,6 +107,10 @@ EOF
 ```
 
 This preseed configuration initializes the LXD daemon to listen for HTTPS connections on port 9999 of the 192.0.2.1 address, to automatically update images every 15 hours and to create a network bridge device named `lxdbr0`, which gets assigned an IPv4 address automatically.
+
+```{warning}
+Creating a managed bridge with an IPv4 or IPv6 subnet enables the corresponding host-wide forwarding sysctls (`net.ipv4.ip_forward=1` and/or `net.ipv6.conf.<iface>.forwarding=1`), which turn on forwarding for *all* interfaces on the host.
+```
 
 ### Re-configuring an existing LXD installation
 

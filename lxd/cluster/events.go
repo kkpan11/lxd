@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"time"
 
@@ -14,11 +15,6 @@ import (
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/revert"
 )
-
-// eventHubMinHosts is the minimum number of members that must have the event-hub role to trigger switching into
-// event-hub mode (where cluster members will only connect to event-hub members rather than all members when
-// operating in the normal full-mesh mode).
-const eventHubMinHosts = 2
 
 // EventMode indicates the event distribution mode.
 type EventMode string
@@ -109,10 +105,10 @@ func (lc *eventListenerClient) SetEventMode(eventMode EventMode, eventHubPushCh 
 	}
 }
 
-var eventMode EventMode = EventModeFullMesh
+var eventMode = EventModeFullMesh
 var eventHubAddresses []string
 var eventHubPushCh = make(chan api.Event, 10) // Buffer size to accommodate slow consumers before dropping events.
-var eventHubPushChTimeout = time.Duration(time.Second)
+var eventHubPushChTimeout = time.Second
 var listeners = map[string]*eventListenerClient{}
 var listenersNotify = map[chan struct{}][]string{}
 var listenersLock sync.Mutex
@@ -124,17 +120,6 @@ func ServerEventMode() EventMode {
 	defer listenersLock.Unlock()
 
 	return eventMode
-}
-
-// RoleInSlice returns whether or not the rule is within the roles list.
-func RoleInSlice(role db.ClusterRole, roles []db.ClusterRole) bool {
-	for _, r := range roles {
-		if r == role {
-			return true
-		}
-	}
-
-	return false
 }
 
 // EventListenerWait waits for there to be listener connected to the specified address, or one of the event hubs
@@ -184,16 +169,19 @@ func EventListenerWait(ctx context.Context, address string) error {
 	}
 }
 
-// hubAddresses returns the addresses of members with event-hub role, and the event mode of the server.
-// The event mode will only be hub-server or hub-client if at least eventHubMinHosts have an event-hub role.
-// Otherwise the mode will be full-mesh.
+// hubAddresses returns hub member addresses and the local event mode.
+// When control-plane mode is active (3 or more members with control-plane role),
+// control-plane members are the event hubs. Otherwise full-mesh mode is used.
 func hubAddresses(localAddress string, members map[int64]APIHeartbeatMember) ([]string, EventMode) {
 	var hubAddresses []string
 	var localHasHubRole bool
+	memberRoles := make(map[string][]db.ClusterRole, len(members))
 
-	// Do a first pass of members to count the members with event-hub role, and whether we are a hub server.
+	// In control-plane mode, members with control-plane role act as event hubs.
 	for _, member := range members {
-		if RoleInSlice(db.ClusterRoleEventHub, member.Roles) {
+		memberRoles[member.Address] = member.Roles
+
+		if slices.Contains(member.Roles, db.ClusterRoleControlPlane) {
 			hubAddresses = append(hubAddresses, member.Address)
 
 			if member.Address == localAddress {
@@ -202,16 +190,16 @@ func hubAddresses(localAddress string, members map[int64]APIHeartbeatMember) ([]
 		}
 	}
 
-	eventMode := EventModeFullMesh
-	if len(hubAddresses) >= eventHubMinHosts {
-		if localHasHubRole {
-			eventMode = EventModeHubServer
-		} else {
-			eventMode = EventModeHubClient
-		}
+	// Outside control-plane mode, always use full-mesh event connectivity.
+	if !IsControlPlaneActive(memberRoles) {
+		return nil, EventModeFullMesh
 	}
 
-	return hubAddresses, eventMode
+	if localHasHubRole {
+		return hubAddresses, EventModeHubServer
+	}
+
+	return hubAddresses, EventModeHubClient
 }
 
 // EventsUpdateListeners refreshes the cluster event listener connections.
@@ -239,7 +227,7 @@ func EventsUpdateListeners(endpoints *endpoints.Endpoints, cluster *db.Cluster, 
 			return nil
 		})
 		if err != nil {
-			logger.Warn("Failed to get current cluster members", logger.Ctx{"err": err})
+			logger.Warn("Failed getting current cluster members", logger.Ctx{"err": err})
 			return
 		}
 
@@ -267,7 +255,7 @@ func EventsUpdateListeners(endpoints *endpoints.Endpoints, cluster *db.Cluster, 
 			continue
 		}
 
-		if localEventMode != EventModeFullMesh && !RoleInSlice(db.ClusterRoleEventHub, hbMember.Roles) {
+		if localEventMode != EventModeFullMesh && !slices.Contains(hubAddresses, hbMember.Address) {
 			continue // Skip non-event-hub members if we are operating in event-hub mode.
 		}
 
@@ -323,7 +311,7 @@ func EventsUpdateListeners(endpoints *endpoints.Endpoints, cluster *db.Cluster, 
 
 			// Indicate to any notifiers waiting for this member's address that it is connected.
 			for connected, notifyAddresses := range listenersNotify {
-				if shared.ValueInSlice(m.Address, notifyAddresses) {
+				if slices.Contains(notifyAddresses, m.Address) {
 					close(connected)
 					delete(listenersNotify, connected)
 				}
@@ -373,7 +361,7 @@ func EventsUpdateListeners(endpoints *endpoints.Endpoints, cluster *db.Cluster, 
 
 // Establish a client connection to get events from the given node.
 func eventsConnect(address string, networkCert *shared.CertInfo, serverCert *shared.CertInfo) (*eventListenerClient, error) {
-	client, err := Connect(address, networkCert, serverCert, nil, true)
+	client, err := Connect(context.Background(), address, networkCert, serverCert, true)
 	if err != nil {
 		return nil, err
 	}

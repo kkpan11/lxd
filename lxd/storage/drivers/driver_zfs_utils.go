@@ -1,11 +1,14 @@
 package drivers
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -38,42 +41,42 @@ func (d *zfs) dataset(vol Volume, deleted bool) string {
 	name, snapName, _ := api.GetParentAndSnapshotName(vol.name)
 
 	if vol.volType == VolumeTypeImage && vol.contentType == ContentTypeFS && d.isBlockBacked(vol) {
-		name = fmt.Sprintf("%s_%s", name, vol.ConfigBlockFilesystem())
+		name = name + "_" + vol.ConfigBlockFilesystem()
 	}
 
 	if (vol.volType == VolumeTypeVM || vol.volType == VolumeTypeImage) && vol.contentType == ContentTypeBlock {
-		name = fmt.Sprintf("%s%s", name, zfsBlockVolSuffix)
+		name = name + zfsBlockVolSuffix
 	} else if vol.volType == VolumeTypeCustom && vol.contentType == ContentTypeISO {
-		name = fmt.Sprintf("%s%s", name, zfsISOVolSuffix)
+		name = name + zfsISOVolSuffix
 	}
 
 	if snapName != "" {
 		if deleted {
-			name = fmt.Sprintf("%s@deleted-%s", name, uuid.New().String())
+			name = name + "@deleted-" + uuid.New().String()
 		} else {
-			name = fmt.Sprintf("%s@snapshot-%s", name, snapName)
+			name = name + "@snapshot-" + snapName
 		}
 	} else if deleted {
 		if vol.volType != VolumeTypeImage {
 			name = uuid.New().String()
 		}
 
-		return filepath.Join(d.config["zfs.pool_name"], "deleted", string(vol.volType), name)
+		return d.config["zfs.pool_name"] + "/deleted/" + string(vol.volType) + "/" + name
 	}
 
-	return filepath.Join(d.config["zfs.pool_name"], string(vol.volType), name)
+	return d.config["zfs.pool_name"] + "/" + string(vol.volType) + "/" + name
 }
 
 func (d *zfs) createDataset(dataset string, options ...string) error {
-	args := []string{"create"}
+	args := make([]string, 0, 1+2*len(options)+1)
+	args = append(args, "create")
 	for _, option := range options {
-		args = append(args, "-o")
-		args = append(args, option)
+		args = append(args, "-o", option)
 	}
 
 	args = append(args, dataset)
 
-	_, err := shared.RunCommand("zfs", args...)
+	_, err := shared.RunCommand(context.TODO(), "zfs", args...)
 	if err != nil {
 		return err
 	}
@@ -82,15 +85,15 @@ func (d *zfs) createDataset(dataset string, options ...string) error {
 }
 
 func (d *zfs) createVolume(dataset string, size int64, options ...string) error {
-	args := []string{"create", "-s", "-V", fmt.Sprintf("%d", size)}
+	args := make([]string, 0, 4+2*len(options)+1)
+	args = append(args, "create", "-s", "-V", strconv.FormatInt(size, 10))
 	for _, option := range options {
-		args = append(args, "-o")
-		args = append(args, option)
+		args = append(args, "-o", option)
 	}
 
 	args = append(args, dataset)
 
-	_, err := shared.RunCommand("zfs", args...)
+	_, err := shared.RunCommand(context.TODO(), "zfs", args...)
 	if err != nil {
 		return err
 	}
@@ -99,7 +102,7 @@ func (d *zfs) createVolume(dataset string, size int64, options ...string) error 
 }
 
 func (d *zfs) datasetExists(dataset string) (bool, error) {
-	out, err := shared.RunCommand("zfs", "get", "-H", "-o", "name", "name", dataset)
+	out, err := shared.RunCommand(context.TODO(), "zfs", "get", "-H", "-o", "name", "name", dataset)
 	if err != nil {
 		return false, nil
 	}
@@ -115,78 +118,114 @@ func (d *zfs) deleteDatasetRecursive(dataset string) error {
 	}
 
 	// Delete the dataset (and any snapshots left).
-	_, err = shared.TryRunCommand("zfs", "destroy", "-r", dataset)
+	_, err = shared.RunCommandRetry(context.TODO(), noKillRetryOpts, "zfs", "destroy", "-r", dataset)
 	if err != nil {
 		return err
 	}
 
 	// Check if the origin can now be deleted.
 	if origin != "" && origin != "-" {
-		if strings.HasPrefix(origin, filepath.Join(d.config["zfs.pool_name"], "deleted")) {
-			// Strip the snapshot name when dealing with a deleted volume.
-			dataset = strings.SplitN(origin, "@", 2)[0]
-		} else if strings.Contains(origin, "@deleted-") || strings.Contains(origin, "@copy-") {
-			// Handle deleted snapshots.
-			dataset = origin
-		} else {
-			// Origin is still active.
-			dataset = ""
+		// It will be set non-empty if origin (or parent of) should be deleted.
+		var originToDelete string
+
+		// Determine if the origin is a temporary snapshot created.
+		if strings.Contains(origin, "@deleted-") || strings.Contains(origin, "@copy-") {
+			originToDelete = origin
+		} else if strings.HasPrefix(origin, d.config["zfs.pool_name"]+"/deleted/") {
+			// This is a snapshot in deleted/ dataset.
+			// Keep it as a snapshot path, don't strip the @ part
+			originToDelete = origin
 		}
 
-		if dataset != "" {
-			// Get all clones.
-			clones, err := d.getClones(dataset)
+		// If no origin needs to be deleted we're done.
+		if originToDelete == "" {
+			return nil
+		}
+
+		// Check if the origin has any clones.
+		clones, err := d.getClones(originToDelete)
+		if err != nil {
+			return err
+		}
+
+		// If there are clones, we can't delete the origin.
+		if len(clones) > 0 {
+			return nil
+		}
+
+		// For snapshots in deleted/ datasets, we need special handling
+		if strings.Contains(originToDelete, "@") && strings.HasPrefix(originToDelete, d.config["zfs.pool_name"]+"/deleted/") {
+			parentVolume, _, _ := strings.Cut(originToDelete, "@")
+			// Delete just this snapshot (not recursive)
+			_, err = shared.RunCommandRetry(context.TODO(), noKillRetryOpts, "zfs", "destroy", originToDelete)
 			if err != nil {
 				return err
 			}
 
-			if len(clones) == 0 {
-				// Delete the origin.
-				err = d.deleteDatasetRecursive(dataset)
+			// Check if the parent volume has any remaining snapshots or clones.
+			parentClones, err := d.getClones(parentVolume)
+			if err != nil {
+				return err
+			}
+
+			parentSnapshots, err := d.getDatasets(parentVolume, "snapshot")
+			if err != nil {
+				return err
+			}
+
+			// If no clones and no snapshots, delete the parent volume and recurse
+			if len(parentClones) == 0 && len(parentSnapshots) == 0 {
+				// Use recursive deletion to continue up the chain
+				err = d.deleteDatasetRecursive(parentVolume)
 				if err != nil {
 					return err
 				}
 			}
+		} else {
+			// For regular temporary snapshots or volumes, recurse
+			err = d.deleteDatasetRecursive(originToDelete)
+			if err != nil {
+				return err
+			}
 		}
 	}
+
 	return nil
 }
 
 func (d *zfs) getClones(dataset string) ([]string, error) {
-	out, err := shared.RunCommand("zfs", "get", "-H", "-p", "-r", "-o", "value", "clones", dataset)
+	out, err := shared.RunCommand(context.TODO(), "zfs", "get", "-H", "-p", "-r", "-o", "value", "clones", dataset)
 	if err != nil {
 		return nil, err
 	}
 
 	clones := []string{}
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line == dataset || line == "" || line == "-" {
 			continue
 		}
 
-		line = strings.TrimPrefix(line, fmt.Sprintf("%s/", dataset))
-		clones = append(clones, line)
+		clones = append(clones, strings.TrimPrefix(line, dataset+"/"))
 	}
 
 	return clones, nil
 }
 
 func (d *zfs) getDatasets(dataset string, types string) ([]string, error) {
-	out, err := shared.RunCommand("zfs", "get", "-H", "-r", "-o", "name", "-t", types, "name", dataset)
+	out, err := shared.RunCommand(context.TODO(), "zfs", "get", "-H", "-r", "-o", "name", "-t", types, "name", dataset)
 	if err != nil {
 		return nil, err
 	}
 
 	children := []string{}
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line == dataset || line == "" {
 			continue
 		}
 
-		line = strings.TrimPrefix(line, dataset)
-		children = append(children, line)
+		children = append(children, strings.TrimPrefix(line, dataset))
 	}
 
 	return children, nil
@@ -194,18 +233,18 @@ func (d *zfs) getDatasets(dataset string, types string) ([]string, error) {
 
 // filterRedundantOptions filters out options for setting dataset properties that match with the values already set.
 func (d *zfs) filterRedundantOptions(dataset string, options ...string) ([]string, error) {
-	var keys, values []string
+	keys := make([]string, 0, len(options))
+	values := make([]string, 0, len(options))
 
 	// Extract keys and values from options.
 	for _, option := range options {
-		property := strings.Split(option, "=")
-
-		if len(property) != 2 {
+		key, value, found := strings.Cut(option, "=")
+		if !found {
 			return nil, fmt.Errorf("Wrongly formatted option %q", option)
 		}
 
-		keys = append(keys, property[0])
-		values = append(values, property[1])
+		keys = append(keys, key)
+		values = append(values, value)
 	}
 
 	// Get current values for the keys.
@@ -231,11 +270,12 @@ func (d *zfs) filterRedundantOptions(dataset string, options ...string) ([]strin
 }
 
 func (d *zfs) setDatasetProperties(dataset string, options ...string) error {
-	args := []string{"set"}
+	args := make([]string, 0, 1+len(options)+1)
+	args = append(args, "set")
 	args = append(args, options...)
 	args = append(args, dataset)
 
-	_, err := shared.RunCommand("zfs", args...)
+	_, err := shared.RunCommand(context.TODO(), "zfs", args...)
 	if err != nil {
 		return err
 	}
@@ -272,7 +312,7 @@ func (d *zfs) setBlocksize(vol Volume, size int64) error {
 }
 
 func (d *zfs) getDatasetProperty(dataset string, key string) (string, error) {
-	output, err := shared.RunCommand("zfs", "get", "-H", "-p", "-o", "value", key, dataset)
+	output, err := shared.RunCommand(context.TODO(), "zfs", "get", "-H", "-p", "-o", "value", key, dataset)
 	if err != nil {
 		return "", err
 	}
@@ -281,62 +321,57 @@ func (d *zfs) getDatasetProperty(dataset string, key string) (string, error) {
 }
 
 func (d *zfs) getDatasetProperties(dataset string, keys ...string) (map[string]string, error) {
-	output, err := shared.RunCommand("zfs", "get", "-H", "-p", "-o", "property,value", strings.Join(keys, ","), dataset)
+	output, err := shared.RunCommand(context.TODO(), "zfs", "get", "-H", "-p", "-o", "property,value", strings.Join(keys, ","), dataset)
 	if err != nil {
 		return nil, err
 	}
 
 	props := make(map[string]string, len(keys))
 
-	for _, row := range strings.Split(output, "\n") {
-		prop := strings.Split(row, "\t")
-
-		if len(prop) < 2 {
+	for row := range strings.SplitSeq(output, "\n") {
+		key, val, found := strings.Cut(row, "\t")
+		if !found {
 			continue
 		}
 
-		key := prop[0]
-		val := prop[1]
 		props[key] = val
 	}
 
 	return props, nil
 }
 
-// version returns the ZFS version based on package or kernel module version.
+// version returns the ZFS version based on kernel module version on package.
 func (d *zfs) version() (string, error) {
-	// This function is only really ever relevant on Ubuntu as the only
-	// distro that ships out of sync tools and kernel modules
-	out, err := shared.RunCommand("dpkg-query", "--showformat=${Version}", "--show", "zfsutils-linux")
-	if out != "" && err == nil {
-		return strings.TrimSpace(string(out)), nil
-	}
-
 	// Loaded kernel module version
-	if shared.PathExists("/sys/module/zfs/version") {
-		out, err := os.ReadFile("/sys/module/zfs/version")
-		if err == nil {
-			return strings.TrimSpace(string(out)), nil
-		}
+	outBytes, err := os.ReadFile("/sys/module/zfs/version")
+	if err == nil {
+		return strings.TrimSpace(string(outBytes)), nil
 	}
 
 	// Module information version
-	out, err = shared.RunCommand("modinfo", "-F", "version", "zfs")
+	out, err := shared.RunCommand(context.TODO(), "modinfo", "-F", "version", "zfs")
 	if err == nil {
-		return strings.TrimSpace(string(out)), nil
+		return strings.TrimSpace(out), nil
 	}
 
-	return "", fmt.Errorf("Could not determine ZFS module version")
+	// This function is only really ever relevant on Ubuntu as the only
+	// distro that ships out of sync tools and kernel modules
+	out, err = shared.RunCommand(context.TODO(), "dpkg-query", "--showformat=${Version}", "--show", "zfsutils-linux")
+	if out != "" && err == nil {
+		return strings.TrimSpace(out), nil
+	}
+
+	return "", errors.New("Could not determine ZFS module version")
 }
 
 // initialDatasets returns the list of all expected datasets.
 func (d *zfs) initialDatasets() []string {
-	entries := []string{"deleted"}
+	entries := make([]string, 0, 1+len(d.Info().VolumeTypes)*2)
+	entries = append(entries, "deleted")
 
 	// Iterate over the listed supported volume types.
 	for _, volType := range d.Info().VolumeTypes {
-		entries = append(entries, BaseDirectories[volType][0])
-		entries = append(entries, filepath.Join("deleted", BaseDirectories[volType][0]))
+		entries = append(entries, BaseDirectories[volType].Paths[0], "deleted/"+BaseDirectories[volType].Paths[0])
 	}
 
 	return entries
@@ -344,21 +379,17 @@ func (d *zfs) initialDatasets() []string {
 
 func (d *zfs) needsRecursion(dataset string) bool {
 	// Ignore snapshots for the test.
-	dataset = strings.Split(dataset, "@")[0]
+	dataset, _, _ = strings.Cut(dataset, "@")
 
 	entries, err := d.getDatasets(dataset, "filesystem,volume")
 	if err != nil {
 		return false
 	}
 
-	if len(entries) == 0 {
-		return false
-	}
-
-	return true
+	return len(entries) != 0
 }
 
-func (d *zfs) sendDataset(dataset string, parent string, volSrcArgs *migration.VolumeSourceArgs, conn io.ReadWriteCloser, tracker *ioprogress.ProgressTracker) error {
+func (d *zfs) sendDataset(dataset string, parent string, volSrcArgs *migration.VolumeSourceArgs, conn io.ReadWriteCloser, wrapper ioprogress.WriterWrapper) error {
 	defer func() { _ = conn.Close() }()
 
 	// Assemble zfs send command.
@@ -367,24 +398,22 @@ func (d *zfs) sendDataset(dataset string, parent string, volSrcArgs *migration.V
 	// Check if nesting is required.
 	// We only want to use recursion (and possible raw) mode if required as it can interfere with ZFS encryption.
 	if d.needsRecursion(dataset) {
-		args = append(args, "-R")
+		args = append(args, "--replicate")
 
 		if zfsRaw {
-			args = append(args, "-w")
+			args = append(args, "--raw")
 		}
 	}
 
-	if shared.ValueInSlice("compress", volSrcArgs.MigrationType.Features) {
-		args = append(args, "-c")
-		args = append(args, "-L")
+	if slices.Contains(volSrcArgs.MigrationType.Features, "compress") {
+		args = append(args, "-c", "-L")
 	}
 
 	if parent != "" {
 		args = append(args, "-i", parent)
 	}
 
-	args = append(args, dataset)
-	cmd := exec.Command("zfs", args...)
+	cmd := exec.Command("zfs", append(args, dataset)...)
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -393,11 +422,8 @@ func (d *zfs) sendDataset(dataset string, parent string, volSrcArgs *migration.V
 
 	// Setup progress tracker.
 	var stdout io.WriteCloser = conn
-	if tracker != nil {
-		stdout = &ioprogress.ProgressWriter{
-			WriteCloser: conn,
-			Tracker:     tracker,
-		}
+	if wrapper != nil {
+		stdout = wrapper(conn)
 	}
 
 	cmd.Stdout = stdout
@@ -422,9 +448,10 @@ func (d *zfs) sendDataset(dataset string, parent string, volSrcArgs *migration.V
 
 func (d *zfs) receiveDataset(vol Volume, conn io.ReadWriteCloser, writeWrapper func(io.WriteCloser) io.WriteCloser) error {
 	// Assemble zfs receive command.
-	cmd := exec.Command("zfs", "receive", "-x", "mountpoint", "-F", "-u", d.dataset(vol, false))
+	dataset := d.dataset(vol, false)
+	cmd := exec.Command("zfs", "receive", "-x", "mountpoint", "-F", "-u", dataset)
 	if vol.ContentType() == ContentTypeBlock || d.isBlockBacked(vol) {
-		cmd = exec.Command("zfs", "receive", "-F", "-u", d.dataset(vol, false))
+		cmd = exec.Command("zfs", "receive", "-F", "-u", dataset)
 	}
 
 	// Prepare stdin/stderr.
@@ -484,7 +511,7 @@ func ValidateZfsBlocksize(value string) error {
 	}
 
 	if sizeBytes < zfsMinBlocksize || sizeBytes > zfsMaxBlocksize || (sizeBytes&(sizeBytes-1)) != 0 {
-		return fmt.Errorf("Value should be between 512B and 16MiB, and be power of 2")
+		return errors.New("Value should be between 512B and 16MiB, and be power of 2")
 	}
 
 	return nil
@@ -521,12 +548,8 @@ func (d *zfs) datasetHeader(vol Volume, snapshots []string) (*ZFSMetaDataHeader,
 	return &migrationHeader, nil
 }
 
-func (d *zfs) randomVolumeName(vol Volume) string {
-	return fmt.Sprintf("%s_%s", vol.name, uuid.New().String())
-}
-
 func (d *zfs) delegateDataset(vol Volume, pid int) error {
-	_, err := shared.RunCommand("zfs", "zone", fmt.Sprintf("/proc/%d/ns/user", pid), d.dataset(vol, false))
+	_, err := shared.RunCommand(context.TODO(), "zfs", "zone", fmt.Sprintf("/proc/%d/ns/user", pid), d.dataset(vol, false))
 	if err != nil {
 		return err
 	}
@@ -537,4 +560,76 @@ func (d *zfs) delegateDataset(vol Volume, pid int) error {
 // ZFSSupportsDelegation returns true if the ZFS version on the system supports user namespace delegation.
 func ZFSSupportsDelegation() bool {
 	return zfsDelegate
+}
+
+// parseImageVariantName parses an image dataset name into fingerprint and
+// variant suffix. For example:
+//   - "abc123" -> ("abc123", "")
+//   - "abc123_btrfs" -> ("abc123", "btrfs")
+func parseImageVariantName(name string) (fingerprint string, suffix string) {
+	// Image fingerprints are hex strings (SHA256) and don't contain underscores.
+	// The variant suffix is appended after an underscore.
+	fingerprint, suffix, found := strings.Cut(name, "_")
+	if found && fingerprint != "" {
+		return fingerprint, suffix
+	}
+
+	return name, ""
+}
+
+// variantMatchesConfig checks if a variant (identified by its suffix) matches
+// the given pool configuration. For example:
+//   - ("", false, "ext4") -> true
+//   - ("ext4", true, "ext4") -> true
+//   - ("btrfs", true, "ext4") -> false
+func variantMatchesConfig(suffix string, poolIsBlockBacked bool, poolBlockFS string) bool {
+	if suffix == "" {
+		return !poolIsBlockBacked
+	}
+
+	return poolIsBlockBacked && poolBlockFS == suffix
+}
+
+// getPoolBlockConfig extracts block mode and filesystem settings from a pool config map.
+// Returns whether block mode is enabled and the effective filesystem (defaulting to DefaultFilesystem).
+func getPoolBlockConfig(config map[string]string) (isBlockBacked bool, blockFS string) {
+	isBlockBacked = shared.IsTrue(config["volume.zfs.block_mode"])
+	blockFS = config["volume.block.filesystem"]
+	if blockFS == "" {
+		blockFS = DefaultFilesystem
+	}
+
+	return isBlockBacked, blockFS
+}
+
+// variantNeedsRecreateForBlocksize checks if an existing variant's volblocksize
+// differs from what the new config requires.
+func (d *zfs) variantNeedsRecreateForBlocksize(dataset string, vol Volume) (bool, error) {
+	currentBlocksize, err := d.getDatasetProperty(dataset, "volblocksize")
+	if err != nil {
+		return false, err
+	}
+
+	desiredBlocksize := vol.ExpandedConfig("zfs.blocksize")
+	if desiredBlocksize == "" {
+		// No specific blocksize requested, use default (don't need to recreate).
+		return false, nil
+	}
+
+	desiredBytes, err := units.ParseByteSizeString(desiredBlocksize)
+	if err != nil {
+		return false, err
+	}
+
+	// zfs.blocksize may be configured up to 16MiB but volblocksize is capped at 128KiB.
+	if desiredBytes > zfsMaxVolBlocksize {
+		desiredBytes = zfsMaxVolBlocksize
+	}
+
+	currentBytes, err := units.ParseByteSizeString(currentBlocksize)
+	if err != nil {
+		return false, err
+	}
+
+	return currentBytes != desiredBytes, nil
 }

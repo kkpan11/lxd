@@ -4,23 +4,20 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
-	"path"
-	"runtime"
 
 	_ "github.com/mattn/go-sqlite3" // For opening the in-memory database
 )
 
-// DotGo writes '<name>.go' source file in the package of the calling function, containing
-// SQL statements that match the given schema updates.
+// DotGo writes '<filename>' in the current directory, containing SQL statements that match the given schema updates.
 //
-// The <name>.go file contains a "flattened" render of all given updates and
+// The <filename> contains a "flattened" render of all given updates and
 // can be used to initialize brand new databases using Schema.Fresh().
-func DotGo(updates map[int]Update, name string) error {
+func DotGo(updates map[int]Update, pkg string, filename string) error {
 	// Apply all the updates that we have on a pristine database and dump
 	// the resulting schema.
 	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
-		return fmt.Errorf("failed to open schema.go for writing: %w", err)
+		return fmt.Errorf("failed opening in-memory SQLite database: %w", err)
 	}
 
 	schema := NewFromMap(updates)
@@ -35,18 +32,14 @@ func DotGo(updates map[int]Update, name string) error {
 		return err
 	}
 
-	// Passing 1 to runtime.Caller identifies our caller.
-	_, filename, _, _ := runtime.Caller(1)
-
-	file, err := os.Create(path.Join(path.Dir(filename), name+".go"))
+	file, err := os.Create(filename)
 	if err != nil {
-		return fmt.Errorf("failed to open Go file for writing: %w", err)
+		return fmt.Errorf("failed opening Go file for writing: %w", err)
 	}
 
-	pkg := path.Base(path.Dir(filename))
-	_, err = file.Write([]byte(fmt.Sprintf(dotGoTemplate, pkg, dump)))
+	_, err = fmt.Fprintf(file, dotGoTemplate, pkg, dump)
 	if err != nil {
-		return fmt.Errorf("failed to write to Go file: %w", err)
+		return fmt.Errorf("failed writing to Go file: %w", err)
 	}
 
 	return nil

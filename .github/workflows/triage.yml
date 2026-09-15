@@ -1,41 +1,22 @@
 name: Triaging
 on:
-  pull_request_target:
-  issues:
-    types:
-      - labeled
-      - unlabeled
+  # pull_request_target is needed so that actions/labeler can write labels on PRs
+  # from forks (pull_request lacks write access in that case). No PR code is ever
+  # checked out here, so the privileged context is not exposed to untrusted input.
+  pull_request_target: # zizmor: ignore[dangerous-triggers]
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   label:
-    if: github.event.pull_request
+    if: ${{ github.repository == 'canonical/lxd' }}
     permissions:
       contents: read  # for actions/labeler to determine modified files
       pull-requests: write  # for actions/labeler to add labels to PRs
     name: PR labels
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-slim
     steps:
-    - uses: actions/labeler@v5
-      with:
-        repo-token: "${{ secrets.GITHUB_TOKEN }}"
-        sync-labels: true
-  notify:
-    name: Notify
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: write
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: Notify
-        uses: iamfj/action-label-notification@v1.0.0
+      - uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7.0.0
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          mapping: >
-            - label: Documentation
-              recipients:
-                - '@mionaalex'
+          repo-token: "${{ secrets.GITHUB_TOKEN }}"
+          sync-labels: true

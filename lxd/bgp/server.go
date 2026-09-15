@@ -1,17 +1,23 @@
 package bgp
 
 import (
+	"bytes"
 	"context"
+	"crypto/subtle"
+	"errors"
 	"fmt"
+	"maps"
 	"net"
+	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/google/uuid"
-	bgpAPI "github.com/osrg/gobgp/v3/api"
-	bgpPacket "github.com/osrg/gobgp/v3/pkg/packet/bgp"
-	bgpServer "github.com/osrg/gobgp/v3/pkg/server"
-	"google.golang.org/protobuf/types/known/anypb"
+	bgpAPI "github.com/osrg/gobgp/v4/api"
+	bgpAPIUtil "github.com/osrg/gobgp/v4/pkg/apiutil"
+	bgpPacket "github.com/osrg/gobgp/v4/pkg/packet/bgp"
+	bgpServer "github.com/osrg/gobgp/v4/pkg/server"
 
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/revert"
@@ -25,7 +31,7 @@ type Server struct {
 	address  string
 	asn      uint32
 	routerID net.IP
-	paths    map[string]path
+	paths    map[uuid.UUID]path
 	peers    map[string]peer
 
 	mu sync.Mutex
@@ -49,52 +55,28 @@ type peer struct {
 func NewServer() *Server {
 	// Setup new struct.
 	s := &Server{
-		paths: map[string]path{},
+		paths: map[uuid.UUID]path{},
 		peers: map[string]peer{},
 	}
 
 	return s
 }
 
-func (s *Server) setup() {
-	if s.bgp != nil {
-		return
-	}
-
-	// Spawn the BGP goroutines.
-	s.bgp = bgpServer.NewBgpServer()
-	go s.bgp.Serve()
-
-	// Insert any path that's already defined.
-	if len(s.paths) > 0 {
-		// Reset the path list.
-		paths := s.paths
-		s.paths = map[string]path{}
-
-		for _, path := range paths {
-			err := s.addPrefix(path.prefix, path.nexthop, path.owner)
-			logger.Warn("Unable to add prefix to BGP server", logger.Ctx{"prefix": path.prefix.String(), "err": err})
-		}
-	}
-}
-
 // Start sets up the BGP listener.
-func (s *Server) Start(address string, asn uint32, routerID net.IP) error {
-	// Locking.
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.start(address, asn, routerID)
-}
-
 func (s *Server) start(address string, asn uint32, routerID net.IP) error {
 	// If routerID is nil, fill with our best guess.
 	if routerID == nil || routerID.To4() == nil {
 		return ErrBadRouterID
 	}
 
-	// Make sure we have a BGP instance.
-	s.setup()
+	// Check if already running
+	if s.bgp != nil {
+		return errors.New("BGP listener is already running")
+	}
+
+	// Spawn the BGP goroutines.
+	s.bgp = bgpServer.NewBgpServer()
+	go s.bgp.Serve()
 
 	// Get the address and port.
 	addrHost, addrPort, err := net.SplitHostPort(address)
@@ -131,8 +113,26 @@ func (s *Server) start(address string, asn uint32, routerID net.IP) error {
 		return err
 	}
 
-	// Add any existing peers.
-	for _, peer := range s.peers {
+	// Copy the path list
+	oldPaths := map[uuid.UUID]path{}
+	maps.Copy(oldPaths, s.paths)
+
+	// Add existing paths.
+	s.paths = map[uuid.UUID]path{}
+	for _, path := range oldPaths {
+		err := s.addPrefix(path.prefix, path.nexthop, path.owner)
+		if err != nil {
+			logger.Warn("Cannot add prefix to BGP server", logger.Ctx{"prefix": path.prefix.String(), "err": err})
+		}
+	}
+
+	// Copy the peer list.
+	oldPeers := map[string]peer{}
+	maps.Copy(oldPeers, s.peers)
+
+	// Add existing peers.
+	s.peers = map[string]peer{}
+	for _, peer := range oldPeers {
 		err := s.addPeer(peer.address, peer.asn, peer.password, peer.holdtime)
 		if err != nil {
 			return err
@@ -148,21 +148,17 @@ func (s *Server) start(address string, asn uint32, routerID net.IP) error {
 }
 
 // Stop tears down the BGP listener.
-func (s *Server) Stop() error {
-	// Locking.
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.stop()
-}
-
 func (s *Server) stop() error {
 	// Skip if no instance.
 	if s.bgp == nil {
 		return nil
 	}
 
-	// Remove all the peers (ignore failures).
+	// Save the peer list.
+	oldPeers := map[string]peer{}
+	maps.Copy(oldPeers, s.peers)
+
+	// Remove all the peers.
 	for _, peer := range s.peers {
 		err := s.removePeer(peer.address)
 		if err != nil {
@@ -170,37 +166,38 @@ func (s *Server) stop() error {
 		}
 	}
 
+	// Restore peer list.
+	s.peers = oldPeers
+
 	// Stop the listener.
 	err := s.bgp.StopBgp(context.Background(), &bgpAPI.StopBgpRequest{})
 	if err != nil {
 		return err
 	}
 
-	// Unset the address
+	// Mark the daemon as down.
 	s.address = ""
 	s.asn = 0
 	s.routerID = nil
+	s.bgp = nil
+
 	return nil
 }
 
-// Reconfigure updates the listener with a new configuration..
-func (s *Server) Reconfigure(address string, asn uint32, routerID net.IP) error {
+// Configure updates the listener with a new configuration..
+func (s *Server) Configure(address string, asn uint32, routerID net.IP) error {
 	// Locking.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.reconfigure(address, asn, routerID)
+	return s.configure(address, asn, routerID)
 }
 
-func (s *Server) reconfigure(address string, asn uint32, routerID net.IP) error {
-	// Get the old address.
+func (s *Server) configure(address string, asn uint32, routerID net.IP) error {
+	// Store current configuration for reverting.
 	oldAddress := s.address
 	oldASN := s.asn
 	oldRouterID := s.routerID
-	oldPeers := map[string]peer{}
-	for peerUUID, peer := range s.peers {
-		oldPeers[peerUUID] = peer
-	}
 
 	// Setup reverter.
 	revert := revert.New()
@@ -209,11 +206,8 @@ func (s *Server) reconfigure(address string, asn uint32, routerID net.IP) error 
 	// Stop the listener.
 	err := s.stop()
 	if err != nil {
-		return err
+		return fmt.Errorf("Failed stopping current listener: %w", err)
 	}
-
-	// Restore peer list.
-	s.peers = oldPeers
 
 	// Check if we should start.
 	if address != "" && asn > 0 && routerID != nil {
@@ -223,7 +217,7 @@ func (s *Server) reconfigure(address string, asn uint32, routerID net.IP) error 
 		// Start the listener with the new address.
 		err = s.start(address, asn, routerID)
 		if err != nil {
-			return err
+			return fmt.Errorf("Failed starting new listener: %w", err)
 		}
 	}
 
@@ -243,68 +237,69 @@ func (s *Server) AddPrefix(subnet net.IPNet, nexthop net.IP, owner string) error
 
 func (s *Server) addPrefix(subnet net.IPNet, nexthop net.IP, owner string) error {
 	// Prepare the prefix.
-	prefixLen, _ := subnet.Mask.Size()
-	prefix := subnet.IP.String()
+	prefix, err := netip.ParsePrefix(subnet.String())
+	if err != nil {
+		return err
+	}
 
-	nlri, _ := anypb.New(&bgpAPI.IPAddressPrefix{
-		Prefix:    prefix,
-		PrefixLen: uint32(prefixLen),
-	})
+	nlri, err := bgpPacket.NewIPAddrPrefix(prefix)
+	if err != nil {
+		return err
+	}
 
-	aOrigin, _ := anypb.New(&bgpAPI.OriginAttribute{
-		Origin: 0,
-	})
+	attrs := []bgpPacket.PathAttributeInterface{bgpPacket.NewPathAttributeOrigin(0)}
 
 	// Add the prefix to the server.
-	var pathUUID string
+	var pathUUID uuid.UUID
 	if s.bgp != nil {
+		nextHop, err := netip.ParseAddr(nexthop.String())
+		if err != nil {
+			return err
+		}
+
+		family := bgpPacket.RF_IPv4_UC
 		if subnet.IP.To4() != nil {
 			// IPv4 prefix.
-			aNextHop, _ := anypb.New(&bgpAPI.NextHopAttribute{
-				NextHop: nexthop.String(),
-			})
-
-			resp, err := s.bgp.AddPath(context.Background(), &bgpAPI.AddPathRequest{
-				Path: &bgpAPI.Path{
-					Family: &bgpAPI.Family{Afi: bgpAPI.Family_AFI_IP, Safi: bgpAPI.Family_SAFI_UNICAST},
-					Nlri:   nlri,
-					Pattrs: []*anypb.Any{aOrigin, aNextHop},
-				},
-			})
+			aNextHop, err := bgpPacket.NewPathAttributeNextHop(nextHop)
 			if err != nil {
 				return err
 			}
 
-			pathUUID = string(resp.Uuid)
+			attrs = append(attrs, aNextHop)
 		} else {
 			// IPv6 prefix.
-			family := &bgpAPI.Family{
-				Afi:  bgpAPI.Family_AFI_IP6,
-				Safi: bgpAPI.Family_SAFI_UNICAST,
-			}
-
-			v6Attrs, _ := anypb.New(&bgpAPI.MpReachNLRIAttribute{
-				Family:   family,
-				NextHops: []string{nexthop.String()},
-				Nlris:    []*anypb.Any{nlri},
-			})
-
-			resp, err := s.bgp.AddPath(context.Background(), &bgpAPI.AddPathRequest{
-				Path: &bgpAPI.Path{
-					Family: family,
-					Nlri:   nlri,
-					Pattrs: []*anypb.Any{aOrigin, v6Attrs},
-				},
-			})
+			family = bgpPacket.RF_IPv6_UC
+			v6Attrs, err := bgpPacket.NewPathAttributeMpReachNLRI(family, []bgpPacket.PathNLRI{{NLRI: nlri}}, nextHop)
 			if err != nil {
 				return err
 			}
 
-			pathUUID = string(resp.Uuid)
+			attrs = append(attrs, v6Attrs)
 		}
+
+		responses, err := s.bgp.AddPath(bgpAPIUtil.AddPathRequest{
+			Paths: []*bgpAPIUtil.Path{{
+				Family: family,
+				Nlri:   nlri,
+				Attrs:  attrs,
+			}},
+		})
+		if err != nil {
+			return err
+		}
+
+		if len(responses) != 1 {
+			return fmt.Errorf("Expected one response when adding BGP path, got %d", len(responses))
+		}
+
+		if responses[0].Error != nil {
+			return responses[0].Error
+		}
+
+		pathUUID = responses[0].UUID
 	} else {
 		// Generate a dummy UUID.
-		pathUUID = uuid.New().String()
+		pathUUID = uuid.New()
 	}
 
 	// Add path to the map.
@@ -324,10 +319,8 @@ func (s *Server) RemovePrefixByOwner(owner string) error {
 	defer s.mu.Unlock()
 
 	// Make a copy of the paths dict to safely iterate (path removal mutates it).
-	paths := map[string]path{}
-	for pathUUID, path := range s.paths {
-		paths[pathUUID] = path
-	}
+	paths := map[uuid.UUID]path{}
+	maps.Copy(paths, s.paths)
 
 	// Iterate through the paths and remove them from the server.
 	for pathUUID, path := range paths {
@@ -354,7 +347,7 @@ func (s *Server) RemovePrefix(subnet net.IPNet, nexthop net.IP) error {
 func (s *Server) removePrefix(subnet net.IPNet, nexthop net.IP) error {
 	found := false
 	for pathUUID, path := range s.paths {
-		if path.prefix.String() != subnet.String() || path.nexthop.String() != nexthop.String() {
+		if !path.prefix.IP.Equal(subnet.IP) || !bytes.Equal(path.prefix.Mask, subnet.Mask) || !path.nexthop.Equal(nexthop) {
 			continue
 		}
 
@@ -374,11 +367,11 @@ func (s *Server) removePrefix(subnet net.IPNet, nexthop net.IP) error {
 	return nil
 }
 
-func (s *Server) removePrefixByUUID(pathUUID string) error {
+func (s *Server) removePrefixByUUID(pathUUID uuid.UUID) error {
 	// Remove it from the BGP server.
 	if s.bgp != nil {
-		err := s.bgp.DeletePath(context.Background(), &bgpAPI.DeletePathRequest{Uuid: []byte(pathUUID)})
-		if err != nil && err.Error() != "can't find a specified path" {
+		err := s.bgp.DeletePath(bgpAPIUtil.DeletePathRequest{UUIDs: []uuid.UUID{pathUUID}})
+		if err != nil && !strings.HasSuffix(err.Error(), "find a specified path(s) with the given UUID(s)") {
 			return err
 		}
 	}
@@ -399,20 +392,22 @@ func (s *Server) AddPeer(address net.IP, asn uint32, password string, holdTime u
 }
 
 func (s *Server) addPeer(address net.IP, asn uint32, password string, holdTime uint64) error {
+	addrStr := address.String()
+
 	// Look for an existing peer.
-	bgpPeer, bgpPeerExists := s.peers[address.String()]
+	bgpPeer, bgpPeerExists := s.peers[addrStr]
 	if bgpPeerExists {
 		if bgpPeer.asn != asn {
-			return fmt.Errorf("Peer %q already used but with differing ASN (%d vs %d)", address, asn, bgpPeer.asn)
+			return fmt.Errorf("Peer %q already used but with differing ASN (%d vs %d)", addrStr, asn, bgpPeer.asn)
 		}
 
-		if bgpPeer.password != password {
-			return fmt.Errorf("Peer %q already used but with a different password", address)
+		if subtle.ConstantTimeCompare([]byte(bgpPeer.password), []byte(password)) != 1 {
+			return fmt.Errorf("Peer %q already used but with a different password", addrStr)
 		}
 
 		// Re-use the existing entry.
 		bgpPeer.count++
-		s.peers[address.String()] = bgpPeer
+		s.peers[addrStr] = bgpPeer
 		return nil
 	}
 
@@ -420,7 +415,7 @@ func (s *Server) addPeer(address net.IP, asn uint32, password string, holdTime u
 	n := &bgpAPI.Peer{
 		// Peer information.
 		Conf: &bgpAPI.PeerConf{
-			NeighborAddress: address.String(),
+			NeighborAddress: addrStr,
 			PeerAsn:         uint32(asn),
 			AuthPassword:    password,
 		},
@@ -449,16 +444,10 @@ func (s *Server) addPeer(address net.IP, asn uint32, password string, holdTime u
 
 	// Setup peer for dual-stack.
 	n.AfiSafis = make([]*bgpAPI.AfiSafi, 0)
-	for _, f := range []string{"ipv4-unicast", "ipv6-unicast"} {
-		rf, err := bgpPacket.GetRouteFamily(f)
-		if err != nil {
-			return err
-		}
-
-		afi, safi := bgpPacket.RouteFamilyToAfiSafi(rf)
-		family := &bgpAPI.Family{
-			Afi:  bgpAPI.Family_Afi(afi),
-			Safi: bgpAPI.Family_Safi(safi),
+	for _, routeFamily := range []bgpPacket.Family{bgpPacket.RF_IPv4_UC, bgpPacket.RF_IPv6_UC} {
+		apiFamily := &bgpAPI.Family{
+			Afi:  bgpAPI.Family_Afi(routeFamily.Afi()),
+			Safi: bgpAPI.Family_Safi(routeFamily.Safi()),
 		}
 
 		n.AfiSafis = append(n.AfiSafis, &bgpAPI.AfiSafi{
@@ -467,7 +456,7 @@ func (s *Server) addPeer(address net.IP, asn uint32, password string, holdTime u
 					Enabled: true,
 				},
 			},
-			Config: &bgpAPI.AfiSafiConfig{Family: family},
+			Config: &bgpAPI.AfiSafiConfig{Family: apiFamily},
 		})
 	}
 
@@ -480,17 +469,12 @@ func (s *Server) addPeer(address net.IP, asn uint32, password string, holdTime u
 	}
 
 	// Add the peer to the list.
-	if bgpPeerExists {
-		bgpPeer.count++
-		s.peers[address.String()] = bgpPeer
-	} else {
-		s.peers[address.String()] = peer{
-			address:  address,
-			asn:      asn,
-			password: password,
-			holdtime: holdTime,
-			count:    1,
-		}
+	s.peers[addrStr] = peer{
+		address:  address,
+		asn:      asn,
+		password: password,
+		holdtime: holdTime,
+		count:    1,
 	}
 
 	return nil
@@ -506,15 +490,17 @@ func (s *Server) RemovePeer(address net.IP) error {
 }
 
 func (s *Server) removePeer(address net.IP) error {
+	addrStr := address.String()
+
 	// Find the peer.
-	bgpPeer, bgpPeerExists := s.peers[address.String()]
+	bgpPeer, bgpPeerExists := s.peers[addrStr]
 	if !bgpPeerExists {
 		return ErrPeerNotFound
 	}
 
 	// Remove the peer from the BGP server.
 	if s.bgp != nil && bgpPeer.count == 1 {
-		err := s.bgp.DeletePeer(context.Background(), &bgpAPI.DeletePeerRequest{Address: address.String()})
+		err := s.bgp.DeletePeer(context.Background(), &bgpAPI.DeletePeerRequest{Address: addrStr})
 		if err != nil {
 			return err
 		}
@@ -523,11 +509,11 @@ func (s *Server) removePeer(address net.IP) error {
 	// Update peer list.
 	if bgpPeer.count == 1 {
 		// Delete the peer.
-		delete(s.peers, address.String())
+		delete(s.peers, addrStr)
 	} else {
 		// Decrease refcount.
 		bgpPeer.count--
-		s.peers[address.String()] = bgpPeer
+		s.peers[addrStr] = bgpPeer
 	}
 
 	return nil

@@ -4,12 +4,12 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
 	"golang.org/x/term"
 
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/logger"
 )
 
@@ -31,15 +31,15 @@ func (a *Asker) AskBool(question string, defaultAnswer string) (bool, error) {
 		answer, err := a.askQuestion(question, defaultAnswer)
 		if err != nil {
 			if a.logger != nil {
-				a.logger.Error("Failed to read answer for question", logger.Ctx{"answer": answer, "question": question, "err": err})
+				a.logger.Error("Failed reading answer for question", logger.Ctx{"answer": answer, "question": question, "err": err})
 			}
 
 			return false, err
 		}
 
-		if shared.ValueInSlice(strings.ToLower(answer), []string{"yes", "y"}) {
+		if slices.Contains([]string{"yes", "y"}, strings.ToLower(answer)) {
 			return true, nil
-		} else if shared.ValueInSlice(strings.ToLower(answer), []string{"no", "n"}) {
+		} else if slices.Contains([]string{"no", "n"}, strings.ToLower(answer)) {
 			return false, nil
 		}
 
@@ -53,13 +53,13 @@ func (a *Asker) AskChoice(question string, choices []string, defaultAnswer strin
 		answer, err := a.askQuestion(question, defaultAnswer)
 		if err != nil {
 			if a.logger != nil {
-				a.logger.Error("Failed to read answer for question", logger.Ctx{"answer": answer, "question": question, "err": err})
+				a.logger.Error("Failed reading answer for question", logger.Ctx{"answer": answer, "question": question, "err": err})
 			}
 
 			return "", err
 		}
 
-		if shared.ValueInSlice(answer, choices) {
+		if slices.Contains(choices, answer) {
 			return answer, nil
 		} else if a.logger != nil {
 			a.logger.Error("Answer not among the available choices", logger.Ctx{"answer": answer, "choices": choices})
@@ -70,12 +70,12 @@ func (a *Asker) AskChoice(question string, choices []string, defaultAnswer strin
 }
 
 // AskInt asks the user to enter an integer between a min and max value.
-func (a *Asker) AskInt(question string, min int64, max int64, defaultAnswer string, validate func(int64) error) (int64, error) {
+func (a *Asker) AskInt(question string, minimum int64, maximum int64, defaultAnswer string, validate func(int64) error) (int64, error) {
 	for {
 		answer, err := a.askQuestion(question, defaultAnswer)
 		if err != nil {
 			if a.logger != nil {
-				a.logger.Error("Failed to read answer for question", logger.Ctx{"answer": answer, "question": question, "err": err})
+				a.logger.Error("Failed reading answer for question", logger.Ctx{"answer": answer, "question": question, "err": err})
 			}
 
 			return -1, err
@@ -91,7 +91,7 @@ func (a *Asker) AskInt(question string, min int64, max int64, defaultAnswer stri
 			continue
 		}
 
-		if !((min == -1 || result >= min) && (max == -1 || result <= max)) {
+		if !((minimum == -1 || result >= minimum) && (maximum == -1 || result <= maximum)) { //nolint:staticcheck
 			if a.logger != nil {
 				a.logger.Error("Invalid input (out of range) for the question", logger.Ctx{"answer": answer, "question": question})
 			}
@@ -123,7 +123,7 @@ func (a *Asker) AskString(question string, defaultAnswer string, validate func(s
 		answer, err := a.askQuestion(question, defaultAnswer)
 		if err != nil {
 			if a.logger != nil {
-				a.logger.Error("Failed to read answer for question", logger.Ctx{"answer": answer, "question": question, "err": err})
+				a.logger.Error("Failed reading answer for question", logger.Ctx{"answer": answer, "question": question, "err": err})
 			}
 
 			return "", err

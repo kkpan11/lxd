@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,7 +17,6 @@ import (
 	storagePools "github.com/canonical/lxd/lxd/storage"
 	storageDrivers "github.com/canonical/lxd/lxd/storage/drivers"
 	"github.com/canonical/lxd/lxd/warnings"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/entity"
 	"github.com/canonical/lxd/shared/logger"
@@ -48,11 +48,11 @@ func readStoragePoolDriversCache() ([]api.ServerStorageDriverInfo, map[string]st
 
 func storageStartup(s *state.State) error {
 	// Update the storage drivers supported and used cache in api_1.0.go.
-	storagePoolDriversCacheUpdate(s)
+	storagePoolDriversCacheUpdate(s.ShutdownCtx, s)
 
 	var poolNames []string
 
-	err := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err := s.DB.Cluster.Transaction(s.ShutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
 		var err error
 
 		poolNames, err = tx.GetCreatedStoragePoolNames(ctx)
@@ -62,6 +62,11 @@ func storageStartup(s *state.State) error {
 	if err != nil {
 		if response.IsNotFoundError(err) {
 			logger.Debug("No existing storage pools detected")
+
+			// There aren't any storage pools.
+			// Unblock all the waitready callers using the --storage flag.
+			s.StorageReady.Cancel()
+
 			return nil
 		}
 
@@ -90,7 +95,7 @@ func storageStartup(s *state.State) error {
 		_, err = pool.Mount()
 		if err != nil {
 			logger.Error("Failed mounting storage pool", logger.Ctx{"pool": poolName, "err": err})
-			_ = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+			_ = s.DB.Cluster.Transaction(s.ShutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
 				return tx.UpsertWarningLocalNode(ctx, "", entity.TypeStoragePool, int(pool.ID()), warningtype.StoragePoolUnvailable, err.Error())
 			})
 
@@ -114,57 +119,90 @@ func storageStartup(s *state.State) error {
 	// For any remaining storage pools that were not successfully initialised, we now start a go routine to
 	// periodically try to initialize them again in the background.
 	if len(initPools) > 0 {
-		go func() {
-			for {
-				t := time.NewTimer(time.Duration(time.Minute))
-
-				select {
-				case <-s.ShutdownCtx.Done():
-					t.Stop()
-					return
-				case <-t.C:
-					t.Stop()
-
-					// Try initializing remaining storage pools in random order.
-					tryInstancesStart := false
-					for poolName := range initPools {
-						if initPool(poolName) {
-							// Storage pool initialized successfully or deleted so
-							// remove it from the list so its not retried.
-							delete(initPools, poolName)
-							tryInstancesStart = true
-						}
-					}
-
-					if len(initPools) <= 0 {
-						logger.Info("All storage pools initialized")
-					}
-
-					// At least one remaining storage pool was initialized, check if any
-					// instances can now start.
-					if tryInstancesStart {
-						instances, err := instance.LoadNodeAll(s, instancetype.Any)
-						if err != nil {
-							logger.Error("Failed loading instances to start", logger.Ctx{"err": err})
-						} else {
-							instancesStart(s, instances)
-						}
-					}
-
-					if len(initPools) <= 0 {
-						return // Our job here is done.
-					}
+		go runWithBackoff(s.ShutdownCtx, 5*time.Second, 5*time.Second, time.Minute, func() bool {
+			// Try initializing remaining storage pools in random order.
+			tryInstancesStart := false
+			for poolName := range initPools {
+				if initPool(poolName) {
+					// Storage pool initialized successfully or deleted so
+					// remove it from the list so its not retried.
+					delete(initPools, poolName)
+					tryInstancesStart = true
 				}
 			}
-		}()
+
+			if len(initPools) <= 0 {
+				logger.Info("All storage pools initialized")
+			}
+
+			// At least one remaining storage pool was initialized, check if any
+			// instances can now start.
+			if tryInstancesStart {
+				instances, err := instance.LoadNodeAll(s, instancetype.Any)
+				if err != nil {
+					logger.Error("Failed loading instances to start", logger.Ctx{"err": err})
+				} else {
+					instancesStart(s.ShutdownCtx, s, instances)
+				}
+			}
+
+			if len(initPools) <= 0 {
+				// All storage pools are ready now after performing some retries.
+				// This unblocks any waitready caller using the --storage flag.
+				s.StorageReady.Cancel()
+
+				return true // Our job here is done.
+			}
+
+			return false
+		})
 	} else {
+		// All storage pools are ready.
+		// This unblocks any waitready caller using the --storage flag.
+		s.StorageReady.Cancel()
+
 		logger.Info("All storage pools initialized")
 	}
 
 	return nil
 }
 
-func storagePoolDriversCacheUpdate(s *state.State) {
+func storageStop(s *state.State) {
+	if s.DB.Cluster == nil {
+		logger.Warn("Skipping storage stop due to global database not being available")
+		return
+	}
+
+	logger.Info("Stopping storage pools")
+
+	var err error
+	var pools []string
+
+	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		pools, err = tx.GetStoragePoolNames(ctx)
+
+		return err
+	})
+	if err != nil && !response.IsNotFoundError(err) {
+		logger.Error("Failed getting storage pools", logger.Ctx{"err": err})
+	}
+
+	for _, poolName := range pools {
+		pool, err := storagePools.LoadByName(s, poolName)
+		if err != nil {
+			logger.Error("Failed getting storage pool", logger.Ctx{"pool": poolName, "err": err})
+			continue
+		}
+
+		_, err = pool.Unmount()
+		if err != nil {
+			logger.Error("Cannot unmount storage pool", logger.Ctx{"pool": poolName, "err": err})
+			continue
+		}
+	}
+}
+
+func storagePoolDriversCacheUpdate(ctx context.Context, s *state.State) {
 	// Get a list of all storage drivers currently in use
 	// on this LXD instance. Only do this when we do not already have done
 	// this once to avoid unnecessarily querying the db. All subsequent
@@ -177,7 +215,7 @@ func storagePoolDriversCacheUpdate(s *state.State) {
 
 	var drivers []string
 
-	err := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err := s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 		var err error
 
 		drivers, err = tx.GetStorageDrivers(ctx)
@@ -195,13 +233,17 @@ func storagePoolDriversCacheUpdate(s *state.State) {
 	supportedDrivers := make([]api.ServerStorageDriverInfo, 0, len(info))
 
 	for _, entry := range info {
-		supportedDrivers = append(supportedDrivers, api.ServerStorageDriverInfo{
-			Name:    entry.Name,
-			Version: entry.Version,
-			Remote:  entry.Remote,
-		})
+		// If an empty version is reported by the driver that is an indicator that
+		// the driver (or its dependencies) are not available on this system.
+		if entry.Version != "" {
+			supportedDrivers = append(supportedDrivers, api.ServerStorageDriverInfo{
+				Name:    entry.Name,
+				Version: entry.Version,
+				Remote:  entry.Remote,
+			})
+		}
 
-		if shared.ValueInSlice(entry.Name, drivers) {
+		if slices.Contains(drivers, entry.Name) {
 			usedDrivers[entry.Name] = entry.Version
 		}
 	}
@@ -209,7 +251,7 @@ func storagePoolDriversCacheUpdate(s *state.State) {
 	// Prepare the cache entries.
 	backends := []string{}
 	for k, v := range usedDrivers {
-		backends = append(backends, fmt.Sprintf("%s %s", k, v))
+		backends = append(backends, k+" "+v)
 	}
 
 	// Update the user agent.

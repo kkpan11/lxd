@@ -1,7 +1,6 @@
 test_init_dump() {
   # - lxd init --dump
   LXD_INIT_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
-  chmod +x "${LXD_INIT_DIR}"
   spawn_lxd "${LXD_INIT_DIR}" false
 
   (
@@ -12,7 +11,7 @@ test_init_dump() {
     storage_pool="lxdtest-$(basename "${LXD_DIR}")-data"
     driver="dir"
 
-    cat <<EOF | lxd init --preseed
+    lxd init --preseed <<EOF
 config:
   core.https_address: 127.0.0.1:9999
   images.auto_update_interval: 15
@@ -45,10 +44,13 @@ profiles:
 EOF
   lxd init --dump > config.yaml
 
+cluster_uuid="$(lxc config get volatile.uuid)"
+
 cat <<EOF > expected.yaml
 config:
   core.https_address: 127.0.0.1:9999
   images.auto_update_interval: "15"
+  volatile.uuid: ${cluster_uuid}
 networks:
 - config:
     ipv4.address: none
@@ -97,6 +99,8 @@ projects:
     features.storage.volumes: "true"
   description: Default LXD project
   name: default
+  storage: ""
+  network: ""
 
 EOF
 

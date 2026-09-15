@@ -1,32 +1,250 @@
-# How to run
+# LXD tests
+
+For a description of where and how LXD is tested, please refer to the [overview](./overview.md) document.
+
+## How to run
 
 To run all tests, including the Go tests, run from repository root:
 
-    sudo -E make check
+```sh
+sudo -E make check
+```
 
 To run only the integration tests, run from the test directory:
 
-    sudo -E ./main.sh
+```sh
+sudo -E ./main.sh
+```
 
-# Environment variables
+## Snap integration tests
 
-Name                           | Default                   | Description
-:--                            | :---                      | :----------
-`LXD_BACKEND`                  | dir                       | What backend to test against (btrfs, ceph, dir, lvm, zfs, or random)
-`LXD_CEPH_CLUSTER`             | ceph                      | The name of the ceph cluster to create osd pools in
-`LXD_CEPH_CEPHFS`              | ""                        | Enables the CephFS tests using the specified cephfs filesystem for `cephfs` pools
-`LXD_CEPH_CEPHOBJECT_RADOSGW`  | ""                        | Enables the Ceph Object tests using the specified radosgw HTTP endpoint for `cephobject` pools
-`LXD_CONCURRENT`               | 0                         | Run concurrency tests, very CPU intensive
-`LXD_VERBOSE`                  | ""                        | Run lxd, lxc and the shell in verbose mode (used in CI; less verbose than `LXD_DEBUG`)
-`LXD_DEBUG`                    | ""                        | Run lxd, lxc and the shell in debug mode (very verbose)
-`LXD_INSPECT`                  | 0                         | Don't teardown the test environment on failure
-`LXD_LOGS `                    | ""                        | Path to a directory to copy all the LXD logs to
-`LXD_OFFLINE`                  | 0                         | Skip anything that requires network access
-`LXD_SKIP_TESTS`               | ""                        | Space-delimited list of test names to skip
-`LXD_TEST_IMAGE`               | "" (busybox test image)   | Path to an image tarball to use instead of the default busybox image
-`LXD_TMPFS`                    | 0                         | Sets up a tmpfs for the whole testsuite to run on (fast but needs memory)
-`LXD_NIC_SRIOV_PARENT`         | ""                        | Enables SR-IOV NIC tests using the specified parent device
-`LXD_IB_PHYSICAL_PARENT`       | ""                        | Enables Infiniband physical tests using the specified parent device
-`LXD_IB_SRIOV_PARENT`          | ""                        | Enables Infiniband SR-IOV tests using the specified parent device
-`LXD_NIC_BRIDGED_DRIVER`       | ""                        | Specifies bridged NIC driver for tests (either native or openvswitch, defaults to native)
-`LXD_REQUIRED_TESTS`           | ""                        | Space-delimited list of test names that must not be skipped if their prerequisites are not met
+Snap integration test scripts are in `test/snap/` and can be run directly
+from the repository root:
+
+```sh
+sudo -E ./test/snap/cgroup latest/edge
+```
+
+The snap channel is optional and defaults to `latest/edge`. The runner installs
+the selected store snap by default. To remove the installed LXD snap before a
+test run, which is useful for repeated local testing, set `PURGE_LXD`:
+
+```sh
+sudo -E env PURGE_LXD=1 ./test/snap/interception latest/edge
+```
+
+To reuse an installed LXD snap without installing or refreshing it, set
+`KEEP_LXD`:
+
+```sh
+sudo -E env KEEP_LXD=1 ./test/snap/interception latest/edge
+```
+
+### Test a source build
+
+To test binaries built from the current LXD source tree, first run `make`, then
+enable sideloading:
+
+```sh
+make
+sudo -E env LXD_SNAP_SIDELOAD=1 ./test/snap/interception latest/edge
+```
+
+Set `LXD_SNAP_BINARY_DIR` to use binaries from a directory other than
+`$(go env GOPATH)/bin`:
+
+```sh
+sudo -E env LXD_SNAP_SIDELOAD=1 LXD_SNAP_BINARY_DIR=/path/to/bin ./test/snap/interception latest/edge
+```
+
+To sideload individual binaries while testing an installed store snap, set the
+corresponding path:
+
+```sh
+sudo -E env LXD_SIDELOAD_PATH=/path/to/lxd ./test/snap/interception latest/edge
+sudo -E env LXC_SIDELOAD_PATH=/path/to/lxc ./test/snap/interception latest/edge
+sudo -E env LXD_AGENT_SIDELOAD_PATH=/path/to/lxd-agent ./test/snap/vm latest/edge
+```
+
+### Test a local snap
+
+To test a locally built snap, set `LXD_SNAP_PATH`:
+
+```sh
+sudo -E env LXD_SNAP_PATH=/path/to/lxd_0+git_amd64.snap ./test/snap/interception latest/edge
+```
+
+To use the system's ZFS tools instead of the tools bundled in the LXD snap, set
+`LXD_ZFS_EXTERNAL`:
+
+```sh
+sudo -E env LXD_ZFS_EXTERNAL=1 ./test/snap/interception latest/edge
+```
+
+### Test OVN
+
+The `network-ovn` suite can use the host's OVN packages or a chosen MicroOVN
+snap channel:
+
+```sh
+sudo -E env OVN_SOURCE=deb PURGE_LXD=1 ./test/snap/network-ovn latest/edge
+sudo -E env OVN_SOURCE=22.03/edge PURGE_LXD=1 ./test/snap/network-ovn latest/edge
+sudo -E env OVN_SOURCE=24.03/edge PURGE_LXD=1 ./test/snap/network-ovn latest/edge
+sudo -E env PURGE_LXD=1 ./test/snap/network-ovn latest/edge
+```
+
+The test host must have snapd installed and the command must run as root.
+
+## Environment variables
+
+Name                                       | Default                   | Description
+:--                                        | :---                      | :----------
+`LXD_BACKEND`                              | dir                       | What backend to test against (btrfs, ceph, dir, lvm, zfs, or random)
+`LXD_BACKENDS`                             | `LXD_BACKEND`             | Space-delimited list of backends to run test against. Accepts `fast` (`btrfs` or `dir`), `fasts` (`btrfs` and `dir`) and `all` (see the list in `LXD_BACKEND`)
+`LXD_CEPH_CLUSTER`                         | ceph                      | The name of the ceph cluster to create osd pools in
+`LXD_CEPH_CEPHFS`                          | cephfs                    | Enables the CephFS tests using the specified cephfs filesystem for `cephfs` pools
+`LXD_CEPH_CEPHOBJECT_RADOSGW`              | ""                        | Enables the Ceph Object tests using the specified radosgw HTTP endpoint for `cephobject` pools
+`LXD_VERBOSE`                              | ""                        | Run lxd, lxc and the shell in verbose mode (used in CI; less verbose than `LXD_DEBUG`)
+`LXD_DEBUG`                                | ""                        | Run lxd, lxc and the shell in debug mode (very verbose)
+`LXD_INSPECT`                              | 0                         | Set to 1 to start an inspection shell in the test environment on failure
+`LXD_LOGS`                                 | ""                        | Path to a directory to copy all the LXD logs to
+`LXD_REPEAT_TESTS`                         | 1                         | Number of times to repeat test(s)
+`LXD_RANDOMIZE_TESTS`                      | 0                         | Randomize the order of tests in a group
+`LXD_SKIP_TESTS`                           | ""                        | Space-delimited list of test names to skip
+`LXD_TEST_IMAGE`                           | "" (busybox test image)   | Path to an image tarball to use instead of the default busybox image
+`LXD_TEST_LIVE_MIGRATION_ON_THE_SAME_HOST` | ""                        | When set to true, LXD ignores EBUSY errors during same-host live migration when unmounting a source volume that is already mounted on the destination instance.
+`LXD_TMPFS`                                | 0                         | Sets up a tmpfs for the whole testsuite to run on (fast but needs memory)
+`LXD_NIC_SRIOV_PARENT`                     | ""                        | Enables SR-IOV NIC tests using the specified parent device
+`LXD_IB_PHYSICAL_PARENT`                   | ""                        | Enables Infiniband physical tests using the specified parent device
+`LXD_IB_SRIOV_PARENT`                      | ""                        | Enables Infiniband SR-IOV tests using the specified parent device
+`LXD_NIC_BRIDGED_DRIVER`                   | ""                        | Specifies bridged NIC driver for tests (either native or openvswitch, defaults to native)
+`LXD_REQUIRED_TESTS`                       | ""                        | Space-delimited list of test names that must not be skipped if their prerequisites are not met
+`LXD_VM_TESTS`                             | 1                         | Enables tests using VMs and the on-demand installation of the needed tools
+
+## Recommendations
+
+### `sub_test` usage
+
+Use `sub_test` to label meaningful phases within a test and make logs easier to scan.
+Prefer a small number of focused sub-tests over excessive nesting.
+Use `sub_test` before a logical group of commands that verifies a specific expected behavior for a bug fix or feature.
+Comments within the sub-test block are appropriate to explain why specific commands are used, any setup or initial configuration, and other intent that isn't obvious from the commands.
+
+Good:
+
+```sh
+sub_test "Verify intended behavior X"
+...
+sub_test "Verify intended behavior Y"
+...
+```
+
+### `echo` context
+
+Prefer `sub_test` labels and concise comments for context instead of adding `echo` statements.
+Use `echo` only when you need to debug flaky behavior.
+
+### Expected failure
+
+If a command is expected to fail, special care needs to be used in testing.
+
+Bad:
+
+```sh
+set -e
+...
+
+! cmd_should_fail
+
+some_other_command
+```
+
+Good:
+
+```sh
+set -e
+
+! cmd_should_fail || false
+
+some_other_command
+```
+
+Best:
+
+```sh
+set -e
+
+if cmd_should_fail; then
+  echo "ERROR: cmd_should_fail unexpectedly succeeded, aborting" >&2
+  exit 1
+fi
+
+some_other_command
+```
+
+In the "bad" example, if the command unexpectedly succeeds, the script won't
+abort because `bash` ignores `set -e` for compounded commands (`!
+cmd_should_fail`).
+
+The "good" example works around the problem of compound commands by falling
+back to executing `false` in case of unexpected success of the command.
+
+The "best" example also works around the problem of compound commands but in a
+very intuitive and readable form, albeit longer.
+
+````{note}
+This odd behavior of `set -e` with compound commands does not apply inside `[]`.
+
+```sh
+set -e
+# Does the right thing of failing if the file unexpectedly exist
+[ ! -e "should/not/exist" ]
+```
+
+However, note that in the above example, if the `!` is moved outside of the `[]`, it would also warrant a ` || false` fallback.
+````
+
+For error message assertions, prefer single-quoted strings so error text with `"` does not require escaping and the comparisons stay readable.
+
+### `jq` usage
+
+Always use `jq --exit-status` (or the shorthand `-e`) when checking for the presence of fields or specific values. This makes test failures explicit:
+
+Bad:
+```sh
+jq '.field' output.json > /dev/null  # Silent fail if field missing
+```
+
+Good:
+```sh
+jq -e '.field' output.json          # Explicit exit code if field missing
+jq -e '.field == "expected"' output.json
+```
+
+### Avoid `grep -c` for presence or absence checks
+
+Avoid using `grep -c` to test for presence or absence — it makes tests brittle and harder to read.
+`grep -c` for actual counting (where the count matters) is fine.
+
+Bad:
+```sh
+# Using -c when you only care about presence, not count
+[ "$(lxc list | grep -c c1)" = "1" ]
+```
+
+Good:
+```sh
+# Just check presence
+lxc list | grep -wF c1
+```
+
+Best:
+```sh
+# Filter output directly and compare exactly
+[ "$(lxc list -f csv -c n)" = "c1" ]
+```
+
+OK (counting genuinely matters):
+```sh
+[ "$(grep -c "pattern" logfile)" = "3" ]
+```

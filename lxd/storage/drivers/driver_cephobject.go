@@ -2,15 +2,16 @@ package drivers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os/exec"
 	"strings"
 
 	"github.com/canonical/lxd/lxd/migration"
-	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
+	"github.com/canonical/lxd/shared/ioprogress"
 	"github.com/canonical/lxd/shared/validate"
 )
 
@@ -33,6 +34,7 @@ func (d *cephobject) load() error {
 		"storage_delete_old_snapshot_records":                nil,
 		"storage_zfs_drop_block_volume_filesystem_extension": nil,
 		"storage_prefix_bucket_names_with_project":           nil,
+		"storage_zfs_remove_local_bucket_datasets":           nil,
 	}
 
 	// Done if previously loaded.
@@ -50,19 +52,12 @@ func (d *cephobject) load() error {
 
 	// Detect and record the version.
 	if cephobjectVersion == "" {
-		out, err := shared.RunCommand("radosgw-admin", "--version")
+		ver, err := radosgwVersion()
 		if err != nil {
 			return err
 		}
 
-		out = strings.TrimSpace(out)
-
-		fields := strings.Split(out, " ")
-		if strings.HasPrefix(out, "ceph version ") && len(fields) > 2 {
-			cephobjectVersion = fields[2]
-		} else {
-			cephobjectVersion = out
-		}
+		cephobjectVersion = ver
 	}
 
 	cephobjectLoaded = true
@@ -78,18 +73,19 @@ func (d *cephobject) isRemote() bool {
 // Info returns the pool driver information.
 func (d *cephobject) Info() Info {
 	return Info{
-		Name:              "cephobject",
-		Version:           cephobjectVersion,
-		OptimizedImages:   false,
-		PreservesInodes:   false,
-		Remote:            d.isRemote(),
-		Buckets:           true,
-		VolumeTypes:       []VolumeType{},
-		VolumeMultiNode:   false,
-		BlockBacking:      false,
-		RunningCopyFreeze: false,
-		DirectIO:          false,
-		MountedRoot:       false,
+		Name:                     "cephobject",
+		Version:                  cephobjectVersion,
+		OptimizedImages:          false,
+		PreservesInodes:          false,
+		Remote:                   d.isRemote(),
+		Buckets:                  true,
+		VolumeTypes:              []VolumeType{},
+		VolumeMultiNode:          false,
+		BlockBacking:             false,
+		RunningCopyFreeze:        false,
+		DirectIO:                 false,
+		MountedRoot:              false,
+		PopulateParentVolumeUUID: false,
 	}
 }
 
@@ -101,6 +97,7 @@ func (d *cephobject) Validate(config map[string]string) error {
 		// ---
 		//  type: string
 		//  shortdesc: The Ceph cluster to use
+		//  scope: global
 		"cephobject.cluster_name": validate.IsAny,
 		// lxdmeta:generate(entities=storage-cephobject; group=pool-conf; key=cephobject.user.name)
 		//
@@ -108,31 +105,36 @@ func (d *cephobject) Validate(config map[string]string) error {
 		//  type: string
 		//  defaultdesc: `admin`
 		//  shortdesc: The Ceph user to use
+		//  scope: global
 		"cephobject.user.name": validate.IsAny,
 		// lxdmeta:generate(entities=storage-cephobject; group=pool-conf; key=cephobject.radosgw.endpoint)
 		//
 		// ---
 		//  type: string
 		//  shortdesc: URL of the `radosgw` gateway process
+		//  scope: global
 		"cephobject.radosgw.endpoint": validate.Optional(validate.IsRequestURL),
 		// lxdmeta:generate(entities=storage-cephobject; group=pool-conf; key=cephobject.radosgw.endpoint_cert_file)
 		// Specify the path to the file that contains the TLS client certificate.
 		// ---
 		//  type: string
 		//  shortdesc: TLS client certificate to use for endpoint communication
+		//  scope: global
 		"cephobject.radosgw.endpoint_cert_file": validate.Optional(validate.IsAbsFilePath),
 		// lxdmeta:generate(entities=storage-cephobject; group=pool-conf; key=cephobject.bucket.name_prefix)
 		//
 		// ---
 		//  type: string
 		//  shortdesc: Prefix to add to bucket names in Ceph
-		"cephobject.bucket.name_prefix": validate.Optional(validate.IsAny),
+		//  scope: global
+		"cephobject.bucket.name_prefix": validate.IsAny,
 		// lxdmeta:generate(entities=storage-cephobject; group=pool-conf; key=volatile.pool.pristine)
 		//
 		// ---
 		//  type: string
 		//  defaultdesc: `true`
 		//  shortdesc: Whether the `radosgw` `lxd-admin` user existed at creation time
+		//  scope: global
 		"volatile.pool.pristine": validate.Optional(validate.IsBool),
 	}
 
@@ -149,8 +151,23 @@ func (d *cephobject) FillConfig() error {
 		d.config["cephobject.user.name"] = CephDefaultUser
 	}
 
+	return nil
+}
+
+// SourceIdentifier returns a string consisting of the RadosGW endpoint.
+func (d *cephobject) SourceIdentifier() (string, error) {
+	endpoint := d.config["cephobject.radosgw.endpoint"]
+	if endpoint != "" {
+		return endpoint, nil
+	}
+
+	return "", errors.New("Cannot derive identifier from empty endpoint")
+}
+
+// ValidateSource checks whether the required config keys are set to access the remote source.
+func (d *cephobject) ValidateSource() error {
 	if d.config["cephobject.radosgw.endpoint"] == "" {
-		return fmt.Errorf(`"cephobject.radosgw.endpoint" option is required`)
+		return errors.New(`"cephobject.radosgw.endpoint" option is required`)
 	}
 
 	return nil
@@ -159,11 +176,6 @@ func (d *cephobject) FillConfig() error {
 // Create is called during pool creation and is effectively using an empty driver struct.
 // WARNING: The Create() function cannot rely on any of the struct attributes being set.
 func (d *cephobject) Create() error {
-	err := d.FillConfig()
-	if err != nil {
-		return err
-	}
-
 	// Check if there is an existing cephobjectRadosgwAdminUser user.
 	adminUserInfo, _, err := d.radosgwadminGetUser(context.TODO(), cephobjectRadosgwAdminUser)
 	if err != nil && !api.StatusErrorCheck(err, http.StatusNotFound) {
@@ -184,7 +196,7 @@ func (d *cephobject) Create() error {
 }
 
 // Delete clears any local and remote data related to this driver instance.
-func (d *cephobject) Delete(op *operations.Operation) error {
+func (d *cephobject) Delete(progressReporter ioprogress.ProgressReporter) error {
 	if shared.IsTrue(d.config["volatile.pool.pristine"]) {
 		err := d.radosgwadminUserDelete(context.TODO(), cephobjectRadosgwAdminUser)
 		if err != nil {
@@ -206,7 +218,7 @@ func (d *cephobject) Update(changedConfig map[string]string) error {
 
 		for _, bucketName := range buckets {
 			if strings.HasPrefix(bucketName, d.config["cephobject.bucket.name_prefix"]) {
-				return fmt.Errorf(`Cannot change "cephobject.bucket.name_prefix" when there are existing buclets`)
+				return errors.New(`Cannot change "cephobject.bucket.name_prefix" when there are existing buckets`)
 			}
 		}
 	}

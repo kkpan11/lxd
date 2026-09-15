@@ -1,5 +1,5 @@
 ---
-discourse: ubuntu:41516
+discourse: "[Identity&#32;and&#32;Access&#32;Management&#32;for&#32;LXD](41516)"
 ---
 
 (authorization)=
@@ -23,7 +23,7 @@ If the list of projects is empty, the client will not be allowed access to any o
 (fine-grained-authorization)=
 ## Fine-grained authorization
 
-It is possible to restrict {ref}`OIDC clients <authentication-openid>` to granular actions on specific LXD resources.
+It is possible to restrict {ref}`OIDC clients <authentication-openid>` and fine-grained TLS identities to granular actions on specific LXD resources.
 For example, one could restrict a user to be able to view, but not edit, a single instance.
 
 There are four key concepts that LXD uses to manage these fine-grained permissions:
@@ -139,9 +139,8 @@ When an OIDC client makes a request to LXD, any groups that can be extracted fro
 
 To configure IdP group mappings in LXD, first configure your IdP to add groups to identity and access tokens as a custom claim.
 This configuration depends on your IdP.
-In [{spellexception}`Auth0`](https://auth0.com/), for example, you can add the "roles" that a user has as a custom claim via an [action](https://community.auth0.com/t/how-to-add-roles-and-permissions-to-the-id-token-using-actions/84506).
-Alternatively, if {abbr}`RBAC (role-based access control)` is enabled for the audience, a "permissions" claim can be added automatically.
-In Keycloak, you can define a [mapper](https://keycloak.discourse.group/t/anyway-to-include-user-groups-into-my-jwt-token/8715) to set Keycloak groups in the token.
+In [{spellexception}`Auth0`](https://auth0.com/), for example, you can enable [{abbr}`RBAC (role-based access control)`](https://auth0.com/docs/manage-users/access-control/rbac) which will add a "permissions" claim to tokens. Then, configure {ref}`automatic mapping to LXD authorization groups <oidc-auth0-automatic-group-mapping>`.
+In Keycloak, you can define a [mapper](https://forum.keycloak.org/t/anyway-to-include-user-groups-into-my-jwt-token/8715) to set Keycloak groups in the token. In [Pocket ID](https://pocket-id.org/docs), you can set up {ref}`custom claims <oidc-pocket-id-automatic-group-mapping>` in your admin dashboard.
 
 Then configure LXD to extract this claim.
 To do so, set the value of the {config:option}`server-oidc:oidc.groups.claim` configuration key to the value of the field name of the custom claim:

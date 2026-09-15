@@ -1,6 +1,15 @@
 (network-ovn-setup)=
 # How to set up OVN with LXD
 
+````{only} integrated
+
+```{admonition} For MicroCloud users
+:class: note
+The MicroCloud setup process sets up an OVN network. Thus, you do not need to follow the steps on this page.
+```
+
+````
+
 See the following sections for how to set up a basic OVN network, either as a standalone network or to host a small LXD cluster.
 
 ## Set up a standalone OVN network
@@ -32,8 +41,9 @@ Complete the following steps to create a standalone OVN network that is connecte
 1. Run [`lxc list`](lxc_list.md) to show the instance information:
 
    ```{terminal}
-   :input: lxc list
    :scroll:
+   
+   lxc list
 
    +------+---------+---------------------+----------------------------------------------+-----------+-----------+
    | NAME |  STATE  |        IPV4         |                     IPV6                     |   TYPE    | SNAPSHOTS |
@@ -45,6 +55,7 @@ Complete the following steps to create a standalone OVN network that is connecte
 ## Set up a LXD cluster on OVN
 
 ```{youtube} https://www.youtube.com/watch?v=1M__Rm9iZb8
+:title: OVN and a LXD cluster
 ```
 
 Complete the following steps to set up a LXD cluster that uses an OVN network.
@@ -161,6 +172,10 @@ See the linked YouTube video for the complete tutorial using four machines.
    To do so, find the value for `ovn-northd-nb-db` in `/etc/default/ovn-central` and provide it to LXD with the following command:
 
        lxc config set network.ovn.northbound_connection <ovn-northd-nb-db>
+
+   ```{note}
+   If you are using a MicroOVN deployment, pass the value of the MicroOVN node IP address you want to target. Prefix the IP address with `ssl:`, and suffix it with the `:6641` port number that corresponds to the OVN central service within MicroOVN.
+   ```
 
 1. Finally, create the actual OVN network (on the first machine):
 

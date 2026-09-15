@@ -2,8 +2,8 @@
 
 package idmap
 
-// #cgo LDFLAGS: -lacl
 /*
+#cgo LDFLAGS: -lacl
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE 1
 #endif
@@ -394,13 +394,13 @@ static int create_detached_idmapped_mount(const char *path, const char *fstype)
 	if (ret < 0)
 		return -errno;
 
-	close(fd_userns);
 	return 0;
 }
 */
 import "C"
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -413,7 +413,7 @@ import (
 	"github.com/canonical/lxd/shared/logger"
 )
 
-// ShiftOwner updates uid and gid for a file when entering/exiting a namespace
+// ShiftOwner updates uid and gid for a file when entering/exiting a namespace.
 func ShiftOwner(basepath string, path string, uid int, gid int) error {
 	cbasepath := C.CString(basepath)
 	defer C.free(unsafe.Pointer(cbasepath))
@@ -423,13 +423,13 @@ func ShiftOwner(basepath string, path string, uid int, gid int) error {
 
 	r := C.shiftowner(cbasepath, cpath, C.int(uid), C.int(gid))
 	if r != 0 {
-		return fmt.Errorf("Failed to change ownership of: %s", path)
+		return fmt.Errorf("Failed changing ownership of: %q", path)
 	}
 
 	return nil
 }
 
-// GetCaps extracts the list of capabilities effective on the file
+// GetCaps extracts the list of capabilities effective on the file.
 func GetCaps(path string) ([]byte, error) {
 	xattrs, err := shared.GetAllXattr(path)
 	if err != nil {
@@ -444,7 +444,7 @@ func GetCaps(path string) ([]byte, error) {
 	return []byte(valueStr), nil
 }
 
-// SetCaps applies the caps for a particular root uid
+// SetCaps applies the caps for a particular root uid.
 func SetCaps(path string, caps []byte, uid int64) error {
 	cpath := C.CString(path)
 	defer C.free(unsafe.Pointer(cpath))
@@ -454,13 +454,13 @@ func SetCaps(path string, caps []byte, uid int64) error {
 
 	r := C.set_vfs_ns_caps(cpath, ccaps, C.ssize_t(len(caps)), C.uint32_t(uid))
 	if r != 0 {
-		return fmt.Errorf("Failed to apply capabilities to: %s", path)
+		return fmt.Errorf("Failed applying capabilities to: %q", path)
 	}
 
 	return nil
 }
 
-// ShiftACL updates uid and gid for file ACLs when entering/exiting a namespace
+// ShiftACL updates uid and gid for file ACLs when entering/exiting a namespace.
 func ShiftACL(path string, shiftIDs func(uid int64, gid int64) (int64, int64)) error {
 	err := shiftACLType(path, C.ACL_TYPE_ACCESS, shiftIDs)
 	if err != nil {
@@ -499,13 +499,13 @@ func shiftACLType(path string, aclType int, shiftIDs func(uid int64, gid int64) 
 		if ret == 0 {
 			break
 		} else if ret < 0 {
-			return fmt.Errorf("Failed to get the ACL entry for %s", path)
+			return fmt.Errorf("Failed getting the ACL entry for %q", path)
 		}
 
 		// Get the ACL type
 		ret = C.acl_get_tag_type(ent, &tag)
 		if ret == -1 {
-			return fmt.Errorf("Failed to get the ACL type for %s", path)
+			return fmt.Errorf("Failed getting the ACL type for %q", path)
 		}
 
 		// We only care about user and group ACLs, copy anything else
@@ -516,7 +516,7 @@ func shiftACLType(path string, aclType int, shiftIDs func(uid int64, gid int64) 
 		// Get the value
 		idp := (*C.id_t)(C.acl_get_qualifier(ent))
 		if idp == nil {
-			return fmt.Errorf("Failed to get current ACL value for %s", path)
+			return fmt.Errorf("Failed getting current ACL value for %q", path)
 		}
 
 		// Shift the value
@@ -530,7 +530,7 @@ func shiftACLType(path string, aclType int, shiftIDs func(uid int64, gid int64) 
 		// Update the new entry with the shifted value
 		ret = C.acl_set_qualifier(ent, unsafe.Pointer(&newID))
 		if ret == -1 {
-			return fmt.Errorf("Failed to set ACL qualifier on %s", path)
+			return fmt.Errorf("Failed setting ACL qualifier on %q", path)
 		}
 
 		update = true
@@ -540,14 +540,14 @@ func shiftACLType(path string, aclType int, shiftIDs func(uid int64, gid int64) 
 	if update {
 		ret, err := C.acl_set_file(cpath, C.uint(aclType), acl)
 		if ret < 0 {
-			return fmt.Errorf("%s - Failed to change ACLs on %s", err, path)
+			return fmt.Errorf("%s - Failed changing ACLs on %q", err, path)
 		}
 	}
 
 	return nil
 }
 
-// SupportsVFS3Fscaps checks if VFS3Fscaps are supported
+// SupportsVFS3Fscaps checks if VFS3Fscaps are supported.
 func SupportsVFS3Fscaps(prefix string) bool {
 	tmpfile, err := os.CreateTemp(prefix, ".lxd_fcaps_v3_")
 	if err != nil {
@@ -584,10 +584,10 @@ func SupportsVFS3Fscaps(prefix string) bool {
 	return true
 }
 
-// UnshiftACL performs an UID/GID unshift on the ACL xattr value in accordance with idmap (set) provided
+// UnshiftACL performs an UID/GID unshift on the ACL xattr value in accordance with idmap (set) provided.
 func UnshiftACL(value string, set *IdmapSet) (string, error) {
 	if set == nil {
-		return "", fmt.Errorf("Invalid IdmapSet supplied")
+		return "", errors.New("Invalid IdmapSet supplied")
 	}
 
 	buf := []byte(value)
@@ -597,7 +597,7 @@ func UnshiftACL(value string, set *IdmapSet) (string, error) {
 
 	size := len(buf)
 	if size < int(unsafe.Sizeof(*header)) {
-		return "", fmt.Errorf("Invalid ACL size")
+		return "", errors.New("Invalid ACL size")
 	}
 
 	if header.a_version != C.native_to_le32(C.POSIX_ACL_XATTR_VERSION) {
@@ -606,11 +606,11 @@ func UnshiftACL(value string, set *IdmapSet) (string, error) {
 
 	count := C.posix_acl_xattr_count(C.size_t(size))
 	if count < 0 {
-		return "", fmt.Errorf("Invalid ACL count")
+		return "", errors.New("Invalid ACL count")
 	}
 
 	if count == 0 {
-		return "", fmt.Errorf("No valid ACLs found")
+		return "", errors.New("No valid ACLs found")
 	}
 
 	entryPtr := C.posix_entry_start(unsafe.Pointer(header))
@@ -635,13 +635,13 @@ func UnshiftACL(value string, set *IdmapSet) (string, error) {
 			}
 
 		case C.ACL_USER_OBJ:
-			logger.Debugf("Ignoring ACL type ACL_USER_OBJ")
+			logger.Debug("Ignoring ACL type ACL_USER_OBJ")
 		case C.ACL_GROUP_OBJ:
-			logger.Debugf("Ignoring ACL type ACL_GROUP_OBJ")
+			logger.Debug("Ignoring ACL type ACL_GROUP_OBJ")
 		case C.ACL_MASK:
-			logger.Debugf("Ignoring ACL type ACL_MASK")
+			logger.Debug("Ignoring ACL type ACL_MASK")
 		case C.ACL_OTHER:
-			logger.Debugf("Ignoring ACL type ACL_OTHER")
+			logger.Debug("Ignoring ACL type ACL_OTHER")
 		default:
 			logger.Debugf("Ignoring unknown ACL type %d", C.le16_to_native(entry.e_tag))
 		}
@@ -654,10 +654,10 @@ func UnshiftACL(value string, set *IdmapSet) (string, error) {
 	return string(buf), nil
 }
 
-// UnshiftCaps performs an UID/GID unshift on the security.capability xattr value in accordance with idmap (set) provided
+// UnshiftCaps performs an UID/GID unshift on the security.capability xattr value in accordance with idmap (set) provided.
 func UnshiftCaps(value string, set *IdmapSet) (string, error) {
 	if set == nil {
-		return "", fmt.Errorf("Invalid IdmapSet supplied")
+		return "", errors.New("Invalid IdmapSet supplied")
 	}
 
 	buf := []byte(value)
@@ -681,16 +681,16 @@ func UnshiftCaps(value string, set *IdmapSet) (string, error) {
 	return string(buf), nil
 }
 
-// IdmapStorageType represents a file system idmapping type
+// IdmapStorageType represents a file system idmapping type.
 type IdmapStorageType string
 
-// Define IdmapStorageType type values
+// Define IdmapStorageType type values.
 const (
 	IdmapStorageNone     = "none"
 	IdmapStorageIdmapped = "idmapped"
 )
 
-// CanIdmapMount checks if (fstype) filesystem supports idmapped mounts
+// CanIdmapMount checks if (fstype) filesystem supports idmapped mounts.
 func CanIdmapMount(path string, fstype string) bool {
 	cpath := C.CString(path)
 	defer C.free(unsafe.Pointer(cpath))

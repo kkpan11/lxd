@@ -1,14 +1,13 @@
 package events
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
 
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/cancel"
 )
@@ -39,7 +38,7 @@ func (s *DevLXDServer) AddListener(instanceID int, connection EventListenerConne
 		listenerCommon: listenerCommon{
 			EventListenerConnection: connection,
 			messageTypes:            messageTypes,
-			done:                    cancel.New(context.Background()),
+			done:                    cancel.New(),
 			id:                      uuid.New().String(),
 		},
 		instanceID: instanceID,
@@ -79,7 +78,7 @@ func (s *DevLXDServer) broadcast(instanceID int, event api.Event) error {
 	s.lock.Lock()
 	listeners := s.listeners
 	for _, listener := range listeners {
-		if !shared.ValueInSlice(event.Type, listener.messageTypes) {
+		if !slices.Contains(listener.messageTypes, event.Type) {
 			continue
 		}
 

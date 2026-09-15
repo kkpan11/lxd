@@ -2,6 +2,7 @@
 # How to back up a LXD server
 
 ```{youtube} https://www.youtube.com/watch?v=IFOZpAxckPo
+:title: LXD backup and disaster recovery
 ```
 
 In a production setup, you should always back up the contents of your LXD server.
@@ -65,7 +66,7 @@ If you are using the LXD snap, you can also create a full backup by exporting a 
 
        sudo snap export-snapshot <ID> <output_file>
 
-See [Snapshots](https://snapcraft.io/docs/snapshots) in the Snapcraft documentation for details.
+See {ref}`snap:how-to-guides-manage-snaps-create-data-snapshots` in the Snap documentation for details.
 
 ## Partial backup
 
@@ -84,7 +85,7 @@ The following sections give a brief summary of the options you have for backing 
 #### Secondary backup LXD server
 
 LXD supports copying and moving instances and storage volumes between two hosts.
-See {ref}`move-instances` and {ref}`howto-storage-move-volume` for instructions.
+See {ref}`howto-instances-migrate` and {ref}`howto-storage-move-volume` for instructions.
 
 So if you have a spare server, you can regularly copy your instances and storage volumes to that secondary server to back them up.
 Use the `--refresh` flag to update the copies (see {ref}`storage-optimized-volume-transfer` for the benefits).

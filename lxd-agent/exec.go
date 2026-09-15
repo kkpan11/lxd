@@ -2,11 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
@@ -18,8 +19,8 @@ import (
 	"github.com/gorilla/websocket"
 	"golang.org/x/sys/unix"
 
+	"github.com/canonical/lxd/lxd-agent/operations"
 	"github.com/canonical/lxd/lxd/db/operationtype"
-	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
@@ -40,7 +41,7 @@ var execCmd = APIEndpoint{
 }
 
 func execPost(d *Daemon, r *http.Request) response.Response {
-	post := api.ContainerExecPost{}
+	post := api.InstanceExecPost{}
 
 	buf, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -53,15 +54,13 @@ func execPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	if !post.WaitForWS {
-		return response.BadRequest(fmt.Errorf("Websockets are required for VM exec"))
+		return response.BadRequest(errors.New("Websockets are required for VM exec"))
 	}
 
 	env := map[string]string{}
 
 	if post.Environment != nil {
-		for k, v := range post.Environment {
-			env[k] = v
-		}
+		maps.Copy(env, post.Environment)
 	}
 
 	// Set default value for PATH
@@ -71,7 +70,7 @@ func execPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	if shared.PathExists("/snap/bin") {
-		env["PATH"] = fmt.Sprintf("%s:/snap/bin", env["PATH"])
+		env["PATH"] = env["PATH"] + ":/snap/bin"
 	}
 
 	// If running as root, set some env variables
@@ -134,17 +133,20 @@ func execPost(d *Daemon, r *http.Request) response.Response {
 	ws.uid = post.User
 	ws.gid = post.Group
 
-	resources := map[string][]api.URL{}
+	args := operations.OperationArgs{
+		Type:        operationtype.CommandExec,
+		Class:       operationtype.OperationClassWebsocket,
+		Metadata:    ws.Metadata(),
+		RunHook:     ws.Do,
+		ConnectHook: ws.Connect,
+	}
 
-	op, err := operations.OperationCreate(nil, "", operations.OperationClassWebsocket, operationtype.CommandExec, resources, ws.Metadata(), ws.Do, nil, ws.Connect, r)
+	op, err := operations.ScheduleOperation(d.events, args)
 	if err != nil {
 		return response.InternalError(err)
 	}
 
-	// Link the operation to the agent's event server.
-	op.SetEventServer(d.events)
-
-	return operations.OperationResponse(op)
+	return response.OperationResponse(op)
 }
 
 type execWs struct {
@@ -163,8 +165,9 @@ type execWs struct {
 	cwd                   string
 }
 
-func (s *execWs) Metadata() any {
-	fds := shared.Jmap{}
+// Metadata returns the metadata for the operation.
+func (s *execWs) Metadata() map[string]any {
+	fds := make(map[string]string, len(s.fds))
 	for fd, secret := range s.fds {
 		if fd == execWSControl {
 			fds[api.SecretNameControl] = secret
@@ -173,7 +176,7 @@ func (s *execWs) Metadata() any {
 		}
 	}
 
-	return shared.Jmap{
+	return map[string]any{
 		"fds":         fds,
 		"command":     s.command,
 		"environment": s.env,
@@ -181,14 +184,17 @@ func (s *execWs) Metadata() any {
 	}
 }
 
+// Connect establishes the websocket connections.
 func (s *execWs) Connect(op *operations.Operation, r *http.Request, w http.ResponseWriter) error {
 	secret := r.FormValue("secret")
 	if secret == "" {
-		return fmt.Errorf("missing secret")
+		return errors.New("missing secret")
 	}
 
+	secretBytes := []byte(secret)
+
 	for fd, fdSecret := range s.fds {
-		if secret == fdSecret {
+		if subtle.ConstantTimeCompare(secretBytes, []byte(fdSecret)) == 1 {
 			conn, err := ws.Upgrader.Upgrade(w, r, nil)
 			if err != nil {
 				return err
@@ -209,11 +215,13 @@ func (s *execWs) Connect(op *operations.Operation, r *http.Request, w http.Respo
 
 				s.requiredConnectedDone() // All required connections now connected.
 				return nil
-			} else if !found {
-				return fmt.Errorf("Unknown websocket number")
-			} else {
-				return fmt.Errorf("Websocket number already connected")
 			}
+
+			if !found {
+				return errors.New("Unknown websocket number")
+			}
+
+			return errors.New("Websocket number already connected")
 		}
 	}
 
@@ -222,7 +230,8 @@ func (s *execWs) Connect(op *operations.Operation, r *http.Request, w http.Respo
 	return os.ErrPermission
 }
 
-func (s *execWs) Do(op *operations.Operation) error {
+// Do executes the operation.
+func (s *execWs) Do(ctx context.Context, op *operations.Operation) error {
 	// Once this function ends ensure that any connected websockets are closed.
 	defer func() {
 		s.connsLock.Lock()
@@ -239,9 +248,8 @@ func (s *execWs) Do(op *operations.Operation) error {
 	logger.Debug("Waiting for exec websockets to connect")
 	select {
 	case <-s.requiredConnectedCtx.Done():
-		break
 	case <-time.After(time.Second * 5):
-		return fmt.Errorf("Timed out waiting for websockets to connect")
+		return errors.New("Timed out waiting for websockets to connect")
 	}
 
 	var err error
@@ -270,7 +278,7 @@ func (s *execWs) Do(op *operations.Operation) error {
 	} else {
 		ttys = make([]*os.File, 3)
 		ptys = make([]*os.File, 3)
-		for i := 0; i < len(ttys); i++ {
+		for i := range ttys {
 			ptys[i], ttys[i], err = os.Pipe()
 			if err != nil {
 				return err
@@ -326,7 +334,7 @@ func (s *execWs) Do(op *operations.Operation) error {
 
 	// Prepare the environment
 	for k, v := range s.env {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+		cmd.Env = append(cmd.Env, k+"="+v)
 	}
 
 	cmd.Stdin = stdin
@@ -357,7 +365,7 @@ func (s *execWs) Do(op *operations.Operation) error {
 	if err != nil {
 		exitStatus := -1
 
-		if errors.Is(err, exec.ErrNotFound) || os.IsNotExist(err) {
+		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
 			exitStatus = 127
 		} else if errors.Is(err, fs.ErrPermission) {
 			exitStatus = 126
@@ -369,10 +377,7 @@ func (s *execWs) Do(op *operations.Operation) error {
 	l := logger.AddContext(logger.Ctx{"PID": cmd.Process.Pid, "interactive": s.interactive})
 	l.Debug("Instance process started")
 
-	wgEOF.Add(1)
-	go func() {
-		defer wgEOF.Done()
-
+	wgEOF.Go(func() {
 		l.Debug("Exec control handler started")
 		defer l.Debug("Exec control handler finished")
 
@@ -396,7 +401,7 @@ func (s *execWs) Do(op *operations.Operation) error {
 
 				err := unix.Kill(cmd.Process.Pid, unix.SIGKILL)
 				if err != nil {
-					l.Error("Failed to send SIGKILL")
+					l.Error("Failed sending SIGKILL")
 				} else {
 					l.Info("Sent SIGKILL")
 				}
@@ -416,29 +421,29 @@ func (s *execWs) Do(op *operations.Operation) error {
 				return
 			}
 
-			command := api.ContainerExecControl{}
+			command := api.InstanceExecControl{}
 			err = json.Unmarshal(buf, &command)
 			if err != nil {
-				l.Debug("Failed to unmarshal control socket command", logger.Ctx{"err": err})
+				l.Debug("Failed unmarshaling control socket command", logger.Ctx{"err": err})
 				continue
 			}
 
 			if command.Command == "window-resize" && s.interactive {
 				winchWidth, err := strconv.Atoi(command.Args["width"])
 				if err != nil {
-					l.Debug("Unable to extract window width", logger.Ctx{"err": err})
+					l.Debug("Cannot extract window width", logger.Ctx{"err": err})
 					continue
 				}
 
 				winchHeight, err := strconv.Atoi(command.Args["height"])
 				if err != nil {
-					l.Debug("Unable to extract window height", logger.Ctx{"err": err})
+					l.Debug("Cannot extract window height", logger.Ctx{"err": err})
 					continue
 				}
 
 				err = shared.SetSize(int(ptys[0].Fd()), winchWidth, winchHeight)
 				if err != nil {
-					l.Debug("Failed to set window size", logger.Ctx{"err": err, "width": winchWidth, "height": winchHeight})
+					l.Debug("Failed setting window size", logger.Ctx{"err": err, "width": winchWidth, "height": winchHeight})
 					continue
 				}
 			} else if command.Command == "signal" {
@@ -451,13 +456,10 @@ func (s *execWs) Do(op *operations.Operation) error {
 				l.Info("Forwarded signal", logger.Ctx{"signal": command.Signal})
 			}
 		}
-	}()
+	})
 
 	if s.interactive {
-		wgEOF.Add(1)
-		go func() {
-			defer wgEOF.Done()
-
+		wgEOF.Go(func() {
 			l.Debug("Exec mirror websocket started", logger.Ctx{"number": 0})
 			defer l.Debug("Exec mirror websocket finished", logger.Ctx{"number": 0})
 
@@ -470,10 +472,10 @@ func (s *execWs) Do(op *operations.Operation) error {
 			<-readDone
 			<-writeDone
 			_ = conn.Close()
-		}()
+		})
 	} else {
 		wgEOF.Add(len(ttys) - 1)
-		for i := 0; i < len(ttys); i++ {
+		for i := range ttys {
 			go func(i int) {
 				l.Debug("Exec mirror websocket started", logger.Ctx{"number": i})
 				defer l.Debug("Exec mirror websocket finished", logger.Ctx{"number": i})

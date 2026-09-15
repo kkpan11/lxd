@@ -1,9 +1,10 @@
 //go:build linux && cgo && !agent
 
+//go:generate dbgen . generated.go
+
 package cluster
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
 )
@@ -60,31 +61,4 @@ func StmtString(code int) (string, error) {
 	}
 
 	return stmt, nil
-}
-
-// applyTriggers adds triggers to the database.
-//
-// Warning: These triggers are applied separately to the schema update mechanism. Changes to these triggers (especially their names)
-// may require a patch.
-func applyTriggers(ctx context.Context, tx *sql.Tx) error {
-	for entityType, entityTypeInfo := range entityTypes {
-		triggerName, triggerSQL := entityTypeInfo.onDeleteTriggerSQL()
-		if triggerName == "" && triggerSQL == "" {
-			continue
-		} else if triggerName == "" || triggerSQL == "" {
-			return fmt.Errorf("Trigger name or SQL missing for entity type %q", entityType)
-		}
-
-		_, err := tx.ExecContext(ctx, fmt.Sprintf(`DROP TRIGGER IF EXISTS %s`, triggerName))
-		if err != nil {
-			return err
-		}
-
-		_, err = tx.ExecContext(ctx, triggerSQL)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
 }

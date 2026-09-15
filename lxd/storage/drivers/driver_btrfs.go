@@ -2,20 +2,21 @@ package drivers
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/canonical/lxd/lxd/migration"
-	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/storage/filesystem"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
+	"github.com/canonical/lxd/shared/ioprogress"
 	"github.com/canonical/lxd/shared/revert"
 	"github.com/canonical/lxd/shared/units"
 	"github.com/canonical/lxd/shared/validate"
@@ -39,6 +40,7 @@ func (d *btrfs) load() error {
 		"storage_delete_old_snapshot_records":                nil,
 		"storage_zfs_drop_block_volume_filesystem_extension": nil,
 		"storage_prefix_bucket_names_with_project":           nil,
+		"storage_zfs_remove_local_bucket_datasets":           nil,
 	}
 
 	// Done if previously loaded.
@@ -56,14 +58,14 @@ func (d *btrfs) load() error {
 
 	// Detect and record the version.
 	if btrfsVersion == "" {
-		out, err := shared.RunCommand("btrfs", "version")
+		out, err := shared.RunCommand(context.TODO(), "btrfs", "version")
 		if err != nil {
 			return err
 		}
 
 		count, err := fmt.Sscanf(strings.SplitN(out, " ", 2)[1], "v%s\n", &btrfsVersion)
 		if err != nil || count != 1 {
-			return fmt.Errorf("The 'btrfs' tool isn't working properly")
+			return errors.New("The 'btrfs' tool is not working properly")
 		}
 	}
 
@@ -92,19 +94,21 @@ func (d *btrfs) Info() Info {
 	return Info{
 		Name:                         "btrfs",
 		Version:                      btrfsVersion,
+		DefaultBlockSize:             d.defaultBlockVolumeSize(),
 		DefaultVMBlockFilesystemSize: d.defaultVMBlockFilesystemSize(),
 		OptimizedImages:              true,
 		OptimizedBackups:             true,
 		OptimizedBackupHeader:        true,
 		PreservesInodes:              !d.state.OS.RunningInUserNS,
 		Remote:                       d.isRemote(),
-		VolumeTypes:                  []VolumeType{VolumeTypeBucket, VolumeTypeCustom, VolumeTypeImage, VolumeTypeContainer, VolumeTypeVM},
+		VolumeTypes:                  []VolumeType{VolumeTypeCustom, VolumeTypeImage, VolumeTypeContainer, VolumeTypeVM},
 		BlockBacking:                 false,
 		RunningCopyFreeze:            false,
 		DirectIO:                     true,
 		IOUring:                      true,
 		MountedRoot:                  true,
-		Buckets:                      true,
+		Buckets:                      false,
+		PopulateParentVolumeUUID:     false,
 	}
 }
 
@@ -114,12 +118,12 @@ func (d *btrfs) FillConfig() error {
 	if d.config["source"] == "" || d.config["source"] == loopPath {
 		// Pick a default size of the loop file if not specified.
 		if d.config["size"] == "" {
-			defaultSize, err := loopFileSizeDefault()
+			size, err := loopFileSizeResolve(loopPath, shared.IsTrue(d.config["source.recover"]))
 			if err != nil {
 				return err
 			}
 
-			d.config["size"] = fmt.Sprintf("%dGiB", defaultSize)
+			d.config["size"] = size
 		}
 	} else {
 		// Unset size property since it's irrelevant.
@@ -128,6 +132,10 @@ func (d *btrfs) FillConfig() error {
 
 	// Store the provided source as we are likely to be mangling it.
 	d.config["volatile.initial_source"] = d.config["source"]
+	if d.config["volatile.initial_source"] == "" || d.config["volatile.initial_source"] == loopPath {
+		// Create a loop based pool.
+		d.config["source"] = loopPath
+	}
 
 	// Set the block device's UUID in case it already has one.
 	// This allows to recover the pools configuration without actually
@@ -144,22 +152,29 @@ func (d *btrfs) FillConfig() error {
 	return nil
 }
 
+// SourceIdentifier returns the underlying source.
+func (d *btrfs) SourceIdentifier() (string, error) {
+	source := d.config["source"]
+	if source != "" {
+		return source, nil
+	}
+
+	return "", errors.New("Cannot derive identifier from empty source")
+}
+
+// ValidateSource checks whether the required config keys are valid to access the underlying source.
+func (d *btrfs) ValidateSource() error {
+	return nil
+}
+
 // Create is called during pool creation and is effectively using an empty driver struct.
 // WARNING: The Create() function cannot rely on any of the struct attributes being set.
 func (d *btrfs) Create() error {
 	revert := revert.New()
 	defer revert.Fail()
 
-	err := d.FillConfig()
-	if err != nil {
-		return err
-	}
-
 	loopPath := loopFilePath(d.name)
 	if d.config["volatile.initial_source"] == "" || d.config["volatile.initial_source"] == loopPath {
-		// Create a loop based pool.
-		d.config["source"] = loopPath
-
 		// Create the loop file itself.
 		size, err := units.ParseByteSizeString(d.config["size"])
 		if err != nil {
@@ -168,7 +183,7 @@ func (d *btrfs) Create() error {
 
 		err = ensureSparseFile(d.config["source"], size)
 		if err != nil {
-			return fmt.Errorf("Failed to create the sparse file: %w", err)
+			return fmt.Errorf("Failed creating the sparse file: %w", err)
 		}
 
 		revert.Add(func() { _ = os.Remove(d.config["source"]) })
@@ -176,7 +191,7 @@ func (d *btrfs) Create() error {
 		// Format the file.
 		_, err = makeFSType(d.config["source"], "btrfs", &mkfsOptions{Label: d.name})
 		if err != nil {
-			return fmt.Errorf("Failed to format sparse file: %w", err)
+			return fmt.Errorf("Failed formatting sparse file: %w", err)
 		}
 	} else if shared.IsBlockdevPath(d.config["volatile.initial_source"]) {
 		// Make sure to use the block volumes `volatile.initial_source` here
@@ -187,7 +202,7 @@ func (d *btrfs) Create() error {
 		if shared.IsTrue(d.config["source.wipe"]) {
 			err := wipeBlockHeaders(d.config["volatile.initial_source"])
 			if err != nil {
-				return fmt.Errorf("Failed to wipe headers from disk %q: %w", d.config["volatile.initial_source"], err)
+				return fmt.Errorf("Failed wiping headers from disk %q: %w", d.config["volatile.initial_source"], err)
 			}
 
 			d.config["source.wipe"] = ""
@@ -196,7 +211,7 @@ func (d *btrfs) Create() error {
 		// Format the block device.
 		_, err := makeFSType(d.config["volatile.initial_source"], "btrfs", &mkfsOptions{Label: d.name})
 		if err != nil {
-			return fmt.Errorf("Failed to format block device: %w", err)
+			return fmt.Errorf("Failed formatting block device: %w", err)
 		}
 
 		// Record the UUID as the source.
@@ -205,18 +220,7 @@ func (d *btrfs) Create() error {
 			return err
 		}
 
-		// Confirm that the symlink is appearing (give it 10s).
-		// In case of timeout it falls back to using the volume's path
-		// instead of its UUID.
-		ctx, cancel := context.WithTimeout(d.state.ShutdownCtx, 10*time.Second)
-		defer cancel()
-
-		if tryExists(ctx, fmt.Sprintf("/dev/disk/by-uuid/%s", devUUID)) {
-			// Override the config to use the UUID.
-			d.config["source"] = devUUID
-		} else {
-			d.config["source"] = d.config["volatile.initial_source"]
-		}
+		d.config["source"] = devUUID
 	} else if d.config["source"] != "" {
 		hostPath := shared.HostPath(d.config["source"])
 		if d.isSubvolume(hostPath) {
@@ -228,7 +232,7 @@ func (d *btrfs) Create() error {
 
 			// Check that the provided subvolume is empty.
 			if hasSubvolumes {
-				return fmt.Errorf("Requested btrfs subvolume exists but is not empty")
+				return errors.New("Requested btrfs subvolume exists but is not empty")
 			}
 		} else {
 			// New btrfs subvolume on existing btrfs filesystem.
@@ -255,18 +259,18 @@ func (d *btrfs) Create() error {
 				// Delete the current directory to replace by subvolume.
 				err := os.Remove(cleanSource)
 				if err != nil && !os.IsNotExist(err) {
-					return fmt.Errorf("Failed to remove %q: %w", cleanSource, err)
+					return fmt.Errorf("Failed removing %q: %w", cleanSource, err)
 				}
 			}
 
 			// Create the subvolume.
-			_, err := shared.RunCommand("btrfs", "subvolume", "create", hostPath)
+			_, err := shared.RunCommand(context.TODO(), "btrfs", "subvolume", "create", hostPath)
 			if err != nil {
 				return err
 			}
 		}
 	} else {
-		return fmt.Errorf(`Invalid "source" property`)
+		return errors.New(`Invalid "source" property`)
 	}
 
 	revert.Success()
@@ -274,7 +278,7 @@ func (d *btrfs) Create() error {
 }
 
 // Delete removes the storage pool from the storage device.
-func (d *btrfs) Delete(op *operations.Operation) error {
+func (d *btrfs) Delete(progressReporter ioprogress.ProgressReporter) error {
 	// If the user completely destroyed it, call it done.
 	if !shared.PathExists(GetPoolMountPath(d.name)) {
 		return nil
@@ -282,7 +286,7 @@ func (d *btrfs) Delete(op *operations.Operation) error {
 
 	// Delete potential intermediate btrfs subvolumes.
 	for _, volType := range d.Info().VolumeTypes {
-		for _, dir := range BaseDirectories[volType] {
+		for _, dir := range BaseDirectories[volType].Paths {
 			path := filepath.Join(GetPoolMountPath(d.name), dir)
 			if !shared.PathExists(path) {
 				continue
@@ -346,8 +350,12 @@ func (d *btrfs) Validate(config map[string]string) error {
 		//  type: string
 		//  defaultdesc: `user_subvol_rm_allowed`
 		//  shortdesc: Mount options for block devices
+		//  scope: global
 		"btrfs.mount_options": validate.IsAny,
 	}
+
+	// Append common local pool rules.
+	maps.Insert(rules, maps.All(d.commonRules.LocalPoolRules()))
 
 	return d.validatePool(config, rules, nil)
 }
@@ -367,7 +375,7 @@ func (d *btrfs) Update(changedConfig map[string]string) error {
 		mntFlags, mntOptions := filesystem.ResolveMountOptions(strings.Split(d.getMountOptions(), ","))
 		mntFlags |= unix.MS_REMOUNT
 
-		err := TryMount("", GetPoolMountPath(d.name), "none", mntFlags, mntOptions)
+		err := TryMount(context.TODO(), "", GetPoolMountPath(d.name), "none", mntFlags, mntOptions)
 		if err != nil {
 			return err
 		}
@@ -379,7 +387,7 @@ func (d *btrfs) Update(changedConfig map[string]string) error {
 		loopPath := loopFilePath(d.name)
 
 		if d.config["source"] != loopPath {
-			return fmt.Errorf("Cannot resize non-loopback pools")
+			return errors.New("Cannot resize non-loopback pools")
 		}
 
 		// Resize loop file
@@ -409,7 +417,7 @@ func (d *btrfs) Update(changedConfig map[string]string) error {
 			return err
 		}
 
-		_, err = shared.RunCommand("btrfs", "filesystem", "resize", "max", GetPoolMountPath(d.name))
+		_, err = shared.RunCommand(context.TODO(), "btrfs", "filesystem", "resize", "max", GetPoolMountPath(d.name))
 		if err != nil {
 			return err
 		}
@@ -448,12 +456,18 @@ func (d *btrfs) Mount() (bool, error) {
 
 			mntSrcFS, _ := filesystem.Detect(mntSrc)
 			if mntSrcFS != "btrfs" {
-				return false, fmt.Errorf("Source path %q isn't btrfs (detected %s)", mntSrc, mntSrcFS)
+				return false, fmt.Errorf("Source path %q is not btrfs (detected %s)", mntSrc, mntSrcFS)
 			}
 		}
 	} else {
 		// Mount using UUID.
-		mntSrc = fmt.Sprintf("/dev/disk/by-uuid/%s", d.config["source"])
+		// We don't use the volatile.initial_source as it might change between system reboots.
+		mntSrcPath, err := d.getDiskPathFromFSUUID(d.config["source"])
+		if err != nil {
+			return false, fmt.Errorf("Failed getting disk path for filesystem UUID %q: %w", d.config["source"], err)
+		}
+
+		mntSrc = mntSrcPath
 	}
 
 	// Get the custom mount flags/options.
@@ -462,7 +476,7 @@ func (d *btrfs) Mount() (bool, error) {
 	// Handle bind-mounts first.
 	if mntFilesystem == "none" {
 		// Setup the bind-mount itself.
-		err := TryMount(mntSrc, mntDst, mntFilesystem, unix.MS_BIND, "")
+		err := TryMount(context.TODO(), mntSrc, mntDst, mntFilesystem, unix.MS_BIND, "")
 		if err != nil {
 			return false, err
 		}
@@ -474,7 +488,7 @@ func (d *btrfs) Mount() (bool, error) {
 
 		// Now apply the custom options.
 		mntFlags |= unix.MS_REMOUNT
-		err = TryMount("", mntDst, mntFilesystem, mntFlags, mntOptions)
+		err = TryMount(context.TODO(), "", mntDst, mntFilesystem, mntFlags, mntOptions)
 		if err != nil {
 			return false, err
 		}
@@ -483,7 +497,7 @@ func (d *btrfs) Mount() (bool, error) {
 	}
 
 	// Handle traditional mounts.
-	err = TryMount(mntSrc, mntDst, mntFilesystem, mntFlags, mntOptions)
+	err = TryMount(context.TODO(), mntSrc, mntDst, mntFilesystem, mntFlags, mntOptions)
 	if err != nil {
 		return false, err
 	}

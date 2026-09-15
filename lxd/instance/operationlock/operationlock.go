@@ -2,7 +2,9 @@ package operationlock
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/canonical/lxd/lxd/project"
@@ -33,9 +35,12 @@ const ActionUpdate Action = "update"
 // ActionDelete for deleting an instance.
 const ActionDelete Action = "delete"
 
-// ErrNonReusuableSucceeded is returned when no operation is created due to having to wait for a matching
-// non-reusuable operation that has now completed successfully.
-var ErrNonReusuableSucceeded error = fmt.Errorf("A matching non-reusable operation has now succeeded")
+// ActionMigrate for migrating an instance.
+const ActionMigrate Action = "migrate"
+
+// ErrNonReusableSucceeded is returned when no operation is created due to having to wait for a matching
+// non-reusable operation that has now completed successfully.
+var ErrNonReusableSucceeded = errors.New("A matching non-reusable operation has now succeeded")
 
 var instanceOperationsLock sync.Mutex
 var instanceOperations = make(map[string]*InstanceOperation)
@@ -53,11 +58,11 @@ type InstanceOperation struct {
 
 // Create creates a new operation lock for an Instance if one does not already exist and returns it.
 // The lock will be released after TimeoutDefault or when Done() is called, which ever occurs first.
-// If createReusuable is set as true then future lock attempts can specify the reuseExisting argument as true
+// If createReusable is set as true then future lock attempts can specify the reuseExisting argument as true
 // which will then trigger a reset of the timeout to TimeoutDefault on the existing lock and return it.
-func Create(projectName string, instanceName string, action Action, createReusuable bool, reuseExisting bool) (*InstanceOperation, error) {
+func Create(projectName string, instanceName string, action Action, createReusable bool, reuseExisting bool) (*InstanceOperation, error) {
 	if projectName == "" || instanceName == "" {
-		return nil, fmt.Errorf("Invalid project or instance name")
+		return nil, errors.New("Invalid project or instance name")
 	}
 
 	instanceOperationsLock.Lock()
@@ -80,7 +85,7 @@ func Create(projectName string, instanceName string, action Action, createReusua
 	op.projectName = projectName
 	op.instanceName = instanceName
 	op.action = action
-	op.reusable = createReusuable
+	op.reusable = createReusable
 	op.chanDone = make(chan error)
 
 	instanceOperations[opKey] = op
@@ -103,12 +108,12 @@ func Create(projectName string, instanceName string, action Action, createReusua
 //
 // Returns ErrWaitedForMatching if it waited for a matching operation to finish and it's finished successfully and
 // so didn't return create a new operation.
-func CreateWaitGet(projectName string, instanceName string, action Action, inheritableActions []Action, createReusuable bool, reuseExisting bool) (*InstanceOperation, error) {
+func CreateWaitGet(projectName string, instanceName string, action Action, inheritableActions []Action, createReusable bool, reuseExisting bool) (*InstanceOperation, error) {
 	op := Get(projectName, instanceName)
 
 	// No existing operation, call create.
 	if op == nil {
-		op, err := Create(projectName, instanceName, action, createReusuable, reuseExisting)
+		op, err := Create(projectName, instanceName, action, createReusable, reuseExisting)
 		return op, err
 	}
 
@@ -122,7 +127,7 @@ func CreateWaitGet(projectName string, instanceName string, action Action, inher
 
 		// The matching operation ended without error, but this means we've not created a new
 		// operation for this request, so return a special error indicating this scenario.
-		return nil, ErrNonReusuableSucceeded
+		return nil, ErrNonReusableSucceeded
 	}
 
 	// Operation action matches one the inheritable actions, return the operation.
@@ -133,7 +138,7 @@ func CreateWaitGet(projectName string, instanceName string, action Action, inher
 	}
 
 	// Send the rest to Create to try and create a new operation.
-	op, err := Create(projectName, instanceName, action, createReusuable, reuseExisting)
+	op, err := Create(projectName, instanceName, action, createReusable, reuseExisting)
 
 	return op, err
 }
@@ -160,13 +165,7 @@ func (op *InstanceOperation) Action() Action {
 
 // ActionMatch returns true if operation's action matches one of the matchActions.
 func (op *InstanceOperation) ActionMatch(matchActions ...Action) bool {
-	for _, matchAction := range matchActions {
-		if op.action == matchAction {
-			return true
-		}
-	}
-
-	return false
+	return slices.Contains(matchActions, op.action)
 }
 
 // Wait waits for an operation to finish.

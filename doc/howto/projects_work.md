@@ -20,8 +20,9 @@ To list all projects (that you have permission to see), enter the following comm
 By default, the output is presented as a list:
 
 ```{terminal}
-:input: lxc project list
 :scroll:
+
+lxc project list
 
 +----------------------+--------+----------+-----------------+-----------------+----------+---------------+---------------------+---------+
 |      NAME            | IMAGES | PROFILES | STORAGE VOLUMES | STORAGE BUCKETS | NETWORKS | NETWORK ZONES |     DESCRIPTION     | USED BY |
@@ -57,7 +58,7 @@ To list all projects (that you have permission to see), expand the {guilabel}`Pr
 ````{tabs}
 ```{group-tab} CLI
 By default, all commands that you issue in LXD affect the project that you are currently using.
-To see which project you are in, use the [`lxc project list`](lxc_project_list.md) command.
+To see which project you are in, use either the [`lxc project list`](lxc_project_list.md) or [`lxc project get-current`](lxc_project_get-current.md) command.
 
 To switch to a different project, enter the following command:
 
@@ -107,6 +108,7 @@ Instead, {ref}`switch to the other project <projects-switch>`.
 ```
 ````
 
+(howto-projects-work-move-instance)=
 ## Move an instance to another project
 
 ````{tabs}

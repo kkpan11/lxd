@@ -8,9 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 
-	"github.com/canonical/lxd/shared"
+	"github.com/canonical/lxd/lxd/db/query"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/entity"
 )
@@ -25,8 +26,11 @@ type EntityType string
 
 // entityTypeDBInfo defines how an entity type behaves at the database level.
 //
-// To create a new entity type, first create a new `(shared/entity).Type` then create a type that implements the methods
-// defined on entityTypeDBInfo.
+// To create a new entity type:
+// 1. Create a new `(shared/entity).Type`
+// 2. Create a type that implements the methods defined on entityTypeDBInfo.
+// 3. Consider adding an implementation of entityDeleter in lxd/entity_deleter.go
+// 4. Consider updating [entity.Reference.Name] or adding a helper function in shared/entity/ref.go for parsing an [entity.Reference]'s path parts.
 //
 // The code method must return a unique int64 for the entity type (see the entityTypeCode constants below). Other SQL
 // related method may return an empty string if the method is not applicable to the entity type. For example,
@@ -49,8 +53,8 @@ type entityTypeDBInfo interface {
 	allURLsQuery() string
 
 	// urlByIDQuery must return a SQL query that when executed, returns values identically to allURLsQuery. The query
-	// must accept a single integer bind argument for the ID of the resource.
-	urlByIDQuery() string
+	// must contain an "IN" clause containing the given ids. It does not accept any bind parameters.
+	urlsByIDsQuery(ids ...int64) string
 
 	// urlsByProjectQuery must return a SQL query that when executed, returns values identically to allURLsQuery. The
 	// query must accept a single string bind argument for the project name.
@@ -69,8 +73,18 @@ type entityTypeDBInfo interface {
 	// triggers are in place so that warnings and group permissions do not contain stale entries. The first return value
 	// must be the name of the trigger, the second return value must be the SQL for creating the trigger.
 	onDeleteTriggerSQL() (name string, sql string)
+
+	// onUpdateTriggerSQL must return the SQL for a trigger that runs when an entity of this type is updated. If both
+	// name and sql are empty, no trigger is run.
+	onUpdateTriggerSQL() (name string, sql string)
+
+	// onInsertTriggerSQL must return the SQL for a trigger that runs when an entity of this type is inserted. If both
+	// name and sql are empty, no trigger is run.
+	onInsertTriggerSQL() (name string, sql string)
 }
 
+// entityTypes maps each entity type to its DB-specific info. It must stay in sync with the entityTypes map in
+// shared/entity/type.go. [TestEntityTypesCoversAllEntityTypes] enforces this.
 var entityTypes = map[entity.Type]entityTypeDBInfo{
 	entity.TypeContainer:             entityTypeContainer{},
 	entity.TypeImage:                 entityTypeImage{},
@@ -83,12 +97,10 @@ var entityTypes = map[entity.Type]entityTypeDBInfo{
 	entity.TypeNetwork:               entityTypeNetwork{},
 	entity.TypeNetworkACL:            entityTypeNetworkACL{},
 	entity.TypeClusterMember:         entityTypeClusterMember{},
-	entity.TypeOperation:             entityTypeOperation{},
 	entity.TypeStoragePool:           entityTypeStoragePool{},
 	entity.TypeStorageVolume:         entityTypeStorageVolume{},
 	entity.TypeStorageVolumeBackup:   entityTypeStorageVolumeBackup{},
 	entity.TypeStorageVolumeSnapshot: entityTypeStorageVolumeSnapshot{},
-	entity.TypeWarning:               entityTypeWarning{},
 	entity.TypeClusterGroup:          entityTypeClusterGroup{},
 	entity.TypeStorageBucket:         entityTypeStorageBucket{},
 	entity.TypeServer:                entityTypeServer{},
@@ -97,6 +109,9 @@ var entityTypes = map[entity.Type]entityTypeDBInfo{
 	entity.TypeIdentity:              entityTypeIdentity{},
 	entity.TypeAuthGroup:             entityTypeAuthGroup{},
 	entity.TypeIdentityProviderGroup: entityTypeIdentityProviderGroup{},
+	entity.TypePlacementGroup:        entityTypePlacementGroup{},
+	entity.TypeClusterLink:           entityTypeClusterLink{},
+	entity.TypeReplicator:            entityTypeReplicator{},
 }
 
 const (
@@ -126,6 +141,9 @@ const (
 	entityTypeCodeAuthGroup             int64 = 22
 	entityTypeCodeIdentityProviderGroup int64 = 23
 	entityTypeCodeIdentity              int64 = 24
+	entityTypeCodePlacementGroup        int64 = 25
+	entityTypeCodeClusterLink           int64 = 26
+	entityTypeCodeReplicator            int64 = 27
 )
 
 var entityTypeByCode = map[int64]EntityType{
@@ -138,31 +156,22 @@ func init() {
 	}
 }
 
-// Scan implements sql.Scanner for EntityType. This converts the integer value back into the correct entity.Type
-// constant or returns an error.
-func (e *EntityType) Scan(value any) error {
-	// Always expect null values to be coalesced into entityTypeNone (-1).
-	if value == nil {
-		return fmt.Errorf("Entity type cannot be null")
-	}
-
-	intValue, err := driver.Int32.ConvertValue(value)
-	if err != nil {
-		return fmt.Errorf("Invalid entity type `%v`: %w", value, err)
-	}
-
-	entityTypeInt, ok := intValue.(int64)
+// ScanInteger implements [query.IntegerScanner] for EntityType. This simplifies the Scan implementation.
+func (e *EntityType) ScanInteger(entityTypeCode int64) error {
+	entityType, ok := entityTypeByCode[entityTypeCode]
 	if !ok {
-		return fmt.Errorf("Entity should be an integer, got `%v` (%T)", intValue, intValue)
-	}
-
-	entityType, ok := entityTypeByCode[entityTypeInt]
-	if !ok {
-		return fmt.Errorf("Unknown entity type %d", entityTypeInt)
+		return fmt.Errorf("Unknown entity type %d", entityTypeCode)
 	}
 
 	*e = entityType
 	return nil
+}
+
+// Scan implements sql.Scanner for EntityType. This converts the integer value back into the correct entity.Type
+// constant or returns an error.
+func (e *EntityType) Scan(value any) error {
+	// Always expect null values to be coalesced into entityTypeNone (-1).
+	return query.ScanValue(value, e, false)
 }
 
 // Value implements driver.Valuer for EntityType. This converts the EntityType into an integer or throws an error.
@@ -181,37 +190,38 @@ func (e EntityType) Value() (driver.Value, error) {
 
 // EntityRef represents the expected format of entity URL queries.
 type EntityRef struct {
-	EntityType  EntityType
-	EntityID    int
-	ProjectName string
-	Location    string
-	PathArgs    []string
+	EntityType EntityType
+	EntityID   int
+	entity.Reference
 }
 
 // scan accepts a scanning function (e.g. `(*sql.Row).Scan`) and uses it to parse the row and set its fields.
 func (e *EntityRef) scan(scan func(dest ...any) error) error {
-	var pathArgs string
-	err := scan(&e.EntityType, &e.EntityID, &e.ProjectName, &e.Location, &pathArgs)
+	var entityType EntityType
+	var entityID int
+	var projectName, location, pathArgsJSON string
+
+	err := scan(&entityType, &entityID, &projectName, &location, &pathArgsJSON)
 	if err != nil {
-		return fmt.Errorf("Failed to scan entity URL: %w", err)
+		return fmt.Errorf("Failed scanning entity URL: %w", err)
 	}
 
-	err = json.Unmarshal([]byte(pathArgs), &e.PathArgs)
+	var pathArgs []string
+	err = json.Unmarshal([]byte(pathArgsJSON), &pathArgs)
 	if err != nil {
-		return fmt.Errorf("Failed to unmarshal entity URL path arguments: %w", err)
+		return fmt.Errorf("Failed unmarshaling entity URL path arguments: %w", err)
 	}
+
+	ref, err := entity.NewReference(projectName, entity.Type(entityType), location, pathArgs...)
+	if err != nil {
+		return fmt.Errorf("Failed constructing entity reference: %w", err)
+	}
+
+	e.EntityType = entityType
+	e.EntityID = entityID
+	e.Reference = *ref
 
 	return nil
-}
-
-// getURL is a convenience for generating a URL from the EntityRef.
-func (e *EntityRef) getURL() (*api.URL, error) {
-	u, err := entity.Type(e.EntityType).URL(e.ProjectName, e.Location, e.PathArgs...)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to create entity URL: %w", err)
-	}
-
-	return u, nil
 }
 
 // GetEntityURL returns the *api.URL of a single entity by its type and ID.
@@ -225,28 +235,28 @@ func GetEntityURL(ctx context.Context, tx *sql.Tx, entityType entity.Type, entit
 		return nil, fmt.Errorf("Could not get entity URL: Unknown entity type %q", entityType)
 	}
 
-	stmt := info.urlByIDQuery()
+	stmt := info.urlsByIDsQuery(int64(entityID))
 	if stmt == "" {
 		return nil, fmt.Errorf("Could not get entity URL: No statement found for entity type %q", entityType)
 	}
 
-	row := tx.QueryRowContext(ctx, stmt, entityID)
+	row := tx.QueryRowContext(ctx, stmt)
 	entityRef := &EntityRef{}
 	err := entityRef.scan(row.Scan)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("Failed to scan entity URL: %w", err)
+		return nil, fmt.Errorf("Failed scanning entity URL: %w", err)
 	} else if err != nil {
-		return nil, api.StatusErrorf(http.StatusNotFound, "No entity found with id `%d` and type %q", entityID, entityType)
+		return nil, api.StatusErrorf(http.StatusNotFound, "No entity found with id %d and type %q", entityID, entityType)
 	}
 
-	return entityRef.getURL()
+	return entityRef.URL(), nil
 }
 
-// GetEntityURLs accepts a project name and a variadic of entity types and returns a map of entity.Type to map of entity ID, to *api.URL.
+// GetEntityURLsByProjectAndType accepts a project name and a variadic of entity types and returns a map of entity.Type to map of entity ID, to *api.URL.
 // This method combines the above queries into a single query using the UNION operator. If no entity types are given, this function will
 // return URLs for all entity types. If no project name is given, this function will return URLs for all projects. This may result in
 // stupendously large queries, so use with caution!
-func GetEntityURLs(ctx context.Context, tx *sql.Tx, projectName string, filteringEntityTypes ...entity.Type) (map[entity.Type]map[int]*api.URL, error) { //nolint:unused // This will be used in a forthcoming feature.
+func GetEntityURLsByProjectAndType(ctx context.Context, tx *sql.Tx, projectName string, filteringEntityTypes ...entity.Type) (map[entity.Type]map[int]*api.URL, error) {
 	var stmts []string
 	var args []any
 	result := make(map[entity.Type]map[int]*api.URL)
@@ -254,7 +264,7 @@ func GetEntityURLs(ctx context.Context, tx *sql.Tx, projectName string, filterin
 	// If the server entity type is in the list of entity types, or if we are getting all entity types and
 	// not filtering by project, we need to add a server URL to the result. The entity ID of the server entity type is
 	// always zero.
-	if shared.ValueInSlice(entity.TypeServer, filteringEntityTypes) || (len(filteringEntityTypes) == 0 && projectName == "") {
+	if (len(filteringEntityTypes) == 0 && projectName == "") || slices.Contains(filteringEntityTypes, entity.TypeServer) {
 		result[entity.TypeServer] = map[int]*api.URL{0: entity.ServerURL()}
 
 		// Return early if there are no other entity types in the list (no queries to execute).
@@ -335,22 +345,66 @@ func GetEntityURLs(ctx context.Context, tx *sql.Tx, projectName string, filterin
 	stmt := strings.Join(stmts, " UNION ")
 	rows, err := tx.QueryContext(ctx, stmt, args...)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to perform entity URL query: %w", err)
+		return nil, fmt.Errorf("Failed performing entity URL query: %w", err)
 	}
 
 	for rows.Next() {
 		entityRef := &EntityRef{}
 		err := entityRef.scan(rows.Scan)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to scan entity URL: %w", err)
+			return nil, fmt.Errorf("Failed scanning entity URL: %w", err)
 		}
 
-		u, err := entityRef.getURL()
+		result[entity.Type(entityRef.EntityType)][entityRef.EntityID] = entityRef.URL()
+	}
+
+	return result, nil
+}
+
+// GetEntityURLsByEntityTypeAndID performs a single query to return entity URLs for many different entity types and IDs.
+// It effectively converts the input map of entity type to list of IDs to a map of entity type to map of ID to URL.
+func GetEntityURLsByEntityTypeAndID(ctx context.Context, tx *sql.Tx, entities map[entity.Type][]int64) (map[entity.Type]map[int64]*api.URL, error) {
+	result := make(map[entity.Type]map[int64]*api.URL)
+	stmts := make([]string, 0, len(entities))
+	for entityType, ids := range entities {
+		if entityType == entity.TypeServer {
+			result[entity.TypeServer] = map[int64]*api.URL{0: entity.ServerURL()}
+			continue
+		}
+
+		info, ok := entityTypes[entityType]
+		if !ok {
+			return nil, fmt.Errorf("Could not get entity URL: Unknown entity type %q", entityType)
+		}
+
+		stmt := info.urlsByIDsQuery(ids...)
+		if stmt == "" {
+			return nil, fmt.Errorf("Could not get entity URL: No statement found for entity type %q", entityType)
+		}
+
+		stmts = append(stmts, stmt)
+		result[entityType] = make(map[int64]*api.URL)
+	}
+
+	// If there were only server entities, then there's nothing left to do.
+	if len(stmts) == 0 {
+		return result, nil
+	}
+
+	// Join into a single statement with UNION and query.
+	stmt := strings.Join(stmts, " UNION ")
+	err := query.Scan(ctx, tx, stmt, func(scan func(dest ...any) error) error {
+		entityRef := &EntityRef{}
+		err := entityRef.scan(scan)
 		if err != nil {
-			return nil, err
+			return fmt.Errorf("Failed scanning entity URL: %w", err)
 		}
 
-		result[entity.Type(entityRef.EntityType)][entityRef.EntityID] = u
+		result[entity.Type(entityRef.EntityType)][int64(entityRef.EntityID)] = entityRef.URL()
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("Failed performing entity URL query: %w", err)
 	}
 
 	return result, nil
@@ -370,20 +424,23 @@ func PopulateEntityReferencesFromURLs(ctx context.Context, tx *sql.Tx, entityURL
 	}
 
 	stmts := make([]string, 0, len(entityURLs))
-	var args []any
+	var args []any //nolint:prealloc
 	for i, entityURL := range entityURLs {
 		// Parse the URL to get the majority of the fields of the EntityRef for that URL.
 		entityType, projectName, location, pathArgs, err := entity.ParseURL(entityURL.URL)
 		if err != nil {
-			return fmt.Errorf("Failed to get entity IDs from URLs: %w", err)
+			return fmt.Errorf("Failed getting entity IDs from URLs: %w", err)
 		}
 
 		// Populate the result map.
+		ref, err := entity.NewReference(projectName, entityType, location, pathArgs...)
+		if err != nil {
+			return fmt.Errorf("Failed constructing entity reference: %w", err)
+		}
+
 		entityURLMap[entityURL] = &EntityRef{
-			EntityType:  EntityType(entityType),
-			ProjectName: projectName,
-			Location:    location,
-			PathArgs:    pathArgs,
+			EntityType: EntityType(entityType),
+			Reference:  *ref,
 		}
 
 		// If the given URL is the server url it is valid but there is no need to perform a query for it, the entity
@@ -421,24 +478,24 @@ func PopulateEntityReferencesFromURLs(ctx context.Context, tx *sql.Tx, entityURL
 	stmt := strings.Join(stmts, " UNION ")
 	rows, err := tx.QueryContext(ctx, stmt, args...)
 	if err != nil {
-		return fmt.Errorf("Failed to get entityIDs from URLS: %w", err)
+		return fmt.Errorf("Failed getting entityIDs from URLS: %w", err)
 	}
 
 	for rows.Next() {
 		var rowID, entityID int
 		err = rows.Scan(&rowID, &entityID)
 		if err != nil {
-			return fmt.Errorf("Failed to get entityIDs from URLS: %w", err)
+			return fmt.Errorf("Failed getting entityIDs from URLS: %w", err)
 		}
 
 		if rowID >= len(entityURLs) {
-			return fmt.Errorf("Failed to get entityIDs from URLS: Internal error, returned row ID greater than number of URLs")
+			return errors.New("Failed getting entityIDs from URLS: Internal error, returned row ID greater than number of URLs")
 		}
 
 		// Using the row ID, get the *api.URL from the argument slice, then use it as a key in our result map to get the *EntityRef.
 		entityRef, ok := entityURLMap[entityURLs[rowID]]
 		if !ok {
-			return fmt.Errorf("Failed to get entityIDs from URLS: Internal error, entity URL missing from result object")
+			return errors.New("Failed getting entityIDs from URLS: Internal error, entity URL missing from result object")
 		}
 
 		// Set the value of the EntityID in the *EntityRef.
@@ -447,13 +504,13 @@ func PopulateEntityReferencesFromURLs(ctx context.Context, tx *sql.Tx, entityURL
 
 	err = rows.Err()
 	if err != nil {
-		return fmt.Errorf("Failed to get entity IDs from URLs: %w", err)
+		return fmt.Errorf("Failed getting entity IDs from URLs: %w", err)
 	}
 
 	// Check that all given URLs have been resolved to an ID.
 	for u, ref := range entityURLMap {
 		if ref.EntityID == 0 && ref.EntityType != EntityType(entity.TypeServer) {
-			return fmt.Errorf("Failed to find entity ID for URL %q", u.String())
+			return fmt.Errorf("Failed finding entity ID for URL %q", u.String())
 		}
 	}
 
@@ -464,41 +521,38 @@ func PopulateEntityReferencesFromURLs(ctx context.Context, tx *sql.Tx, entityURL
 // It is used by the OpenFGA datastore implementation to find permissions for the entity with the given URL.
 func GetEntityReferenceFromURL(ctx context.Context, tx *sql.Tx, entityURL *api.URL) (*EntityRef, error) {
 	// Parse the URL to get the majority of the fields of the EntityRef for that URL.
-	entityType, projectName, location, pathArgs, err := entity.ParseURL(entityURL.URL)
+	ref, err := entity.ReferenceFromURL(entityURL.URL)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to get entity ID from URL: %w", err)
+		return nil, fmt.Errorf("Failed getting entity ID from URL: %w", err)
 	}
 
-	// Populate the fields we know from the URL.
 	entityRef := &EntityRef{
-		EntityType:  EntityType(entityType),
-		ProjectName: projectName,
-		Location:    location,
-		PathArgs:    pathArgs,
+		EntityType: EntityType(ref.EntityType),
+		Reference:  *ref,
 	}
 
 	// If the given URL is the server url it is valid but there is no need to perform a query for it, the entity
 	// ID of the server is always zero (by virtue of being the zero value for int).
-	if entityType == entity.TypeServer {
+	if ref.EntityType == entity.TypeServer {
 		return entityRef, nil
 	}
 
-	info, ok := entityTypes[entityType]
+	info, ok := entityTypes[ref.EntityType]
 	if !ok {
-		return nil, fmt.Errorf("Could not get entity ID from URL: Unknown entity type %q", entityType)
+		return nil, fmt.Errorf("Could not get entity ID from URL: Unknown entity type %q", ref.EntityType)
 	}
 
 	// Get the statement corresponding to the entity type.
 	stmt := info.idFromURLQuery()
 	if stmt == "" {
-		return nil, fmt.Errorf("Could not get entity ID from URL: No statement found for entity type %q", entityType)
+		return nil, fmt.Errorf("Could not get entity ID from URL: No statement found for entity type %q", ref.EntityType)
 	}
 
 	// The first bind argument in all entityIDFromURL queries is an index that we use to correspond output of large UNION
 	// queries (see PopulateEntityReferencesFromURLs). In this case we are only querying for one ID, so the `0` argument
 	// is a placeholder.
-	args := []any{0, projectName, location}
-	for _, pathArg := range pathArgs {
+	args := []any{0, ref.ProjectName, ref.Location}
+	for _, pathArg := range ref.PathArgs {
 		args = append(args, pathArg)
 	}
 
@@ -511,7 +565,7 @@ func GetEntityReferenceFromURL(ctx context.Context, tx *sql.Tx, entityURL *api.U
 			return nil, api.StatusErrorf(http.StatusNotFound, "No such entity %q", entityURL.String())
 		}
 
-		return nil, fmt.Errorf("Failed to get entityID from URL: %w", err)
+		return nil, fmt.Errorf("Failed getting entityID from URL: %w", err)
 	}
 
 	entityRef.EntityID = entityID

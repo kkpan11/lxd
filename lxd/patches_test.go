@@ -3,17 +3,22 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/zitadel/oidc/v3/pkg/oidc"
 
 	"github.com/canonical/lxd/lxd/auth"
 	"github.com/canonical/lxd/lxd/certificate"
+	clusterConfig "github.com/canonical/lxd/lxd/cluster/config"
 	"github.com/canonical/lxd/lxd/db"
 	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
+	"github.com/canonical/lxd/lxd/db/query"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
+	"github.com/canonical/lxd/shared/cancel"
 	"github.com/canonical/lxd/shared/entity"
 )
 
@@ -21,18 +26,19 @@ func Test_patchSplitIdentityCertificateEntityTypes(t *testing.T) {
 	// Set up test database.
 	cluster, cleanup := db.NewTestCluster(t)
 	defer cleanup()
-	ctx := context.Background()
+	ctx := cancel.New()
 
-	var groupID int
+	var groupID int64
 	var certificateID int
 	var identityID int
 	err := cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		var err error
+
 		// Create a group.
-		groupIDint64, err := dbCluster.CreateAuthGroup(ctx, tx.Tx(), dbCluster.AuthGroup{
+		groupID, err = query.Create(ctx, tx.Tx(), dbCluster.AuthGroupsRow{
 			Name: "test-group",
 		})
 		require.NoError(t, err)
-		groupID = int(groupIDint64)
 
 		// Create a certificate
 		cert, _, err := shared.GenerateMemCert(true, shared.CertOptions{})
@@ -40,7 +46,7 @@ func Test_patchSplitIdentityCertificateEntityTypes(t *testing.T) {
 		x509Cert, err := shared.ParseCert(cert)
 		require.NoError(t, err)
 
-		certificateIDint64, err := dbCluster.CreateCertificate(ctx, tx.Tx(), dbCluster.Certificate{
+		certificateIDint64, err := dbCluster.CreateCertificateLegacy(ctx, tx.Tx(), dbCluster.CertificateLegacy{
 			Fingerprint: shared.CertFingerprint(x509Cert),
 			Type:        certificate.TypeClient,
 			Name:        "test-cert",
@@ -53,7 +59,7 @@ func Test_patchSplitIdentityCertificateEntityTypes(t *testing.T) {
 		// Create an OIDC identity
 		oidcMetadata, err := json.Marshal(dbCluster.OIDCMetadata{Subject: "test-subject"})
 		require.NoError(t, err)
-		identityIDint64, err := dbCluster.CreateIdentity(ctx, tx.Tx(), dbCluster.Identity{
+		identityIDint64, err := query.Create(ctx, tx.Tx(), dbCluster.IdentitiesRow{
 			AuthMethod: api.AuthenticationMethodOIDC,
 			Type:       api.IdentityTypeOIDCClient,
 			Identifier: "jane.doe@example.com",
@@ -110,6 +116,137 @@ func Test_patchSplitIdentityCertificateEntityTypes(t *testing.T) {
 
 		// The entity type of the third permission should not have changed.
 		assert.Equal(t, entity.TypeIdentity, entity.Type(permissions[1].EntityType))
+		return nil
+	})
+	require.NoError(t, err)
+}
+
+func Test_patchOIDCGroupsClaimScope(t *testing.T) {
+	defaultScopes := []string{oidc.ScopeOpenID, oidc.ScopeEmail, oidc.ScopeProfile, oidc.ScopeOfflineAccess}
+	case1 := func() {
+		// Set up test database.
+		cluster, cleanup := db.NewTestCluster(t)
+		defer cleanup()
+
+		// Set the groups claim.
+		// Use default values for oidc.scopes
+		ctx := cancel.New()
+		err := cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+			conf, err := clusterConfig.Load(ctx, tx)
+			require.NoError(t, err)
+
+			_, err = conf.Patch(tx, map[string]string{
+				"oidc.groups.claim": "groups",
+			})
+			require.NoError(t, err)
+			return nil
+		})
+		require.NoError(t, err)
+
+		// Run the patch.
+		daemonDB := &db.DB{Cluster: cluster}
+		daemon := &Daemon{db: daemonDB, shutdownCtx: ctx}
+		err = patchOIDCGroupsClaimScope("", daemon)
+		require.NoError(t, err)
+
+		// Check the result.
+		err = cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+			conf, err := clusterConfig.Load(ctx, tx)
+			require.NoError(t, err)
+
+			_, _, _, scopes, _, groupsClaim, _ := conf.OIDCServer()
+			// Expect the groups claim to still be set.
+			assert.Equal(t, "groups", groupsClaim)
+
+			// Expect that `oidc.scopes` contains all of the default scopes, plus the groups claim.
+			assert.ElementsMatch(t, append(defaultScopes, groupsClaim), scopes)
+
+			return nil
+		})
+		require.NoError(t, err)
+	}
+
+	case2 := func() {
+		// Set up test database.
+		cluster, cleanup := db.NewTestCluster(t)
+		defer cleanup()
+
+		// Set the groups claim.
+		// This time set oidc.scopes to already include the groups claim (i.e. this patch was already run on another member).
+		ctx := cancel.New()
+		err := cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+			conf, err := clusterConfig.Load(ctx, tx)
+			require.NoError(t, err)
+
+			_, err = conf.Patch(tx, map[string]string{
+				"oidc.groups.claim": "groups",
+				"oidc.scopes":       strings.Join(append(defaultScopes, "groups"), " "),
+			})
+			require.NoError(t, err)
+			return nil
+		})
+		require.NoError(t, err)
+
+		// Run the patch.
+		daemonDB := &db.DB{Cluster: cluster}
+		daemon := &Daemon{db: daemonDB, shutdownCtx: ctx}
+		err = patchOIDCGroupsClaimScope("", daemon)
+		require.NoError(t, err)
+
+		// Check the result.
+		err = cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+			conf, err := clusterConfig.Load(ctx, tx)
+			require.NoError(t, err)
+
+			_, _, _, scopes, _, groupsClaim, _ := conf.OIDCServer()
+			// Expect the groups claim to still be set.
+			assert.Equal(t, "groups", groupsClaim)
+
+			// Expect that `oidc.scopes` contains all of the default scopes, plus the groups claim.
+			assert.ElementsMatch(t, append(defaultScopes, groupsClaim), scopes)
+
+			return nil
+		})
+		require.NoError(t, err)
+	}
+
+	case1()
+	case2()
+}
+
+func Test_patchClusteringEventHubRoleToControlPlane(t *testing.T) {
+	cluster, cleanup := db.NewTestCluster(t)
+	defer cleanup()
+
+	ctx := cancel.New()
+	err := cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		id, err := tx.CreateNode("buzz", "1.2.3.4:666")
+		require.NoError(t, err)
+
+		_, err = tx.Tx().Exec("INSERT INTO nodes_roles (node_id, role) VALUES (?, ?)", id, 1)
+		require.NoError(t, err)
+
+		return nil
+	})
+	require.NoError(t, err)
+
+	daemonDB := &db.DB{Cluster: cluster}
+	daemon := &Daemon{db: daemonDB, shutdownCtx: ctx}
+	err = patchClusteringEventHubRoleToControlPlane("", daemon)
+	require.NoError(t, err)
+
+	err = cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		node, err := tx.GetNodeByName(ctx, "buzz")
+		require.NoError(t, err)
+		assert.Empty(t, node.Roles)
+
+		rows, err := tx.Tx().Query("SELECT role FROM nodes_roles WHERE node_id=?", node.ID)
+		require.NoError(t, err)
+		defer func() { _ = rows.Close() }()
+
+		assert.False(t, rows.Next(), "expected no rows in nodes_roles after patch")
+		require.NoError(t, rows.Err())
+
 		return nil
 	})
 	require.NoError(t, err)
